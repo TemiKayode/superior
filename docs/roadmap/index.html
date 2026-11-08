@@ -110,7 +110,7 @@ const PHASES = [
       { name: "Exit gate", tasks: [
         { t: "Boots to a shell on x86-64", s: "done", ev: "A user-space shell that is its own COM1 driver (I/O-port and IRQ capabilities). <code>cargo xtask test</code> types a session over serial — help, echo, sleep, ipc, backspace editing — checks every answer, and requires <code>shutdown</code> to power QEMU off. Also fixed a lost-signal race that hung 1 boot in 5; 16/16 clean since. <code>097c782</code>" },
         { t: "Boots to a shell on AArch64", s: "open", ev: "Not started." },
-        { t: "Tier 1 IPC within 1.5× of seL4", s: "open", ev: "Round trips are timed in the self-test, but not yet compared with seL4's published figures." },
+        { t: "Tier 1 IPC within 1.5× of seL4", s: "done", ev: "<code>cargo xtask bench</code>: one-way call and reply timed as sel4bench does, 5 × 100,000 round trips under WHPX on an i7-1165G7. Median call 504, reply 496 TSC cycles vs seL4 MCS (Skylake) 771 / 667: 0.65× and 0.74×. Allowing for TSC vs turbo clock, at most 1.10× / 1.25×. x86-64 under a hypervisor, not bare metal. <code>1dd67c0</code>" },
       ]},
     ]},
   { id: "P1", name: "Core runtime and drivers", months: "Months 5–15",
