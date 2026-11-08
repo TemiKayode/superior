@@ -138,6 +138,15 @@ pub fn derive_cap(
         .map_err(|_| "derive failed")
 }
 
+/// Limits thread `t` to `budget` timer ticks in every `period` ticks.
+pub fn configure_sched(t: Tid, budget: u32, period: u32) -> Result<(), &'static str> {
+    KERNEL
+        .lock()
+        .ipc
+        .configure_sc(t, budget, period)
+        .map_err(|_| "bad scheduling parameters")
+}
+
 /// Index in the capability table of thread `t`'s slot `slot`.
 fn cap_slot(t: Tid, slot: usize) -> Option<usize> {
     ((t as usize) < MAX_THREADS && slot < CSPACE_SLOTS).then(|| t as usize * CSPACE_SLOTS + slot)
@@ -172,7 +181,9 @@ pub fn handle_syscall(frame: &mut UserFrame) -> Exit {
         Some(Syscall::DebugPutStr) => debug_put_str(k, cur, frame.rdi, frame.rsi),
         Some(Syscall::DebugSelftestDone) => {
             let stats = k.stats;
+            let sched = k.ipc.stats;
             drop(guard);
+            report_sched(sched);
             selftest_done(cur, frame.rdi, stats)
         }
         Some(op) => match CapTransfer::decode(frame.r10) {
@@ -198,8 +209,9 @@ pub fn handle_timer(frame: &mut UserFrame) -> Exit {
     }
     if !frame.is_user_mode() {
         // The only kernel code that runs with interrupts enabled is the
-        // idle halt in `resume`. Wake any sleeper and return to it; the
-        // idle loop decides who runs.
+        // idle halt in `resume`. Advance time (refilling budgets), wake any
+        // sleeper, and return to it; the idle loop decides who runs.
+        k.ipc.tick();
         let _ = k.ipc.signal_irq(TIMER_NTFN, 1);
         return Exit::Iret;
     }
@@ -317,6 +329,9 @@ fn ipc_op(
     if op == Syscall::Yield {
         return k.ipc.yield_now().map_err(|e| e.status());
     }
+    if op == Syscall::SchedPassive {
+        return k.ipc.make_passive().map_err(|e| e.status());
+    }
     let replying = matches!(op, Syscall::Reply | Syscall::ReplyRecv);
     if replying && xfer.grant.is_some() {
         let may = k
@@ -391,6 +406,31 @@ fn debug_put_str(k: &Kernel, cur: Tid, ptr: u64, len: u64) -> Result<(), u64> {
     Ok(())
 }
 
+/// Checks the boot self-test's scheduling-context scenario: a budgeted
+/// high-priority hog must have been throttled, and the passive server must
+/// have run on its callers' contexts.
+fn report_sched(s: superior_objects::ipc::SchedStats) {
+    if s.throttles == 0 {
+        kprintln!("[fail] no thread was ever throttled by its budget");
+    } else {
+        kprintln!("[pass] budgets: {} throttles", s.throttles);
+    }
+    if s.donated_ticks == 0 {
+        kprintln!("[fail] the passive server never ran on a lent scheduling context");
+    } else {
+        kprintln!(
+            "[pass] passive server: {} ticks charged to callers' contexts",
+            s.donated_ticks
+        );
+    }
+    SCHED_OK.store(
+        s.throttles > 0 && s.donated_ticks > 0,
+        core::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+static SCHED_OK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 fn selftest_done(cur: Tid, code: u64, stats: Stats) -> ! {
     let Stats {
         ticks,
@@ -410,6 +450,11 @@ fn selftest_done(cur: Tid, code: u64, stats: Stats) -> ! {
     } else {
         kprintln!("[pass] timer preemption: {ticks} ticks, {preemptions} preemptive switches");
         code
+    };
+    let code = if SCHED_OK.load(core::sync::atomic::Ordering::Relaxed) {
+        code
+    } else {
+        code.max(1)
     };
     // The client sleeps on the timer notification after every other
     // thread has blocked, so the CPU must have idled.

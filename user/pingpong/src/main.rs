@@ -13,6 +13,9 @@
 //!   client's priority, so the client only runs if the kernel preempts it.
 //!   Then it tells the client it is done and blocks for good.
 //!
+//! - role 3, the **hog**: spins forever above every other thread. Only its
+//!   scheduling context's budget (2 ticks in 10) lets anything else run.
+//!
 //! Finally the client sleeps on the timer notification. With every other
 //! thread blocked, that only returns if the kernel idles and the timer
 //! wakes it.
@@ -152,11 +155,14 @@ pub extern "C" fn _start(role: u64) -> ! {
     match role {
         0 => server(),
         1 => client(),
-        _ => spinner(),
+        2 => spinner(),
+        _ => hog(),
     }
 }
 
 fn server() -> ! {
+    // From the first receive on, run only on callers' scheduling contexts.
+    syscall(Syscall::SchedPassive, 0, [0; 4]);
     let mut r = syscall(Syscall::Recv, EP, [0; 4]);
     loop {
         let (reply, xfer) = match r.msg[1] {
@@ -266,6 +272,14 @@ fn transfer_tests() -> bool {
         1,
     );
     pass
+}
+
+/// Spins forever at the highest priority; its budget keeps it in check.
+fn hog() -> ! {
+    let mut n = 0u64;
+    loop {
+        n = core::hint::black_box(n.wrapping_add(1));
+    }
 }
 
 fn spinner() -> ! {

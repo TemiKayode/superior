@@ -16,8 +16,16 @@
 //!   (the IPC fast path), unless a higher-priority thread is ready.
 //! - Strict fixed priorities (64 levels), FIFO within a level, and
 //!   round-robin time slices within a level driven by [`Ipc::tick`].
-//!   Scheduling contexts with budgets (MCS) come later and slot in at
-//!   `switch_to`.
+//! - Scheduling contexts (MCS, spec section 3): every thread owns one,
+//!   unlimited unless configured with a budget per period. Budgets are
+//!   charged per timer tick and refilled in full at each period boundary
+//!   (periodic, not yet sporadic); a thread whose context runs dry is
+//!   throttled until the refill.
+//! - A passive server has given up its own context and runs only on its
+//!   caller's, lent on `Call` and returned on reply, so time spent serving
+//!   a client is charged to that client. A passive thread with no lent
+//!   context cannot run: woken any other way (a `Send`, a signal), it is
+//!   parked in [`State::NoSchedContext`].
 //!
 //! Message delivery always fills `msg`, `badge` and `status` of the thread
 //! being woken; the kernel copies them into that thread's registers.
@@ -57,6 +65,48 @@ pub enum State {
     BlockedWait {
         ntfn: u16,
     },
+    /// Runnable, but its scheduling context `sc` has no budget left until
+    /// the next refill.
+    Throttled {
+        sc: Tid,
+    },
+    /// Passive with no lent scheduling context: cannot run.
+    NoSchedContext,
+}
+
+/// CPU time a thread may consume. Scheduling context `i` belongs to
+/// thread `i`; a passive server borrows its caller's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SchedContext {
+    /// Ticks per period; `None` is unlimited.
+    pub budget: Option<u32>,
+    pub period: u32,
+    /// Ticks left in the current period.
+    pub remaining: u32,
+    /// Tick at which the budget is next refilled.
+    pub next_refill: u64,
+}
+
+const UNLIMITED: SchedContext = SchedContext {
+    budget: None,
+    period: 0,
+    remaining: 0,
+    next_refill: 0,
+};
+
+impl SchedContext {
+    fn exhausted(&self) -> bool {
+        self.budget.is_some() && self.remaining == 0
+    }
+}
+
+/// Scheduler counters, for tests and diagnostics.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SchedStats {
+    /// Times a thread was stopped because its budget ran out.
+    pub throttles: u64,
+    /// Ticks charged to a context lent by a caller (a passive server ran).
+    pub donated_ticks: u64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -77,6 +127,12 @@ pub struct Tcb {
     xfer: CapTransfer,
     /// Slot the last delivered message's capability landed in, if any.
     pub cap_received: Option<u16>,
+    /// Runs only on a lent scheduling context.
+    pub passive: bool,
+    /// Becomes passive the next time it blocks.
+    passive_pending: bool,
+    /// The scheduling context a caller lent this (passive) thread.
+    lent: Option<Tid>,
 }
 
 /// A capability to copy from `from`'s slot `grant` into `to`'s slot `accept`.
@@ -103,6 +159,9 @@ const IDLE_TCB: Tcb = Tcb {
     slice: TIMESLICE_TICKS,
     xfer: CapTransfer::NONE,
     cap_received: None,
+    passive: false,
+    passive_pending: false,
+    lent: None,
 };
 
 #[derive(Clone, Copy, Default, Debug)]
@@ -176,6 +235,7 @@ pub enum IpcError {
     BadThread,
     BadObject,
     BadPriority,
+    BadSchedParams,
     ThreadActive,
     WouldBlock,
 }
@@ -201,6 +261,10 @@ pub struct Ipc<const T: usize, const E: usize, const N: usize> {
     ready_bits: u64,
     current: Option<Tid>,
     transfers: [Option<Transfer>; MAX_TRANSFERS],
+    scs: [SchedContext; T],
+    /// Timer ticks since boot.
+    now: u64,
+    pub stats: SchedStats,
 }
 
 impl<const T: usize, const E: usize, const N: usize> Default for Ipc<T, E, N> {
@@ -225,6 +289,12 @@ impl<const T: usize, const E: usize, const N: usize> Ipc<T, E, N> {
             ready_bits: 0,
             current: None,
             transfers: [None; MAX_TRANSFERS],
+            scs: [UNLIMITED; T],
+            now: 0,
+            stats: SchedStats {
+                throttles: 0,
+                donated_ticks: 0,
+            },
         }
     }
 
@@ -284,28 +354,122 @@ impl<const T: usize, const E: usize, const N: usize> Ipc<T, E, N> {
         Ok(())
     }
 
-    /// One timer tick. Charges the current thread; when its slice is used
-    /// up, it is refilled and the thread rotates behind any ready thread
-    /// of equal or higher priority. Returns true if the current thread changed.
-    pub fn tick(&mut self) -> bool {
-        let Some(c) = self.current else {
-            return false;
+    /// Gives thread `t`'s scheduling context `budget` ticks every `period`
+    /// ticks, starting with a full budget now.
+    pub fn configure_sc(&mut self, t: Tid, budget: u32, period: u32) -> Result<(), IpcError> {
+        if t as usize >= T {
+            return Err(IpcError::BadThread);
+        }
+        if budget == 0 || budget > period {
+            return Err(IpcError::BadSchedParams);
+        }
+        self.scs[t as usize] = SchedContext {
+            budget: Some(budget),
+            period,
+            remaining: budget,
+            next_refill: self.now + period as u64,
         };
+        Ok(())
+    }
+
+    pub fn sched_context(&self, sc: Tid) -> &SchedContext {
+        &self.scs[sc as usize]
+    }
+
+    /// The current thread gives up its own scheduling context the next
+    /// time it blocks, and from then on runs only on contexts its callers
+    /// lend it.
+    pub fn make_passive(&mut self) -> Result<(), IpcError> {
+        let cur = self.cur()?;
+        let tcb = &mut self.threads[cur as usize];
+        tcb.passive_pending = true;
+        tcb.status = 0;
+        Ok(())
+    }
+
+    /// The scheduling context `t` runs on, if any.
+    pub fn active_sc(&self, t: Tid) -> Option<Tid> {
+        let tcb = &self.threads[t as usize];
+        if tcb.passive { tcb.lent } else { Some(t) }
+    }
+
+    /// One timer tick: charges the tick to the current thread's scheduling
+    /// context (throttling it if that empties the budget), refills contexts
+    /// whose period has ended (waking threads throttled on them), then
+    /// applies round-robin time slicing. Returns true if the current
+    /// thread changed.
+    pub fn tick(&mut self) -> bool {
+        self.now += 1;
+        let before = self.current;
+        if let Some(c) = before {
+            self.charge(c);
+        }
+        self.refill();
+        if self.current.is_some() && self.current == before {
+            self.rotate();
+        }
+        self.schedule();
+        self.current != before
+    }
+
+    fn charge(&mut self, c: Tid) {
+        let Some(sc) = self.active_sc(c) else {
+            // Passive with nothing lent: may not run unaccounted.
+            self.threads[c as usize].state = State::NoSchedContext;
+            self.current = None;
+            return;
+        };
+        if sc != c {
+            self.stats.donated_ticks += 1;
+        }
+        let ctx = &mut self.scs[sc as usize];
+        if ctx.budget.is_some() {
+            ctx.remaining = ctx.remaining.saturating_sub(1);
+            if ctx.remaining == 0 {
+                self.threads[c as usize].state = State::Throttled { sc };
+                self.current = None;
+                self.stats.throttles += 1;
+            }
+        }
+    }
+
+    fn refill(&mut self) {
+        let now = self.now;
+        for ctx in self.scs.iter_mut() {
+            if let Some(b) = ctx.budget
+                && now >= ctx.next_refill
+            {
+                ctx.remaining = b;
+                while ctx.next_refill <= now {
+                    ctx.next_refill += ctx.period as u64;
+                }
+            }
+        }
+        for t in 0..T {
+            if let State::Throttled { sc } = self.threads[t].state
+                && !self.scs[sc as usize].exhausted()
+            {
+                self.wake(t as Tid);
+            }
+        }
+    }
+
+    /// Round robin: when the current thread's slice is used up it goes
+    /// behind any ready thread of equal or higher priority.
+    fn rotate(&mut self) {
+        let Some(c) = self.current else { return };
         let tcb = &mut self.threads[c as usize];
         if tcb.slice > 1 {
             tcb.slice -= 1;
-            return false;
+            return;
         }
         tcb.slice = TIMESLICE_TICKS;
         let prio = tcb.prio;
-        match self.highest_ready() {
-            Some(p) if p >= prio => {
-                self.current = None;
-                self.make_ready(c);
-                self.schedule();
-                self.current != Some(c)
-            }
-            _ => false,
+        if let Some(p) = self.highest_ready()
+            && p >= prio
+        {
+            self.current = None;
+            self.make_ready(c);
         }
     }
 
@@ -365,6 +529,7 @@ impl<const T: usize, const E: usize, const N: usize> Ipc<T, E, N> {
             let server = self.dequeue_ep(e);
             self.deliver(cur, server, msg, badge);
             self.take_caller(server, cur);
+            self.lend(cur, server);
             self.threads[cur as usize].state = State::BlockedReply;
             self.current = None;
             self.switch_or_schedule(server);
@@ -405,7 +570,10 @@ impl<const T: usize, const E: usize, const N: usize> Ipc<T, E, N> {
         self.threads[cur as usize].status = 0;
         if let Some(c) = self.threads[cur as usize].caller.take() {
             self.deliver(cur, c, msg, 0);
+            self.threads[cur as usize].lent = None;
+            self.park_if_no_sc(cur);
             self.wake(c);
+            self.schedule();
         }
         Ok(())
     }
@@ -418,12 +586,15 @@ impl<const T: usize, const E: usize, const N: usize> Ipc<T, E, N> {
         let caller = self.threads[cur as usize].caller.take();
         if let Some(c) = caller {
             self.deliver(cur, c, msg, 0);
+            self.threads[cur as usize].lent = None;
         }
         if self.eps[e].state == EpState::Sending {
             self.take_from_sender(cur, e);
+            self.park_if_no_sc(cur);
             if let Some(c) = caller {
                 self.wake(c);
             }
+            self.schedule();
         } else {
             self.block_on_ep(cur, e, State::BlockedRecv { ep }, EpState::Receiving);
             match caller {
@@ -480,6 +651,7 @@ impl<const T: usize, const E: usize, const N: usize> Ipc<T, E, N> {
             tcb.badge = word;
             tcb.status = 0;
         } else {
+            self.settle_passive(cur);
             self.threads[cur as usize].state = State::BlockedWait { ntfn };
             self.current = None;
             self.ntfns[n].waiters.push_back(&mut self.threads, cur);
@@ -553,6 +725,7 @@ impl<const T: usize, const E: usize, const N: usize> Ipc<T, E, N> {
         self.deliver(s, cur, sender.msg, sender.badge);
         if let State::BlockedSend { call: true, .. } = sender.state {
             self.take_caller(cur, s);
+            self.lend(s, cur);
             self.threads[s as usize].state = State::BlockedReply;
         } else {
             self.threads[s as usize].status = 0;
@@ -561,6 +734,7 @@ impl<const T: usize, const E: usize, const N: usize> Ipc<T, E, N> {
     }
 
     fn block_on_ep(&mut self, t: Tid, e: usize, state: State, ep_state: EpState) {
+        self.settle_passive(t);
         self.threads[t as usize].state = state;
         if self.current == Some(t) {
             self.current = None;
@@ -577,11 +751,49 @@ impl<const T: usize, const E: usize, const N: usize> Ipc<T, E, N> {
         t
     }
 
-    fn make_ready(&mut self, t: Tid) {
+    /// A pending switch to passive takes effect as the thread blocks.
+    fn settle_passive(&mut self, t: Tid) {
+        let tcb = &mut self.threads[t as usize];
+        if core::mem::take(&mut tcb.passive_pending) {
+            tcb.passive = true;
+        }
+    }
+
+    /// `caller` calls passive `server`: lend it the context `caller` runs on.
+    fn lend(&mut self, caller: Tid, server: Tid) {
+        if self.threads[server as usize].passive {
+            self.threads[server as usize].lent = self.active_sc(caller);
+        }
+    }
+
+    /// Stops the current thread `t` if it has no context to run on.
+    fn park_if_no_sc(&mut self, t: Tid) {
+        if self.current == Some(t) && self.active_sc(t).is_none() {
+            self.threads[t as usize].state = State::NoSchedContext;
+            self.current = None;
+        }
+    }
+
+    /// Queues `t` to run, or, if it has no context with budget, parks it
+    /// as throttled (until refill) or without a context. Returns whether
+    /// it was queued.
+    fn make_ready(&mut self, t: Tid) -> bool {
+        match self.active_sc(t) {
+            None => {
+                self.threads[t as usize].state = State::NoSchedContext;
+                return false;
+            }
+            Some(sc) if self.scs[sc as usize].exhausted() => {
+                self.threads[t as usize].state = State::Throttled { sc };
+                return false;
+            }
+            Some(_) => {}
+        }
         let p = self.threads[t as usize].prio as usize;
         self.threads[t as usize].state = State::Ready;
         self.ready[p].push_back(&mut self.threads, t);
         self.ready_bits |= 1 << p;
+        true
     }
 
     fn highest_ready(&self) -> Option<u8> {
@@ -590,7 +802,9 @@ impl<const T: usize, const E: usize, const N: usize> Ipc<T, E, N> {
 
     /// Makes `t` runnable; preempts the current thread if `t` outranks it.
     fn wake(&mut self, t: Tid) {
-        self.make_ready(t);
+        if !self.make_ready(t) {
+            return;
+        }
         if let Some(c) = self.current
             && self.threads[t as usize].prio > self.threads[c as usize].prio
         {
@@ -609,7 +823,14 @@ impl<const T: usize, const E: usize, const N: usize> Ipc<T, E, N> {
     /// waiting, in which case `t` queues like anyone else.
     fn switch_or_schedule(&mut self, t: Tid) {
         debug_assert!(self.current.is_none());
+        let runnable = self
+            .active_sc(t)
+            .is_some_and(|sc| !self.scs[sc as usize].exhausted());
         match self.highest_ready() {
+            _ if !runnable => {
+                self.make_ready(t); // parks it
+                self.schedule();
+            }
             Some(p) if p > self.threads[t as usize].prio => {
                 self.make_ready(t);
                 self.schedule();
@@ -1001,5 +1222,110 @@ mod tests {
         k.set_cap_received(SERVER, Some(3));
         k.call(0, 0, [0; 4]).unwrap();
         assert_eq!(k.thread(SERVER).cap_received, None);
+    }
+    #[test]
+    fn budget_throttles_then_refills_and_preempts() {
+        let mut k = K::new();
+        k.spawn(SERVER, 10).unwrap();
+        k.spawn(CLIENT, 5).unwrap();
+        k.configure_sc(SERVER, 2, 5).unwrap();
+        k.schedule();
+        assert_eq!(k.current(), Some(SERVER));
+        assert!(!k.tick()); // 1 of 2 used
+        assert!(k.tick(), "budget gone: throttled");
+        assert_eq!(k.current(), Some(CLIENT));
+        assert_eq!(k.thread(SERVER).state, State::Throttled { sc: SERVER });
+        assert_eq!(k.stats.throttles, 1);
+        assert!(!k.tick()); // tick 3
+        assert!(!k.tick()); // tick 4
+        assert!(k.tick(), "tick 5: refilled, higher priority preempts");
+        assert_eq!(k.current(), Some(SERVER));
+        assert_eq!(k.sched_context(SERVER).remaining, 2);
+        assert_eq!(k.thread(CLIENT).state, State::Ready);
+    }
+
+    #[test]
+    fn configure_sc_rejects_bad_parameters() {
+        let mut k = K::new();
+        assert_eq!(k.configure_sc(CLIENT, 0, 5), Err(IpcError::BadSchedParams));
+        assert_eq!(k.configure_sc(CLIENT, 6, 5), Err(IpcError::BadSchedParams));
+        assert_eq!(k.configure_sc(100, 1, 5), Err(IpcError::BadThread));
+        assert!(k.configure_sc(CLIENT, 5, 5).is_ok());
+    }
+
+    /// Server goes passive on its first receive; returns a kernel with the
+    /// server blocked and the client current.
+    fn passive_server(client_budget: u32, period: u32) -> K {
+        let mut k = K::new();
+        k.spawn(SERVER, 10).unwrap();
+        k.spawn(CLIENT, 5).unwrap();
+        k.configure_sc(CLIENT, client_budget, period).unwrap();
+        k.schedule();
+        k.make_passive().unwrap();
+        k.recv(0, true).unwrap();
+        assert!(k.thread(SERVER).passive);
+        assert_eq!(k.active_sc(SERVER), None);
+        assert_eq!(k.current(), Some(CLIENT));
+        k
+    }
+
+    #[test]
+    fn passive_server_runs_on_callers_budget() {
+        let mut k = passive_server(3, 100);
+        k.call(0, 0, [0; 4]).unwrap();
+        assert_eq!(k.current(), Some(SERVER));
+        assert_eq!(k.active_sc(SERVER), Some(CLIENT), "lent by the caller");
+        k.tick();
+        assert_eq!(
+            k.sched_context(CLIENT).remaining,
+            2,
+            "charged to the client"
+        );
+        assert_eq!(k.stats.donated_ticks, 1);
+        k.reply_recv(0, [0; 4]).unwrap();
+        assert_eq!(k.current(), Some(CLIENT));
+        assert_eq!(k.active_sc(SERVER), None, "returned on reply");
+    }
+
+    #[test]
+    fn passive_server_is_throttled_with_the_lent_budget() {
+        let mut k = passive_server(1, 4);
+        k.call(0, 0, [0; 4]).unwrap();
+        assert!(k.tick());
+        assert_eq!(k.current(), None, "server out of the client's budget");
+        assert_eq!(k.thread(SERVER).state, State::Throttled { sc: CLIENT });
+        k.tick(); // 2
+        k.tick(); // 3
+        assert_eq!(k.current(), None);
+        k.tick(); // 4: refill
+        assert_eq!(k.current(), Some(SERVER));
+    }
+
+    #[test]
+    fn passive_server_parks_after_plain_reply() {
+        let mut k = passive_server(10, 10);
+        k.call(0, 0, [0; 4]).unwrap();
+        k.reply([0; 4]).unwrap();
+        assert_eq!(k.thread(SERVER).state, State::NoSchedContext);
+        assert_eq!(k.current(), Some(CLIENT));
+    }
+
+    #[test]
+    fn send_to_passive_server_parks_it() {
+        let mut k = passive_server(10, 10);
+        k.send(0, 0, [7, 0, 0, 0], true).unwrap();
+        assert_eq!(k.thread(SERVER).state, State::NoSchedContext);
+        assert_eq!(k.current(), Some(CLIENT));
+    }
+
+    #[test]
+    fn make_passive_takes_effect_at_next_block() {
+        let mut k = K::new();
+        k.spawn(SERVER, 10).unwrap();
+        k.schedule();
+        k.make_passive().unwrap();
+        // Not blocked yet: still runs on its own context.
+        assert!(!k.tick());
+        assert_eq!(k.current(), Some(SERVER));
     }
 }

@@ -21,6 +21,11 @@ Phase 0 (foundations). Working today, under QEMU on x86-64:
   threads that entered by system call leave by `sysret`, preempted threads by `iretq`.
 - Local APIC timer, calibrated against the PIT, at 100 Hz; round-robin time slices within
   a priority level, never handing the CPU to a lower priority.
+- Scheduling contexts (MCS): each thread owns one, unlimited unless given a budget per
+  period. Budgets are charged per tick and refilled each period (periodic, not yet
+  sporadic); a thread that runs dry is throttled until the refill. A passive server
+  (`SchedPassive`) runs only on its caller's context, lent on `Call` and returned on
+  reply, so serving a client is charged to that client.
 - Idle: with every thread blocked the kernel halts the CPU until an interrupt makes one
   runnable. The timer signals a notification each tick, so threads sleep by waiting on it.
 - IPC engine: `Send`, `Call`, `Recv`, `Reply`, `ReplyRecv`, `Signal`, `Wait`, `Yield`;
@@ -39,9 +44,13 @@ Phase 0 (foundations). Working today, under QEMU on x86-64:
   capability in a reply, uses it, watches the server revoke it, and checks that ungranted
   or out-of-range transfers are refused. The client then sleeps on the timer
   notification with every other thread blocked, so the CPU idles and the timer wakes it.
-  Self-test builds fail after 60 seconds instead of hanging.
+  Self-test builds fail after 60 seconds instead of hanging. A hog at the top priority
+  spins forever on a budget of 2 ticks in 10; without the budget nothing else runs and the
+  test times out. The IPC server is passive, and the kernel checks that ticks were charged
+  to its callers.
 
-Not yet: scheduling contexts (MCS budgets), retype into kernel objects from user space, SMP, an IPC benchmark on real hardware.
+Not yet: scheduling-context capabilities (budgets are set at boot), sporadic refills,
+timeout faults, retype into kernel objects from user space, SMP, an IPC benchmark on real hardware.
 
 The architectural specification lives in the Superior OS Architectural Specification doc:
 https://claude.ai/artifact/QKJS8qH5Dfbjzn58RStq1j

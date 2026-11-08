@@ -97,7 +97,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 /// share one endpoint: the server holds the original, the client a badged
 /// copy derived from it with Write and GrantReply only, so it can call (and
 /// accept capabilities in replies) but not receive or grant. The server
-/// also holds a notification it hands to the client through a reply.
+/// also holds a notification it hands to the client through a reply. It
+/// goes passive before its first receive, so it serves each call on the
+/// caller's scheduling context.
 ///
 /// The spinner has the client's priority, is ahead of it in the ready
 /// queue, and makes no system call while it spins. The client gets the
@@ -143,8 +145,12 @@ fn start_pingpong() -> Result<(), &'static str> {
         &[(1, timer), (2, Capability::new(spinner_done, Rights::READ))],
     )?;
     task::derive_cap(0, 0, 2, 0, Rights::WRITE | Rights::GRANT_REPLY, Some(0xC1))?;
+    // A hog above everyone, spinning forever, held to 2 ticks in every 10
+    // by its scheduling context. Without the budget nothing else would run.
+    task::spawn_process(3, USER_IMAGE, 20, 3, &[])?;
+    task::configure_sched(3, 2, 10)?;
     kprintln!(
-        "[ok] server (prio 10), spinner and client (prio 5) loaded in separate address spaces"
+        "[ok] hog (prio 20, 2/10 ticks), passive server (prio 10), spinner and client (prio 5) loaded"
     );
     Ok(())
 }

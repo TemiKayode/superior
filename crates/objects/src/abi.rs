@@ -84,6 +84,9 @@ pub enum Syscall {
     /// Empties slot `rdi`. Capabilities derived from it stay revocable
     /// through its parent.
     CapDelete = 11,
+    /// The caller gives up its own scheduling context the next time it
+    /// blocks; afterwards it runs only on contexts lent by its callers.
+    SchedPassive = 12,
     /// Debug build only: print a UTF-8 string. rdi = pointer, rsi = length.
     DebugPutStr = 0x100,
     /// Debug build only: report a self-test result. rdi = 0 for pass.
@@ -105,6 +108,7 @@ impl Syscall {
             9 => Syscall::Yield,
             10 => Syscall::CapRevoke,
             11 => Syscall::CapDelete,
+            12 => Syscall::SchedPassive,
             0x100 => Syscall::DebugPutStr,
             0x101 => Syscall::DebugSelftestDone,
             _ => return None,
