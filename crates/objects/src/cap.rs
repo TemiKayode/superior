@@ -84,10 +84,24 @@ impl fmt::Debug for Rights {
 /// The kernel object a capability refers to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Object {
-    Untyped { base: u64, size_bits: u8 },
-    Endpoint { id: u32 },
-    Notification { id: u32 },
-    Frame { paddr: u64, size_bits: u8 },
+    Untyped {
+        base: u64,
+        size_bits: u8,
+    },
+    Endpoint {
+        id: u32,
+    },
+    Notification {
+        id: u32,
+    },
+    Frame {
+        paddr: u64,
+        size_bits: u8,
+    },
+    /// A thread (an entry in the kernel's thread table).
+    Thread {
+        id: u32,
+    },
 }
 
 impl Object {

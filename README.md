@@ -33,6 +33,12 @@ Phase 0 (foundations). Working today, under QEMU on x86-64:
   mapping copies shares memory. Deleting or revoking a frame capability unmaps it first,
   so memory is never reused while still mapped. Intermediate page tables still come from
   kernel memory, not from the caller's untyped.
+- Threads as objects: retype makes a thread; `ThreadConfigure` sets entry, stack,
+  argument and priority (no higher than the creator's) to run in the creator's address
+  space, inheriting its fault handler and budget; `ThreadCopyCap` fills its CSpace;
+  `ThreadResume` and `ThreadSuspend` start and stop it (a blocked call is cancelled with
+  `Interrupted`). Deleting the last capability destroys the thread and empties its CSpace.
+  Threads live in the kernel's fixed thread table (8, 4 used at boot).
 - User faults as messages: a thread names a fault endpoint (`SetFaultHandler`); a page
   fault, general-protection fault, invalid opcode or divide error in user mode becomes a
   `Call` to it (kind, address, rip, error code). The handler's reply retries the
@@ -69,11 +75,12 @@ Phase 0 (foundations). Working today, under QEMU on x86-64:
   shares one through a read-only copy, and checks that revoking unmaps them and that
   reused memory comes back zeroed. The server doubles as the client's fault handler and
   emulates a faulting load, a store to a read-only page, `hlt` and `ud2`; the spinner
-  ends by faulting with no handler and is stopped.
+  ends by faulting with no handler and is stopped. The client creates a worker thread in
+  its own address space, checks it ran with its copied capabilities and inherited fault
+  handler, suspends and resumes it, then destroys it and refills the thread table.
 
 Not yet: page tables paid for from user untyped memory, mapping into other address
-spaces, threads and CNodes as retypable
-objects, scheduling-context capabilities (budgets are set at boot), sporadic refills,
+spaces, new address spaces and CNodes as retypable objects, scheduling-context capabilities (budgets are set at boot), sporadic refills,
 timeout faults, SMP, an IPC benchmark on real hardware.
 
 The architectural specification lives in the Superior OS Architectural Specification doc:

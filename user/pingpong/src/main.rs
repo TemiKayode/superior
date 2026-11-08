@@ -34,6 +34,7 @@
 
 use core::arch::asm;
 use core::fmt::{self, Write};
+use core::sync::atomic::{AtomicU64, Ordering};
 use superior_objects::abi::{
     CapTransfer, Error, FaultKind, FaultReply, MSG_WORDS, ObjectType, Syscall,
 };
@@ -50,6 +51,21 @@ const DONE_OUT: u64 = 0;
 const FAULT_EP: u64 = 11;
 const FAULT_BADGE: u64 = 0xFA;
 const UNMAPPED: u64 = 0x7000_6000_0000;
+/// Client: a worker thread it creates, with its stack and signals.
+const TCB: u64 = 12;
+const STACK_FRAME: u64 = 6;
+const DONE_NTFN: u64 = 7;
+const PARK_EP: u64 = 8;
+const DONE_BADGED: u64 = 9;
+const VA_STACK: u64 = USER_BASE + 0x5000_0000;
+const WORKER_ARG: u64 = 14;
+/// Worker CSpace slots.
+const W_DONE: u64 = 0;
+const W_PARK: u64 = 1;
+/// Shared with the worker thread, which runs in this address space.
+static WORKER_RESULT: AtomicU64 = AtomicU64::new(0);
+static WORKER_FAULT: AtomicU64 = AtomicU64::new(0);
+static WORKER_STATUS: AtomicU64 = AtomicU64::new(u64::MAX);
 const SPIN_ITERATIONS: u64 = 100_000_000;
 const SLEEP_TICKS: u64 = 5;
 /// Server: the notification it hands out.
@@ -452,6 +468,118 @@ fn fault_reply([kind, addr, rip, code]: [u64; 4]) -> [u64; 4] {
     }
 }
 
+/// A thread the client creates in its own address space.
+extern "C" fn worker(arg: u64) -> ! {
+    let seen: u64;
+    // SAFETY: faults; the inherited handler (the server) skips the 3-byte
+    // load and hands back the faulting address in rax.
+    unsafe {
+        asm!(
+            "mov rax, qword ptr [rdi]",
+            in("rdi") UNMAPPED,
+            out("rax") seen,
+            options(nostack),
+        );
+    }
+    WORKER_FAULT.store(seen, Ordering::SeqCst);
+    WORKER_RESULT.store(arg * 3, Ordering::SeqCst);
+    syscall(Syscall::Signal, W_DONE, [0; 4]);
+    loop {
+        // Nobody sends here: this blocks until the client suspends it.
+        let r = syscall(Syscall::Recv, W_PARK, [0; 4]);
+        WORKER_STATUS.store(r.status, Ordering::SeqCst);
+        syscall(Syscall::Signal, W_DONE, [0; 4]);
+    }
+}
+
+fn thread_op(op: Syscall, args: [u64; 4]) -> u64 {
+    syscall(op, TCB, args).status
+}
+
+/// Threads as objects: make one, give it capabilities, run it, stop it,
+/// restart it and destroy it.
+fn thread_tests() -> bool {
+    use ObjectType::{Endpoint, Frame, Notification, Thread};
+    let mut pass = true;
+    let setup = [
+        retype(UNTYPED, Thread, 0, TCB),
+        retype(UNTYPED, Frame, 0, STACK_FRAME),
+        map(STACK_FRAME, VA_STACK, true),
+        retype(UNTYPED, Notification, 0, DONE_NTFN),
+        mint(DONE_NTFN, DONE_BADGED, RIGHT_WRITE, 0x1),
+        retype(UNTYPED, Endpoint, 0, PARK_EP),
+        thread_op(
+            Syscall::ThreadCopyCap,
+            [DONE_BADGED, W_DONE, RIGHT_WRITE, 0],
+        ),
+        thread_op(Syscall::ThreadCopyCap, [PARK_EP, W_PARK, RIGHT_READ, 0]),
+    ];
+    pass &= expect(
+        "make a thread object, its stack and its capabilities",
+        ok(setup.iter().all(|&s| s == 0)),
+        1,
+    );
+
+    let entry = worker as *const () as u64;
+    let top = VA_STACK + 0x1000;
+    let too_high = thread_op(Syscall::ThreadConfigure, [entry, top, WORKER_ARG, 6]);
+    let kernel_entry = thread_op(Syscall::ThreadConfigure, [0xffff_8000_0000_0000, top, 0, 5]);
+    pass &= expect(
+        "a thread may not outrank its creator or start outside user memory",
+        ok(too_high == Error::InsufficientRights.code()
+            && kernel_entry == Error::InvalidArgument.code()),
+        1,
+    );
+
+    let conf = thread_op(Syscall::ThreadConfigure, [entry, top, WORKER_ARG, 5]);
+    let run = thread_op(Syscall::ThreadResume, [0; 4]);
+    let w = syscall(Syscall::Wait, DONE_NTFN, [0; 4]);
+    pass &= expect(
+        "the new thread runs here, with copied capabilities and the inherited fault handler",
+        ok(conf == 0
+            && run == 0
+            && w.status == 0
+            && w.badge == 0x1
+            && WORKER_RESULT.load(Ordering::SeqCst) == WORKER_ARG * 3
+            && WORKER_FAULT.load(Ordering::SeqCst) == UNMAPPED),
+        1,
+    );
+
+    // The worker now waits in Recv. Stop it, then start it again.
+    let stop = thread_op(Syscall::ThreadSuspend, [0; 4]);
+    let again = thread_op(Syscall::ThreadResume, [0; 4]);
+    let w = syscall(Syscall::Wait, DONE_NTFN, [0; 4]);
+    pass &= expect(
+        "suspending a blocked thread cancels its call, and it resumes after",
+        ok(stop == 0
+            && again == 0
+            && w.status == 0
+            && WORKER_STATUS.load(Ordering::SeqCst) == Error::Interrupted.code()),
+        1,
+    );
+
+    // Deleting the only capability destroys the thread and frees its table
+    // entry: every free entry can be retyped again.
+    let del = syscall(Syscall::CapDelete, TCB, [0; 4]).status;
+    let mut made = 0;
+    let mut last = 0;
+    for slot in [TCB, 13, 14, 15, 10] {
+        last = retype(UNTYPED, Thread, 0, slot);
+        if last != 0 {
+            break;
+        }
+        made += 1;
+    }
+    let rv = syscall(Syscall::CapRevoke, UNTYPED, [0; 4]).status;
+    say!("     made {made} threads before the table filled");
+    pass &= expect(
+        "deleting the capability destroys the thread and frees its entry",
+        ok(del == 0 && made == 4 && last == Error::ObjectTableFull.code() && rv == 0),
+        1,
+    );
+    pass
+}
+
 /// Faults: delivered to the handler as IPC, resumed by its reply.
 fn fault_tests() -> bool {
     let mut pass = true;
@@ -666,6 +794,7 @@ fn client() -> ! {
     pass &= retype_tests();
     pass &= frame_tests();
     pass &= fault_tests();
+    pass &= thread_tests();
 
     // Round trips through the server.
     let (mut min, mut total) = (u64::MAX, 0u64);

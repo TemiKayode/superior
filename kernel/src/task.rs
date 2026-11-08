@@ -12,7 +12,8 @@
 //!
 //! Kernel objects: user space makes endpoints, notifications and smaller
 //! untyped blocks with `Retype`, which consumes memory from an untyped
-//! capability, and 4 KiB frames they can map into their own address space
+//! capability, threads that run in the creator's address space, and 4 KiB
+//! frames they can map into their own address space
 //! (`FrameMap`). A frame capability records where it is mapped; deleting or
 //! revoking it unmaps it first, so memory is never reused while still
 //! mapped. The endpoint and notification state itself lives in the IPC
@@ -86,6 +87,12 @@ struct Kernel {
     fault_ep: [Option<(u16, u64)>; MAX_THREADS],
     /// Blocked in a fault call: the reply says how to resume.
     in_fault: [bool; MAX_THREADS],
+    /// Thread table entries in use, by a boot thread or a Thread object.
+    thread_used: [bool; MAX_THREADS],
+    /// Made by retype (so destroyed with its last capability).
+    thread_object: [bool; MAX_THREADS],
+    /// Configured with ThreadConfigure, and at what priority.
+    configured: [Option<u8>; MAX_THREADS],
     /// Not yet run: its frame holds start registers (entry, stack, argument),
     /// not the results of a system call, and must be resumed untouched.
     fresh: [bool; MAX_THREADS],
@@ -105,6 +112,9 @@ static KERNEL: Mutex<Kernel> = Mutex::new(Kernel {
     mapped: [None; CAP_TABLE_SLOTS],
     fault_ep: [None; MAX_THREADS],
     in_fault: [false; MAX_THREADS],
+    thread_used: [false; MAX_THREADS],
+    thread_object: [false; MAX_THREADS],
+    configured: [None; MAX_THREADS],
     // The timer's notification belongs to the kernel and is never freed.
     ntfn_used: {
         let mut u = [false; MAX_NOTIFICATIONS];
@@ -153,6 +163,7 @@ pub fn spawn_process(
     }
     k.frames[t] = UserFrame::new_thread(entry, stack_top, arg);
     k.spaces[t] = Some(space);
+    k.thread_used[t] = true;
     k.fresh[t] = true;
     k.ipc
         .spawn(tid, prio)
@@ -233,6 +244,10 @@ pub fn handle_syscall(frame: &mut UserFrame) -> Exit {
         Some(Syscall::FrameMap) => frame_map(k, cur, frame),
         Some(Syscall::FrameUnmap) => frame_unmap(k, cur, frame.rdi),
         Some(Syscall::SetFaultHandler) => set_fault_handler(k, cur, frame.rdi),
+        Some(Syscall::ThreadConfigure) => thread_configure(k, cur, frame),
+        Some(Syscall::ThreadResume) => thread_resume(k, cur, frame.rdi),
+        Some(Syscall::ThreadSuspend) => thread_suspend(k, cur, frame.rdi),
+        Some(Syscall::ThreadCopyCap) => thread_copy_cap(k, cur, frame),
         Some(Syscall::CapMint) => cap_mint(k, cur, frame),
         Some(Syscall::Retype) => retype(k, cur, frame),
         Some(Syscall::DebugPutStr) => debug_put_str(k, cur, frame.rdi, frame.rsi),
@@ -528,6 +543,21 @@ fn cap_error(e: CapError) -> u64 {
 /// Frees every endpoint and notification no capability refers to any
 /// more, waking threads blocked on them with `ObjectDestroyed`.
 fn reap(k: &mut Kernel) {
+    // Destroying a thread empties its CSpace, which can orphan more
+    // objects (or threads): repeat until nothing changes.
+    loop {
+        let dead = (0..MAX_THREADS).find(|&t| {
+            k.thread_object[t]
+                && !k
+                    .caps
+                    .iter()
+                    .any(|c| c.object == Object::Thread { id: t as u32 })
+        });
+        match dead {
+            Some(t) => destroy_thread(k, t as Tid),
+            None => break,
+        }
+    }
     for id in 0..MAX_ENDPOINTS {
         let live = k
             .caps
@@ -558,6 +588,110 @@ fn reap(k: &mut Kernel) {
             let _ = k.ipc.destroy_notification(id as u16);
         }
     }
+}
+
+/// Stops thread `t`, empties its CSpace and frees its table entry. Its
+/// address space belongs to its creator and stays.
+fn destroy_thread(k: &mut Kernel, t: Tid) {
+    let _ = k.ipc.suspend(t);
+    for slot in 0..CSPACE_SLOTS {
+        let s = cap_slot(t, slot).unwrap();
+        if k.caps.get(s).is_some() {
+            unmap_slot(k, s);
+            let _ = k.caps.delete(s);
+        }
+    }
+    let i = t as usize;
+    k.thread_object[i] = false;
+    k.thread_used[i] = false;
+    k.configured[i] = None;
+    k.spaces[i] = None;
+    k.fault_ep[i] = None;
+    k.in_fault[i] = false;
+    let _ = k.ipc.reset_thread(t);
+}
+
+/// The thread a capability in the caller's slot names, with Write right.
+fn thread_cap(k: &Kernel, cur: Tid, slot: u64) -> Result<Tid, u64> {
+    let s = own_slot(cur, slot).ok_or(Error::InvalidCapability.code())?;
+    let cap = k.caps.get(s).ok_or(Error::InvalidCapability.code())?;
+    let Object::Thread { id } = cap.object else {
+        return Err(Error::InvalidCapability.code());
+    };
+    if !cap.rights.contains(Rights::WRITE) {
+        return Err(Error::InsufficientRights.code());
+    }
+    Ok(id as Tid)
+}
+
+fn thread_inactive(k: &Kernel, t: Tid) -> bool {
+    k.ipc.thread(t).state == superior_objects::ipc::State::Inactive
+}
+
+/// `ThreadConfigure`: rdi = thread, rsi = entry, rdx = stack top, r8 =
+/// argument, r9 = priority.
+fn thread_configure(k: &mut Kernel, cur: Tid, f: &UserFrame) -> Result<(), u64> {
+    let t = thread_cap(k, cur, f.rdi)?;
+    if !thread_inactive(k, t) {
+        return Err(Error::IllegalOperation.code());
+    }
+    let (entry, stack_top, prio) = (f.rsi, f.rdx, f.r9);
+    // sysret to a non-canonical rip faults in the kernel: keep both
+    // addresses inside the user window.
+    if !(USER_BASE..USER_END).contains(&entry)
+        || !(USER_BASE + 16..=USER_END).contains(&stack_top)
+        || !stack_top.is_multiple_of(16)
+    {
+        return Err(Error::InvalidArgument.code());
+    }
+    // A thread cannot create one that outranks it.
+    if prio > k.ipc.thread(cur).prio as u64 {
+        return Err(Error::InsufficientRights.code());
+    }
+    let i = t as usize;
+    k.spaces[i] = k.spaces[cur as usize];
+    k.frames[i] = UserFrame::new_thread(entry, stack_top, f.r8);
+    k.fresh[i] = true;
+    k.preempted[i] = false;
+    k.fault_ep[i] = k.fault_ep[cur as usize];
+    // Nor escape its budget: the new thread gets the same parameters.
+    let sc = *k.ipc.sched_context(cur);
+    if let Some(budget) = sc.budget {
+        let _ = k.ipc.configure_sc(t, budget, sc.period);
+    }
+    k.configured[i] = Some(prio as u8);
+    Ok(())
+}
+
+/// `ThreadResume`: starts a configured thread, or restarts a suspended one.
+fn thread_resume(k: &mut Kernel, cur: Tid, slot: u64) -> Result<(), u64> {
+    let t = thread_cap(k, cur, slot)?;
+    let prio = k.configured[t as usize].ok_or(Error::IllegalOperation.code())?;
+    if !thread_inactive(k, t) {
+        return Err(Error::IllegalOperation.code());
+    }
+    k.ipc.spawn(t, prio).map_err(|e| e.status())
+}
+
+/// `ThreadSuspend`: stops a thread wherever it is.
+fn thread_suspend(k: &mut Kernel, cur: Tid, slot: u64) -> Result<(), u64> {
+    let t = thread_cap(k, cur, slot)?;
+    // A cancelled fault call is simply retried on resume: the faulting
+    // instruction runs again and faults again.
+    k.in_fault[t as usize] = false;
+    k.ipc.suspend(t).map_err(|e| e.status())
+}
+
+/// `ThreadCopyCap`: rdi = thread, rsi = caller's slot, rdx = the thread's
+/// slot, r8 = rights mask.
+fn thread_copy_cap(k: &mut Kernel, cur: Tid, f: &UserFrame) -> Result<(), u64> {
+    let t = thread_cap(k, cur, f.rdi)?;
+    let src = own_slot(cur, f.rsi).ok_or(Error::InvalidCapability.code())?;
+    let dst = own_slot(t, f.rdx).ok_or(Error::InvalidArgument.code())?;
+    let mask = u8::try_from(f.r8)
+        .map(Rights::from_bits_truncate)
+        .map_err(|_| Error::InvalidArgument.code())?;
+    k.caps.derive(src, dst, mask, None).map_err(cap_error)
 }
 
 /// The caller's slot `slot` as a capability-table index.
@@ -598,6 +732,7 @@ fn retype(k: &mut Kernel, cur: Tid, f: &UserFrame) -> Result<(), u64> {
         ObjectType::Endpoint => Some(free(&k.ep_used).ok_or(Error::ObjectTableFull.code())?),
         ObjectType::Notification => Some(free(&k.ntfn_used).ok_or(Error::ObjectTableFull.code())?),
         ObjectType::Frame => None,
+        ObjectType::Thread => Some(free(&k.thread_used).ok_or(Error::ObjectTableFull.code())?),
     };
     let base = k.caps.carve(src, bits).map_err(cap_error)?;
     let ipc_rights = Rights::READ | Rights::WRITE | Rights::GRANT | Rights::GRANT_REPLY;
@@ -609,6 +744,17 @@ fn retype(k: &mut Kernel, cur: Tid, f: &UserFrame) -> Result<(), u64> {
         (ObjectType::Notification, Some(id)) => {
             k.ntfn_used[id] = true;
             Capability::new(Object::Notification { id: id as u32 }, ipc_rights)
+        }
+        (ObjectType::Thread, Some(t)) => {
+            let _ = k.ipc.reset_thread(t as Tid);
+            k.thread_used[t] = true;
+            k.thread_object[t] = true;
+            k.configured[t] = None;
+            k.reply_grant[t] = false;
+            Capability::new(
+                Object::Thread { id: t as u32 },
+                Rights::READ | Rights::WRITE | Rights::GRANT,
+            )
         }
         (ObjectType::Frame, _) => {
             vm::zero_frame(base);

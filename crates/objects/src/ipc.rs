@@ -205,6 +205,28 @@ impl Queue {
         }
         Some(t)
     }
+
+    /// Unlinks `t` from anywhere in the queue. Returns whether it was there.
+    fn remove(&mut self, threads: &mut [Tcb], t: Tid) -> bool {
+        let mut prev: Option<Tid> = None;
+        let mut at = self.head;
+        while let Some(x) = at {
+            if x == t {
+                let next = threads[x as usize].next.take();
+                match prev {
+                    Some(p) => threads[p as usize].next = next,
+                    None => self.head = next,
+                }
+                if self.tail == Some(t) {
+                    self.tail = prev;
+                }
+                return true;
+            }
+            prev = Some(x);
+            at = threads[x as usize].next;
+        }
+        false
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -329,18 +351,91 @@ impl<const T: usize, const E: usize, const N: usize> Ipc<T, E, N> {
         self.threads[t as usize].caller
     }
 
-    /// Stops the current thread for good (it becomes inactive), e.g. after
-    /// a fault nobody handles. Anything it owed or awaited is dropped.
+    /// Stops the current thread (it becomes inactive), e.g. after a fault
+    /// nobody handles.
     pub fn suspend_current(&mut self) {
-        if let Some(c) = self.current.take() {
-            let tcb = &mut self.threads[c as usize];
-            tcb.state = State::Inactive;
-            if let Some(caller) = tcb.caller.take() {
-                self.threads[caller as usize].status = Error::ReplyAbandoned.code();
-                self.make_ready(caller);
-            }
-            self.schedule();
+        if let Some(c) = self.current {
+            let _ = self.suspend(c);
         }
+    }
+
+    /// Stops thread `t` wherever it is: running, queued to run, or blocked.
+    /// A blocked thread's system call is cancelled with
+    /// [`Error::Interrupted`] (seen when it is resumed with
+    /// [`Ipc::spawn`]); a caller it owed a reply gets `ReplyAbandoned`.
+    pub fn suspend(&mut self, t: Tid) -> Result<(), IpcError> {
+        if t as usize >= T {
+            return Err(IpcError::BadThread);
+        }
+        let blocked = match self.threads[t as usize].state {
+            State::Inactive => return Ok(()),
+            State::Running => {
+                self.current = None;
+                false
+            }
+            State::Ready => {
+                let p = self.threads[t as usize].prio as usize;
+                self.ready[p].remove(&mut self.threads, t);
+                if self.ready[p].is_empty() {
+                    self.ready_bits &= !(1 << p);
+                }
+                false
+            }
+            State::BlockedSend { ep, .. } | State::BlockedRecv { ep } => {
+                let e = ep as usize;
+                self.eps[e].queue.remove(&mut self.threads, t);
+                if self.eps[e].queue.is_empty() {
+                    self.eps[e].state = EpState::Idle;
+                }
+                true
+            }
+            State::BlockedWait { ntfn } => {
+                self.ntfns[ntfn as usize]
+                    .waiters
+                    .remove(&mut self.threads, t);
+                true
+            }
+            State::BlockedReply => true,
+            State::Throttled { .. } | State::NoSchedContext => false,
+        };
+        let tcb = &mut self.threads[t as usize];
+        tcb.state = State::Inactive;
+        tcb.lent = None;
+        if blocked {
+            tcb.status = Error::Interrupted.code();
+        }
+        if let Some(caller) = tcb.caller.take() {
+            self.abandon(caller);
+        }
+        self.schedule();
+        Ok(())
+    }
+
+    /// Clears an inactive thread's state (and scheduling context) so the
+    /// table entry can be reused for a new thread.
+    pub fn reset_thread(&mut self, t: Tid) -> Result<(), IpcError> {
+        let tcb = self
+            .threads
+            .get_mut(t as usize)
+            .ok_or(IpcError::BadThread)?;
+        if tcb.state != State::Inactive {
+            return Err(IpcError::ThreadActive);
+        }
+        *tcb = IDLE_TCB;
+        self.scs[t as usize] = UNLIMITED;
+        Ok(())
+    }
+
+    /// Wakes `caller` with `ReplyAbandoned` if it still waits for a reply.
+    fn abandon(&mut self, caller: Tid) {
+        if self.threads[caller as usize].state == State::BlockedReply {
+            self.threads[caller as usize].status = Error::ReplyAbandoned.code();
+            self.wake(caller);
+        }
+    }
+
+    fn awaits_reply(&self, t: Tid) -> bool {
+        self.threads[t as usize].state == State::BlockedReply
     }
 
     /// Sets the status thread `t` will see when it next returns to user
@@ -383,7 +478,7 @@ impl<const T: usize, const E: usize, const N: usize> Ipc<T, E, N> {
         }
     }
 
-    /// Makes an inactive thread runnable.
+    /// Makes an inactive thread runnable (starting or resuming it).
     pub fn spawn(&mut self, t: Tid, prio: u8) -> Result<(), IpcError> {
         let tcb = self
             .threads
@@ -397,7 +492,8 @@ impl<const T: usize, const E: usize, const N: usize> Ipc<T, E, N> {
         }
         tcb.prio = prio;
         tcb.slice = TIMESLICE_TICKS;
-        self.make_ready(t);
+        // Like any wakeup: a thread that outranks the running one takes over.
+        self.wake(t);
         Ok(())
     }
 
@@ -616,10 +712,17 @@ impl<const T: usize, const E: usize, const N: usize> Ipc<T, E, N> {
         let cur = self.cur()?;
         self.threads[cur as usize].status = 0;
         if let Some(c) = self.threads[cur as usize].caller.take() {
-            self.deliver(cur, c, msg, 0);
+            // The caller may have been suspended meanwhile: then the reply
+            // has nobody to go to.
+            let waiting = self.awaits_reply(c);
+            if waiting {
+                self.deliver(cur, c, msg, 0);
+            }
             self.threads[cur as usize].lent = None;
             self.park_if_no_sc(cur);
-            self.wake(c);
+            if waiting {
+                self.wake(c);
+            }
             self.schedule();
         }
         Ok(())
@@ -630,10 +733,13 @@ impl<const T: usize, const E: usize, const N: usize> Ipc<T, E, N> {
     pub fn reply_recv(&mut self, ep: u16, msg: [u64; MSG_WORDS]) -> Result<(), IpcError> {
         let cur = self.cur()?;
         let e = self.ep_index(ep)?;
-        let caller = self.threads[cur as usize].caller.take();
+        let owed = self.threads[cur as usize].caller.take();
+        if owed.is_some() {
+            self.threads[cur as usize].lent = None;
+        }
+        let caller = owed.filter(|&c| self.awaits_reply(c));
         if let Some(c) = caller {
             self.deliver(cur, c, msg, 0);
-            self.threads[cur as usize].lent = None;
         }
         if self.eps[e].state == EpState::Sending {
             self.take_from_sender(cur, e);
@@ -759,7 +865,9 @@ impl<const T: usize, const E: usize, const N: usize> Ipc<T, E, N> {
     /// owed someone, that earlier caller is woken with `ReplyAbandoned`
     /// rather than left blocked forever.
     fn take_caller(&mut self, server: Tid, caller: Tid) {
-        if let Some(old) = self.threads[server as usize].caller.replace(caller) {
+        if let Some(old) = self.threads[server as usize].caller.replace(caller)
+            && self.awaits_reply(old)
+        {
             self.threads[old as usize].status = Error::ReplyAbandoned.code();
             self.make_ready(old);
         }
@@ -1028,12 +1136,14 @@ mod tests {
     }
 
     #[test]
-    fn fast_path_yields_to_higher_priority_ready_thread() {
+    fn spawn_of_a_higher_priority_thread_preempts() {
         let mut k = server_waiting(); // server 10 waiting, client 5 running
-        k.spawn(OTHER, 20).unwrap(); // ready, but client keeps running (no preemption on spawn)
-        k.call(EP, 0, [0; 4]).unwrap();
-        assert_eq!(k.current(), Some(OTHER), "prio 20 beats the direct switch");
-        assert_eq!(k.thread(SERVER).state, State::Ready);
+        k.spawn(OTHER, 20).unwrap();
+        assert_eq!(k.current(), Some(OTHER), "starting a thread is a wakeup");
+        assert_eq!(k.thread(CLIENT).state, State::Ready);
+        // The preempted client resumes first among its level once OTHER blocks.
+        k.wait(1).unwrap();
+        assert_eq!(k.current(), Some(CLIENT));
     }
 
     #[test]
@@ -1423,5 +1533,96 @@ mod tests {
         assert_eq!(k.current(), Some(CLIENT));
         assert_eq!(k.thread(CLIENT).status, Error::ReplyAbandoned.code());
         assert!(!k.tick() || k.current() == Some(CLIENT));
+    }
+    #[test]
+    fn suspend_blocked_receiver_cancels_its_call() {
+        let mut k = K::new();
+        k.spawn(SERVER, 10).unwrap();
+        k.spawn(CLIENT, 5).unwrap();
+        k.schedule();
+        k.recv(0, true).unwrap();
+        assert_eq!(k.current(), Some(CLIENT));
+        k.suspend(SERVER).unwrap();
+        assert_eq!(k.thread(SERVER).state, State::Inactive);
+        // The endpoint no longer has a receiver: a send is dropped.
+        k.send(0, 0, [1, 0, 0, 0], false).unwrap();
+        assert_eq!(k.current(), Some(CLIENT));
+        // Resumed, the server returns from its receive with Interrupted.
+        k.spawn(SERVER, 10).unwrap();
+        assert_eq!(k.current(), Some(SERVER));
+        assert_eq!(k.thread(SERVER).status, Error::Interrupted.code());
+    }
+
+    #[test]
+    fn suspend_removes_from_the_middle_of_queues() {
+        let mut k = K::new();
+        k.spawn(SERVER, 5).unwrap();
+        k.spawn(CLIENT, 5).unwrap();
+        k.spawn(OTHER, 5).unwrap();
+        k.schedule(); // SERVER runs; CLIENT, OTHER queued
+        k.suspend(CLIENT).unwrap();
+        k.yield_now().unwrap();
+        assert_eq!(k.current(), Some(OTHER), "CLIENT skipped");
+        k.yield_now().unwrap();
+        assert_eq!(k.current(), Some(SERVER));
+        k.yield_now().unwrap();
+        assert_eq!(k.current(), Some(OTHER), "queue intact after removal");
+    }
+
+    #[test]
+    fn suspend_running_and_ready_threads() {
+        let mut k = K::new();
+        k.spawn(SERVER, 10).unwrap();
+        k.spawn(CLIENT, 5).unwrap();
+        k.schedule();
+        k.suspend(SERVER).unwrap(); // the current thread
+        assert_eq!(k.current(), Some(CLIENT));
+        k.suspend(CLIENT).unwrap();
+        assert_eq!(k.current(), None);
+        assert_eq!(k.thread(CLIENT).status, 0, "not blocked: result kept");
+        assert_eq!(k.suspend(CLIENT), Ok(()), "already inactive");
+    }
+
+    #[test]
+    fn reply_to_a_suspended_caller_is_dropped() {
+        let mut k = K::new();
+        k.spawn(SERVER, 10).unwrap();
+        k.spawn(CLIENT, 5).unwrap();
+        k.spawn(OTHER, 1).unwrap();
+        k.schedule();
+        k.recv(0, true).unwrap();
+        k.call(0, 0, [0; 4]).unwrap(); // client waits for the reply
+        k.suspend(CLIENT).unwrap();
+        assert_eq!(k.thread(CLIENT).status, Error::Interrupted.code());
+        k.reply_recv(0, [9, 0, 0, 0]).unwrap();
+        assert_eq!(k.thread(CLIENT).state, State::Inactive, "not woken");
+        assert_eq!(k.current(), Some(OTHER));
+    }
+
+    #[test]
+    fn suspending_a_server_abandons_its_caller() {
+        let mut k = K::new();
+        k.spawn(SERVER, 10).unwrap();
+        k.spawn(CLIENT, 5).unwrap();
+        k.schedule();
+        k.recv(0, true).unwrap();
+        k.call(0, 0, [0; 4]).unwrap();
+        assert_eq!(k.current(), Some(SERVER));
+        k.suspend(SERVER).unwrap();
+        assert_eq!(k.current(), Some(CLIENT));
+        assert_eq!(k.thread(CLIENT).status, Error::ReplyAbandoned.code());
+    }
+
+    #[test]
+    fn reset_thread_needs_inactive_and_clears_budget() {
+        let mut k = K::new();
+        k.spawn(CLIENT, 5).unwrap();
+        k.configure_sc(CLIENT, 1, 4).unwrap();
+        assert_eq!(k.reset_thread(CLIENT), Err(IpcError::ThreadActive));
+        k.schedule();
+        k.suspend(CLIENT).unwrap();
+        k.reset_thread(CLIENT).unwrap();
+        assert_eq!(k.sched_context(CLIENT).budget, None);
+        assert_eq!(k.thread(CLIENT).state, State::Inactive);
     }
 }

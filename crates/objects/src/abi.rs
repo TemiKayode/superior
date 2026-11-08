@@ -107,6 +107,19 @@ pub enum Syscall {
     /// message [`FaultKind`], address, rip, error code, and the badge of
     /// that capability. The reply says how to go on ([`FaultReply`]).
     SetFaultHandler = 17,
+    /// Sets up the inactive thread in slot `rdi` (Write right) to run in
+    /// the caller's address space: `rsi` = entry, `rdx` = stack top
+    /// (16-byte aligned), `r8` = argument (its `rdi`), `r9` = priority, at
+    /// most the caller's. It inherits the caller's fault handler and budget.
+    ThreadConfigure = 18,
+    /// Starts (or restarts after `ThreadSuspend`) the thread in slot `rdi`.
+    ThreadResume = 19,
+    /// Stops the thread in slot `rdi`. A blocked system call is cancelled
+    /// with `Interrupted`.
+    ThreadSuspend = 20,
+    /// Copies the caller's slot `rsi` into slot `rdx` of the CSpace of the
+    /// thread in slot `rdi`, with rights mask `r8`.
+    ThreadCopyCap = 21,
     /// Debug build only: print a UTF-8 string. rdi = pointer, rsi = length.
     DebugPutStr = 0x100,
     /// Debug build only: report a self-test result. rdi = 0 for pass.
@@ -134,6 +147,10 @@ impl Syscall {
             15 => Syscall::FrameMap,
             16 => Syscall::FrameUnmap,
             17 => Syscall::SetFaultHandler,
+            18 => Syscall::ThreadConfigure,
+            19 => Syscall::ThreadResume,
+            20 => Syscall::ThreadSuspend,
+            21 => Syscall::ThreadCopyCap,
             0x100 => Syscall::DebugPutStr,
             0x101 => Syscall::DebugSelftestDone,
             _ => return None,
@@ -167,6 +184,8 @@ pub enum Error {
     ObjectDestroyed = 10,
     /// The frame capability is already mapped, or the address is in use.
     AlreadyMapped = 11,
+    /// The thread was suspended while blocked; its system call was cancelled.
+    Interrupted = 12,
 }
 
 /// What a fault message (`msg[0]`) reports.
@@ -219,6 +238,8 @@ pub enum ObjectType {
     Notification = 2,
     /// A 4 KiB page of memory, zeroed when made.
     Frame = 3,
+    /// A thread, inactive until configured and resumed.
+    Thread = 4,
 }
 
 impl ObjectType {
@@ -228,6 +249,7 @@ impl ObjectType {
             1 => ObjectType::Endpoint,
             2 => ObjectType::Notification,
             3 => ObjectType::Frame,
+            4 => ObjectType::Thread,
             _ => return None,
         })
     }
@@ -241,6 +263,7 @@ impl ObjectType {
             ObjectType::Endpoint => Some(4),
             ObjectType::Notification => Some(5),
             ObjectType::Frame => Some(FRAME_BITS),
+            ObjectType::Thread => Some(11),
         }
     }
 }
