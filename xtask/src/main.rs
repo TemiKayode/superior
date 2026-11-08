@@ -61,14 +61,13 @@ fn run(cmd: &mut Command) -> Result<(), String> {
 fn host_tests() -> Result<(), String> {
     println!("== host unit tests");
     run(cargo().args(["test", "--quiet", "-p", "superior-objects"]))?;
-    println!("== model check: every reachable capability-table state (release)");
+    println!("== model check and long simulation (release)");
     run(cargo().args([
         "test",
         "--quiet",
         "--release",
         "-p",
         "superior-objects",
-        "model::",
         "--",
         "--ignored",
         "--nocapture",

@@ -395,7 +395,17 @@ impl<const T: usize, const E: usize, const N: usize> Ipc<T, E, N> {
                     .remove(&mut self.threads, t);
                 true
             }
-            State::BlockedReply => true,
+            State::BlockedReply => {
+                // The server must forget it: if this thread is resumed and
+                // calls again, that server's reply must not land in the
+                // new call.
+                for s in self.threads.iter_mut() {
+                    if s.caller == Some(t) {
+                        s.caller = None;
+                    }
+                }
+                true
+            }
             State::Throttled { .. } | State::NoSchedContext => false,
         };
         let tcb = &mut self.threads[t as usize];
@@ -423,6 +433,31 @@ impl<const T: usize, const E: usize, const N: usize> Ipc<T, E, N> {
         }
         *tcb = IDLE_TCB;
         self.scs[t as usize] = UNLIMITED;
+        // Its scheduling context goes with it: a passive thread running on
+        // it (lent by a call) loses it and cannot run until lent another.
+        for w in 0..T {
+            if self.threads[w].lent != Some(t) {
+                continue;
+            }
+            self.threads[w].lent = None;
+            match self.threads[w].state {
+                State::Running => {
+                    self.current = None;
+                    self.threads[w].state = State::NoSchedContext;
+                }
+                State::Ready => {
+                    let p = self.threads[w].prio as usize;
+                    self.ready[p].remove(&mut self.threads, w as Tid);
+                    if self.ready[p].is_empty() {
+                        self.ready_bits &= !(1 << p);
+                    }
+                    self.threads[w].state = State::NoSchedContext;
+                }
+                State::Throttled { .. } => self.threads[w].state = State::NoSchedContext,
+                _ => {}
+            }
+        }
+        self.schedule();
         Ok(())
     }
 
@@ -512,6 +547,12 @@ impl<const T: usize, const E: usize, const N: usize> Ipc<T, E, N> {
             remaining: budget,
             next_refill: self.now + period as u64,
         };
+        // Threads throttled on this context have budget again.
+        for w in 0..T {
+            if self.threads[w].state == (State::Throttled { sc: t }) {
+                self.wake(w as Tid);
+            }
+        }
         Ok(())
     }
 
@@ -622,15 +663,26 @@ impl<const T: usize, const E: usize, const N: usize> Ipc<T, E, N> {
         if self.current.is_some() {
             return;
         }
-        if self.ready_bits == 0 {
-            return;
+        while self.ready_bits != 0 {
+            let p = 63 - self.ready_bits.leading_zeros() as usize;
+            let t = self.ready[p].pop(&mut self.threads).unwrap();
+            if self.ready[p].is_empty() {
+                self.ready_bits &= !(1 << p);
+            }
+            // A queued thread's context may have run dry since it was
+            // queued (another thread on the same context used it up): park
+            // it until a refill, as it would have been on waking.
+            match self.active_sc(t) {
+                None => self.threads[t as usize].state = State::NoSchedContext,
+                Some(sc) if self.scs[sc as usize].exhausted() => {
+                    self.threads[t as usize].state = State::Throttled { sc };
+                }
+                Some(_) => {
+                    self.switch_to(t);
+                    return;
+                }
+            }
         }
-        let p = 63 - self.ready_bits.leading_zeros() as usize;
-        let t = self.ready[p].pop(&mut self.threads).unwrap();
-        if self.ready[p].is_empty() {
-            self.ready_bits &= !(1 << p);
-        }
-        self.switch_to(t);
     }
 
     // ---- system calls, always on behalf of `current` --------------------
@@ -696,6 +748,11 @@ impl<const T: usize, const E: usize, const N: usize> Ipc<T, E, N> {
         let e = self.ep_index(ep)?;
         if self.eps[e].state == EpState::Sending {
             self.take_from_sender(cur, e);
+            // A passive receiver runs on what the caller lent it, which
+            // may be nothing (the caller went passive as it blocked).
+            self.park_if_no_sc(cur);
+            self.schedule();
+            self.preempt_if_outranked();
             Ok(())
         } else if blocking {
             self.block_on_ep(cur, e, State::BlockedRecv { ep }, EpState::Receiving);
@@ -748,6 +805,7 @@ impl<const T: usize, const E: usize, const N: usize> Ipc<T, E, N> {
                 self.wake(c);
             }
             self.schedule();
+            self.preempt_if_outranked();
         } else {
             self.block_on_ep(cur, e, State::BlockedRecv { ep }, EpState::Receiving);
             match caller {
@@ -974,6 +1032,29 @@ impl<const T: usize, const E: usize, const N: usize> Ipc<T, E, N> {
         }
     }
 
+    /// Taking a new caller can wake an abandoned earlier one without
+    /// preempting (the operation was still in progress): if anything ready
+    /// now outranks the current thread, switch to it.
+    fn preempt_if_outranked(&mut self) {
+        if let (Some(c), Some(p)) = (self.current, self.highest_ready())
+            && p > self.threads[c as usize].prio
+        {
+            self.current = None;
+            let runnable = self
+                .active_sc(c)
+                .is_some_and(|sc| !self.scs[sc as usize].exhausted());
+            if runnable {
+                let cp = self.threads[c as usize].prio as usize;
+                self.threads[c as usize].state = State::Ready;
+                self.ready[cp].push_front(&mut self.threads, c);
+                self.ready_bits |= 1 << cp;
+            } else {
+                self.make_ready(c); // parks it
+            }
+            self.schedule();
+        }
+    }
+
     /// Direct switch to `t` (fast path) unless a higher-priority thread is
     /// waiting, in which case `t` queues like anyone else.
     fn switch_or_schedule(&mut self, t: Tid) {
@@ -997,6 +1078,185 @@ impl<const T: usize, const E: usize, const N: usize> Ipc<T, E, N> {
     fn switch_to(&mut self, t: Tid) {
         self.threads[t as usize].state = State::Running;
         self.current = Some(t);
+    }
+}
+
+#[cfg(test)]
+impl<const T: usize, const E: usize, const N: usize> Ipc<T, E, N> {
+    /// Checks every structural invariant of the engine, for the
+    /// simulation harness. Call after the kernel would (after `schedule`).
+    #[allow(clippy::needless_range_loop)]
+    pub(crate) fn check_invariants(&self) -> Result<(), std::string::String> {
+        use std::format;
+        use std::vec::Vec;
+        let th = &self.threads;
+        // Walk a queue, refusing cycles; returns its members in order.
+        let walk = |q: &Queue, what: &str| -> Result<Vec<Tid>, std::string::String> {
+            let mut out = Vec::new();
+            let mut at = q.head;
+            while let Some(t) = at {
+                if out.len() > T {
+                    return Err(format!("{what}: cycle"));
+                }
+                out.push(t);
+                at = th[t as usize].next;
+            }
+            if q.tail != out.last().copied() {
+                return Err(format!(
+                    "{what}: tail {:?} but last is {:?}",
+                    q.tail,
+                    out.last()
+                ));
+            }
+            Ok(out)
+        };
+        let mut seen = [0u32; T];
+        let mut mark = |members: &[Tid], what: &str| -> Result<(), std::string::String> {
+            for &t in members {
+                seen[t as usize] += 1;
+                if seen[t as usize] > 1 {
+                    return Err(format!("thread {t} on two queues (second: {what})"));
+                }
+            }
+            Ok(())
+        };
+        // Ready queues.
+        for p in 0..PRIORITIES {
+            let q = walk(&self.ready[p], "ready")?;
+            if (self.ready_bits >> p & 1 == 1) != !q.is_empty() {
+                return Err(format!("ready bit {p} disagrees with its queue"));
+            }
+            for &t in &q {
+                let tcb = &th[t as usize];
+                if tcb.state != State::Ready || tcb.prio as usize != p {
+                    return Err(format!(
+                        "thread {t} in ready[{p}] is {:?} prio {}",
+                        tcb.state, tcb.prio
+                    ));
+                }
+            }
+            mark(&q, "ready")?;
+        }
+        // Endpoints.
+        for e in 0..E {
+            let q = walk(&self.eps[e].queue, "endpoint")?;
+            let ok = match self.eps[e].state {
+                EpState::Idle => q.is_empty(),
+                EpState::Sending => {
+                    !q.is_empty()
+                        && q.iter().all(|&t| {
+                            matches!(th[t as usize].state,
+                            State::BlockedSend { ep, .. } if ep as usize == e)
+                        })
+                }
+                EpState::Receiving => {
+                    !q.is_empty()
+                        && q.iter().all(|&t| {
+                            matches!(th[t as usize].state,
+                            State::BlockedRecv { ep } if ep as usize == e)
+                        })
+                }
+            };
+            if !ok {
+                return Err(format!(
+                    "endpoint {e} is {:?} with queue {q:?}",
+                    self.eps[e].state
+                ));
+            }
+            mark(&q, "endpoint")?;
+        }
+        // Notifications.
+        for n in 0..N {
+            let q = walk(&self.ntfns[n].waiters, "notification")?;
+            if q.iter()
+                .any(|&t| th[t as usize].state != State::BlockedWait { ntfn: n as u16 })
+            {
+                return Err(format!("notification {n} has a waiter not waiting on it"));
+            }
+            if !q.is_empty() && self.ntfns[n].word != 0 {
+                return Err(format!("notification {n} has waiters and pending bits"));
+            }
+            mark(&q, "notification")?;
+        }
+        // Every queued state is on exactly the queue it names, and only
+        // queued states are on queues.
+        let mut running = 0;
+        for (t, tcb) in th.iter().enumerate() {
+            let queued = matches!(
+                tcb.state,
+                State::Ready
+                    | State::BlockedSend { .. }
+                    | State::BlockedRecv { .. }
+                    | State::BlockedWait { .. }
+            );
+            if queued != (seen[t] == 1) {
+                return Err(format!(
+                    "thread {t} is {:?} but on {} queues",
+                    tcb.state, seen[t]
+                ));
+            }
+            if tcb.state == State::Running {
+                running += 1;
+                if self.current != Some(t as Tid) {
+                    return Err(format!(
+                        "thread {t} Running but current is {:?}",
+                        self.current
+                    ));
+                }
+            }
+            // A thread waiting for a reply is owed one by exactly one server.
+            if tcb.state == State::BlockedReply {
+                let owers = th.iter().filter(|s| s.caller == Some(t as Tid)).count();
+                if owers != 1 {
+                    return Err(format!("thread {t} awaits a reply owed by {owers} threads"));
+                }
+            }
+            if let State::Throttled { sc } = tcb.state
+                && !self.scs[sc as usize].exhausted()
+            {
+                return Err(format!("thread {t} throttled on a context with budget"));
+            }
+            if tcb.lent.is_some() && !tcb.passive {
+                return Err(format!(
+                    "thread {t} holds a lent context but is not passive"
+                ));
+            }
+        }
+        if running != self.current.is_some() as usize {
+            return Err(format!(
+                "{running} Running threads, current {:?}",
+                self.current
+            ));
+        }
+        // Strict priorities: nothing ready outranks the running thread, and
+        // the CPU is never idle with a thread ready.
+        match (self.current, self.highest_ready()) {
+            (None, Some(p)) => return Err(format!("idle with priority {p} ready")),
+            (Some(c), Some(p)) if p > th[c as usize].prio => {
+                return Err(format!("thread {c} runs below ready priority {p}"));
+            }
+            _ => {}
+        }
+        if let Some(c) = self.current {
+            match self.active_sc(c) {
+                None => return Err(format!("current thread {c} has no scheduling context")),
+                Some(sc) if self.scs[sc as usize].exhausted() => {
+                    return Err(format!("current thread {c} runs on an empty budget"));
+                }
+                _ => {}
+            }
+        }
+        for (i, sc) in self.scs.iter().enumerate() {
+            if let Some(b) = sc.budget
+                && sc.remaining > b
+            {
+                return Err(format!(
+                    "context {i}: {} left of a {b} budget",
+                    sc.remaining
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1122,7 +1382,9 @@ mod tests {
         k.recv(EP, true).unwrap(); // owes CLIENT
         k.recv(EP, true).unwrap(); // takes OTHER without replying to CLIENT
         assert_eq!(k.thread(CLIENT).status, Error::ReplyAbandoned.code());
-        assert_eq!(k.thread(CLIENT).state, State::Ready);
+        // The abandoned caller outranks the server, so it runs at once.
+        assert_eq!(k.current(), Some(CLIENT));
+        assert_eq!(k.thread(SERVER).state, State::Ready);
         assert_eq!(k.thread(OTHER).state, State::BlockedReply);
     }
 
@@ -1624,5 +1886,66 @@ mod tests {
         k.reset_thread(CLIENT).unwrap();
         assert_eq!(k.sched_context(CLIENT).budget, None);
         assert_eq!(k.thread(CLIENT).state, State::Inactive);
+    }
+    // Regressions found by the simulation harness (crate::sim).
+
+    #[test]
+    fn a_reply_never_reaches_a_later_call_of_a_restarted_caller() {
+        let mut k = K::new();
+        k.spawn(SERVER, 3).unwrap();
+        k.spawn(OTHER, 2).unwrap();
+        k.spawn(CLIENT, 1).unwrap();
+        k.schedule();
+        k.recv(0, true).unwrap(); // SERVER waits on endpoint 0
+        k.recv(1, true).unwrap(); // OTHER waits on endpoint 1
+        k.call(0, 0, [1, 0, 0, 0]).unwrap();
+        assert_eq!(k.current(), Some(SERVER));
+        k.suspend(CLIENT).unwrap();
+        k.spawn(CLIENT, 4).unwrap();
+        assert_eq!(k.current(), Some(CLIENT));
+        k.call(1, 0, [2, 0, 0, 0]).unwrap(); // now awaits OTHER's reply
+        assert_eq!(k.current(), Some(SERVER));
+        k.reply([99, 0, 0, 0]).unwrap(); // owed to nobody any more
+        assert_eq!(k.thread(CLIENT).state, State::BlockedReply);
+        assert_ne!(k.thread(CLIENT).msg[0], 99);
+    }
+
+    #[test]
+    fn a_passive_server_taking_a_call_that_lends_nothing_stops() {
+        let mut k = K::new();
+        k.spawn(SERVER, 5).unwrap();
+        k.spawn(CLIENT, 4).unwrap();
+        k.spawn(OTHER, 3).unwrap();
+        k.schedule();
+        k.make_passive().unwrap();
+        k.recv(0, true).unwrap();
+        k.call(0, 0, [0; 4]).unwrap(); // SERVER runs on CLIENT's context
+        assert_eq!(k.current(), Some(SERVER));
+        k.wait(0).unwrap(); // SERVER blocks elsewhere, still owing CLIENT
+        assert_eq!(k.current(), Some(OTHER));
+        k.make_passive().unwrap();
+        k.call(0, 0, [0; 4]).unwrap(); // OTHER goes passive as it blocks
+        k.signal_irq(0, 1).unwrap();
+        assert_eq!(k.current(), Some(SERVER));
+        k.recv(0, false).unwrap(); // takes OTHER's call, which lends nothing
+        assert_eq!(k.thread(SERVER).state, State::NoSchedContext);
+        assert_eq!(k.current(), Some(CLIENT));
+        assert_eq!(k.thread(CLIENT).status, Error::ReplyAbandoned.code());
+    }
+
+    #[test]
+    fn a_destroyed_callers_context_is_taken_back_from_its_server() {
+        let mut k = K::new();
+        k.spawn(SERVER, 5).unwrap();
+        k.spawn(CLIENT, 4).unwrap();
+        k.schedule();
+        k.make_passive().unwrap();
+        k.recv(0, true).unwrap();
+        k.call(0, 0, [0; 4]).unwrap();
+        assert_eq!(k.current(), Some(SERVER));
+        k.suspend(CLIENT).unwrap();
+        k.reset_thread(CLIENT).unwrap();
+        assert_eq!(k.thread(SERVER).state, State::NoSchedContext);
+        assert_eq!(k.current(), None);
     }
 }

@@ -16,4 +16,6 @@ pub mod elf;
 pub mod ipc;
 #[cfg(test)]
 pub mod model;
+#[cfg(test)]
+pub mod sim;
 pub mod untyped;

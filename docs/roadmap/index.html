@@ -79,14 +79,14 @@ const PHASES = [
     gate: "Boots to a shell on both ISAs; Tier 1 IPC within 1.5× of published seL4 figures.",
     groups: [
       { name: "Toolchain and boot", tasks: [
-        { t: "Rust toolchain and x86-64 target", s: "done", ev: "Pinned nightly in <code>rust-toolchain.toml</code>, target <code>x86_64-unknown-none</code>; every build in CI of <code>cargo xtask test</code>. <code>0654537</code>" },
+        { t: "Rust toolchain and x86-64 target", s: "done", ev: "Pinned nightly in <code>rust-toolchain.toml</code>, target <code>x86_64-unknown-none</code>; kernel, user program and disk image built by <code>cargo xtask test</code>. <code>0654537</code>" },
         { t: "Rust bootloader on x86-64", s: "done", ev: "Boots via the Rust <code>bootloader</code> 0.11 crate under QEMU; serial console, GDT/TSS, exception handlers. <code>0654537</code>" },
         { t: "AArch64 target and boot", s: "open", ev: "Not started: <code>aarch64-unknown-none</code> kernel booting on QEMU <code>virt</code>." },
       ]},
       { name: "Kernel core on x86-64", tasks: [
         { t: "Untyped memory, retype from user space", s: "done", ev: "All RAM handed out as untyped; no kernel heap. Boot self-test makes, revokes and re-makes objects. <code>131eec1</code>" },
         { t: "Capability table: derivation, mint, revoke, transfer", s: "done", ev: "Rights-checked lookup on every syscall; cross-CSpace derivation tree; revoke removes every copy. Host tests and boot self-test. <code>75bf760</code>" },
-        { t: "CNodes as retypable objects", s: "open", ev: "Not started: CSpaces are still fixed 16-slot windows in one kernel table." },
+        { t: "CNodes as retypable objects", s: "done", ev: "Retype 16–256 slot CNodes; copy, delete, revoke in them; a thread runs with one as its CSpace and keeps it alive. Removing that reference makes the boot test fail. <code>b21a902</code>" },
         { t: "IPC: send, call, receive, reply, fast path", s: "done", ev: "20,000 call/reply round trips across address spaces in the boot self-test; 68 host tests of the engine. <code>ef3b754</code>" },
         { t: "Notifications", s: "done", ev: "Signal/wait with badges; timer notification wakes sleepers. Boot self-test. <code>ae8cb61</code>" },
         { t: "Timer and preemption", s: "done", ev: "LAPIC at 100 Hz; a spinner that never yields is preempted or the test times out. <code>efc94de</code>" },
@@ -101,7 +101,7 @@ const PHASES = [
         { t: "Same self-tests passing on AArch64", s: "open", ev: "Not started." },
       ]},
       { name: "Assurance", tasks: [
-        { t: "Formal model of capability derivation", s: "open", ev: "Not started: an exhaustively checked model of derive, mint, revoke and delete." },
+        { t: "Formal model of capability derivation", s: "done", ev: "Independent spec with ghost provenance; every reachable state of a 4-slot table checked: 2,756,509 states, 286,676,936 transitions, no violation. A planted allocator bug is caught in 2 steps. Bounded model checking, not a proof. <code>1105293</code>" },
         { t: "Deterministic simulation test harness", s: "open", ev: "Not started: seeded, replayable random runs of the kernel engine with invariant checks." },
       ]},
       { name: "User space", tasks: [

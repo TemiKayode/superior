@@ -73,6 +73,15 @@ Phase 0 (foundations). Working today, under QEMU on x86-64:
   integrity, a well-formed tree, that no byte is handed out twice, and that a block with
   nothing made from it can always be carved again. Planting an allocator bug is caught
   in two steps. It is bounded model checking of an executable model, not a proof.
+- Deterministic simulation (`crates/objects/src/sim.rs`): a seeded generator drives the
+  IPC and scheduling engine with random system calls and outside events (ticks,
+  interrupts, suspends, thread re-creation, budget changes, destroyed objects). After
+  every step it checks the engine's structural invariants (queues, one running thread
+  at the highest ready priority, budgets, reply links) and message integrity (every
+  message received was sent once, with its badge, and never after its sender was
+  stopped). Every seed runs twice and must replay identically; a failure prints the seed
+  and the last steps (`SIM_SEED`, `SIM_STEPS` replay it). `cargo xtask test` runs
+  10,000 seeds of 5,000 steps. It found six engine bugs, now fixed with regression tests.
 - Static-pie user programs loaded into their own address spaces and relocated.
 - Boot self-test: a server and a client in separate address spaces do 20,000
   call/reply round trips, and the kernel refuses four kinds of rights violations. A
@@ -116,7 +125,7 @@ https://claude.ai/artifact/QKJS8qH5Dfbjzn58RStq1j
 Needs Rust (the pinned nightly in `rust-toolchain.toml` installs itself) and QEMU.
 
 ```bash
-cargo xtask test   # host unit tests, exhaustive model check, then boot self-tests in QEMU
+cargo xtask test   # host unit tests, model check, long simulation, then boot self-tests in QEMU
 cargo xtask run    # boot in QEMU with the serial console on this terminal
 cargo xtask image  # just build target/superior.img
 ```
