@@ -12,6 +12,7 @@ use superior_objects::cap::{CNode, Capability, Object, Rights};
 use superior_objects::untyped::split_region;
 
 pub const ROOT_CNODE_SLOTS: usize = 1024;
+const LOW_MEMORY_END: u64 = 0x10_0000;
 
 /// The root task's capability space. Owned by the kernel until the root
 /// task starts.
@@ -41,8 +42,14 @@ pub fn init(regions: &MemoryRegions) -> Summary {
         .iter()
         .filter(|r| r.kind == MemoryRegionKind::Usable)
     {
+        // Leave the first 1 MiB alone: on BIOS machines it holds firmware
+        // structures that "usable" does not always protect.
+        let start = r.start.max(LOW_MEMORY_END);
+        if start >= r.end {
+            continue;
+        }
         s.regions += 1;
-        split_region(r.start, r.end, |block| {
+        split_region(start, r.end, |block| {
             s.usable_bytes += block.size();
             let cap = Capability::new(
                 Object::Untyped {

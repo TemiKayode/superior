@@ -407,6 +407,13 @@ name = "superior-objects"
 version = "0.1.0"
 
 [[package]]
+name = "superior-pingpong"
+version = "0.1.0"
+dependencies = [
+ "superior-objects",
+]
+
+[[package]]
 name = "syn"
 version = "2.0.119"
 source = "registry+https://github.com/rust-lang/crates.io-index"

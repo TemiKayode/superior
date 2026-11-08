@@ -115,6 +115,13 @@ pub enum CapError {
     BadgeAlreadySet,
     /// Tried to badge an object type that does not take badges.
     NotBadgeable,
+    /// The operation needs a different object type (e.g. retype on a non-untyped cap).
+    WrongObjectType,
+    /// Retype refused: copies derived from this untyped cap still exist and
+    /// could hand out the same memory twice.
+    HasChildren,
+    /// The untyped block has no aligned room left of the requested size.
+    OutOfMemory,
 }
 
 #[derive(Clone, Copy)]
@@ -123,12 +130,15 @@ struct Slot {
     parent: Option<u32>,
     /// Scratch mark used during revoke; always false between calls.
     doomed: bool,
+    /// For untyped caps: bytes already handed out from the block's start.
+    free_index: u64,
 }
 
 const EMPTY: Slot = Slot {
     cap: None,
     parent: None,
     doomed: false,
+    free_index: 0,
 };
 
 /// A fixed-size table of capability slots.
@@ -171,6 +181,7 @@ impl<const N: usize> CNode<N> {
             cap: Some(cap),
             parent: None,
             doomed: false,
+            free_index: 0,
         };
         Ok(())
     }
@@ -206,8 +217,57 @@ impl<const N: usize> CNode<N> {
             cap: Some(child),
             parent: Some(src as u32),
             doomed: false,
+            free_index: 0,
         };
         Ok(())
+    }
+
+    /// Carves a naturally aligned `2^size_bits` byte region out of the
+    /// untyped block in `slot` and returns its physical base address.
+    ///
+    /// Memory is handed out by a bump watermark and never returned until
+    /// the untyped cap's children are revoked (not yet implemented).
+    /// To guarantee no byte is handed out twice, only an original untyped
+    /// cap with no derived copies may be retyped.
+    pub fn retype(&mut self, slot: usize, size_bits: u8) -> Result<u64, CapError> {
+        let cap = *self.get(slot).ok_or(self.missing(slot))?;
+        let Object::Untyped {
+            base,
+            size_bits: block_bits,
+        } = cap.object
+        else {
+            return Err(CapError::WrongObjectType);
+        };
+        if self.slots[slot].parent.is_some() || self.has_children(slot) {
+            return Err(CapError::HasChildren);
+        }
+        if size_bits > block_bits || size_bits >= 64 {
+            return Err(CapError::OutOfMemory);
+        }
+        let align = 1u64 << size_bits;
+        let offset = (self.slots[slot].free_index + align - 1) & !(align - 1);
+        let end = offset.checked_add(align).ok_or(CapError::OutOfMemory)?;
+        if end > 1u64 << block_bits {
+            return Err(CapError::OutOfMemory);
+        }
+        self.slots[slot].free_index = end;
+        Ok(base + offset)
+    }
+
+    /// Bytes still free (ignoring alignment) in the untyped block in `slot`.
+    pub fn untyped_free(&self, slot: usize) -> Option<u64> {
+        match self.get(slot)?.object {
+            Object::Untyped { size_bits, .. } => {
+                Some((1u64 << size_bits) - self.slots[slot].free_index)
+            }
+            _ => None,
+        }
+    }
+
+    fn has_children(&self, slot: usize) -> bool {
+        self.slots
+            .iter()
+            .any(|s| s.cap.is_some() && s.parent == Some(slot as u32))
     }
 
     /// Removes every capability derived (directly or transitively) from
@@ -388,6 +448,36 @@ mod tests {
         assert_eq!(c.parent_of(1), None);
         assert_eq!(c.revoke(0), Ok(0));
         assert!(c.get(1).is_some());
+    }
+
+    #[test]
+    fn retype_bumps_aligned_and_exhausts() {
+        let mut c = CNode::<4>::new();
+        // A 16 KiB block at 0x4000.
+        let mem = Object::Untyped {
+            base: 0x4000,
+            size_bits: 14,
+        };
+        c.insert_root(0, Capability::new(mem, Rights::ALL)).unwrap();
+        assert_eq!(c.retype(0, 10), Ok(0x4000)); // 1 KiB
+        assert_eq!(c.retype(0, 12), Ok(0x5000)); // aligned up past the 1 KiB
+        assert_eq!(c.retype(0, 13), Ok(0x6000));
+        assert_eq!(c.untyped_free(0), Some(0));
+        assert_eq!(c.retype(0, 12), Err(CapError::OutOfMemory));
+    }
+
+    #[test]
+    fn retype_rejects_bad_requests() {
+        let mut c = root_with_endpoint();
+        assert_eq!(c.retype(0, 12), Err(CapError::WrongObjectType));
+        c.insert_root(1, Capability::new(MEM, Rights::ALL)).unwrap();
+        assert_eq!(c.retype(1, 21), Err(CapError::OutOfMemory));
+        // A derived copy shares the memory, so neither may retype.
+        c.derive(1, 2, Rights::ALL, None).unwrap();
+        assert_eq!(c.retype(1, 12), Err(CapError::HasChildren));
+        assert_eq!(c.retype(2, 12), Err(CapError::HasChildren));
+        c.revoke(1).unwrap();
+        assert_eq!(c.retype(1, 12), Ok(0x10_0000));
     }
 
     #[test]

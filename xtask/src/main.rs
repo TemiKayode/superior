@@ -62,12 +62,34 @@ fn host_tests() -> Result<(), String> {
     run(cargo().args(["test", "--quiet", "-p", "superior-objects"]))
 }
 
+/// Builds the boot user program as a static position-independent
+/// executable; the kernel loads it into its user window and relocates it.
+fn user_program() -> Result<PathBuf, String> {
+    println!("== building user program");
+    run(cargo().args([
+        "build",
+        "--quiet",
+        "-p",
+        "superior-pingpong",
+        "--release",
+        "--target",
+        KERNEL_TARGET,
+    ]))?;
+    Ok(root()
+        .join("target")
+        .join(KERNEL_TARGET)
+        .join("release")
+        .join("superior-pingpong"))
+}
+
 fn image(selftest: bool) -> Result<PathBuf, String> {
+    let user = user_program()?;
     println!(
         "== building kernel{}",
         if selftest { " (selftest)" } else { "" }
     );
     let mut build = cargo();
+    build.env("SUPERIOR_USER_ELF", &user);
     build.args([
         "build",
         "--quiet",

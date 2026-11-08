@@ -27,7 +27,33 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
 });
 
 pub fn init() {
+    disable_legacy_pic();
     IDT.load();
+}
+
+/// The 8259 PIC powers up delivering IRQ 0-7 on vectors 8-15, which
+/// collide with CPU exceptions (IRQ 0, the timer, would arrive as a
+/// "double fault"). Remap it to vectors 0x20-0x2f and mask every line:
+/// device interrupts will go through the APIC to user-space drivers.
+fn disable_legacy_pic() {
+    use x86_64::instructions::port::Port;
+    let mut cmd1 = Port::<u8>::new(0x20);
+    let mut data1 = Port::<u8>::new(0x21);
+    let mut cmd2 = Port::<u8>::new(0xa0);
+    let mut data2 = Port::<u8>::new(0xa1);
+    // SAFETY: standard 8259 initialisation sequence on the PIC's fixed ports.
+    unsafe {
+        cmd1.write(0x11); // ICW1: init, expect ICW4
+        cmd2.write(0x11);
+        data1.write(0x20); // ICW2: vector base
+        data2.write(0x28);
+        data1.write(4); // ICW3: slave on IRQ 2
+        data2.write(2);
+        data1.write(1); // ICW4: 8086 mode
+        data2.write(1);
+        data1.write(0xff); // mask all lines
+        data2.write(0xff);
+    }
 }
 
 extern "x86-interrupt" fn breakpoint(frame: InterruptStackFrame) {

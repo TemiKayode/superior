@@ -1,8 +1,10 @@
 //! The Superior microkernel.
 //!
-//! Phase 0 scope: boot on x86-64 through the `bootloader` crate, bring up
-//! the serial console, GDT/TSS and exception handlers, and hand all usable
-//! physical memory to the root task as untyped capabilities. No heap, ever.
+//! Boots on x86-64 through the `bootloader` crate, brings up the serial
+//! console, GDT/TSS, exception handlers and the `syscall` path, hands all
+//! usable physical memory to the root task as untyped capabilities (no
+//! kernel heap, ever), then starts the boot user programs in their own
+//! address spaces. From then on the kernel runs only on system calls.
 
 #![no_std]
 #![no_main]
@@ -13,10 +15,17 @@ mod interrupts;
 mod memory;
 mod qemu;
 mod serial;
+mod syscall;
+mod task;
+mod vm;
 
 use bootloader_api::config::{BootloaderConfig, Mapping};
 use bootloader_api::{entry_point, BootInfo};
 use core::panic::PanicInfo;
+use superior_objects::cap::{Capability, Object, Rights};
+
+/// The boot user program, built by `cargo xtask` (empty if none).
+static USER_IMAGE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/user.elf"));
 
 pub static BOOTLOADER_CONFIG: BootloaderConfig = {
     let mut config = BootloaderConfig::new_default();
@@ -39,6 +48,8 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     kprintln!("[ok] gdt + tss loaded");
     interrupts::init();
     kprintln!("[ok] idt loaded");
+    syscall::init();
+    kprintln!("[ok] syscall/sysret enabled");
 
     let mem = memory::init(&boot_info.memory_regions);
     kprintln!(
@@ -54,34 +65,52 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             mem.dropped_bytes >> 10
         );
     }
-    if let Some(offset) = boot_info.physical_memory_offset.into_option() {
-        kprintln!("[ok] physical memory mapped at {offset:#x}");
-    }
+    let offset = boot_info
+        .physical_memory_offset
+        .into_option()
+        .expect("bootloader did not map physical memory");
+    vm::init(offset);
+    kprintln!("[ok] physical memory mapped at {offset:#x}");
 
     #[cfg(feature = "selftest")]
-    {
-        selftest(mem.untyped_caps);
-        kprintln!("[pass] all self-tests passed");
-        qemu::exit(qemu::ExitCode::Success);
-    }
+    selftest(mem.untyped_caps);
 
-    #[allow(unreachable_code)]
-    {
-        kprintln!("boot complete; idle");
-        halt_forever()
+    if USER_IMAGE.is_empty() {
+        kprintln!("no boot user program embedded; idle");
+        halt_forever();
     }
+    if let Err(e) = start_pingpong() {
+        panic!("starting user programs: {e}");
+    }
+    task::start()
+}
+
+/// Two processes, each in its own address space, sharing one endpoint.
+/// The server holds it with Read+Write; the client holds a badged copy
+/// with Write only, so it can call but not receive.
+fn start_pingpong() -> Result<(), &'static str> {
+    // Until cross-CNode capability copy exists, the kernel mints these
+    // two endpoint capabilities directly at boot.
+    let endpoint = Object::Endpoint { id: 0 };
+    let server_cap = Capability::new(endpoint, Rights::READ | Rights::WRITE);
+    let client_cap = Capability {
+        badge: 0xC1,
+        ..Capability::new(endpoint, Rights::WRITE | Rights::GRANT_REPLY)
+    };
+    task::spawn_process(0, USER_IMAGE, 10, 0, &[(0, server_cap)])?;
+    task::spawn_process(1, USER_IMAGE, 5, 1, &[(0, client_cap)])?;
+    kprintln!("[ok] server (prio 10) and client (prio 5) loaded in separate address spaces");
+    Ok(())
 }
 
 #[cfg(feature = "selftest")]
 fn selftest(untyped_caps: usize) {
-    use superior_objects::cap::Rights;
-
     // Exceptions: int3 must trap into our handler and return.
     x86_64::instructions::interrupts::int3();
     kprintln!("[pass] breakpoint trap returns");
 
     // Capabilities on the live root CNode: derive a read-only child of the
-    // first untyped cap, then revoke it.
+    // first untyped cap, then revoke it (leaving the cap retypable).
     assert!(
         untyped_caps > 0,
         "no untyped memory handed to the root task"
@@ -95,7 +124,7 @@ fn selftest(untyped_caps: usize) {
     kprintln!("[pass] capability derive + revoke on root CNode");
 }
 
-fn halt_forever() -> ! {
+pub fn halt_forever() -> ! {
     loop {
         x86_64::instructions::hlt();
     }

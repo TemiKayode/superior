@@ -1,0 +1,16 @@
+[package]
+name = "superior-pingpong"
+description = "Boot self-test: an IPC server and client in separate address spaces."
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "superior-pingpong"
+test = false
+bench = false
+
+[dependencies]
+superior-objects = { path = "../../crates/objects" }

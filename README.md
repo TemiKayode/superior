@@ -11,9 +11,22 @@ Superior is a capability-secure microkernel desktop operating system.
 
 ## Status
 
-Phase 0 (foundations). The kernel boots on x86-64 under QEMU, loads its GDT/TSS and
-exception handlers, and hands all usable physical memory to the root task as untyped
-capabilities. There is no kernel heap.
+Phase 0 (foundations). Working today, under QEMU on x86-64:
+
+- Boot, serial console, GDT/TSS, exception handlers, legacy PIC masked.
+- All usable physical memory handed to the root CNode as untyped capabilities; every
+  page table and user page is retyped from them. There is no kernel heap.
+- `syscall`/`sysret` entry on a single kernel stack, with the seL4 model of saving user
+  registers in the thread's TCB.
+- IPC engine: `Send`, `Call`, `Recv`, `Reply`, `ReplyRecv`, `Signal`, `Wait`, `Yield`;
+  direct switch on call/reply (fast path); 64 fixed priorities.
+- Rights-checked capability lookup on every system call; badges delivered to servers.
+- Static-pie user programs loaded into their own address spaces and relocated.
+- Boot self-test: a server and a client in separate address spaces do 20,000
+  call/reply round trips, and the kernel refuses four kinds of rights violations.
+
+Not yet: timer and preemption, scheduling contexts (MCS budgets), capability transfer in
+messages, retype into kernel objects from user space, SMP, an IPC benchmark on real hardware.
 
 The architectural specification lives in the Superior OS Architectural Specification doc:
 https://claude.ai/artifact/QKJS8qH5Dfbjzn58RStq1j
@@ -23,8 +36,9 @@ https://claude.ai/artifact/QKJS8qH5Dfbjzn58RStq1j
 | Path | What it is |
 | --- | --- |
 | `kernel/` | The microkernel (`no_std`, target `x86_64-unknown-none`) |
-| `crates/objects/` | Kernel object model: capabilities, CNodes, untyped memory. Pure logic, unit-tested on the host |
-| `xtask/` | Build driver: kernel build, disk image, QEMU boot |
+| `crates/objects/` | Pure kernel logic, unit-tested on the host: capabilities and CNodes, untyped memory, the IPC and scheduling state machine, the syscall ABI, an ELF reader |
+| `user/pingpong/` | Boot self-test program (IPC server and client) |
+| `xtask/` | Build driver: user program, kernel, disk image, QEMU boot |
 
 ## Building
 
