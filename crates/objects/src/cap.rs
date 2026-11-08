@@ -12,6 +12,11 @@
 //! 3. Revoke removes every descendant and nothing else.
 //! 4. Deleting a capability keeps its descendants revocable through its
 //!    parent (they are re-parented, never orphaned).
+//! 5. No byte of untyped memory is handed out twice: only an untyped
+//!    capability that is not a copy, and has no copies, may be retyped, and
+//!    its watermark is reset only by revoking it, which destroys every
+//!    object made from it. Memory the kernel carved for itself
+//!    ([`CNode::retype`], no child capabilities) is never reset.
 
 use core::fmt;
 
@@ -33,6 +38,11 @@ impl Rights {
 
     pub const fn bits(self) -> u8 {
         self.0
+    }
+
+    /// Rights from a bit set, ignoring unknown bits.
+    pub const fn from_bits_truncate(bits: u8) -> Rights {
+        Rights(bits & Rights::ALL.0)
     }
 
     pub const fn contains(self, other: Rights) -> bool {
@@ -132,6 +142,13 @@ struct Slot {
     doomed: bool,
     /// For untyped caps: bytes already handed out from the block's start.
     free_index: u64,
+    /// For untyped caps: the kernel carved memory from this block for its
+    /// own use, with no child capability to revoke, so the watermark may
+    /// never be reset.
+    raw: bool,
+    /// Made by derive: refers to the same object as its parent, rather
+    /// than being an object retyped from it.
+    copy: bool,
 }
 
 const EMPTY: Slot = Slot {
@@ -139,6 +156,8 @@ const EMPTY: Slot = Slot {
     parent: None,
     doomed: false,
     free_index: 0,
+    raw: false,
+    copy: false,
 };
 
 /// A fixed-size table of capability slots.
@@ -179,11 +198,33 @@ impl<const N: usize> CNode<N> {
         let s = self.empty_slot(slot)?;
         *s = Slot {
             cap: Some(cap),
-            parent: None,
-            doomed: false,
-            free_index: 0,
+            ..EMPTY
         };
         Ok(())
+    }
+
+    /// Places `cap`, an object made from the untyped capability in
+    /// `parent` (see [`CNode::carve`]), in the empty slot `dst` as a child
+    /// of `parent`, so revoking `parent` destroys it.
+    pub fn insert_child(
+        &mut self,
+        parent: usize,
+        dst: usize,
+        cap: Capability,
+    ) -> Result<(), CapError> {
+        self.get(parent).ok_or(self.missing(parent))?;
+        let s = self.empty_slot(dst)?;
+        *s = Slot {
+            cap: Some(cap),
+            parent: Some(parent as u32),
+            ..EMPTY
+        };
+        Ok(())
+    }
+
+    /// Every capability in the table.
+    pub fn iter(&self) -> impl Iterator<Item = &Capability> {
+        self.slots.iter().filter_map(|s| s.cap.as_ref())
     }
 
     /// Derives a new capability from `src` into the empty slot `dst`.
@@ -216,20 +257,29 @@ impl<const N: usize> CNode<N> {
         *s = Slot {
             cap: Some(child),
             parent: Some(src as u32),
-            doomed: false,
-            free_index: 0,
+            copy: true,
+            ..EMPTY
         };
         Ok(())
     }
 
-    /// Carves a naturally aligned `2^size_bits` byte region out of the
-    /// untyped block in `slot` and returns its physical base address.
-    ///
-    /// Memory is handed out by a bump watermark and never returned until
-    /// the untyped cap's children are revoked (not yet implemented).
-    /// To guarantee no byte is handed out twice, only an original untyped
-    /// cap with no derived copies may be retyped.
+    /// Carves memory for the kernel's own use (page tables, user pages):
+    /// like [`CNode::carve`], but no child capability will record it, so
+    /// this block's watermark is never reset.
     pub fn retype(&mut self, slot: usize, size_bits: u8) -> Result<u64, CapError> {
+        let pa = self.carve(slot, size_bits)?;
+        self.slots[slot].raw = true;
+        Ok(pa)
+    }
+
+    /// Carves a naturally aligned `2^size_bits` byte region out of the
+    /// untyped block in `slot` and returns its physical base address. The
+    /// caller records the object made from it with [`CNode::insert_child`].
+    ///
+    /// Memory is handed out by a bump watermark, reset when the untyped
+    /// capability is revoked. To guarantee no byte is handed out twice, an
+    /// untyped capability that is a copy, or has copies, may not be carved.
+    pub fn carve(&mut self, slot: usize, size_bits: u8) -> Result<u64, CapError> {
         let cap = *self.get(slot).ok_or(self.missing(slot))?;
         let Object::Untyped {
             base,
@@ -238,7 +288,7 @@ impl<const N: usize> CNode<N> {
         else {
             return Err(CapError::WrongObjectType);
         };
-        if self.slots[slot].parent.is_some() || self.has_children(slot) {
+        if self.is_copy(slot) || self.has_copies(slot) {
             return Err(CapError::HasChildren);
         }
         if size_bits > block_bits || size_bits >= 64 {
@@ -264,15 +314,34 @@ impl<const N: usize> CNode<N> {
         }
     }
 
-    fn has_children(&self, slot: usize) -> bool {
+    /// A copy refers to the same object as its parent (made by derive);
+    /// an object retyped from an untyped capability is not a copy, even a
+    /// sub-block covering the whole of its parent.
+    fn is_copy(&self, slot: usize) -> bool {
+        self.slots[slot].copy
+    }
+
+    fn has_copies(&self, slot: usize) -> bool {
         self.slots
             .iter()
-            .any(|s| s.cap.is_some() && s.parent == Some(slot as u32))
+            .any(|s| s.cap.is_some() && s.copy && s.parent == Some(slot as u32))
     }
 
     /// Removes every capability derived (directly or transitively) from
     /// `slot`, leaving `slot` itself in place. Returns how many were removed.
+    /// Revoking an untyped capability destroys every object made from it,
+    /// so its memory is free again (unless the kernel carved some for
+    /// itself).
     pub fn revoke(&mut self, slot: usize) -> Result<usize, CapError> {
+        self.revoke_each(slot, |_| {})
+    }
+
+    /// [`CNode::revoke`], calling `removed` with each capability removed.
+    pub fn revoke_each(
+        &mut self,
+        slot: usize,
+        mut removed: impl FnMut(Capability),
+    ) -> Result<usize, CapError> {
         self.get(slot).ok_or(self.missing(slot))?;
         // Mark first, then clear: clearing as we go would cut ancestor
         // chains that later slots still need to walk.
@@ -281,12 +350,27 @@ impl<const N: usize> CNode<N> {
                 self.slots[i].doomed = true;
             }
         }
-        let mut removed = 0;
+        let mut count = 0;
         for s in self.slots.iter_mut().filter(|s| s.doomed) {
+            if let Some(c) = s.cap {
+                removed(c);
+            }
             *s = EMPTY;
-            removed += 1;
+            count += 1;
         }
-        Ok(removed)
+        let s = &mut self.slots[slot];
+        if !s.raw
+            && matches!(
+                s.cap,
+                Some(Capability {
+                    object: Object::Untyped { .. },
+                    ..
+                })
+            )
+        {
+            s.free_index = 0;
+        }
+        Ok(count)
     }
 
     /// Deletes the capability in `slot`. Its children are re-parented to
@@ -335,6 +419,7 @@ impl<const N: usize> CNode<N> {
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
     use super::*;
 
     const EP: Object = Object::Endpoint { id: 7 };
@@ -485,5 +570,78 @@ mod tests {
         extern crate std;
         use std::format;
         assert_eq!(format!("{:?}", Rights::READ | Rights::MAP), "R---M");
+    }
+    fn untyped_root(c: &mut CNode<16>, slot: usize, base: u64, bits: u8) {
+        let mem = Object::Untyped {
+            base,
+            size_bits: bits,
+        };
+        c.insert_root(slot, Capability::new(mem, Rights::ALL))
+            .unwrap();
+    }
+
+    #[test]
+    fn retyped_objects_are_children_not_copies() {
+        let mut c = CNode::<16>::new();
+        untyped_root(&mut c, 0, 0x8000, 15);
+        let pa = c.carve(0, 4).unwrap();
+        let ep = Capability::new(Object::Endpoint { id: 1 }, Rights::ALL);
+        c.insert_child(0, 1, ep).unwrap();
+        assert_eq!(pa, 0x8000);
+        // A retyped child does not block further retypes.
+        assert_eq!(c.carve(0, 4), Ok(0x8010));
+        assert_eq!(c.parent_of(1), Some(0));
+    }
+
+    #[test]
+    fn revoke_untyped_destroys_objects_and_frees_memory() {
+        let mut c = CNode::<16>::new();
+        untyped_root(&mut c, 0, 0x8000, 15);
+        let sub = c.carve(0, 15).unwrap(); // the whole block
+        let sub_cap = Capability::new(
+            Object::Untyped {
+                base: sub,
+                size_bits: 15,
+            },
+            Rights::ALL,
+        );
+        c.insert_child(0, 1, sub_cap).unwrap();
+        c.carve(1, 4).unwrap();
+        let ep = Capability::new(Object::Endpoint { id: 2 }, Rights::ALL);
+        c.insert_child(1, 2, ep).unwrap();
+        c.derive(2, 3, Rights::WRITE, Some(9)).unwrap();
+        assert_eq!(c.carve(0, 12), Err(CapError::OutOfMemory));
+
+        let mut gone = std::vec::Vec::new();
+        assert_eq!(c.revoke_each(0, |cap| gone.push(cap.object)), Ok(3));
+        assert!(gone.contains(&Object::Endpoint { id: 2 }));
+        assert_eq!(c.untyped_free(0), Some(1 << 15), "watermark reset");
+        assert_eq!(c.carve(0, 15), Ok(0x8000), "memory reusable");
+    }
+
+    #[test]
+    fn kernel_carved_untyped_is_never_reset() {
+        let mut c = CNode::<16>::new();
+        untyped_root(&mut c, 0, 0x8000, 15);
+        c.retype(0, 12).unwrap(); // kernel use, no child capability
+        c.revoke(0).unwrap();
+        assert_eq!(c.carve(0, 12), Ok(0x9000), "first page still in use");
+    }
+
+    #[test]
+    fn copies_of_untyped_block_carving_until_revoked() {
+        let mut c = CNode::<16>::new();
+        untyped_root(&mut c, 0, 0x8000, 15);
+        c.derive(0, 1, Rights::ALL, None).unwrap();
+        assert_eq!(c.carve(0, 4), Err(CapError::HasChildren));
+        assert_eq!(c.carve(1, 4), Err(CapError::HasChildren));
+        c.revoke(0).unwrap();
+        assert!(c.carve(0, 4).is_ok());
+    }
+
+    #[test]
+    fn rights_from_bits_drops_unknown() {
+        assert_eq!(Rights::from_bits_truncate(0xff), Rights::ALL);
+        assert_eq!(Rights::from_bits_truncate(0b10), Rights::WRITE);
     }
 }

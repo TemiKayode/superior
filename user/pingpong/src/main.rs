@@ -7,7 +7,8 @@
 //!   or revokes every copy of that capability it has handed out.
 //! - role 1, the **client**: holds a badged copy with Write only. It
 //!   checks that the kernel enforces rights, receives a capability in a
-//!   reply, uses it, watches the server revoke it, then times call/reply
+//!   reply, uses it, watches the server revoke it, makes its own kernel
+//!   objects from untyped memory and reclaims it, then times call/reply
 //!   round trips and reports the result.
 //! - role 2, the **spinner**: spins without a system call. It shares the
 //!   client's priority, so the client only runs if the kernel preempts it.
@@ -28,7 +29,7 @@
 
 use core::arch::asm;
 use core::fmt::{self, Write};
-use superior_objects::abi::{CapTransfer, Error, MSG_WORDS, Syscall};
+use superior_objects::abi::{CapTransfer, Error, MSG_WORDS, ObjectType, Syscall};
 
 const EP: u64 = 0;
 const EMPTY_SLOT: u64 = 5;
@@ -46,6 +47,17 @@ const GIFT: u16 = 1;
 const RECEIVED: u16 = 3;
 /// The gift's badge: signalling through any copy ORs it into the word.
 const GIFT_BADGE: u64 = 0x5;
+/// Client: its 64 KiB untyped block, and slots for objects made from it.
+const UNTYPED: u64 = 4;
+const UNTYPED_BITS: u64 = 16;
+const NEW_NTFN: u64 = 6;
+const NEW_EP: u64 = 7;
+const SUB_UNTYPED: u64 = 8;
+const MINTED: u64 = 9;
+const SUB_NTFN: u64 = 10;
+/// Rights bits (see `superior_objects::cap::Rights`).
+const RIGHT_WRITE: u64 = 1 << 1;
+const RIGHTS_ALL: u64 = 0b1_1111;
 /// Requests in `msg[1]`.
 const OP_ECHO: u64 = 0;
 const OP_GIVE: u64 = 1;
@@ -187,6 +199,117 @@ fn server() -> ! {
             r = syscall(Syscall::Recv, EP, [0; 4]);
         }
     }
+}
+
+fn retype(untyped: u64, ty: ObjectType, bits: u64, dst: u64) -> u64 {
+    syscall(Syscall::Retype, untyped, [ty as u64, bits, dst, 0]).status
+}
+
+fn mint(src: u64, dst: u64, rights: u64, badge: u64) -> u64 {
+    syscall(Syscall::CapMint, src, [dst, rights, badge, 0]).status
+}
+
+fn ok(cond: bool) -> u64 {
+    cond as u64
+}
+
+/// Making kernel objects from untyped memory, and getting it back.
+fn retype_tests() -> bool {
+    use ObjectType::{Endpoint, Notification, Untyped};
+    let mut pass = true;
+    let inval = Error::InvalidCapability.code();
+
+    let made = retype(UNTYPED, Notification, 0, NEW_NTFN);
+    let minted = mint(NEW_NTFN, MINTED, RIGHT_WRITE, 0x7);
+    let sig = syscall(Syscall::Signal, MINTED, [0; 4]).status;
+    let w = syscall(Syscall::Wait, NEW_NTFN, [0; 4]);
+    pass &= expect(
+        "a retyped notification works through a minted, badged copy",
+        ok(made == 0 && minted == 0 && sig == 0 && w.status == 0 && w.badge == 0x7),
+        1,
+    );
+    let r = syscall(Syscall::Wait, MINTED, [0; 4]);
+    pass &= expect(
+        "the minted copy has only the rights asked for",
+        r.status,
+        Error::InsufficientRights.code(),
+    );
+    pass &= expect(
+        "a badge cannot be minted over a badge",
+        mint(MINTED, SUB_NTFN, RIGHTS_ALL, 0x3),
+        Error::InvalidArgument.code(),
+    );
+
+    let made = retype(UNTYPED, Endpoint, 0, NEW_EP);
+    let r = syscall(Syscall::NBRecv, NEW_EP, [0; 4]);
+    pass &= expect(
+        "a retyped endpoint works",
+        ok(made == 0 && r.status == Error::WouldBlock.code()),
+        1,
+    );
+
+    pass &= expect(
+        "retype from a capability that is not untyped is refused",
+        retype(NEW_NTFN, Notification, 0, SUB_NTFN),
+        inval,
+    );
+    pass &= expect(
+        "retype into an occupied slot is refused",
+        retype(UNTYPED, Notification, 0, NEW_NTFN),
+        Error::SlotOccupied.code(),
+    );
+    pass &= expect(
+        "retype larger than the untyped block is refused",
+        retype(UNTYPED, Untyped, UNTYPED_BITS + 1, SUB_UNTYPED),
+        Error::NotEnoughMemory.code(),
+    );
+
+    let rv = syscall(Syscall::CapRevoke, UNTYPED, [0; 4]).status;
+    let s1 = syscall(Syscall::Signal, MINTED, [0; 4]).status;
+    let s2 = syscall(Syscall::NBRecv, NEW_EP, [0; 4]).status;
+    pass &= expect(
+        "revoking the untyped destroys every object made from it",
+        ok(rv == 0 && s1 == inval && s2 == inval),
+        1,
+    );
+
+    // The whole block is free again: carve it into one sub-block.
+    let whole = retype(UNTYPED, Untyped, UNTYPED_BITS, SUB_UNTYPED);
+    let full = retype(UNTYPED, Notification, 0, SUB_NTFN);
+    pass &= expect(
+        "revoked memory is reusable, all of it, and then the block is full",
+        ok(whole == 0 && full == Error::NotEnoughMemory.code()),
+        1,
+    );
+    let nested = retype(SUB_UNTYPED, Notification, 0, SUB_NTFN);
+    let rv = syscall(Syscall::CapRevoke, UNTYPED, [0; 4]).status;
+    let gone = syscall(Syscall::Signal, SUB_NTFN, [0; 4]).status;
+    pass &= expect(
+        "objects from a sub-block die when the parent block is revoked",
+        ok(nested == 0 && rv == 0 && gone == inval),
+        1,
+    );
+
+    // The kernel's notification table is finite; revoking frees entries.
+    let mut made = 0;
+    let mut last = 0;
+    for slot in NEW_NTFN..=SUB_NTFN {
+        last = retype(UNTYPED, Notification, 0, slot);
+        if last != 0 {
+            break;
+        }
+        made += 1;
+    }
+    let rv = syscall(Syscall::CapRevoke, UNTYPED, [0; 4]).status;
+    let again = retype(UNTYPED, Notification, 0, NEW_NTFN);
+    let rv2 = syscall(Syscall::CapRevoke, UNTYPED, [0; 4]).status;
+    say!("     made {made} notifications before the table filled");
+    pass &= expect(
+        "the notification table fills, and revoke frees its entries",
+        ok(made > 0 && last == Error::ObjectTableFull.code() && rv == 0 && again == 0 && rv2 == 0),
+        1,
+    );
+    pass
 }
 
 /// Calls the server with request `op`, offering `accept` for a capability.
@@ -333,6 +456,7 @@ fn client() -> ! {
         Error::InvalidCapability.code(),
     );
     pass &= transfer_tests();
+    pass &= retype_tests();
 
     // Round trips through the server.
     let (mut min, mut total) = (u64::MAX, 0u64);

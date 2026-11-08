@@ -10,6 +10,15 @@
 //! granted through IPC is derived from the sender's across CSpaces, and
 //! revoking the sender's copy reaches every copy it handed out.
 //!
+//! Kernel objects: user space makes endpoints, notifications and smaller
+//! untyped blocks with `Retype`, which consumes memory from an untyped
+//! capability. The endpoint and notification state itself lives in the IPC
+//! engine's fixed tables; retype claims a free entry, and the entry is
+//! freed (waking anyone blocked on it with an error) once the last
+//! capability to the object is gone. The memory consumed is real
+//! accounting: an untyped block can only make as many objects as fit, and
+//! gets its memory back only when revoked.
+//!
 //! The kernel is entered two ways, a system call or a timer interrupt, and
 //! both end in [`resume`]. A thread that entered by system call gets its
 //! results in registers and leaves by `sysret`; a thread that was
@@ -24,7 +33,7 @@ use crate::syscall::{self, Exit, UserFrame};
 use crate::vm::AddressSpace;
 use crate::{kprint, kprintln};
 use spin::{Mutex, MutexGuard};
-use superior_objects::abi::{CapTransfer, Error, Syscall};
+use superior_objects::abi::{CapTransfer, Error, ObjectType, Syscall};
 use superior_objects::cap::{CNode, CapError, Capability, Object, Rights};
 use superior_objects::ipc::{Ipc, Tid};
 use x86_64::instructions::interrupts;
@@ -61,6 +70,9 @@ struct Kernel {
     /// The capability this thread last called through had Grant or
     /// GrantReply, so its server's reply may carry a capability.
     reply_grant: [bool; MAX_THREADS],
+    /// Endpoint and notification table entries in use by some object.
+    ep_used: [bool; MAX_ENDPOINTS],
+    ntfn_used: [bool; MAX_NOTIFICATIONS],
     /// Not yet run: its frame holds start registers (entry, stack, argument),
     /// not the results of a system call, and must be resumed untouched.
     fresh: [bool; MAX_THREADS],
@@ -76,6 +88,13 @@ static KERNEL: Mutex<Kernel> = Mutex::new(Kernel {
     spaces: [None; MAX_THREADS],
     caps: CNode::new(),
     reply_grant: [false; MAX_THREADS],
+    ep_used: [false; MAX_ENDPOINTS],
+    // The timer's notification belongs to the kernel and is never freed.
+    ntfn_used: {
+        let mut u = [false; MAX_NOTIFICATIONS];
+        u[TIMER_NTFN as usize] = true;
+        u
+    },
     fresh: [false; MAX_THREADS],
     preempted: [false; MAX_THREADS],
     stats: Stats {
@@ -108,6 +127,11 @@ pub fn spawn_process(
         k.caps
             .insert_root(slot, cap)
             .map_err(|_| "cspace slot unavailable")?;
+        match cap.object {
+            Object::Endpoint { id } => k.ep_used[id as usize] = true,
+            Object::Notification { id } => k.ntfn_used[id as usize] = true,
+            _ => {}
+        }
     }
     k.frames[t] = UserFrame::new_thread(entry, stack_top, arg);
     k.spaces[t] = Some(space);
@@ -147,6 +171,16 @@ pub fn configure_sched(t: Tid, budget: u32, period: u32) -> Result<(), &'static 
         .map_err(|_| "bad scheduling parameters")
 }
 
+/// Places an original capability in thread `t`'s slot `slot` at boot.
+pub fn grant_root(t: Tid, slot: usize, cap: Capability) -> Result<(), &'static str> {
+    let s = cap_slot(t, slot).ok_or("cspace slot out of range")?;
+    KERNEL
+        .lock()
+        .caps
+        .insert_root(s, cap)
+        .map_err(|_| "cspace slot unavailable")
+}
+
 /// Index in the capability table of thread `t`'s slot `slot`.
 fn cap_slot(t: Tid, slot: usize) -> Option<usize> {
     ((t as usize) < MAX_THREADS && slot < CSPACE_SLOTS).then(|| t as usize * CSPACE_SLOTS + slot)
@@ -178,6 +212,8 @@ pub fn handle_syscall(frame: &mut UserFrame) -> Exit {
         None => Err(Error::IllegalOperation.code()),
         Some(Syscall::CapRevoke) => cap_op(k, cur, frame.rdi, |c, s| c.revoke(s).map(|_| ())),
         Some(Syscall::CapDelete) => cap_op(k, cur, frame.rdi, |c, s| c.delete(s)),
+        Some(Syscall::CapMint) => cap_mint(k, cur, frame),
+        Some(Syscall::Retype) => retype(k, cur, frame),
         Some(Syscall::DebugPutStr) => debug_put_str(k, cur, frame.rdi, frame.rsi),
         Some(Syscall::DebugSelftestDone) => {
             let stats = k.stats;
@@ -191,7 +227,9 @@ pub fn handle_syscall(frame: &mut UserFrame) -> Exit {
             None => Err(Error::InvalidArgument.code()),
         },
     };
-    k.ipc.set_status(result.err().unwrap_or(0));
+    // The result belongs to the caller, even if the operation woke a
+    // thread that has since taken the CPU.
+    k.ipc.set_status_of(cur, result.err().unwrap_or(0));
     complete_transfers(k);
     resume(guard, cur, frame)
 }
@@ -295,10 +333,111 @@ fn cap_op(
         .ok()
         .and_then(|s| cap_slot(cur, s))
         .ok_or(Error::InvalidCapability.code())?;
-    op(&mut k.caps, s).map_err(|e| match e {
+    let r = op(&mut k.caps, s).map_err(cap_error);
+    reap(k);
+    r
+}
+
+fn cap_error(e: CapError) -> u64 {
+    match e {
         CapError::SlotEmpty | CapError::SlotOutOfRange => Error::InvalidCapability.code(),
-        _ => Error::IllegalOperation.code(),
-    })
+        CapError::SlotOccupied => Error::SlotOccupied.code(),
+        CapError::OutOfMemory => Error::NotEnoughMemory.code(),
+        CapError::BadgeAlreadySet | CapError::NotBadgeable => Error::InvalidArgument.code(),
+        CapError::WrongObjectType => Error::InvalidCapability.code(),
+        CapError::HasChildren => Error::IllegalOperation.code(),
+    }
+}
+
+/// Frees every endpoint and notification no capability refers to any
+/// more, waking threads blocked on them with `ObjectDestroyed`.
+fn reap(k: &mut Kernel) {
+    for id in 0..MAX_ENDPOINTS {
+        let live = k
+            .caps
+            .iter()
+            .any(|c| c.object == Object::Endpoint { id: id as u32 });
+        if k.ep_used[id] && !live {
+            k.ep_used[id] = false;
+            let _ = k.ipc.destroy_endpoint(id as u16);
+        }
+    }
+    for id in 0..MAX_NOTIFICATIONS {
+        if id == TIMER_NTFN as usize {
+            continue;
+        }
+        let live = k
+            .caps
+            .iter()
+            .any(|c| c.object == Object::Notification { id: id as u32 });
+        if k.ntfn_used[id] && !live {
+            k.ntfn_used[id] = false;
+            let _ = k.ipc.destroy_notification(id as u16);
+        }
+    }
+}
+
+/// The caller's slot `slot` as a capability-table index.
+fn own_slot(cur: Tid, slot: u64) -> Option<usize> {
+    usize::try_from(slot).ok().and_then(|s| cap_slot(cur, s))
+}
+
+/// `CapMint`: rdi = source slot, rsi = empty destination slot, rdx =
+/// rights mask, r8 = badge (0 = none).
+fn cap_mint(k: &mut Kernel, cur: Tid, f: &UserFrame) -> Result<(), u64> {
+    let src = own_slot(cur, f.rdi).ok_or(Error::InvalidCapability.code())?;
+    let dst = own_slot(cur, f.rsi).ok_or(Error::InvalidArgument.code())?;
+    let mask = u8::try_from(f.rdx)
+        .map(Rights::from_bits_truncate)
+        .map_err(|_| Error::InvalidArgument.code())?;
+    let badge = (f.r8 != 0).then_some(f.r8);
+    k.caps.derive(src, dst, mask, badge).map_err(cap_error)
+}
+
+/// `Retype`: rdi = untyped slot, rsi = object type, rdx = size in bits
+/// (untyped only), r8 = empty destination slot.
+fn retype(k: &mut Kernel, cur: Tid, f: &UserFrame) -> Result<(), u64> {
+    let src = own_slot(cur, f.rdi).ok_or(Error::InvalidCapability.code())?;
+    let ut = *k.caps.get(src).ok_or(Error::InvalidCapability.code())?;
+    if !matches!(ut.object, Object::Untyped { .. }) {
+        return Err(Error::InvalidCapability.code());
+    }
+    let dst = own_slot(cur, f.r8).ok_or(Error::InvalidArgument.code())?;
+    if k.caps.get(dst).is_some() {
+        return Err(Error::SlotOccupied.code());
+    }
+    let ty = ObjectType::from_u64(f.rsi).ok_or(Error::InvalidArgument.code())?;
+    let bits = ty.size_bits(f.rdx).ok_or(Error::InvalidArgument.code())?;
+    // Claim a table entry only once everything else is known to succeed.
+    let free = |used: &[bool]| used.iter().position(|u| !u);
+    let entry = match ty {
+        ObjectType::Untyped => None,
+        ObjectType::Endpoint => Some(free(&k.ep_used).ok_or(Error::ObjectTableFull.code())?),
+        ObjectType::Notification => Some(free(&k.ntfn_used).ok_or(Error::ObjectTableFull.code())?),
+    };
+    let base = k.caps.carve(src, bits).map_err(cap_error)?;
+    let ipc_rights = Rights::READ | Rights::WRITE | Rights::GRANT | Rights::GRANT_REPLY;
+    let cap = match (ty, entry) {
+        (ObjectType::Endpoint, Some(id)) => {
+            k.ep_used[id] = true;
+            Capability::new(Object::Endpoint { id: id as u32 }, ipc_rights)
+        }
+        (ObjectType::Notification, Some(id)) => {
+            k.ntfn_used[id] = true;
+            Capability::new(Object::Notification { id: id as u32 }, ipc_rights)
+        }
+        _ => Capability::new(
+            Object::Untyped {
+                base,
+                size_bits: bits,
+            },
+            Rights::ALL,
+        ),
+    };
+    k.caps
+        .insert_child(src, dst, cap)
+        .expect("destination slot checked empty");
+    Ok(())
 }
 
 fn ipc_op(

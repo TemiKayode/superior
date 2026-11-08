@@ -329,6 +329,39 @@ impl<const T: usize, const E: usize, const N: usize> Ipc<T, E, N> {
         self.threads[t as usize].caller
     }
 
+    /// Sets the status thread `t` will see when it next returns to user
+    /// mode: the result of the operation it just made.
+    pub fn set_status_of(&mut self, t: Tid, status: u64) {
+        self.threads[t as usize].status = status;
+    }
+
+    /// Destroys endpoint `ep`: every thread queued on it (senders or
+    /// receivers) wakes with [`Error::ObjectDestroyed`]. The kernel calls
+    /// this when the last capability to the endpoint goes.
+    pub fn destroy_endpoint(&mut self, ep: u16) -> Result<(), IpcError> {
+        let e = self.ep_index(ep)?;
+        while let Some(t) = self.eps[e].queue.pop(&mut self.threads) {
+            self.threads[t as usize].status = Error::ObjectDestroyed.code();
+            self.wake(t);
+        }
+        self.eps[e].state = EpState::Idle;
+        self.schedule();
+        Ok(())
+    }
+
+    /// Destroys notification `ntfn`: waiters wake with
+    /// [`Error::ObjectDestroyed`] and pending bits are discarded.
+    pub fn destroy_notification(&mut self, ntfn: u16) -> Result<(), IpcError> {
+        let n = self.ntfn_index(ntfn)?;
+        while let Some(t) = self.ntfns[n].waiters.pop(&mut self.threads) {
+            self.threads[t as usize].status = Error::ObjectDestroyed.code();
+            self.wake(t);
+        }
+        self.ntfns[n].word = 0;
+        self.schedule();
+        Ok(())
+    }
+
     /// Sets the status the current thread will see on return.
     pub fn set_status(&mut self, status: u64) {
         if let Some(c) = self.current {
@@ -1327,5 +1360,39 @@ mod tests {
         // Not blocked yet: still runs on its own context.
         assert!(!k.tick());
         assert_eq!(k.current(), Some(SERVER));
+    }
+    #[test]
+    fn destroying_an_endpoint_wakes_its_queue_with_an_error() {
+        let mut k = K::new();
+        k.spawn(SERVER, 10).unwrap();
+        k.spawn(CLIENT, 5).unwrap();
+        k.spawn(OTHER, 1).unwrap();
+        k.schedule();
+        k.recv(0, true).unwrap(); // server waits
+        k.recv(1, true).unwrap(); // client waits on another endpoint
+        assert_eq!(k.current(), Some(OTHER));
+        k.destroy_endpoint(0).unwrap();
+        assert_eq!(k.current(), Some(SERVER), "woken and preempts");
+        assert_eq!(k.thread(SERVER).status, Error::ObjectDestroyed.code());
+        assert_eq!(k.thread(CLIENT).state, State::BlockedRecv { ep: 1 });
+        // The endpoint is usable afresh.
+        k.recv(0, true).unwrap();
+        assert_eq!(k.thread(SERVER).state, State::BlockedRecv { ep: 0 });
+    }
+
+    #[test]
+    fn destroying_a_notification_wakes_waiters_and_drops_bits() {
+        let mut k = K::new();
+        k.spawn(CLIENT, 5).unwrap();
+        k.schedule();
+        k.wait(1).unwrap();
+        assert_eq!(k.current(), None);
+        k.destroy_notification(1).unwrap();
+        assert_eq!(k.current(), Some(CLIENT));
+        assert_eq!(k.thread(CLIENT).status, Error::ObjectDestroyed.code());
+        k.signal(2, 0b1).unwrap();
+        k.destroy_notification(2).unwrap();
+        k.wait(2).unwrap();
+        assert_eq!(k.current(), None, "pending bits were discarded");
     }
 }

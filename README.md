@@ -21,6 +21,12 @@ Phase 0 (foundations). Working today, under QEMU on x86-64:
   threads that entered by system call leave by `sysret`, preempted threads by `iretq`.
 - Local APIC timer, calibrated against the PIT, at 100 Hz; round-robin time slices within
   a priority level, never handing the CPU to a lower priority.
+- Retype from user space: a thread holding untyped memory makes endpoints, notifications
+  and smaller untyped blocks with `Retype`; each new capability is a child of the untyped
+  one, so revoking the untyped destroys every object made from it (waking threads blocked
+  on them with an error) and makes its memory reusable. `CapMint` copies a capability
+  with fewer rights or a badge. Endpoint and notification state still lives in fixed
+  kernel tables (8 of each) claimed at retype, not in the carved memory.
 - Scheduling contexts (MCS): each thread owns one, unlimited unless given a budget per
   period. Budgets are charged per tick and refilled each period (periodic, not yet
   sporadic); a thread that runs dry is throttled until the refill. A passive server
@@ -47,10 +53,12 @@ Phase 0 (foundations). Working today, under QEMU on x86-64:
   Self-test builds fail after 60 seconds instead of hanging. A hog at the top priority
   spins forever on a budget of 2 ticks in 10; without the budget nothing else runs and the
   test times out. The IPC server is passive, and the kernel checks that ticks were charged
-  to its callers.
+  to its callers. The client gets 64 KiB of untyped memory and makes, uses, revokes and
+  re-makes objects from it, down to filling the notification table.
 
-Not yet: scheduling-context capabilities (budgets are set at boot), sporadic refills,
-timeout faults, retype into kernel objects from user space, SMP, an IPC benchmark on real hardware.
+Not yet: frames and mapping memory from user space, threads and CNodes as retypable
+objects, scheduling-context capabilities (budgets are set at boot), sporadic refills,
+timeout faults, SMP, an IPC benchmark on real hardware.
 
 The architectural specification lives in the Superior OS Architectural Specification doc:
 https://claude.ai/artifact/QKJS8qH5Dfbjzn58RStq1j

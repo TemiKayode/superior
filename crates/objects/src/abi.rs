@@ -87,6 +87,14 @@ pub enum Syscall {
     /// The caller gives up its own scheduling context the next time it
     /// blocks; afterwards it runs only on contexts lent by its callers.
     SchedPassive = 12,
+    /// Makes a new kernel object from the untyped capability in slot `rdi`:
+    /// `rsi` = [`ObjectType`], `rdx` = size in bits (untyped only), `r8` =
+    /// the empty slot for the new capability, which becomes a child of the
+    /// untyped one (revoking it destroys the object).
+    Retype = 13,
+    /// Copies the capability in slot `rdi` into the empty slot `rsi` with
+    /// rights `rdx` (a mask: rights only shrink) and badge `r8` (0 = keep).
+    CapMint = 14,
     /// Debug build only: print a UTF-8 string. rdi = pointer, rsi = length.
     DebugPutStr = 0x100,
     /// Debug build only: report a self-test result. rdi = 0 for pass.
@@ -109,6 +117,8 @@ impl Syscall {
             10 => Syscall::CapRevoke,
             11 => Syscall::CapDelete,
             12 => Syscall::SchedPassive,
+            13 => Syscall::Retype,
+            14 => Syscall::CapMint,
             0x100 => Syscall::DebugPutStr,
             0x101 => Syscall::DebugSelftestDone,
             _ => return None,
@@ -132,6 +142,45 @@ pub enum Error {
     InvalidArgument = 5,
     /// The server received a new call before replying to this one.
     ReplyAbandoned = 6,
+    /// The untyped block has no aligned room left for the object.
+    NotEnoughMemory = 7,
+    /// The destination slot already holds a capability.
+    SlotOccupied = 8,
+    /// The kernel's table for this object type is full.
+    ObjectTableFull = 9,
+    /// The object was destroyed while this thread waited on it.
+    ObjectDestroyed = 10,
+}
+
+/// Kernel object types for [`Syscall::Retype`].
+#[repr(u64)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ObjectType {
+    Untyped = 0,
+    Endpoint = 1,
+    Notification = 2,
+}
+
+impl ObjectType {
+    pub const fn from_u64(n: u64) -> Option<ObjectType> {
+        Some(match n {
+            0 => ObjectType::Untyped,
+            1 => ObjectType::Endpoint,
+            2 => ObjectType::Notification,
+            _ => return None,
+        })
+    }
+
+    /// Memory the object takes from its untyped block, as a power of two.
+    /// Untyped blocks take their requested size, from 16 bytes up.
+    pub const fn size_bits(self, requested: u64) -> Option<u8> {
+        match self {
+            ObjectType::Untyped if requested >= 4 && requested <= 47 => Some(requested as u8),
+            ObjectType::Untyped => None,
+            ObjectType::Endpoint => Some(4),
+            ObjectType::Notification => Some(5),
+        }
+    }
 }
 
 impl Error {

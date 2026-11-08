@@ -145,6 +145,19 @@ fn start_pingpong() -> Result<(), &'static str> {
         &[(1, timer), (2, Capability::new(spinner_done, Rights::READ))],
     )?;
     task::derive_cap(0, 0, 2, 0, Rights::WRITE | Rights::GRANT_REPLY, Some(0xC1))?;
+    // 64 KiB of untyped memory for the client to make its own objects from.
+    let base = memory::carve(16).ok_or("no memory for the client's untyped block")?;
+    task::grant_root(
+        2,
+        4,
+        Capability::new(
+            Object::Untyped {
+                base,
+                size_bits: 16,
+            },
+            Rights::ALL,
+        ),
+    )?;
     // A hog above everyone, spinning forever, held to 2 ticks in every 10
     // by its scheduling context. Without the budget nothing else would run.
     task::spawn_process(3, USER_IMAGE, 20, 3, &[])?;

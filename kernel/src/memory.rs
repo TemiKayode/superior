@@ -16,6 +16,13 @@ const LOW_MEMORY_END: u64 = 0x10_0000;
 
 /// The root task's capability space. Owned by the kernel until the root
 /// task starts.
+/// Carves a `2^size_bits` byte block from the root task's untyped memory,
+/// for the kernel to hand to a user thread as a fresh untyped capability.
+pub fn carve(size_bits: u8) -> Option<u64> {
+    let mut cnode = ROOT_CNODE.lock();
+    (0..ROOT_CNODE_SLOTS).find_map(|slot| cnode.retype(slot, size_bits).ok())
+}
+
 pub static ROOT_CNODE: Mutex<CNode<ROOT_CNODE_SLOTS>> = Mutex::new(CNode::new());
 
 pub struct Summary {
