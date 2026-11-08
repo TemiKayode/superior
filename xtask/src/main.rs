@@ -8,6 +8,8 @@
 //!                       scripted session with the shell
 //!   cargo xtask boot-test   just the boot self-tests
 //!   cargo xtask shell-test  just the shell session
+//!   cargo xtask bench   time IPC under hardware virtualization (WHPX or KVM)
+//!                       and check it against seL4's published figures
 //!
 //! QEMU is found through $QEMU, then the default Windows install path, then PATH.
 
@@ -34,7 +36,8 @@ fn main() -> ExitCode {
             .and_then(|img| shell_session(&img)),
         Some("boot-test") => image(true).and_then(|img| boot(&img, true)),
         Some("shell-test") => image(false).and_then(|img| shell_session(&img)),
-        _ => Err("usage: cargo xtask <image | run | test | boot-test | shell-test>".into()),
+        Some("bench") => image(false).and_then(|img| bench(&img)),
+        _ => Err("usage: cargo xtask <image | run | test | boot-test | shell-test | bench>".into()),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -190,8 +193,30 @@ fn boot(img: &Path, selftest: bool) -> Result<(), String> {
 /// code.
 fn shell_session(img: &Path) -> Result<(), String> {
     println!("== shell session on {}", img.display());
+    // (typed text, text the answer must contain).
+    let script: &[(&str, &str)] = &[
+        ("help", "shutdown        power off"),
+        ("echo hello from user space", "\nhello from user space"),
+        ("about", "its own COM1 driver"),
+        ("sleep 20", "slept 20 ticks"),
+        ("ipc 20000", "20000 round trips to another thread"),
+        ("frobnicate", "unknown command: frobnicate"),
+        // A typo fixed with backspace: the shell runs "echo fixed".
+        ("echp\x7fo fixed", "\nfixed"),
+    ];
+    drive_shell(img, &[], script)?;
+    println!("== shell session passed");
+    Ok(())
+}
+
+/// Boots `img` with `extra` QEMU arguments and drives the shell over the
+/// serial port as a person would: wait for the prompt, type a command,
+/// check the answer, and finally `shutdown`, which must end QEMU with the
+/// pass code. Returns everything the shell printed.
+fn drive_shell(img: &Path, extra: &[&str], script: &[(&str, &str)]) -> Result<String, String> {
     let mut child = qemu_command(img)
         .args(["-display", "none"])
+        .args(extra)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
@@ -232,18 +257,7 @@ fn shell_session(img: &Path) -> Result<(), String> {
     };
     let prompt = "superior> ";
     let mut at = expect(prompt, 0)?;
-    // (typed text, text the answer must contain). Typing goes one byte at
-    // a time, as from a keyboard.
-    let script: &[(&str, &str)] = &[
-        ("help", "shutdown        power off"),
-        ("echo hello from user space", "\nhello from user space"),
-        ("about", "its own COM1 driver"),
-        ("sleep 20", "slept 20 ticks"),
-        ("ipc 20000", "20000 round trips to another thread"),
-        ("frobnicate", "unknown command: frobnicate"),
-        // A typo fixed with backspace: the shell runs "echo fixed".
-        ("echp\x7fo fixed", "\nfixed"),
-    ];
+    // Typing goes one byte at a time, as from a keyboard.
     let mut result = Ok(());
     for (typed, want) in script {
         // Enter is sent as a line feed: QEMU on Windows drops a bare
@@ -282,12 +296,85 @@ fn shell_session(img: &Path) -> Result<(), String> {
     println!();
     result?;
     match status.and_then(|s| s.code()) {
-        Some(QEMU_PASS) => {
-            println!("== shell session passed");
-            Ok(())
-        }
+        Some(QEMU_PASS) => Ok(String::from_utf8_lossy(&seen.lock().unwrap()).into_owned()),
         code => Err(format!(
             "shell did not power off cleanly (QEMU exit {code:?})"
         )),
+    }
+}
+
+/// seL4's published one-way IPC costs on x86-64, in cycles: the MCS
+/// configuration (Superior's kernel is MCS) on an i7-6700 (Skylake),
+/// without Meltdown mitigation, from https://sel4.systems/performance.html
+/// (sel4bench-manifest 818079b1, generated 2026-11-07).
+const SEL4_CALL: u64 = 771;
+const SEL4_REPLY: u64 = 667;
+/// The Phase 0 exit gate: Tier 1 IPC within 1.5x of seL4, in tenths.
+const GATE_TENTHS: u64 = 15;
+const BENCH_RUNS: usize = 5;
+
+/// Times IPC in the shell under hardware virtualization, where `rdtsc`
+/// counts real cycles (under QEMU's emulator it counts emulated time and
+/// means nothing). Each run does 100,000 round trips after a warm-up and
+/// reports one-way call and reply costs measured as sel4bench does. The
+/// gate is on the middle run's medians, since host interrupts stretch a
+/// few rounds under a hypervisor; the means are reported too.
+fn bench(img: &Path) -> Result<(), String> {
+    let accel: &[&str] = if cfg!(windows) {
+        // WHPX: the in-kernel irqchip and nested VT-x are not available
+        // on every Hyper-V host.
+        &["-accel", "whpx,kernel-irqchip=off", "-cpu", "host,-vmx"]
+    } else {
+        &["-accel", "kvm", "-cpu", "host"]
+    };
+    println!("== IPC benchmark on {} ({})", img.display(), accel[1]);
+    let script = [("ipc 100000", "(median)"); BENCH_RUNS];
+    let out = drive_shell(img, accel, &script)?;
+    let number_after = |line: &str, key: &str| -> Option<u64> {
+        let rest = &line[line.find(key)? + key.len()..];
+        rest.trim_start()
+            .split(|c: char| !c.is_ascii_digit())
+            .next()?
+            .parse()
+            .ok()
+    };
+    let (mut med, mut mean) = (Vec::new(), Vec::new());
+    for line in out.lines().filter(|l| l.starts_with("one way:")) {
+        let (Some(c), Some(r)) = (number_after(line, "call"), number_after(line, "reply")) else {
+            continue;
+        };
+        if line.contains("(median)") {
+            med.push((c, r));
+        } else if line.contains("(mean)") {
+            mean.push((c, r));
+        }
+    }
+    if med.len() != BENCH_RUNS || mean.len() != BENCH_RUNS {
+        return Err("bench: could not read the shell's timings".into());
+    }
+    let middle = |mut v: Vec<u64>| {
+        v.sort();
+        v[v.len() / 2]
+    };
+    let call = middle(med.iter().map(|m| m.0).collect());
+    let reply = middle(med.iter().map(|m| m.1).collect());
+    let call_mean = middle(mean.iter().map(|m| m.0).collect());
+    let reply_mean = middle(mean.iter().map(|m| m.1).collect());
+    let ratio = |ours: u64, theirs: u64| ours as f64 / theirs as f64;
+    println!("== one-way IPC, cycles   Superior median (mean)   seL4 MCS Skylake   ratio");
+    println!(
+        "   call                 {call:>6} ({call_mean:>5})           {SEL4_CALL:>5}          {:.2}x",
+        ratio(call, SEL4_CALL)
+    );
+    println!(
+        "   reply                {reply:>6} ({reply_mean:>5})           {SEL4_REPLY:>5}          {:.2}x",
+        ratio(reply, SEL4_REPLY)
+    );
+    let within = |ours: u64, theirs: u64| ours * 10 <= theirs * GATE_TENTHS;
+    if within(call, SEL4_CALL) && within(reply, SEL4_REPLY) {
+        println!("== IPC within 1.5x of seL4");
+        Ok(())
+    } else {
+        Err("IPC is not within 1.5x of seL4's published figures".into())
     }
 }

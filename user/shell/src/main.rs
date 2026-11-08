@@ -186,10 +186,18 @@ fn sleep(arg: &str) {
     outln!("slept {ticks} ticks");
 }
 
+/// Answers each call with its first word plus one, and with two
+/// timestamps: when the call arrived and when the reply started. With the
+/// caller's own timestamps these split a round trip into its call and
+/// reply halves, measured one way each as seL4's sel4bench does (both
+/// threads share a core, so they share the time-stamp counter).
 extern "C" fn echo_server(_: u64) -> ! {
     let mut r = syscall(Syscall::Recv, ECHO_SLOT, [0; 4]);
     loop {
-        r = syscall(Syscall::ReplyRecv, ECHO_SLOT, [r.msg[0] + 1, 0, 0, 0]);
+        let arrived = rdtsc();
+        let n = r.msg[0] + 1;
+        let replying = rdtsc();
+        r = syscall(Syscall::ReplyRecv, ECHO_SLOT, [n, arrived, replying, 0]);
     }
 }
 
@@ -221,6 +229,41 @@ fn rdtsc() -> u64 {
     unsafe { core::arch::x86_64::_rdtsc() }
 }
 
+/// Histograms of timings in 8-cycle buckets, for medians: under a
+/// hypervisor a few rounds are stretched by host interrupts, which move the
+/// mean but not the median.
+const BUCKETS: usize = 1024;
+const BUCKET_CYCLES: u64 = 8;
+
+struct Histogram([u32; BUCKETS]);
+
+impl Histogram {
+    fn add(&mut self, cycles: u64) {
+        let b = ((cycles / BUCKET_CYCLES) as usize).min(BUCKETS - 1);
+        self.0[b] += 1;
+    }
+
+    /// The value below which `pct` percent of samples fall.
+    fn percentile(&self, pct: u64) -> u64 {
+        let total: u64 = self.0.iter().map(|&n| n as u64).sum();
+        let want = (total * pct).div_ceil(100).max(1);
+        let mut seen = 0;
+        for (b, &n) in self.0.iter().enumerate() {
+            seen += n as u64;
+            if seen >= want {
+                return b as u64 * BUCKET_CYCLES;
+            }
+        }
+        BUCKETS as u64 * BUCKET_CYCLES
+    }
+}
+
+static mut HISTOGRAMS: [Histogram; 3] = [
+    Histogram([0; BUCKETS]),
+    Histogram([0; BUCKETS]),
+    Histogram([0; BUCKETS]),
+];
+
 fn ipc(arg: &str, started: &mut bool) {
     let rounds = match arg.trim() {
         "" => 10_000,
@@ -239,21 +282,50 @@ fn ipc(arg: &str, started: &mut bool) {
         }
         *started = true;
     }
+    // Warm caches and TLBs first; these rounds are not counted.
+    for i in 0..rounds.min(1000) {
+        syscall(Syscall::Call, ECHO_EP, [i, 0, 0, 0]);
+    }
+    // SAFETY: the shell is the only thread touching these, and only here.
+    let [round, call, reply] = unsafe { &mut *core::ptr::addr_of_mut!(HISTOGRAMS) };
+    for h in [&mut *round, &mut *call, &mut *reply] {
+        h.0 = [0; BUCKETS];
+    }
     let (mut min, mut total) = (u64::MAX, 0u64);
+    let (mut call_total, mut reply_total) = (0u64, 0u64);
     for i in 0..rounds {
         let t0 = rdtsc();
         let r = syscall(Syscall::Call, ECHO_EP, [i, 0, 0, 0]);
-        let dt = rdtsc().wrapping_sub(t0);
+        let t1 = rdtsc();
         if r.status != 0 || r.msg[0] != i + 1 {
             outln!("round {i} failed: status {} reply {}", r.status, r.msg[0]);
             return;
         }
+        let dt = t1.wrapping_sub(t0);
         min = min.min(dt);
         total += dt;
+        let (c, rp) = (r.msg[1].wrapping_sub(t0), t1.wrapping_sub(r.msg[2]));
+        call_total += c;
+        reply_total += rp;
+        round.add(dt);
+        call.add(c);
+        reply.add(rp);
     }
     outln!(
         "{rounds} round trips to another thread: min {min} cycles, mean {} cycles",
         total / rounds
+    );
+    outln!(
+        "one way: call {} cycles, reply {} cycles (mean)",
+        call_total / rounds,
+        reply_total / rounds
+    );
+    outln!(
+        "one way: call {} cycles, reply {} cycles (median); round trip median {}, 90th percentile {}",
+        call.percentile(50),
+        reply.percentile(50),
+        round.percentile(50),
+        round.percentile(90)
     );
 }
 

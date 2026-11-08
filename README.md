@@ -92,6 +92,13 @@ Phase 0 (foundations). Working today, under QEMU on x86-64:
   thread it makes from its own untyped memory) and `shutdown`. `cargo xtask test` types
   a session into it over the serial port, byte by byte, checks every answer, and needs
   `shutdown` to power QEMU off.
+- IPC benchmark (`cargo xtask bench`): the shell's `ipc` times call and reply one way
+  each, as seL4's sel4bench does, under hardware virtualization (WHPX on Windows, KVM
+  elsewhere), five runs of 100,000 round trips after a warm-up. On an i7-1165G7 under
+  Hyper-V: median call 504 and reply 496 TSC cycles, against seL4's published MCS figures
+  of 771 and 667 on Skylake (0.65x and 0.74x; the gate is 1.5x). The TSC runs at the
+  nominal 2.8 GHz while the core may turbo to 4.7 GHz, so in core cycles the ratio could
+  be up to 1.68x worse (1.10x and 1.25x), still inside the gate. Not measured on bare metal.
 - Static-pie user programs loaded into their own address spaces and relocated.
 - Boot self-test: a server and a client in separate address spaces do 20,000
   call/reply round trips, and the kernel refuses four kinds of rights violations. A
@@ -116,7 +123,7 @@ Phase 0 (foundations). Working today, under QEMU on x86-64:
 
 Not yet: page tables paid for from user untyped memory, mapping into other address
 spaces, new address spaces as retypable objects, multi-level CSpaces, scheduling-context capabilities (budgets are set at boot), sporadic refills,
-timeout faults, SMP, an IPC benchmark on real hardware.
+timeout faults, SMP, an IPC benchmark on bare metal.
 
 The architectural specification lives in the Superior OS Architectural Specification doc:
 https://claude.ai/artifact/QKJS8qH5Dfbjzn58RStq1j
@@ -139,6 +146,7 @@ Needs Rust (the pinned nightly in `rust-toolchain.toml` installs itself) and QEM
 cargo xtask test   # host unit tests, model check, long simulation, boot self-tests, shell session
 cargo xtask run    # boot the shell in QEMU, its console on this terminal
 cargo xtask image  # just build target/superior.img
+cargo xtask bench  # IPC timing under WHPX or KVM, checked against seL4's figures
 ```
 
 QEMU is found via `$QEMU`, then `C:\Program Files\qemu`, then `PATH`.
