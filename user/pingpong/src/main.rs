@@ -2,10 +2,13 @@
 //! its own address space:
 //!
 //! - role 0, the **server**: holds an endpoint with Read+Write and answers
-//!   every call with `msg[0] + 1` and the caller's badge.
+//!   every call with `msg[0] + 1` and the caller's badge. On request
+//!   (`msg[1]`) it instead replies granting its notification capability,
+//!   or revokes every copy of that capability it has handed out.
 //! - role 1, the **client**: holds a badged copy with Write only. It
-//!   checks that the kernel enforces rights, then times call/reply round
-//!   trips and reports the result.
+//!   checks that the kernel enforces rights, receives a capability in a
+//!   reply, uses it, watches the server revoke it, then times call/reply
+//!   round trips and reports the result.
 //! - role 2, the **spinner**: spins without a system call. It shares the
 //!   client's priority, so the client only runs if the kernel preempts it.
 //!   Then it tells the client it is done and blocks for good.
@@ -22,7 +25,7 @@
 
 use core::arch::asm;
 use core::fmt::{self, Write};
-use superior_objects::abi::{Error, MSG_WORDS, Syscall};
+use superior_objects::abi::{CapTransfer, Error, MSG_WORDS, Syscall};
 
 const EP: u64 = 0;
 const EMPTY_SLOT: u64 = 5;
@@ -34,6 +37,16 @@ const DONE_OUT: u64 = 0;
 const PARK: u64 = 1;
 const SPIN_ITERATIONS: u64 = 100_000_000;
 const SLEEP_TICKS: u64 = 5;
+/// Server: the notification it hands out.
+const GIFT: u16 = 1;
+/// Client: where a received capability goes.
+const RECEIVED: u16 = 3;
+/// The gift's badge: signalling through any copy ORs it into the word.
+const GIFT_BADGE: u64 = 0x5;
+/// Requests in `msg[1]`.
+const OP_ECHO: u64 = 0;
+const OP_GIVE: u64 = 1;
+const OP_REVOKE: u64 = 2;
 const CLIENT_BADGE: u64 = 0xC1;
 const WARMUP: u64 = 1_000;
 const ROUNDS: u64 = 20_000;
@@ -42,13 +55,20 @@ struct Ret {
     status: u64,
     badge: u64,
     msg: [u64; MSG_WORDS],
+    /// Slot a capability arrived in, if any.
+    cap: Option<u16>,
 }
 
 #[inline(always)]
 fn syscall(nr: Syscall, a0: u64, m: [u64; MSG_WORDS]) -> Ret {
-    let (status, badge, m0, m1, m2, m3);
+    syscall_x(nr, a0, m, CapTransfer::NONE)
+}
+
+#[inline(always)]
+fn syscall_x(nr: Syscall, a0: u64, m: [u64; MSG_WORDS], x: CapTransfer) -> Ret {
+    let (status, badge, m0, m1, m2, m3, cap): (u64, u64, u64, u64, u64, u64, u64);
     // SAFETY: the kernel preserves every register except rax, rdi, rsi,
-    // rdx, r8, r9 (outputs) and rcx, r11 (clobbered by `syscall`).
+    // rdx, r8, r9, r10 (outputs) and rcx, r11 (clobbered by `syscall`).
     unsafe {
         asm!(
             "syscall",
@@ -58,6 +78,7 @@ fn syscall(nr: Syscall, a0: u64, m: [u64; MSG_WORDS]) -> Ret {
             inlateout("rdx") m[1] => m1,
             inlateout("r8") m[2] => m2,
             inlateout("r9") m[3] => m3,
+            inlateout("r10") x.encode() => cap,
             lateout("rcx") _,
             lateout("r11") _,
             options(nostack),
@@ -67,6 +88,7 @@ fn syscall(nr: Syscall, a0: u64, m: [u64; MSG_WORDS]) -> Ret {
         status,
         badge,
         msg: [m0, m1, m2, m3],
+        cap: if cap == 0 { None } else { Some(cap as u16 - 1) },
     }
 }
 
@@ -137,9 +159,113 @@ pub extern "C" fn _start(role: u64) -> ! {
 fn server() -> ! {
     let mut r = syscall(Syscall::Recv, EP, [0; 4]);
     loop {
-        let reply = [r.msg[0].wrapping_add(1), r.badge, 0, 0];
-        r = syscall(Syscall::ReplyRecv, EP, reply);
+        let (reply, xfer) = match r.msg[1] {
+            OP_GIVE => (
+                [0; 4],
+                CapTransfer {
+                    grant: Some(GIFT),
+                    accept: None,
+                },
+            ),
+            OP_REVOKE => {
+                let s = syscall(Syscall::CapRevoke, GIFT as u64, [0; 4]).status;
+                ([s, 0, 0, 0], CapTransfer::NONE)
+            }
+            _ => ([r.msg[0].wrapping_add(1), r.badge, 0, 0], CapTransfer::NONE),
+        };
+        r = syscall_x(Syscall::ReplyRecv, EP, reply, xfer);
+        if r.status != 0 {
+            // The kernel refused the reply (e.g. a grant it did not
+            // allow): report that to the caller and go back to receiving.
+            syscall(Syscall::Reply, 0, [r.status, u64::MAX, 0, 0]);
+            r = syscall(Syscall::Recv, EP, [0; 4]);
+        }
     }
+}
+
+/// Calls the server with request `op`, offering `accept` for a capability.
+fn request(op: u64, accept: Option<u16>) -> Ret {
+    syscall_x(
+        Syscall::Call,
+        EP,
+        [0, op, 0, 0],
+        CapTransfer {
+            grant: None,
+            accept,
+        },
+    )
+}
+
+/// Capability transfer through IPC, granted and revoked by the server.
+fn transfer_tests() -> bool {
+    let mut pass = true;
+    let into = |accept| CapTransfer {
+        grant: None,
+        accept: Some(accept),
+    };
+
+    let r = syscall_x(
+        Syscall::Call,
+        EP,
+        [0, OP_ECHO, 0, 0],
+        CapTransfer {
+            grant: Some(TIMER as u16),
+            accept: None,
+        },
+    );
+    pass &= expect(
+        "granting over an endpoint without the Grant right is refused",
+        r.status,
+        Error::InsufficientRights.code(),
+    );
+    let r = syscall_x(Syscall::Call, EP, [0, OP_ECHO, 0, 0], into(200));
+    pass &= expect(
+        "accept slot outside the CSpace is refused",
+        r.status,
+        Error::InvalidArgument.code(),
+    );
+
+    let r = request(OP_GIVE, None);
+    let dropped = r.status == 0 && r.cap.is_none();
+    let r = syscall(Syscall::Signal, RECEIVED as u64, [0; 4]);
+    pass &= expect(
+        "a capability offered to a caller that accepts none is dropped",
+        (dropped && r.status == Error::InvalidCapability.code()) as u64,
+        1,
+    );
+
+    let r = request(OP_GIVE, Some(RECEIVED));
+    pass &= expect(
+        "a reply grants a capability into the accept slot",
+        (r.status == 0 && r.cap == Some(RECEIVED)) as u64,
+        1,
+    );
+    let s = syscall(Syscall::Signal, RECEIVED as u64, [0; 4]).status;
+    let w = syscall_x(Syscall::Wait, RECEIVED as u64, [0; 4], CapTransfer::NONE);
+    pass &= expect(
+        "the received capability works (signal, then wait sees the bits)",
+        (s == 0 && w.status == 0 && w.badge == GIFT_BADGE) as u64,
+        1,
+    );
+
+    let r = request(OP_REVOKE, None);
+    pass &= expect("the server revokes what it granted", r.msg[0], 0);
+    let r = syscall(Syscall::Signal, RECEIVED as u64, [0; 4]);
+    pass &= expect(
+        "the revoked copy is gone from this CSpace",
+        r.status,
+        Error::InvalidCapability.code(),
+    );
+
+    let r = request(OP_GIVE, Some(RECEIVED));
+    let d = syscall(Syscall::CapDelete, RECEIVED as u64, [0; 4]).status;
+    let after = syscall(Syscall::Signal, RECEIVED as u64, [0; 4]).status;
+    pass &= expect(
+        "a received capability can be deleted by its holder",
+        (r.cap == Some(RECEIVED) && d == 0 && after == Error::InvalidCapability.code()) as u64,
+        1,
+    );
+    pass
 }
 
 fn spinner() -> ! {
@@ -192,6 +318,7 @@ fn client() -> ! {
         r.status,
         Error::InvalidCapability.code(),
     );
+    pass &= transfer_tests();
 
     // Round trips through the server.
     let (mut min, mut total) = (u64::MAX, 0u64);

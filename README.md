@@ -26,16 +26,22 @@ Phase 0 (foundations). Working today, under QEMU on x86-64:
 - IPC engine: `Send`, `Call`, `Recv`, `Reply`, `ReplyRecv`, `Signal`, `Wait`, `Yield`;
   direct switch on call/reply (fast path); 64 fixed priorities.
 - Rights-checked capability lookup on every system call; badges delivered to servers.
+- Capability transfer in IPC: a sender grants a slot, the receiver names an accept slot,
+  and the receiver gets a copy derived from the sender's. Every CSpace is a window onto
+  one capability table, so the derivation tree spans CSpaces and `CapRevoke` removes every
+  copy handed out. Grant needs the Grant right on the endpoint; a reply may grant if the
+  caller's capability had Grant or GrantReply.
 - Static-pie user programs loaded into their own address spaces and relocated.
 - Boot self-test: a server and a client in separate address spaces do 20,000
   call/reply round trips, and the kernel refuses four kinds of rights violations. A
   spinner at the client's priority, queued ahead of it, never makes a system call, so the
-  client finishes only because the timer preempts it. The client then sleeps on the timer
+  client finishes only because the timer preempts it. The client also receives a
+  capability in a reply, uses it, watches the server revoke it, and checks that ungranted
+  or out-of-range transfers are refused. The client then sleeps on the timer
   notification with every other thread blocked, so the CPU idles and the timer wakes it.
   Self-test builds fail after 60 seconds instead of hanging.
 
-Not yet: scheduling contexts (MCS budgets), capability transfer in
-messages, retype into kernel objects from user space, SMP, an IPC benchmark on real hardware.
+Not yet: scheduling contexts (MCS budgets), retype into kernel objects from user space, SMP, an IPC benchmark on real hardware.
 
 The architectural specification lives in the Superior OS Architectural Specification doc:
 https://claude.ai/artifact/QKJS8qH5Dfbjzn58RStq1j

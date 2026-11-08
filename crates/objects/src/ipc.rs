@@ -21,8 +21,16 @@
 //!
 //! Message delivery always fills `msg`, `badge` and `status` of the thread
 //! being woken; the kernel copies them into that thread's registers.
+//!
+//! Capability transfer: before each operation the kernel records the
+//! current thread's [`CapTransfer`] (slot to grant, slot to accept into).
+//! When a message moves from a sender that grants to a receiver that
+//! accepts, delivery records a [`Transfer`]; the kernel drains them after
+//! the operation with [`Ipc::take_transfers`], copies the capability
+//! between CSpaces, and reports the outcome with [`Ipc::set_cap_received`].
+//! CSpaces themselves are not this module's business.
 
-use crate::abi::{Error, MSG_WORDS};
+use crate::abi::{CapTransfer, Error, MSG_WORDS};
 
 pub type Tid = u16;
 pub const PRIORITIES: usize = 64;
@@ -65,7 +73,24 @@ pub struct Tcb {
     next: Option<Tid>,
     /// Ticks left in this thread's time slice.
     slice: u32,
+    /// Capability transfer named by this thread's latest operation.
+    xfer: CapTransfer,
+    /// Slot the last delivered message's capability landed in, if any.
+    pub cap_received: Option<u16>,
 }
+
+/// A capability to copy from `from`'s slot `grant` into `to`'s slot `accept`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Transfer {
+    pub from: Tid,
+    pub grant: u16,
+    pub to: Tid,
+    pub accept: u16,
+}
+
+/// The most deliveries one operation makes: `ReplyRecv` replies, then
+/// may receive from a queued sender.
+pub const MAX_TRANSFERS: usize = 2;
 
 const IDLE_TCB: Tcb = Tcb {
     state: State::Inactive,
@@ -76,6 +101,8 @@ const IDLE_TCB: Tcb = Tcb {
     caller: None,
     next: None,
     slice: TIMESLICE_TICKS,
+    xfer: CapTransfer::NONE,
+    cap_received: None,
 };
 
 #[derive(Clone, Copy, Default, Debug)]
@@ -173,6 +200,7 @@ pub struct Ipc<const T: usize, const E: usize, const N: usize> {
     /// Bit p set ⇔ ready[p] non-empty.
     ready_bits: u64,
     current: Option<Tid>,
+    transfers: [Option<Transfer>; MAX_TRANSFERS],
 }
 
 impl<const T: usize, const E: usize, const N: usize> Default for Ipc<T, E, N> {
@@ -196,6 +224,7 @@ impl<const T: usize, const E: usize, const N: usize> Ipc<T, E, N> {
             ready: [Queue::EMPTY; PRIORITIES],
             ready_bits: 0,
             current: None,
+            transfers: [None; MAX_TRANSFERS],
         }
     }
 
@@ -205,6 +234,29 @@ impl<const T: usize, const E: usize, const N: usize> Ipc<T, E, N> {
 
     pub fn thread(&self, t: Tid) -> &Tcb {
         &self.threads[t as usize]
+    }
+
+    /// Records the capability transfer the current thread's next operation
+    /// offers and accepts. The kernel calls this before every IPC operation.
+    pub fn set_transfer(&mut self, xfer: CapTransfer) {
+        if let Some(c) = self.current {
+            self.threads[c as usize].xfer = xfer;
+        }
+    }
+
+    /// The transfers recorded by deliveries since the last call.
+    pub fn take_transfers(&mut self) -> [Option<Transfer>; MAX_TRANSFERS] {
+        core::mem::take(&mut self.transfers)
+    }
+
+    /// Records where a transferred capability landed for `t`.
+    pub fn set_cap_received(&mut self, t: Tid, slot: Option<u16>) {
+        self.threads[t as usize].cap_received = slot;
+    }
+
+    /// The caller `t` owes a reply to, if any.
+    pub fn caller_of(&self, t: Tid) -> Option<Tid> {
+        self.threads[t as usize].caller
     }
 
     /// Sets the status the current thread will see on return.
@@ -288,7 +340,7 @@ impl<const T: usize, const E: usize, const N: usize> Ipc<T, E, N> {
         self.threads[cur as usize].status = 0;
         if self.eps[e].state == EpState::Receiving {
             let r = self.dequeue_ep(e);
-            self.deliver(r, msg, badge);
+            self.deliver(cur, r, msg, badge);
             self.wake(r);
         } else if blocking {
             let tcb = &mut self.threads[cur as usize];
@@ -311,7 +363,7 @@ impl<const T: usize, const E: usize, const N: usize> Ipc<T, E, N> {
         let e = self.ep_index(ep)?;
         if self.eps[e].state == EpState::Receiving {
             let server = self.dequeue_ep(e);
-            self.deliver(server, msg, badge);
+            self.deliver(cur, server, msg, badge);
             self.take_caller(server, cur);
             self.threads[cur as usize].state = State::BlockedReply;
             self.current = None;
@@ -352,7 +404,7 @@ impl<const T: usize, const E: usize, const N: usize> Ipc<T, E, N> {
         let cur = self.cur()?;
         self.threads[cur as usize].status = 0;
         if let Some(c) = self.threads[cur as usize].caller.take() {
-            self.deliver(c, msg, 0);
+            self.deliver(cur, c, msg, 0);
             self.wake(c);
         }
         Ok(())
@@ -365,7 +417,7 @@ impl<const T: usize, const E: usize, const N: usize> Ipc<T, E, N> {
         let e = self.ep_index(ep)?;
         let caller = self.threads[cur as usize].caller.take();
         if let Some(c) = caller {
-            self.deliver(c, msg, 0);
+            self.deliver(cur, c, msg, 0);
         }
         if self.eps[e].state == EpState::Sending {
             self.take_from_sender(cur, e);
@@ -463,11 +515,25 @@ impl<const T: usize, const E: usize, const N: usize> Ipc<T, E, N> {
             .ok_or(IpcError::BadObject)
     }
 
-    fn deliver(&mut self, t: Tid, msg: [u64; MSG_WORDS], badge: u64) {
-        let tcb = &mut self.threads[t as usize];
+    /// Moves a message from `from` to `to`, recording a capability
+    /// transfer if `from` grants one and `to` accepts one.
+    fn deliver(&mut self, from: Tid, to: Tid, msg: [u64; MSG_WORDS], badge: u64) {
+        let grant = self.threads[from as usize].xfer.grant;
+        let tcb = &mut self.threads[to as usize];
         tcb.msg = msg;
         tcb.badge = badge;
         tcb.status = 0;
+        tcb.cap_received = None;
+        if let (Some(grant), Some(accept)) = (grant, tcb.xfer.accept) {
+            let t = Transfer {
+                from,
+                grant,
+                to,
+                accept,
+            };
+            let free = self.transfers.iter_mut().find(|x| x.is_none());
+            *free.expect("more deliveries in one operation than MAX_TRANSFERS") = Some(t);
+        }
     }
 
     /// Records that `server` owes `caller` a reply. If the server already
@@ -484,7 +550,7 @@ impl<const T: usize, const E: usize, const N: usize> Ipc<T, E, N> {
     fn take_from_sender(&mut self, cur: Tid, e: usize) {
         let s = self.dequeue_ep(e);
         let sender = self.threads[s as usize];
-        self.deliver(cur, sender.msg, sender.badge);
+        self.deliver(s, cur, sender.msg, sender.badge);
         if let State::BlockedSend { call: true, .. } = sender.state {
             self.take_caller(cur, s);
             self.threads[s as usize].state = State::BlockedReply;
@@ -835,5 +901,105 @@ mod tests {
         k.wait(0).unwrap();
         assert_eq!(k.current(), Some(CLIENT), "bits pending: no block");
         assert_eq!(k.thread(CLIENT).badge, 0b11);
+    }
+    fn xfer(grant: Option<u16>, accept: Option<u16>) -> CapTransfer {
+        CapTransfer { grant, accept }
+    }
+
+    fn tr(from: Tid, grant: u16, to: Tid, accept: u16) -> Option<Transfer> {
+        Some(Transfer {
+            from,
+            grant,
+            to,
+            accept,
+        })
+    }
+
+    #[test]
+    fn call_and_reply_record_transfers() {
+        let mut k = K::new();
+        k.spawn(SERVER, 10).unwrap();
+        k.spawn(CLIENT, 5).unwrap();
+        k.schedule();
+        k.set_transfer(xfer(None, Some(4)));
+        k.recv(0, true).unwrap();
+        k.set_transfer(xfer(Some(2), Some(9)));
+        k.call(0, 0, [1, 0, 0, 0]).unwrap();
+        assert_eq!(k.take_transfers(), [tr(CLIENT, 2, SERVER, 4), None]);
+        assert_eq!(k.take_transfers(), [None, None], "drained");
+
+        // The reply grants into the slot the caller named at call time.
+        k.set_transfer(xfer(Some(7), None));
+        k.reply([0; 4]).unwrap();
+        assert_eq!(k.take_transfers(), [tr(SERVER, 7, CLIENT, 9), None]);
+    }
+
+    #[test]
+    fn queued_sender_grant_is_delivered_at_receive() {
+        let mut k = K::new();
+        k.spawn(CLIENT, 5).unwrap();
+        k.schedule();
+        k.set_transfer(xfer(Some(3), None));
+        k.send(0, 0, [0; 4], true).unwrap(); // no receiver: blocks
+        k.spawn(SERVER, 10).unwrap();
+        k.schedule();
+        k.set_transfer(xfer(None, Some(5)));
+        k.recv(0, true).unwrap();
+        assert_eq!(k.take_transfers(), [tr(CLIENT, 3, SERVER, 5), None]);
+    }
+
+    #[test]
+    fn no_transfer_unless_both_sides_agree() {
+        let mut k = K::new();
+        k.spawn(SERVER, 10).unwrap();
+        k.spawn(CLIENT, 5).unwrap();
+        k.schedule();
+        k.set_transfer(CapTransfer::NONE); // server accepts nothing
+        k.recv(0, true).unwrap();
+        k.set_transfer(xfer(Some(2), None)); // client accepts nothing back
+        k.call(0, 0, [0; 4]).unwrap();
+        assert_eq!(k.take_transfers(), [None, None]);
+        k.set_transfer(xfer(Some(5), None));
+        k.reply([0; 4]).unwrap();
+        assert_eq!(k.take_transfers(), [None, None]);
+    }
+
+    #[test]
+    fn reply_recv_records_reply_and_receive_transfers() {
+        let mut k = K::new();
+        k.spawn(CLIENT, 5).unwrap();
+        k.spawn(OTHER, 5).unwrap();
+        k.schedule();
+        // Both call before the server exists, so both queue on the endpoint.
+        k.set_transfer(xfer(Some(1), Some(8)));
+        k.call(0, 0, [0; 4]).unwrap();
+        assert_eq!(k.current(), Some(OTHER));
+        k.set_transfer(xfer(Some(2), Some(3)));
+        k.call(0, 0, [0; 4]).unwrap();
+        k.spawn(SERVER, 10).unwrap();
+        k.schedule();
+        assert_eq!(k.current(), Some(SERVER));
+        k.set_transfer(xfer(None, Some(4)));
+        k.recv(0, true).unwrap();
+        assert_eq!(k.take_transfers(), [tr(CLIENT, 1, SERVER, 4), None]);
+        // Reply to CLIENT (into its slot 8), then take OTHER's call.
+        k.set_transfer(xfer(Some(6), Some(5)));
+        k.reply_recv(0, [0; 4]).unwrap();
+        assert_eq!(
+            k.take_transfers(),
+            [tr(SERVER, 6, CLIENT, 8), tr(OTHER, 2, SERVER, 5)]
+        );
+    }
+
+    #[test]
+    fn delivery_clears_previous_cap_received() {
+        let mut k = K::new();
+        k.spawn(SERVER, 10).unwrap();
+        k.spawn(CLIENT, 5).unwrap();
+        k.schedule();
+        k.recv(0, true).unwrap();
+        k.set_cap_received(SERVER, Some(3));
+        k.call(0, 0, [0; 4]).unwrap();
+        assert_eq!(k.thread(SERVER).cap_received, None);
     }
 }

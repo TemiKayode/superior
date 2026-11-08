@@ -94,8 +94,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 }
 
 /// Three processes, each in its own address space. The server and client
-/// share one endpoint: the server holds it with Read+Write, the client a
-/// badged copy with Write only, so it can call but not receive.
+/// share one endpoint: the server holds the original, the client a badged
+/// copy derived from it with Write and GrantReply only, so it can call (and
+/// accept capabilities in replies) but not receive or grant. The server
+/// also holds a notification it hands to the client through a reply.
 ///
 /// The spinner has the client's priority, is ahead of it in the ready
 /// queue, and makes no system call while it spins. The client gets the
@@ -106,15 +108,15 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 /// sleeps on the timer notification with every other thread blocked, so
 /// the CPU must idle and the timer must wake it.
 fn start_pingpong() -> Result<(), &'static str> {
-    // Until cross-CNode capability copy exists, the kernel mints these
-    // two endpoint capabilities directly at boot.
-    let endpoint = Object::Endpoint { id: 0 };
-    let server_cap = Capability::new(endpoint, Rights::READ | Rights::WRITE);
-    let client_cap = Capability {
-        badge: 0xC1,
-        ..Capability::new(endpoint, Rights::WRITE | Rights::GRANT_REPLY)
+    let endpoint = Capability::new(
+        Object::Endpoint { id: 0 },
+        Rights::READ | Rights::WRITE | Rights::GRANT | Rights::GRANT_REPLY,
+    );
+    let gift = Capability {
+        badge: 0x5,
+        ..Capability::new(Object::Notification { id: 3 }, Rights::READ | Rights::WRITE)
     };
-    task::spawn_process(0, USER_IMAGE, 10, 0, &[(0, server_cap)])?;
+    task::spawn_process(0, USER_IMAGE, 10, 0, &[(0, endpoint), (1, gift)])?;
     let timer = Capability::new(
         Object::Notification {
             id: task::TIMER_NTFN as u32,
@@ -138,12 +140,9 @@ fn start_pingpong() -> Result<(), &'static str> {
         USER_IMAGE,
         5,
         1,
-        &[
-            (0, client_cap),
-            (1, timer),
-            (2, Capability::new(spinner_done, Rights::READ)),
-        ],
+        &[(1, timer), (2, Capability::new(spinner_done, Rights::READ))],
     )?;
+    task::derive_cap(0, 0, 2, 0, Rights::WRITE | Rights::GRANT_REPLY, Some(0xC1))?;
     kprintln!(
         "[ok] server (prio 10), spinner and client (prio 5) loaded in separate address spaces"
     );

@@ -1,9 +1,14 @@
 //! Threads, their capability spaces, and system call handling.
 //!
-//! Each thread has a saved [`UserFrame`], an address space, and a small
-//! CNode as its capability space. A system call names a capability by slot;
-//! this module resolves it, checks rights, and passes the object index to
-//! the IPC engine in `superior_objects::ipc`, which decides who runs next.
+//! Each thread has a saved [`UserFrame`], an address space, and a capability
+//! space (CSpace) of [`CSPACE_SLOTS`] slots. A system call names a
+//! capability by slot; this module resolves it, checks rights, and passes
+//! the object index to the IPC engine in `superior_objects::ipc`, which
+//! decides who runs next.
+//!
+//! All CSpaces are windows onto one capability table, so a capability
+//! granted through IPC is derived from the sender's across CSpaces, and
+//! revoking the sender's copy reaches every copy it handed out.
 //!
 //! The kernel is entered two ways, a system call or a timer interrupt, and
 //! both end in [`resume`]. A thread that entered by system call gets its
@@ -19,13 +24,14 @@ use crate::syscall::{self, Exit, UserFrame};
 use crate::vm::AddressSpace;
 use crate::{kprint, kprintln};
 use spin::{Mutex, MutexGuard};
-use superior_objects::abi::{Error, Syscall};
-use superior_objects::cap::{CNode, Capability, Object, Rights};
+use superior_objects::abi::{CapTransfer, Error, Syscall};
+use superior_objects::cap::{CNode, CapError, Capability, Object, Rights};
 use superior_objects::ipc::{Ipc, Tid};
 use x86_64::instructions::interrupts;
 
 pub const MAX_THREADS: usize = 8;
 pub const CSPACE_SLOTS: usize = 16;
+const CAP_TABLE_SLOTS: usize = MAX_THREADS * CSPACE_SLOTS;
 const MAX_ENDPOINTS: usize = 8;
 const MAX_NOTIFICATIONS: usize = 8;
 const DEBUG_STR_MAX: usize = 256;
@@ -49,7 +55,12 @@ struct Kernel {
     ipc: Ipc<MAX_THREADS, MAX_ENDPOINTS, MAX_NOTIFICATIONS>,
     frames: [UserFrame; MAX_THREADS],
     spaces: [Option<AddressSpace>; MAX_THREADS],
-    cspaces: [CNode<CSPACE_SLOTS>; MAX_THREADS],
+    /// Every thread's CSpace: thread `t` owns slots
+    /// `t * CSPACE_SLOTS .. (t + 1) * CSPACE_SLOTS`.
+    caps: CNode<CAP_TABLE_SLOTS>,
+    /// The capability this thread last called through had Grant or
+    /// GrantReply, so its server's reply may carry a capability.
+    reply_grant: [bool; MAX_THREADS],
     /// Not yet run: its frame holds start registers (entry, stack, argument),
     /// not the results of a system call, and must be resumed untouched.
     fresh: [bool; MAX_THREADS],
@@ -63,7 +74,8 @@ static KERNEL: Mutex<Kernel> = Mutex::new(Kernel {
     ipc: Ipc::new(),
     frames: [UserFrame::ZERO; MAX_THREADS],
     spaces: [None; MAX_THREADS],
-    cspaces: [const { CNode::new() }; MAX_THREADS],
+    caps: CNode::new(),
+    reply_grant: [false; MAX_THREADS],
     fresh: [false; MAX_THREADS],
     preempted: [false; MAX_THREADS],
     stats: Stats {
@@ -92,7 +104,8 @@ pub fn spawn_process(
         return Err("thread id out of range");
     }
     for &(slot, cap) in caps {
-        k.cspaces[t]
+        let slot = cap_slot(tid, slot).ok_or("cspace slot out of range")?;
+        k.caps
             .insert_root(slot, cap)
             .map_err(|_| "cspace slot unavailable")?;
     }
@@ -103,6 +116,31 @@ pub fn spawn_process(
         .spawn(tid, prio)
         .map_err(|_| "could not make thread runnable")?;
     Ok(())
+}
+
+/// Derives a capability from one thread's CSpace into another's, as a
+/// child of the source (so revoking the source removes it).
+pub fn derive_cap(
+    from: Tid,
+    src: usize,
+    to: Tid,
+    dst: usize,
+    mask: Rights,
+    badge: Option<u64>,
+) -> Result<(), &'static str> {
+    let (Some(src), Some(dst)) = (cap_slot(from, src), cap_slot(to, dst)) else {
+        return Err("cspace slot out of range");
+    };
+    KERNEL
+        .lock()
+        .caps
+        .derive(src, dst, mask, badge)
+        .map_err(|_| "derive failed")
+}
+
+/// Index in the capability table of thread `t`'s slot `slot`.
+fn cap_slot(t: Tid, slot: usize) -> Option<usize> {
+    ((t as usize) < MAX_THREADS && slot < CSPACE_SLOTS).then(|| t as usize * CSPACE_SLOTS + slot)
 }
 
 /// Runs the highest-priority thread. Never returns: from here on the
@@ -129,15 +167,21 @@ pub fn handle_syscall(frame: &mut UserFrame) -> Exit {
     let msg = [frame.rsi, frame.rdx, frame.r8, frame.r9];
     let result = match Syscall::from_u64(frame.rax) {
         None => Err(Error::IllegalOperation.code()),
+        Some(Syscall::CapRevoke) => cap_op(k, cur, frame.rdi, |c, s| c.revoke(s).map(|_| ())),
+        Some(Syscall::CapDelete) => cap_op(k, cur, frame.rdi, |c, s| c.delete(s)),
         Some(Syscall::DebugPutStr) => debug_put_str(k, cur, frame.rdi, frame.rsi),
         Some(Syscall::DebugSelftestDone) => {
             let stats = k.stats;
             drop(guard);
             selftest_done(cur, frame.rdi, stats)
         }
-        Some(op) => ipc_op(k, cur, op, frame.rdi as usize, msg),
+        Some(op) => match CapTransfer::decode(frame.r10) {
+            Some(xfer) => ipc_op(k, cur, op, frame.rdi as usize, msg, xfer),
+            None => Err(Error::InvalidArgument.code()),
+        },
     };
     k.ipc.set_status(result.err().unwrap_or(0));
+    complete_transfers(k);
     resume(guard, cur, frame)
 }
 
@@ -203,6 +247,7 @@ fn resume(mut guard: MutexGuard<'_, Kernel>, cur: Tid, frame: &mut UserFrame) ->
         out.rax = t.status;
         out.rdi = t.badge;
         [out.rsi, out.rdx, out.r8, out.r9] = t.msg;
+        out.r10 = t.cap_received.map_or(0, |s| s as u64 + 1);
         Exit::Sysret
     };
     if next != cur {
@@ -212,15 +257,81 @@ fn resume(mut guard: MutexGuard<'_, Kernel>, cur: Tid, frame: &mut UserFrame) ->
     exit
 }
 
-fn ipc_op(k: &mut Kernel, cur: Tid, op: Syscall, slot: usize, msg: [u64; 4]) -> Result<(), u64> {
+/// Copies each capability the last IPC operation transferred. A transfer
+/// that cannot be made (the granted slot was emptied, or the accept slot
+/// filled, while the message waited) is dropped; the message still arrives.
+fn complete_transfers(k: &mut Kernel) {
+    for t in k.ipc.take_transfers().into_iter().flatten() {
+        let src = cap_slot(t.from, t.grant as usize);
+        let dst = cap_slot(t.to, t.accept as usize);
+        let landed = match (src, dst) {
+            (Some(src), Some(dst)) => k.caps.derive(src, dst, Rights::ALL, None).is_ok(),
+            _ => false,
+        };
+        k.ipc.set_cap_received(t.to, landed.then_some(t.accept));
+    }
+}
+
+/// Runs a CNode operation on the caller's slot `slot`.
+fn cap_op(
+    k: &mut Kernel,
+    cur: Tid,
+    slot: u64,
+    op: impl FnOnce(&mut CNode<CAP_TABLE_SLOTS>, usize) -> Result<(), CapError>,
+) -> Result<(), u64> {
+    let s = usize::try_from(slot)
+        .ok()
+        .and_then(|s| cap_slot(cur, s))
+        .ok_or(Error::InvalidCapability.code())?;
+    op(&mut k.caps, s).map_err(|e| match e {
+        CapError::SlotEmpty | CapError::SlotOutOfRange => Error::InvalidCapability.code(),
+        _ => Error::IllegalOperation.code(),
+    })
+}
+
+fn ipc_op(
+    k: &mut Kernel,
+    cur: Tid,
+    op: Syscall,
+    slot: usize,
+    msg: [u64; 4],
+    xfer: CapTransfer,
+) -> Result<(), u64> {
+    // Both named slots must lie in the caller's CSpace, and a granted slot
+    // must hold a capability now. (It is copied at delivery, which for a
+    // blocked sender comes later; see `complete_transfers`.)
+    let in_cspace = |s: Option<u16>| s.is_none_or(|s| (s as usize) < CSPACE_SLOTS);
+    if !in_cspace(xfer.grant) || !in_cspace(xfer.accept) {
+        return Err(Error::InvalidArgument.code());
+    }
+    let granted_slot_empty = xfer.grant.is_some_and(|g| {
+        k.caps
+            .get(cur as usize * CSPACE_SLOTS + g as usize)
+            .is_none()
+    });
+    if granted_slot_empty {
+        return Err(Error::InvalidCapability.code());
+    }
+    k.ipc.set_transfer(xfer);
+
     if op == Syscall::Yield {
         return k.ipc.yield_now().map_err(|e| e.status());
+    }
+    let replying = matches!(op, Syscall::Reply | Syscall::ReplyRecv);
+    if replying && xfer.grant.is_some() {
+        let may = k
+            .ipc
+            .caller_of(cur)
+            .is_some_and(|c| k.reply_grant[c as usize]);
+        if !may {
+            return Err(Error::InsufficientRights.code());
+        }
     }
     if op == Syscall::Reply {
         return k.ipc.reply(msg).map_err(|e| e.status());
     }
-    let cap = *k.cspaces[cur as usize]
-        .get(slot)
+    let cap = *cap_slot(cur, slot)
+        .and_then(|s| k.caps.get(s))
         .ok_or(Error::InvalidCapability.code())?;
     let need = |r: Rights| {
         if cap.rights.contains(r) {
@@ -233,10 +344,18 @@ fn ipc_op(k: &mut Kernel, cur: Tid, op: Syscall, slot: usize, msg: [u64; 4]) -> 
     let r = match (op, cap.object) {
         (Syscall::Send | Syscall::NBSend, Object::Endpoint { id }) => {
             need(Rights::WRITE)?;
+            if xfer.grant.is_some() {
+                need(Rights::GRANT)?;
+            }
             ipc.send(id as u16, cap.badge, msg, op == Syscall::Send)
         }
         (Syscall::Call, Object::Endpoint { id }) => {
             need(Rights::WRITE)?;
+            if xfer.grant.is_some() {
+                need(Rights::GRANT)?;
+            }
+            k.reply_grant[cur as usize] =
+                cap.rights.contains(Rights::GRANT) || cap.rights.contains(Rights::GRANT_REPLY);
             ipc.call(id as u16, cap.badge, msg)
         }
         (Syscall::Recv | Syscall::NBRecv, Object::Endpoint { id }) => {
