@@ -64,6 +64,15 @@ Phase 0 (foundations). Working today, under QEMU on x86-64:
   one capability table, so the derivation tree spans CSpaces and `CapRevoke` removes every
   copy handed out. Grant needs the Grant right on the endpoint; a reply may grant if the
   caller's capability had Grant or GrantReply.
+- Formal model of capability derivation (`crates/objects/src/model.rs`): an independent
+  specification (a derivation forest with ghost provenance for every carve) that the
+  real `CNode` must refine. A checker runs every operation (derive with masks and badges,
+  retype of sub-blocks, whole blocks and frames, delete, revoke) from every reachable state
+  of a 4-slot table until no new state appears: 2,756,509 states and 286,676,936
+  transitions. After each step it checks refinement, no rights amplification, badge
+  integrity, a well-formed tree, that no byte is handed out twice, and that a block with
+  nothing made from it can always be carved again. Planting an allocator bug is caught
+  in two steps. It is bounded model checking of an executable model, not a proof.
 - Static-pie user programs loaded into their own address spaces and relocated.
 - Boot self-test: a server and a client in separate address spaces do 20,000
   call/reply round trips, and the kernel refuses four kinds of rights violations. A
@@ -107,7 +116,7 @@ https://claude.ai/artifact/QKJS8qH5Dfbjzn58RStq1j
 Needs Rust (the pinned nightly in `rust-toolchain.toml` installs itself) and QEMU.
 
 ```bash
-cargo xtask test   # host unit tests, then boot self-tests in QEMU
+cargo xtask test   # host unit tests, exhaustive model check, then boot self-tests in QEMU
 cargo xtask run    # boot in QEMU with the serial console on this terminal
 cargo xtask image  # just build target/superior.img
 ```

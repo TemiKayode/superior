@@ -14,14 +14,15 @@
 //!    parent (they are re-parented, never orphaned).
 //! 5. No byte of untyped memory is handed out twice: only an untyped
 //!    capability that is not a copy, and has no copies, may be retyped, and
-//!    its watermark is reset only by revoking it, which destroys every
-//!    object made from it. Memory the kernel carved for itself
+//!    its watermark is reset only when nothing made from it is left: by
+//!    revoking it, which destroys every object made from it, or at retype
+//!    once every object's capability has been deleted. Memory the kernel carved for itself
 //!    ([`CNode::retype`], no child capabilities) is never reset.
 
 use core::fmt;
 
 /// Rights over an object, as a bit set.
-#[derive(Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Default, Hash)]
 pub struct Rights(u8);
 
 impl Rights {
@@ -82,7 +83,7 @@ impl fmt::Debug for Rights {
 }
 
 /// The kernel object a capability refers to.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Object {
     Untyped {
         base: u64,
@@ -118,7 +119,7 @@ impl Object {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Capability {
     pub object: Object,
     pub rights: Rights,
@@ -180,7 +181,12 @@ const EMPTY: Slot = Slot {
     copy: false,
 };
 
+/// One slot's full state: capability, parent, copy, raw, watermark.
+#[cfg(test)]
+pub(crate) type SlotState = (Option<Capability>, Option<u32>, bool, bool, u64);
+
 /// A fixed-size table of capability slots.
+#[derive(Clone)]
 pub struct CNode<const N: usize> {
     slots: [Slot; N],
 }
@@ -311,6 +317,11 @@ impl<const N: usize> CNode<N> {
         if self.is_copy(slot) || self.has_copies(slot) {
             return Err(CapError::HasChildren);
         }
+        // Nothing made from the block is left (each object's capability
+        // was deleted): all of it is free again, as after a revoke.
+        if !self.slots[slot].raw && !self.has_children(slot) {
+            self.slots[slot].free_index = 0;
+        }
         if size_bits > block_bits || size_bits >= 64 {
             return Err(CapError::OutOfMemory);
         }
@@ -339,6 +350,12 @@ impl<const N: usize> CNode<N> {
     /// sub-block covering the whole of its parent.
     fn is_copy(&self, slot: usize) -> bool {
         self.slots[slot].copy
+    }
+
+    fn has_children(&self, slot: usize) -> bool {
+        self.slots
+            .iter()
+            .any(|s| s.cap.is_some() && s.parent == Some(slot as u32))
     }
 
     fn has_copies(&self, slot: usize) -> bool {
@@ -419,6 +436,21 @@ impl<const N: usize> CNode<N> {
             }
         }
         false
+    }
+
+    /// Whether `slot` holds a copy made by derive (for the model checker).
+    #[cfg(test)]
+    pub(crate) fn is_copy_slot(&self, slot: usize) -> bool {
+        self.slots[slot].copy
+    }
+
+    /// The whole table's state, to tell explored states apart.
+    #[cfg(test)]
+    pub(crate) fn fingerprint(&self) -> std::vec::Vec<SlotState> {
+        self.slots
+            .iter()
+            .map(|s| (s.cap, s.parent, s.copy, s.raw, s.free_index))
+            .collect()
     }
 
     fn empty_slot(&mut self, slot: usize) -> Result<&mut Slot, CapError> {

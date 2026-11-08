@@ -2,7 +2,8 @@
 //!
 //!   cargo xtask image   build the kernel and a BIOS-bootable disk image
 //!   cargo xtask run     build and boot it in QEMU (serial on this terminal)
-//!   cargo xtask test    host unit tests, then boot self-tests in QEMU
+//!   cargo xtask test    host unit tests, the exhaustive model check, then boot
+//!                       self-tests in QEMU
 //!
 //! QEMU is found through $QEMU, then the default Windows install path, then PATH.
 
@@ -59,7 +60,19 @@ fn run(cmd: &mut Command) -> Result<(), String> {
 
 fn host_tests() -> Result<(), String> {
     println!("== host unit tests");
-    run(cargo().args(["test", "--quiet", "-p", "superior-objects"]))
+    run(cargo().args(["test", "--quiet", "-p", "superior-objects"]))?;
+    println!("== model check: every reachable capability-table state (release)");
+    run(cargo().args([
+        "test",
+        "--quiet",
+        "--release",
+        "-p",
+        "superior-objects",
+        "model::",
+        "--",
+        "--ignored",
+        "--nocapture",
+    ]))
 }
 
 /// Builds the boot user program as a static position-independent

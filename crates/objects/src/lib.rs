@@ -14,4 +14,6 @@ pub mod abi;
 pub mod cap;
 pub mod elf;
 pub mod ipc;
+#[cfg(test)]
+pub mod model;
 pub mod untyped;
