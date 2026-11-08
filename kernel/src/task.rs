@@ -1,5 +1,10 @@
 //! Threads, their capability spaces, and system call handling.
 //!
+//! System call arguments are named by their x86-64 registers below (`rdi`
+//! names the capability, `rsi`, `rdx`, `r8`, `r9` the message words, `r10`
+//! the transfer word, `rax` the number and result). On AArch64 they are
+//! `x0`, `x1`-`x4`, `x5` and `x8`; see `arch::Args`.
+//!
 //! Each thread has a saved [`UserFrame`], an address space, and a capability
 //! space (CSpace) of [`CSPACE_SLOTS`] slots. A system call names a
 //! capability by slot; this module resolves it, checks rights, and passes
@@ -35,8 +40,9 @@
 //! an interrupt makes a thread runnable. The timer signals notification
 //! [`TIMER_NTFN`] on every tick, so a thread can sleep by waiting on it.
 
-use crate::syscall::{self, Exit, UserFrame};
-use crate::vm::{self, AddressSpace, MapError, USER_BASE, USER_END};
+use crate::arch::vm::{self, AddressSpace, USER_BASE, USER_END};
+use crate::arch::{self, Args, Exit, UserFrame};
+use crate::memory::MapError;
 use crate::{kprint, kprintln};
 use spin::{Mutex, MutexGuard};
 use superior_objects::abi::{
@@ -44,7 +50,6 @@ use superior_objects::abi::{
 };
 use superior_objects::cap::{CNode, CapError, Capability, Object, Rights};
 use superior_objects::ipc::{Ipc, Tid};
-use x86_64::instructions::interrupts;
 
 pub const MAX_THREADS: usize = 8;
 pub const CSPACE_SLOTS: usize = 16;
@@ -61,6 +66,8 @@ const CAP_TABLE_SLOTS: usize = CNODE_POOL + CNODE_CHUNK * CNODE_CHUNKS;
 const MAX_ENDPOINTS: usize = 8;
 const MAX_NOTIFICATIONS: usize = 8;
 const DEBUG_STR_MAX: usize = 256;
+/// Interrupt lines a notification can be bound to.
+const MAX_IRQS: usize = 64;
 /// The notification the timer signals (bit 0) on every tick.
 pub const TIMER_NTFN: u16 = 0;
 /// Self-test builds give up after this many seconds, so a deadlock fails
@@ -92,7 +99,7 @@ struct Kernel {
     /// Live CNode objects, by first pool chunk: their slot-count bits.
     cnodes: [Option<u8>; CNODE_CHUNKS],
     /// Notification (and badge) each interrupt line signals.
-    irq_ntfn: [Option<(u16, u64)>; 16],
+    irq_ntfn: [Option<(u16, u64)>; MAX_IRQS],
     /// The capability this thread last called through had Grant or
     /// GrantReply, so its server's reply may carry a capability.
     reply_grant: [bool; MAX_THREADS],
@@ -136,7 +143,7 @@ static KERNEL: Mutex<Kernel> = Mutex::new(Kernel {
         c
     },
     cnodes: [None; CNODE_CHUNKS],
-    irq_ntfn: [None; 16],
+    irq_ntfn: [None; MAX_IRQS],
     reply_grant: [false; MAX_THREADS],
     ep_used: [false; MAX_ENDPOINTS],
     mapped: [None; CAP_TABLE_SLOTS],
@@ -260,7 +267,7 @@ pub fn start() -> ! {
         k.spaces[t].unwrap().activate();
         k.frames[t]
     };
-    syscall::enter_user(frame)
+    arch::enter_user(frame)
 }
 
 pub fn handle_syscall(frame: &mut UserFrame) -> Exit {
@@ -270,38 +277,39 @@ pub fn handle_syscall(frame: &mut UserFrame) -> Exit {
     k.frames[cur as usize] = *frame;
     k.preempted[cur as usize] = false;
 
-    let msg = [frame.rsi, frame.rdx, frame.r8, frame.r9];
-    let result = match Syscall::from_u64(frame.rax) {
+    let a = frame.args();
+    let msg = [a.a1, a.a2, a.a3, a.a4];
+    let result = match Syscall::from_u64(a.nr) {
         None => Err(Error::IllegalOperation.code()),
-        Some(Syscall::CapRevoke) => cap_revoke(k, cur, frame.rdi),
-        Some(Syscall::CapDelete) => cap_delete(k, cur, frame.rdi),
-        Some(Syscall::FrameMap) => frame_map(k, cur, frame),
-        Some(Syscall::FrameUnmap) => frame_unmap(k, cur, frame.rdi),
-        Some(Syscall::SetFaultHandler) => set_fault_handler(k, cur, frame.rdi),
-        Some(Syscall::ThreadConfigure) => thread_configure(k, cur, frame),
-        Some(Syscall::ThreadResume) => thread_resume(k, cur, frame.rdi),
-        Some(Syscall::ThreadSuspend) => thread_suspend(k, cur, frame.rdi),
-        Some(Syscall::ThreadCopyCap) => thread_copy_cap(k, cur, frame),
-        Some(Syscall::ThreadSetSpace) => thread_set_space(k, cur, frame),
-        Some(Syscall::CNodeCopy) => cnode_copy(k, cur, frame),
-        Some(Syscall::IrqSetNotification) => irq_set_notification(k, cur, frame),
-        Some(Syscall::IrqAck) => irq_cap(k, cur, frame.rdi).map(crate::interrupts::pic_unmask),
-        Some(Syscall::IoPortIn) => io_port_in(k, cur, frame),
-        Some(Syscall::IoPortOut) => io_port_out(k, cur, frame),
-        Some(Syscall::CNodeDelete) => cnode_index(k, cur, frame).and_then(|s| delete_index(k, s)),
-        Some(Syscall::CNodeRevoke) => cnode_index(k, cur, frame).and_then(|s| revoke_index(k, s)),
-        Some(Syscall::CapMint) => cap_mint(k, cur, frame),
-        Some(Syscall::Retype) => retype(k, cur, frame),
-        Some(Syscall::DebugPutStr) => debug_put_str(k, cur, frame.rdi, frame.rsi),
+        Some(Syscall::CapRevoke) => cap_revoke(k, cur, a.a0),
+        Some(Syscall::CapDelete) => cap_delete(k, cur, a.a0),
+        Some(Syscall::FrameMap) => frame_map(k, cur, &a),
+        Some(Syscall::FrameUnmap) => frame_unmap(k, cur, a.a0),
+        Some(Syscall::SetFaultHandler) => set_fault_handler(k, cur, a.a0),
+        Some(Syscall::ThreadConfigure) => thread_configure(k, cur, &a),
+        Some(Syscall::ThreadResume) => thread_resume(k, cur, a.a0),
+        Some(Syscall::ThreadSuspend) => thread_suspend(k, cur, a.a0),
+        Some(Syscall::ThreadCopyCap) => thread_copy_cap(k, cur, &a),
+        Some(Syscall::ThreadSetSpace) => thread_set_space(k, cur, &a),
+        Some(Syscall::CNodeCopy) => cnode_copy(k, cur, &a),
+        Some(Syscall::IrqSetNotification) => irq_set_notification(k, cur, &a),
+        Some(Syscall::IrqAck) => irq_cap(k, cur, a.a0).map(arch::irq_unmask),
+        Some(Syscall::IoPortIn) => io_port_in(k, cur, &a),
+        Some(Syscall::IoPortOut) => io_port_out(k, cur, &a),
+        Some(Syscall::CNodeDelete) => cnode_index(k, cur, &a).and_then(|s| delete_index(k, s)),
+        Some(Syscall::CNodeRevoke) => cnode_index(k, cur, &a).and_then(|s| revoke_index(k, s)),
+        Some(Syscall::CapMint) => cap_mint(k, cur, &a),
+        Some(Syscall::Retype) => retype(k, cur, &a),
+        Some(Syscall::DebugPutStr) => debug_put_str(k, cur, a.a0, a.a1),
         Some(Syscall::DebugSelftestDone) => {
             let stats = k.stats;
             let sched = k.ipc.stats;
             drop(guard);
             report_sched(sched);
-            selftest_done(cur, frame.rdi, stats)
+            selftest_done(cur, a.a0, stats)
         }
-        Some(op) => match CapTransfer::decode(frame.r10) {
-            Some(xfer) => ipc_op(k, cur, op, frame.rdi as usize, msg, xfer),
+        Some(op) => match CapTransfer::decode(a.a5) {
+            Some(xfer) => ipc_op(k, cur, op, a.a0 as usize, msg, xfer),
             None => Err(Error::InvalidArgument.code()),
         },
     };
@@ -318,18 +326,18 @@ pub fn handle_timer(frame: &mut UserFrame) -> Exit {
     let k = &mut *guard;
     k.stats.ticks += 1;
     #[cfg(feature = "selftest")]
-    if k.stats.ticks > SELFTEST_TIMEOUT_SECS * crate::apic::TICK_HZ as u64 {
+    if k.stats.ticks > SELFTEST_TIMEOUT_SECS * arch::TICK_HZ as u64 {
         // Say where every thread is stuck before giving up.
         for t in 0..MAX_THREADS as Tid {
             let tcb = k.ipc.thread(t);
             if tcb.state != superior_objects::ipc::State::Inactive || k.thread_used[t as usize] {
                 kprintln!(
-                    "[state] thread {t}: {:?} prio {} passive {} sc {:?} rip {:#x}",
+                    "[state] thread {t}: {:?} prio {} passive {} sc {:?} pc {:#x}",
                     tcb.state,
                     tcb.prio,
                     tcb.passive,
                     k.ipc.sched_context(t),
-                    k.frames[t as usize].rip
+                    k.frames[t as usize].pc()
                 );
             }
         }
@@ -340,7 +348,7 @@ pub fn handle_timer(frame: &mut UserFrame) -> Exit {
         );
         drop(guard);
         kprintln!("[fail] self-test timed out after {SELFTEST_TIMEOUT_SECS} s");
-        crate::qemu::exit(crate::qemu::ExitCode::Failure);
+        arch::qemu_exit(false);
     }
     if !frame.is_user_mode() {
         // The only kernel code that runs with interrupts enabled is the
@@ -366,15 +374,11 @@ pub fn handle_timer(frame: &mut UserFrame) -> Exit {
 /// A CPU exception. From user mode it becomes a `Call` from the faulting
 /// thread to its fault handler, or stops the thread if it has none; in
 /// kernel mode it is a kernel bug.
-pub fn handle_fault(frame: &mut UserFrame, kind: FaultKind, code: u64) -> Exit {
-    let addr = match kind {
-        FaultKind::PageFault => x86_64::registers::control::Cr2::read_raw(),
-        _ => 0,
-    };
+pub fn handle_fault(frame: &mut UserFrame, kind: FaultKind, code: u64, addr: u64) -> Exit {
     if !frame.is_user_mode() {
         panic!(
-            "kernel {kind:?} at rip {:#x}, address {addr:#x}, code {code:#x}",
-            frame.rip
+            "kernel {kind:?} at pc {:#x}, address {addr:#x}, code {code:#x}",
+            frame.pc()
         );
     }
     let mut guard = KERNEL.lock();
@@ -388,13 +392,13 @@ pub fn handle_fault(frame: &mut UserFrame, kind: FaultKind, code: u64) -> Exit {
             k.stats.faults_handled += 1;
             k.in_fault[cur as usize] = true;
             k.ipc.set_transfer(CapTransfer::NONE);
-            let msg = [kind as u64, addr, frame.rip, code];
+            let msg = [kind as u64, addr, frame.pc(), code];
             if k.ipc.call(ep, badge, msg).is_err() {
                 k.in_fault[cur as usize] = false;
-                stop_thread(k, cur, kind, addr, frame.rip);
+                stop_thread(k, cur, kind, addr, frame.pc());
             }
         }
-        None => stop_thread(k, cur, kind, addr, frame.rip),
+        None => stop_thread(k, cur, kind, addr, frame.pc()),
     }
     resume(guard, cur, frame)
 }
@@ -405,7 +409,7 @@ pub fn handle_fault(frame: &mut UserFrame, kind: FaultKind, code: u64) -> Exit {
 pub fn handle_irq(frame: &mut UserFrame, line: u8) -> Exit {
     let mut guard = KERNEL.lock();
     let k = &mut *guard;
-    let bound = k.irq_ntfn[line as usize];
+    let bound = k.irq_ntfn.get(line as usize).copied().flatten();
     if !frame.is_user_mode() {
         if let Some((ntfn, badge)) = bound {
             let _ = k.ipc.signal_irq(ntfn, badge);
@@ -431,12 +435,12 @@ fn irq_cap(k: &Kernel, cur: Tid, slot: u64) -> Result<u8, u64> {
 }
 
 /// `IrqSetNotification`: rdi = IRQ capability, rsi = notification (Write).
-fn irq_set_notification(k: &mut Kernel, cur: Tid, f: &UserFrame) -> Result<(), u64> {
-    let line = irq_cap(k, cur, f.rdi)?;
-    if !crate::interrupts::irq_routable(line) {
+fn irq_set_notification(k: &mut Kernel, cur: Tid, f: &Args) -> Result<(), u64> {
+    let line = irq_cap(k, cur, f.a0)?;
+    if !arch::irq_routable(line) || line as usize >= MAX_IRQS {
         return Err(Error::InvalidArgument.code());
     }
-    let s = own_slot(k, cur, f.rsi).ok_or(Error::InvalidCapability.code())?;
+    let s = own_slot(k, cur, f.a1).ok_or(Error::InvalidCapability.code())?;
     let cap = *k.caps.get(s).ok_or(Error::InvalidCapability.code())?;
     let Object::Notification { id } = cap.object else {
         return Err(Error::InvalidCapability.code());
@@ -447,14 +451,14 @@ fn irq_set_notification(k: &mut Kernel, cur: Tid, f: &UserFrame) -> Result<(), u
     // An unbadged signal would OR in nothing: use bit 0.
     let badge = if cap.badge == 0 { 1 } else { cap.badge };
     k.irq_ntfn[line as usize] = Some((id as u16, badge));
-    crate::interrupts::pic_unmask(line);
+    arch::irq_unmask(line);
     Ok(())
 }
 
 /// The port `rsi`, `rdx` bytes wide, checked against the I/O-port
 /// capability in `rdi` and the right `need`.
-fn io_port(k: &Kernel, cur: Tid, f: &UserFrame, need: Rights) -> Result<(u16, u64), u64> {
-    let s = own_slot(k, cur, f.rdi).ok_or(Error::InvalidCapability.code())?;
+fn io_port(k: &Kernel, cur: Tid, f: &Args, need: Rights) -> Result<(u16, u64), u64> {
+    let s = own_slot(k, cur, f.a0).ok_or(Error::InvalidCapability.code())?;
     let cap = k.caps.get(s).ok_or(Error::InvalidCapability.code())?;
     let Object::IoPort { base, count } = cap.object else {
         return Err(Error::InvalidCapability.code());
@@ -462,53 +466,35 @@ fn io_port(k: &Kernel, cur: Tid, f: &UserFrame, need: Rights) -> Result<(u16, u6
     if !cap.rights.contains(need) {
         return Err(Error::InsufficientRights.code());
     }
-    let width = f.rdx;
+    let width = f.a2;
     if !matches!(width, 1 | 2 | 4) {
         return Err(Error::InvalidArgument.code());
     }
     let (lo, hi) = (base as u64, base as u64 + count as u64);
-    if f.rsi < lo || f.rsi + width > hi {
+    if f.a1 < lo || f.a1 + width > hi {
         return Err(Error::InvalidArgument.code());
     }
-    Ok((f.rsi as u16, width))
+    Ok((f.a1 as u16, width))
 }
 
 /// `IoPortIn`: rdi = I/O-port capability, rsi = port, rdx = width.
-fn io_port_in(k: &mut Kernel, cur: Tid, f: &UserFrame) -> Result<(), u64> {
-    use x86_64::instructions::port::Port;
+fn io_port_in(k: &mut Kernel, cur: Tid, f: &Args) -> Result<(), u64> {
     let (port, width) = io_port(k, cur, f, Rights::READ)?;
-    // SAFETY: the capability grants this port range; port reads have no
-    // memory-safety effect on the kernel.
-    let v = unsafe {
-        match width {
-            1 => Port::<u8>::new(port).read() as u64,
-            2 => Port::<u16>::new(port).read() as u64,
-            _ => Port::<u32>::new(port).read() as u64,
-        }
-    };
+    let v = arch::io_in(port, width);
     k.ipc.set_msg_of(cur, [v, 0, 0, 0]);
     Ok(())
 }
 
 /// `IoPortOut`: rdi = I/O-port capability, rsi = port, rdx = width, r8 =
 /// value.
-fn io_port_out(k: &mut Kernel, cur: Tid, f: &UserFrame) -> Result<(), u64> {
-    use x86_64::instructions::port::Port;
+fn io_port_out(k: &mut Kernel, cur: Tid, f: &Args) -> Result<(), u64> {
     let (port, width) = io_port(k, cur, f, Rights::WRITE)?;
-    // SAFETY: as in `io_port_in`; the ports a capability can name are
-    // chosen at boot to be device ports, never ones the kernel relies on.
-    unsafe {
-        match width {
-            1 => Port::<u8>::new(port).write(f.r8 as u8),
-            2 => Port::<u16>::new(port).write(f.r8 as u16),
-            _ => Port::<u32>::new(port).write(f.r8 as u32),
-        }
-    }
+    arch::io_out(port, width, f.a3);
     Ok(())
 }
 
-fn stop_thread(k: &mut Kernel, t: Tid, kind: FaultKind, addr: u64, rip: u64) {
-    kprintln!("[fault] thread {t}: unhandled {kind:?} at rip {rip:#x}, address {addr:#x}; stopped");
+fn stop_thread(k: &mut Kernel, t: Tid, kind: FaultKind, addr: u64, pc: u64) {
+    kprintln!("[fault] thread {t}: unhandled {kind:?} at pc {pc:#x}, address {addr:#x}; stopped");
     k.stats.faults_unhandled += 1;
     k.ipc.suspend_current();
 }
@@ -524,13 +510,12 @@ fn apply_fault_reply(k: &mut Kernel, t: Tid) -> bool {
     match msg[0] {
         x if x == FaultReply::Retry as u64 => true,
         x if x == FaultReply::ResumeAt as u64 => {
-            // iretq to a non-canonical rip would fault in the kernel.
+            // Returning to an address outside the user window could fault
+            // in the kernel (a non-canonical rip on x86-64).
             if !(USER_BASE..USER_END).contains(&msg[1]) {
                 return false;
             }
-            let f = &mut k.frames[t as usize];
-            f.rip = msg[1];
-            f.rax = msg[2];
+            k.frames[t as usize].resume_at(msg[1], msg[2]);
             true
         }
         _ => false,
@@ -569,11 +554,10 @@ fn resume(mut guard: MutexGuard<'_, Kernel>, cur: Tid, frame: &mut UserFrame) ->
         }
         guard.stats.idle_halts += 1;
         drop(guard);
-        // `sti; hlt` is atomic: an interrupt cannot slip in between and
-        // leave the CPU halted with work to do. The interrupt handler runs
-        // on this stack and returns here.
-        interrupts::enable_and_hlt();
-        interrupts::disable();
+        // Waits for an interrupt with no window in which one could slip
+        // past and leave the CPU halted with work to do. The interrupt
+        // handler runs on this stack and returns here.
+        arch::idle_wait();
         guard = KERNEL.lock();
     };
     let k = &mut *guard;
@@ -586,10 +570,12 @@ fn resume(mut guard: MutexGuard<'_, Kernel>, cur: Tid, frame: &mut UserFrame) ->
         Exit::Iret
     } else {
         let t = k.ipc.thread(next);
-        out.rax = t.status;
-        out.rdi = t.badge;
-        [out.rsi, out.rdx, out.r8, out.r9] = t.msg;
-        out.r10 = t.cap_received.map_or(0, |s| s as u64 + 1);
+        out.set_results(
+            t.status,
+            t.badge,
+            t.msg,
+            t.cap_received.map_or(0, |s| s as u64 + 1),
+        );
         Exit::Sysret
     };
     if next != cur {
@@ -659,13 +645,13 @@ fn unmap_slot(k: &mut Kernel, s: usize) {
 }
 
 /// `FrameMap`: rdi = frame slot, rsi = user address, rdx = 1 for writable.
-fn frame_map(k: &mut Kernel, cur: Tid, f: &UserFrame) -> Result<(), u64> {
-    let s = own_slot(k, cur, f.rdi).ok_or(Error::InvalidCapability.code())?;
+fn frame_map(k: &mut Kernel, cur: Tid, f: &Args) -> Result<(), u64> {
+    let s = own_slot(k, cur, f.a0).ok_or(Error::InvalidCapability.code())?;
     let cap = *k.caps.get(s).ok_or(Error::InvalidCapability.code())?;
     let Object::Frame { paddr, .. } = cap.object else {
         return Err(Error::InvalidCapability.code());
     };
-    let writable = match f.rdx {
+    let writable = match f.a2 {
         0 => false,
         1 => true,
         _ => return Err(Error::InvalidArgument.code()),
@@ -678,7 +664,7 @@ fn frame_map(k: &mut Kernel, cur: Tid, f: &UserFrame) -> Result<(), u64> {
     if !cap.rights.contains(needed) {
         return Err(Error::InsufficientRights.code());
     }
-    let va = f.rsi;
+    let va = f.a1;
     if !va.is_multiple_of(4096) || !(USER_BASE..USER_END).contains(&va) {
         return Err(Error::InvalidArgument.code());
     }
@@ -824,13 +810,13 @@ fn thread_inactive(k: &Kernel, t: Tid) -> bool {
 
 /// `ThreadConfigure`: rdi = thread, rsi = entry, rdx = stack top, r8 =
 /// argument, r9 = priority.
-fn thread_configure(k: &mut Kernel, cur: Tid, f: &UserFrame) -> Result<(), u64> {
-    let t = thread_cap(k, cur, f.rdi)?;
+fn thread_configure(k: &mut Kernel, cur: Tid, f: &Args) -> Result<(), u64> {
+    let t = thread_cap(k, cur, f.a0)?;
     if !thread_inactive(k, t) {
         return Err(Error::IllegalOperation.code());
     }
-    let (entry, stack_top, prio) = (f.rsi, f.rdx, f.r9);
-    // sysret to a non-canonical rip faults in the kernel: keep both
+    let (entry, stack_top, prio) = (f.a1, f.a2, f.a4);
+    // Returning to a non-canonical address faults in the kernel: keep both
     // addresses inside the user window.
     if !(USER_BASE..USER_END).contains(&entry)
         || !(USER_BASE + 16..=USER_END).contains(&stack_top)
@@ -844,7 +830,7 @@ fn thread_configure(k: &mut Kernel, cur: Tid, f: &UserFrame) -> Result<(), u64> 
     }
     let i = t as usize;
     k.spaces[i] = k.spaces[cur as usize];
-    k.frames[i] = UserFrame::new_thread(entry, stack_top, f.r8);
+    k.frames[i] = UserFrame::new_thread(entry, stack_top, f.a3);
     k.fresh[i] = true;
     k.preempted[i] = false;
     k.fault_ep[i] = k.fault_ep[cur as usize];
@@ -878,11 +864,11 @@ fn thread_suspend(k: &mut Kernel, cur: Tid, slot: u64) -> Result<(), u64> {
 
 /// `ThreadCopyCap`: rdi = thread, rsi = caller's slot, rdx = the thread's
 /// slot, r8 = rights mask.
-fn thread_copy_cap(k: &mut Kernel, cur: Tid, f: &UserFrame) -> Result<(), u64> {
-    let t = thread_cap(k, cur, f.rdi)?;
-    let src = own_slot(k, cur, f.rsi).ok_or(Error::InvalidCapability.code())?;
-    let dst = own_slot(k, t, f.rdx).ok_or(Error::InvalidArgument.code())?;
-    let mask = u8::try_from(f.r8)
+fn thread_copy_cap(k: &mut Kernel, cur: Tid, f: &Args) -> Result<(), u64> {
+    let t = thread_cap(k, cur, f.a0)?;
+    let src = own_slot(k, cur, f.a1).ok_or(Error::InvalidCapability.code())?;
+    let dst = own_slot(k, t, f.a2).ok_or(Error::InvalidArgument.code())?;
+    let mask = u8::try_from(f.a3)
         .map(Rights::from_bits_truncate)
         .map_err(|_| Error::InvalidArgument.code())?;
     k.caps.derive(src, dst, mask, None).map_err(cap_error)
@@ -908,9 +894,9 @@ fn cnode_cap(k: &Kernel, cur: Tid, slot: u64) -> Result<(usize, usize), u64> {
 }
 
 /// Table index of index `rsi` of the CNode in the caller's slot `rdi`.
-fn cnode_index(k: &Kernel, cur: Tid, f: &UserFrame) -> Result<usize, u64> {
-    let (base, size) = cnode_cap(k, cur, f.rdi)?;
-    let i = usize::try_from(f.rsi)
+fn cnode_index(k: &Kernel, cur: Tid, f: &Args) -> Result<usize, u64> {
+    let (base, size) = cnode_cap(k, cur, f.a0)?;
+    let i = usize::try_from(f.a1)
         .ok()
         .filter(|&i| i < size)
         .ok_or(Error::InvalidArgument.code())?;
@@ -919,25 +905,25 @@ fn cnode_index(k: &Kernel, cur: Tid, f: &UserFrame) -> Result<usize, u64> {
 
 /// `CNodeCopy`: rdi = CNode, rsi = index, rdx = caller's slot, r8 = rights
 /// mask, r9 = badge (0 = keep).
-fn cnode_copy(k: &mut Kernel, cur: Tid, f: &UserFrame) -> Result<(), u64> {
+fn cnode_copy(k: &mut Kernel, cur: Tid, f: &Args) -> Result<(), u64> {
     let dst = cnode_index(k, cur, f)?;
-    let src = own_slot(k, cur, f.rdx).ok_or(Error::InvalidCapability.code())?;
-    let mask = u8::try_from(f.r8)
+    let src = own_slot(k, cur, f.a2).ok_or(Error::InvalidCapability.code())?;
+    let mask = u8::try_from(f.a3)
         .map(Rights::from_bits_truncate)
         .map_err(|_| Error::InvalidArgument.code())?;
-    let badge = (f.r9 != 0).then_some(f.r9);
+    let badge = (f.a4 != 0).then_some(f.a4);
     k.caps.derive(src, dst, mask, badge).map_err(cap_error)
 }
 
 /// `ThreadSetSpace`: rdi = thread, rsi = CNode. The thread's hidden root
 /// slot gets a copy of the CNode capability, keeping the CNode alive.
-fn thread_set_space(k: &mut Kernel, cur: Tid, f: &UserFrame) -> Result<(), u64> {
-    let t = thread_cap(k, cur, f.rdi)?;
+fn thread_set_space(k: &mut Kernel, cur: Tid, f: &Args) -> Result<(), u64> {
+    let t = thread_cap(k, cur, f.a0)?;
     if !thread_inactive(k, t) {
         return Err(Error::IllegalOperation.code());
     }
-    let (base, size) = cnode_cap(k, cur, f.rsi)?;
-    let src = own_slot(k, cur, f.rsi).ok_or(Error::InvalidCapability.code())?;
+    let (base, size) = cnode_cap(k, cur, f.a1)?;
+    let src = own_slot(k, cur, f.a1).ok_or(Error::InvalidCapability.code())?;
     let root = ROOT_SLOTS + t as usize;
     if k.caps.get(root).is_some() {
         let _ = k.caps.delete(root);
@@ -987,30 +973,30 @@ fn destroy_cnode(k: &mut Kernel, c: usize) {
 
 /// `CapMint`: rdi = source slot, rsi = empty destination slot, rdx =
 /// rights mask, r8 = badge (0 = none).
-fn cap_mint(k: &mut Kernel, cur: Tid, f: &UserFrame) -> Result<(), u64> {
-    let src = own_slot(k, cur, f.rdi).ok_or(Error::InvalidCapability.code())?;
-    let dst = own_slot(k, cur, f.rsi).ok_or(Error::InvalidArgument.code())?;
-    let mask = u8::try_from(f.rdx)
+fn cap_mint(k: &mut Kernel, cur: Tid, f: &Args) -> Result<(), u64> {
+    let src = own_slot(k, cur, f.a0).ok_or(Error::InvalidCapability.code())?;
+    let dst = own_slot(k, cur, f.a1).ok_or(Error::InvalidArgument.code())?;
+    let mask = u8::try_from(f.a2)
         .map(Rights::from_bits_truncate)
         .map_err(|_| Error::InvalidArgument.code())?;
-    let badge = (f.r8 != 0).then_some(f.r8);
+    let badge = (f.a3 != 0).then_some(f.a3);
     k.caps.derive(src, dst, mask, badge).map_err(cap_error)
 }
 
 /// `Retype`: rdi = untyped slot, rsi = object type, rdx = size in bits
 /// (untyped only), r8 = empty destination slot.
-fn retype(k: &mut Kernel, cur: Tid, f: &UserFrame) -> Result<(), u64> {
-    let src = own_slot(k, cur, f.rdi).ok_or(Error::InvalidCapability.code())?;
+fn retype(k: &mut Kernel, cur: Tid, f: &Args) -> Result<(), u64> {
+    let src = own_slot(k, cur, f.a0).ok_or(Error::InvalidCapability.code())?;
     let ut = *k.caps.get(src).ok_or(Error::InvalidCapability.code())?;
     if !matches!(ut.object, Object::Untyped { .. }) {
         return Err(Error::InvalidCapability.code());
     }
-    let dst = own_slot(k, cur, f.r8).ok_or(Error::InvalidArgument.code())?;
+    let dst = own_slot(k, cur, f.a3).ok_or(Error::InvalidArgument.code())?;
     if k.caps.get(dst).is_some() {
         return Err(Error::SlotOccupied.code());
     }
-    let ty = ObjectType::from_u64(f.rsi).ok_or(Error::InvalidArgument.code())?;
-    let bits = ty.size_bits(f.rdx).ok_or(Error::InvalidArgument.code())?;
+    let ty = ObjectType::from_u64(f.a1).ok_or(Error::InvalidArgument.code())?;
+    let bits = ty.size_bits(f.a2).ok_or(Error::InvalidArgument.code())?;
     // Claim a table entry only once everything else is known to succeed.
     let free = |used: &[bool]| used.iter().position(|u| !u);
     let entry = match ty {
@@ -1269,10 +1255,9 @@ fn selftest_done(cur: Tid, code: u64, stats: Stats) -> ! {
     {
         if code == 0 {
             kprintln!("[pass] all self-tests passed");
-            crate::qemu::exit(crate::qemu::ExitCode::Success);
         }
-        crate::qemu::exit(crate::qemu::ExitCode::Failure);
+        arch::qemu_exit(code == 0);
     }
     #[allow(unreachable_code)]
-    crate::halt_forever()
+    arch::halt_forever()
 }

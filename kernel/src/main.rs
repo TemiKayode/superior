@@ -1,28 +1,33 @@
 //! The Superior microkernel.
 //!
-//! Boots on x86-64 through the `bootloader` crate, brings up the serial
-//! console, GDT/TSS, exception handlers and the `syscall` path, hands all
-//! usable physical memory to the root task as untyped capabilities (no
-//! kernel heap, ever), then starts the boot user programs in their own
-//! address spaces. From then on the kernel runs only on system calls and
-//! timer interrupts.
+//! The architecture code (`arch`) boots the machine: console, exception
+//! and interrupt handling, the system call path, the timer, and the
+//! physical memory map. It hands all usable physical memory to the root
+//! CNode as untyped capabilities (no kernel heap, ever) and calls
+//! [`kernel_start`], which starts the boot user programs in their own
+//! address spaces. From then on the kernel runs only on system calls,
+//! faults and interrupts.
+//!
+//! Everything else, capabilities, threads, IPC, scheduling and the system
+//! calls, is shared between architectures (`task`, and the host-tested
+//! `superior_objects` crate).
 
 #![no_std]
 #![no_main]
-#![feature(abi_x86_interrupt)]
+#![cfg_attr(target_arch = "x86_64", feature(abi_x86_interrupt))]
 
-mod apic;
-mod gdt;
-mod interrupts;
+#[cfg(target_arch = "aarch64")]
+#[path = "arch/aarch64/mod.rs"]
+mod arch;
+#[cfg(target_arch = "x86_64")]
+#[path = "arch/x86_64/mod.rs"]
+mod arch;
+
 mod memory;
-mod qemu;
-mod serial;
-mod syscall;
 mod task;
-mod vm;
 
-use bootloader_api::config::{BootloaderConfig, Mapping};
-use bootloader_api::{entry_point, BootInfo};
+pub use arch::serial;
+
 use core::panic::PanicInfo;
 use superior_objects::cap::{Capability, Object, Rights};
 
@@ -31,31 +36,16 @@ static USER_IMAGE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/user.elf"))
 /// The shell, built by `cargo xtask` (empty if none).
 static SHELL_IMAGE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shell.elf"));
 
-pub static BOOTLOADER_CONFIG: BootloaderConfig = {
-    let mut config = BootloaderConfig::new_default();
-    config.mappings.physical_memory = Some(Mapping::Dynamic);
-    config.kernel_stack_size = 128 * 1024;
-    config
-};
-
-entry_point!(kernel_main, config = &BOOTLOADER_CONFIG);
-
-fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
-    serial::init();
+fn banner() {
     kprintln!();
     kprintln!(
-        "Superior microkernel {} (x86_64)",
-        env!("CARGO_PKG_VERSION")
+        "Superior microkernel {} ({})",
+        env!("CARGO_PKG_VERSION"),
+        arch::NAME
     );
+}
 
-    gdt::init();
-    kprintln!("[ok] gdt + tss loaded");
-    interrupts::init();
-    kprintln!("[ok] idt loaded");
-    syscall::init();
-    kprintln!("[ok] syscall/sysret enabled");
-
-    let mem = memory::init(&boot_info.memory_regions);
+fn report_memory(mem: &memory::Summary) {
     kprintln!(
         "[ok] {} MiB usable in {} regions -> {} untyped caps (largest 2^{} bytes)",
         mem.usable_bytes >> 20,
@@ -69,27 +59,20 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             mem.dropped_bytes >> 10
         );
     }
-    let offset = boot_info
-        .physical_memory_offset
-        .into_option()
-        .expect("bootloader did not map physical memory");
-    vm::init(offset);
-    kprintln!("[ok] physical memory mapped at {offset:#x}");
-    let timer_hz = apic::init();
-    kprintln!(
-        "[ok] local APIC timer: {} kHz input, {} Hz tick",
-        timer_hz / 1000,
-        apic::TICK_HZ
-    );
+}
 
+/// Called by the architecture code once the machine is up.
+fn kernel_start(untyped_caps: usize) -> ! {
     #[cfg(feature = "selftest")]
-    selftest(mem.untyped_caps);
+    selftest(untyped_caps);
+    #[cfg(not(feature = "selftest"))]
+    let _ = untyped_caps;
 
     // Self-test builds run the self-test programs; others boot the shell.
     let started = if cfg!(feature = "selftest") || SHELL_IMAGE.is_empty() {
         if USER_IMAGE.is_empty() {
             kprintln!("no boot user program embedded; idle");
-            halt_forever();
+            arch::halt_forever();
         }
         start_pingpong()
     } else {
@@ -101,33 +84,18 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     task::start()
 }
 
-/// The shell: one process that is also the serial driver. It gets COM1's
-/// ports and interrupt line, a notification for that interrupt, the timer
-/// notification, memory to make objects from, and the QEMU exit port for
+/// The shell: one process that is also the serial driver. It gets the
+/// UART (I/O ports on x86-64, its register page on AArch64) and its
+/// interrupt line, a notification for that interrupt, the timer
+/// notification, memory to make objects from, and QEMU's exit device for
 /// `shutdown`. Nothing else: it has no other device and no other process.
 fn start_shell() -> Result<(), &'static str> {
     let rw = Rights::READ | Rights::WRITE;
     let base = memory::carve(16).ok_or("no memory for the shell's untyped block")?;
+    let (uart, irq) = arch::console_caps();
     let caps = [
-        (
-            0,
-            Capability::new(
-                Object::IoPort {
-                    base: 0x3f8,
-                    count: 8,
-                },
-                rw,
-            ),
-        ),
-        (
-            1,
-            Capability::new(
-                Object::Irq {
-                    line: interrupts::COM1_IRQ,
-                },
-                rw,
-            ),
-        ),
+        (0, uart),
+        (1, irq),
         (2, Capability::new(Object::Notification { id: 2 }, rw)),
         (
             3,
@@ -240,8 +208,8 @@ fn start_pingpong() -> Result<(), &'static str> {
 
 #[cfg(feature = "selftest")]
 fn selftest(untyped_caps: usize) {
-    // Exceptions: int3 must trap into our handler and return.
-    x86_64::instructions::interrupts::int3();
+    // Exceptions: a breakpoint must trap into our handler and return.
+    arch::breakpoint_selftest();
     kprintln!("[pass] breakpoint trap returns");
 
     // Capabilities on the live root CNode: derive a read-only child of the
@@ -259,18 +227,12 @@ fn selftest(untyped_caps: usize) {
     kprintln!("[pass] capability derive + revoke on root CNode");
 }
 
-pub fn halt_forever() -> ! {
-    loop {
-        x86_64::instructions::hlt();
-    }
-}
-
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    x86_64::instructions::interrupts::disable();
+    arch::disable_interrupts();
     kprintln!("[panic] {info}");
     #[cfg(feature = "selftest")]
-    qemu::exit(qemu::ExitCode::Failure);
+    arch::qemu_exit(false);
     #[allow(unreachable_code)]
-    halt_forever()
+    arch::halt_forever()
 }

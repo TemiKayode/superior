@@ -1,21 +1,20 @@
 //! Boot-time memory hand-off.
 //!
-//! The kernel keeps no heap. At boot it turns every usable physical region
-//! into naturally aligned untyped blocks and places one capability per
-//! block in the root task's CNode. From then on, all memory — including the
-//! memory for kernel objects — is allocated by user space retyping those
-//! capabilities.
+//! The kernel keeps no heap. At boot the architecture code reports each
+//! usable physical region, and this module turns it into naturally aligned
+//! untyped blocks, one capability per block in the root CNode. From then on
+//! all memory, including memory for kernel objects and page tables, is
+//! allocated by retyping those capabilities.
 
-use bootloader_api::info::{MemoryRegionKind, MemoryRegions};
 use spin::Mutex;
 use superior_objects::cap::{CNode, Capability, Object, Rights};
 use superior_objects::untyped::split_region;
 
 pub const ROOT_CNODE_SLOTS: usize = 1024;
-const LOW_MEMORY_END: u64 = 0x10_0000;
 
-/// The root task's capability space. Owned by the kernel until the root
-/// task starts.
+/// The root task's capability space, owned by the kernel.
+pub static ROOT_CNODE: Mutex<CNode<ROOT_CNODE_SLOTS>> = Mutex::new(CNode::new());
+
 /// Carves a `2^size_bits` byte block from the root task's untyped memory,
 /// for the kernel to hand to a user thread as a fresh untyped capability.
 pub fn carve(size_bits: u8) -> Option<u64> {
@@ -23,8 +22,7 @@ pub fn carve(size_bits: u8) -> Option<u64> {
     (0..ROOT_CNODE_SLOTS).find_map(|slot| cnode.retype(slot, size_bits).ok())
 }
 
-pub static ROOT_CNODE: Mutex<CNode<ROOT_CNODE_SLOTS>> = Mutex::new(CNode::new());
-
+#[derive(Default)]
 pub struct Summary {
     pub regions: usize,
     pub untyped_caps: usize,
@@ -34,45 +32,36 @@ pub struct Summary {
     pub dropped_bytes: u64,
 }
 
-pub fn init(regions: &MemoryRegions) -> Summary {
-    let mut cnode = ROOT_CNODE.lock();
-    let mut s = Summary {
-        regions: 0,
-        untyped_caps: 0,
-        usable_bytes: 0,
-        largest_block_bits: 0,
-        dropped_bytes: 0,
-    };
-    let mut next_slot = 0usize;
-
-    for r in regions
-        .iter()
-        .filter(|r| r.kind == MemoryRegionKind::Usable)
-    {
-        // Leave the first 1 MiB alone: on BIOS machines it holds firmware
-        // structures that "usable" does not always protect.
-        let start = r.start.max(LOW_MEMORY_END);
-        if start >= r.end {
-            continue;
-        }
-        s.regions += 1;
-        split_region(start, r.end, |block| {
-            s.usable_bytes += block.size();
-            let cap = Capability::new(
-                Object::Untyped {
-                    base: block.base,
-                    size_bits: block.size_bits,
-                },
-                Rights::ALL,
-            );
-            if cnode.insert_root(next_slot, cap).is_ok() {
-                next_slot += 1;
-                s.untyped_caps += 1;
-                s.largest_block_bits = s.largest_block_bits.max(block.size_bits);
-            } else {
-                s.dropped_bytes += block.size();
-            }
-        });
+/// Places the usable physical range `[start, end)` in the root CNode.
+pub fn add_region(s: &mut Summary, start: u64, end: u64) {
+    if start >= end {
+        return;
     }
-    s
+    let mut cnode = ROOT_CNODE.lock();
+    s.regions += 1;
+    split_region(start, end, |block| {
+        s.usable_bytes += block.size();
+        let cap = Capability::new(
+            Object::Untyped {
+                base: block.base,
+                size_bits: block.size_bits,
+            },
+            Rights::ALL,
+        );
+        if cnode.insert_root(s.untyped_caps, cap).is_ok() {
+            s.untyped_caps += 1;
+            s.largest_block_bits = s.largest_block_bits.max(block.size_bits);
+        } else {
+            s.dropped_bytes += block.size();
+        }
+    });
+}
+
+/// Why mapping a frame failed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MapError {
+    /// Something is already mapped at the address.
+    InUse,
+    /// No memory for an intermediate page table.
+    OutOfMemory,
 }

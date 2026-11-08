@@ -15,7 +15,7 @@
 //! Interrupts stay disabled for the whole kernel entry; the kernel is
 //! single-core and non-preemptible, and only user mode is interruptible.
 
-use crate::gdt;
+use super::gdt;
 use core::arch::naked_asm;
 use superior_objects::abi::FaultKind;
 use x86_64::registers::model_specific::{Efer, EferFlags, LStar, SFMask, Star};
@@ -94,6 +94,53 @@ impl UserFrame {
     pub fn is_user_mode(&self) -> bool {
         self.cs & 3 == 3
     }
+
+    /// The system call number and its six argument registers.
+    pub fn args(&self) -> Args {
+        Args {
+            nr: self.rax,
+            a0: self.rdi,
+            a1: self.rsi,
+            a2: self.rdx,
+            a3: self.r8,
+            a4: self.r9,
+            a5: self.r10,
+        }
+    }
+
+    /// Delivers a system call's results: status, badge, message and the
+    /// received-capability word, in the registers the ABI names.
+    pub fn set_results(&mut self, status: u64, badge: u64, msg: [u64; 4], cap: u64) {
+        self.rax = status;
+        self.rdi = badge;
+        [self.rsi, self.rdx, self.r8, self.r9] = msg;
+        self.r10 = cap;
+    }
+
+    /// The user instruction pointer.
+    pub fn pc(&self) -> u64 {
+        self.rip
+    }
+
+    /// Resumes at `pc` with `value` in the first result register (`rax`).
+    pub fn resume_at(&mut self, pc: u64, value: u64) {
+        self.rip = pc;
+        self.rax = value;
+    }
+}
+
+/// A system call's number and arguments, independent of register names:
+/// `a0` names the capability, `a1`..`a4` are the message words and `a5`
+/// the capability-transfer word.
+#[derive(Clone, Copy, Debug)]
+pub struct Args {
+    pub nr: u64,
+    pub a0: u64,
+    pub a1: u64,
+    pub a2: u64,
+    pub a3: u64,
+    pub a4: u64,
+    pub a5: u64,
 }
 
 /// How to return to user mode; the handler's return value in `rax`.
@@ -431,18 +478,23 @@ extern "C" fn syscall_handler(frame: &mut UserFrame) -> Exit {
 }
 
 extern "C" fn fault_handler(frame: &mut UserFrame, kind: u64, code: u64) -> Exit {
-    crate::task::handle_fault(frame, FaultKind::from_u64(kind).unwrap(), code)
+    let kind = FaultKind::from_u64(kind).unwrap();
+    let addr = match kind {
+        FaultKind::PageFault => x86_64::registers::control::Cr2::read_raw(),
+        _ => 0,
+    };
+    crate::task::handle_fault(frame, kind, code, addr)
 }
 
 extern "C" fn com1_handler(frame: &mut UserFrame) -> Exit {
     // Masked until the driver acknowledges, so a level that stays raised
     // cannot storm the kernel.
-    crate::interrupts::pic_mask(crate::interrupts::COM1_IRQ);
-    crate::interrupts::pic_eoi(crate::interrupts::COM1_IRQ);
-    crate::task::handle_irq(frame, crate::interrupts::COM1_IRQ)
+    super::interrupts::pic_mask(super::interrupts::COM1_IRQ);
+    super::interrupts::pic_eoi(super::interrupts::COM1_IRQ);
+    crate::task::handle_irq(frame, super::interrupts::COM1_IRQ)
 }
 
 extern "C" fn timer_handler(frame: &mut UserFrame) -> Exit {
-    crate::apic::end_of_interrupt();
+    super::apic::end_of_interrupt();
     crate::task::handle_timer(frame)
 }

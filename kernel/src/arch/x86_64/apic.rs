@@ -8,7 +8,7 @@
 //! Device interrupts are not routed here: in Superior they reach user-space
 //! drivers as notifications, which needs the IOAPIC and comes later.
 
-use crate::vm;
+use super::vm;
 use x86_64::instructions::port::Port;
 use x86_64::registers::model_specific::Msr;
 use x86_64::PhysAddr;

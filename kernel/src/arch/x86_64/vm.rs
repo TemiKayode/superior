@@ -9,6 +9,7 @@
 //! cannot touch it.
 
 use crate::memory::{ROOT_CNODE, ROOT_CNODE_SLOTS};
+pub use crate::memory::MapError;
 use superior_objects::elf::Elf;
 use x86_64::registers::control::Cr3;
 use x86_64::structures::paging::{
@@ -232,15 +233,6 @@ impl AddressSpace {
             unsafe { Cr3::write(self.0, flags) };
         }
     }
-}
-
-/// Why mapping a frame failed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MapError {
-    /// Something is already mapped at the address.
-    InUse,
-    /// No memory for an intermediate page table.
-    OutOfMemory,
 }
 
 /// Zeroes the 4 KiB frame at `pa`, so memory handed to a new owner never

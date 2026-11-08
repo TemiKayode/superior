@@ -4,7 +4,8 @@
 //! thread's handler (see `task::handle_fault`). A fault in kernel mode is
 //! always a kernel bug and panics.
 
-use crate::{apic, gdt, kprintln, syscall};
+use super::{apic, gdt, syscall};
+use crate::kprintln;
 use spin::Lazy;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame};
 use x86_64::VirtAddr;
