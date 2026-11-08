@@ -98,8 +98,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 /// badged copy with Write only, so it can call but not receive.
 ///
 /// The spinner has the client's priority, is ahead of it in the ready
-/// queue, and never makes a system call. The client gets the CPU only if
-/// the timer preempts the spinner, so the test passing proves preemption.
+/// queue, and makes no system call while it spins. The client gets the
+/// CPU only if the timer preempts the spinner, so the test passing proves
+/// preemption.
+///
+/// Afterwards the spinner signals the client and parks; the client then
+/// sleeps on the timer notification with every other thread blocked, so
+/// the CPU must idle and the timer must wake it.
 fn start_pingpong() -> Result<(), &'static str> {
     // Until cross-CNode capability copy exists, the kernel mints these
     // two endpoint capabilities directly at boot.
@@ -110,8 +115,35 @@ fn start_pingpong() -> Result<(), &'static str> {
         ..Capability::new(endpoint, Rights::WRITE | Rights::GRANT_REPLY)
     };
     task::spawn_process(0, USER_IMAGE, 10, 0, &[(0, server_cap)])?;
-    task::spawn_process(1, USER_IMAGE, 5, 2, &[])?;
-    task::spawn_process(2, USER_IMAGE, 5, 1, &[(0, client_cap)])?;
+    let timer = Capability::new(
+        Object::Notification {
+            id: task::TIMER_NTFN as u32,
+        },
+        Rights::READ,
+    );
+    let spinner_done = Object::Notification { id: 1 };
+    let park = Object::Notification { id: 2 };
+    task::spawn_process(
+        1,
+        USER_IMAGE,
+        5,
+        2,
+        &[
+            (0, Capability::new(spinner_done, Rights::WRITE)),
+            (1, Capability::new(park, Rights::READ)),
+        ],
+    )?;
+    task::spawn_process(
+        2,
+        USER_IMAGE,
+        5,
+        1,
+        &[
+            (0, client_cap),
+            (1, timer),
+            (2, Capability::new(spinner_done, Rights::READ)),
+        ],
+    )?;
     kprintln!(
         "[ok] server (prio 10), spinner and client (prio 5) loaded in separate address spaces"
     );

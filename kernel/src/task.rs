@@ -9,20 +9,41 @@
 //! both end in [`resume`]. A thread that entered by system call gets its
 //! results in registers and leaves by `sysret`; a thread that was
 //! preempted gets its exact registers back by `iretq`.
+//!
+//! When no thread can run, [`resume`] idles: it halts the CPU with
+//! interrupts enabled, the one place the kernel ever enables them, until
+//! an interrupt makes a thread runnable. The timer signals notification
+//! [`TIMER_NTFN`] on every tick, so a thread can sleep by waiting on it.
 
 use crate::syscall::{self, Exit, UserFrame};
 use crate::vm::AddressSpace;
-use crate::{kprint, kprintln, qemu};
-use spin::Mutex;
+use crate::{kprint, kprintln};
+use spin::{Mutex, MutexGuard};
 use superior_objects::abi::{Error, Syscall};
 use superior_objects::cap::{CNode, Capability, Object, Rights};
 use superior_objects::ipc::{Ipc, Tid};
+use x86_64::instructions::interrupts;
 
 pub const MAX_THREADS: usize = 8;
 pub const CSPACE_SLOTS: usize = 16;
 const MAX_ENDPOINTS: usize = 8;
 const MAX_NOTIFICATIONS: usize = 8;
 const DEBUG_STR_MAX: usize = 256;
+/// The notification the timer signals (bit 0) on every tick.
+pub const TIMER_NTFN: u16 = 0;
+/// Self-test builds give up after this many seconds, so a deadlock fails
+/// the test instead of idling forever.
+#[cfg(feature = "selftest")]
+const SELFTEST_TIMEOUT_SECS: u64 = 60;
+
+#[derive(Clone, Copy, Default)]
+struct Stats {
+    ticks: u64,
+    /// Timer ticks that took the CPU from one thread and gave it to another.
+    preemptions: u64,
+    /// Times the CPU halted because no thread could run.
+    idle_halts: u64,
+}
 
 struct Kernel {
     ipc: Ipc<MAX_THREADS, MAX_ENDPOINTS, MAX_NOTIFICATIONS>,
@@ -35,9 +56,7 @@ struct Kernel {
     /// Last left user mode by interrupt: its frame is complete and must be
     /// resumed untouched, including `rcx` and `r11`.
     preempted: [bool; MAX_THREADS],
-    ticks: u64,
-    /// Timer ticks that took the CPU from one thread and gave it to another.
-    preemptions: u64,
+    stats: Stats,
 }
 
 static KERNEL: Mutex<Kernel> = Mutex::new(Kernel {
@@ -47,8 +66,11 @@ static KERNEL: Mutex<Kernel> = Mutex::new(Kernel {
     cspaces: [const { CNode::new() }; MAX_THREADS],
     fresh: [false; MAX_THREADS],
     preempted: [false; MAX_THREADS],
-    ticks: 0,
-    preemptions: 0,
+    stats: Stats {
+        ticks: 0,
+        preemptions: 0,
+        idle_halts: 0,
+    },
 });
 
 /// Creates a thread in a new address space running `image`, with `arg` in
@@ -109,9 +131,9 @@ pub fn handle_syscall(frame: &mut UserFrame) -> Exit {
         None => Err(Error::IllegalOperation.code()),
         Some(Syscall::DebugPutStr) => debug_put_str(k, cur, frame.rdi, frame.rsi),
         Some(Syscall::DebugSelftestDone) => {
-            let (ticks, preemptions) = (k.ticks, k.preemptions);
+            let stats = k.stats;
             drop(guard);
-            selftest_done(cur, frame.rdi, ticks, preemptions)
+            selftest_done(cur, frame.rdi, stats)
         }
         Some(op) => ipc_op(k, cur, op, frame.rdi as usize, msg),
     };
@@ -119,32 +141,56 @@ pub fn handle_syscall(frame: &mut UserFrame) -> Exit {
     resume(guard, cur, frame)
 }
 
-/// The timer fired while `frame`'s thread ran in user mode.
+/// The timer fired, either in user mode or while the kernel idled.
 pub fn handle_timer(frame: &mut UserFrame) -> Exit {
-    assert!(frame.is_user_mode(), "timer interrupt in kernel mode");
     let mut guard = KERNEL.lock();
     let k = &mut *guard;
+    k.stats.ticks += 1;
+    #[cfg(feature = "selftest")]
+    if k.stats.ticks > SELFTEST_TIMEOUT_SECS * crate::apic::TICK_HZ as u64 {
+        drop(guard);
+        kprintln!("[fail] self-test timed out after {SELFTEST_TIMEOUT_SECS} s");
+        crate::qemu::exit(crate::qemu::ExitCode::Failure);
+    }
+    if !frame.is_user_mode() {
+        // The only kernel code that runs with interrupts enabled is the
+        // idle halt in `resume`. Wake any sleeper and return to it; the
+        // idle loop decides who runs.
+        let _ = k.ipc.signal_irq(TIMER_NTFN, 1);
+        return Exit::Iret;
+    }
     let cur = k
         .ipc
         .current()
         .expect("timer interrupt with no current thread");
     k.frames[cur as usize] = *frame;
     k.preempted[cur as usize] = true;
-    k.ticks += 1;
     if k.ipc.tick() {
-        k.preemptions += 1;
+        k.stats.preemptions += 1;
     }
+    let _ = k.ipc.signal_irq(TIMER_NTFN, 1);
     resume(guard, cur, frame)
 }
 
 /// Loads the registers of the thread the IPC engine chose into `frame`,
-/// switches address space if needed, and says how to return to it.
-fn resume(mut guard: spin::MutexGuard<'_, Kernel>, cur: Tid, frame: &mut UserFrame) -> Exit {
-    let k = &mut *guard;
-    let Some(next) = k.ipc.current() else {
+/// switches address space if needed, and says how to return to it. If no
+/// thread can run, halts until an interrupt makes one runnable.
+fn resume(mut guard: MutexGuard<'_, Kernel>, cur: Tid, frame: &mut UserFrame) -> Exit {
+    let next = loop {
+        guard.ipc.schedule();
+        if let Some(next) = guard.ipc.current() {
+            break next;
+        }
+        guard.stats.idle_halts += 1;
         drop(guard);
-        no_runnable_threads();
+        // `sti; hlt` is atomic: an interrupt cannot slip in between and
+        // leave the CPU halted with work to do. The interrupt handler runs
+        // on this stack and returns here.
+        interrupts::enable_and_hlt();
+        interrupts::disable();
+        guard = KERNEL.lock();
     };
+    let k = &mut *guard;
     let n = next as usize;
     let mut out = k.frames[n];
     let exit = if core::mem::take(&mut k.fresh[n]) {
@@ -226,7 +272,12 @@ fn debug_put_str(k: &Kernel, cur: Tid, ptr: u64, len: u64) -> Result<(), u64> {
     Ok(())
 }
 
-fn selftest_done(cur: Tid, code: u64, ticks: u64, preemptions: u64) -> ! {
+fn selftest_done(cur: Tid, code: u64, stats: Stats) -> ! {
+    let Stats {
+        ticks,
+        preemptions,
+        idle_halts,
+    } = stats;
     if code == 0 {
         kprintln!("[pass] user self-test reported success (thread {cur})");
     } else {
@@ -241,22 +292,25 @@ fn selftest_done(cur: Tid, code: u64, ticks: u64, preemptions: u64) -> ! {
         kprintln!("[pass] timer preemption: {ticks} ticks, {preemptions} preemptive switches");
         code
     };
+    // The client sleeps on the timer notification after every other
+    // thread has blocked, so the CPU must have idled.
+    let code = if idle_halts == 0 {
+        kprintln!("[fail] the CPU never idled");
+        code.max(1)
+    } else {
+        kprintln!("[pass] idle: halted {idle_halts} times with every thread blocked");
+        code
+    };
+    #[cfg(not(feature = "selftest"))]
+    let _ = code;
     #[cfg(feature = "selftest")]
     {
         if code == 0 {
             kprintln!("[pass] all self-tests passed");
-            qemu::exit(qemu::ExitCode::Success);
+            crate::qemu::exit(crate::qemu::ExitCode::Success);
         }
-        qemu::exit(qemu::ExitCode::Failure);
+        crate::qemu::exit(crate::qemu::ExitCode::Failure);
     }
-    #[allow(unreachable_code)]
-    crate::halt_forever()
-}
-
-fn no_runnable_threads() -> ! {
-    kprintln!("[fail] every thread is blocked: no runnable thread");
-    #[cfg(feature = "selftest")]
-    qemu::exit(qemu::ExitCode::Failure);
     #[allow(unreachable_code)]
     crate::halt_forever()
 }

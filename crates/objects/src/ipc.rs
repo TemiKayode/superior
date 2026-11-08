@@ -387,6 +387,22 @@ impl<const T: usize, const E: usize, const N: usize> Ipc<T, E, N> {
         let cur = self.cur()?;
         let n = self.ntfn_index(ntfn)?;
         self.threads[cur as usize].status = 0;
+        self.deliver_bits(n, bits);
+        Ok(())
+    }
+
+    /// Signals a notification from an interrupt: like [`Ipc::signal`], but
+    /// with no calling thread, so it also works while the CPU is idle. A
+    /// woken thread of higher priority than the current one preempts it;
+    /// with nothing running, the woken thread becomes current.
+    pub fn signal_irq(&mut self, ntfn: u16, bits: u64) -> Result<(), IpcError> {
+        let n = self.ntfn_index(ntfn)?;
+        self.deliver_bits(n, bits);
+        self.schedule();
+        Ok(())
+    }
+
+    fn deliver_bits(&mut self, n: usize, bits: u64) {
         match self.ntfns[n].waiters.pop(&mut self.threads) {
             Some(w) => {
                 let word = self.ntfns[n].word | bits;
@@ -398,7 +414,6 @@ impl<const T: usize, const E: usize, const N: usize> Ipc<T, E, N> {
             }
             None => self.ntfns[n].word |= bits,
         }
-        Ok(())
     }
 
     /// Takes the notification's accumulated bits (returned as the badge),
@@ -767,5 +782,58 @@ mod tests {
             assert!(!k.tick(), "alone: keeps running");
         }
         assert_eq!(k.current(), Some(CLIENT));
+    }
+    #[test]
+    fn signal_irq_wakes_waiter_when_idle() {
+        let mut k = K::new();
+        k.spawn(CLIENT, 5).unwrap();
+        k.schedule();
+        k.wait(0).unwrap();
+        assert_eq!(k.current(), None, "everyone blocked: idle");
+        k.signal_irq(0, 0b1).unwrap();
+        assert_eq!(k.current(), Some(CLIENT));
+        assert_eq!(k.thread(CLIENT).badge, 0b1);
+        assert_eq!(k.thread(CLIENT).status, 0);
+    }
+
+    #[test]
+    fn signal_irq_preempts_lower_priority_only() {
+        let mut k = K::new();
+        k.spawn(SERVER, 10).unwrap();
+        k.spawn(CLIENT, 5).unwrap();
+        k.schedule();
+        k.wait(0).unwrap(); // server waits; client runs
+        assert_eq!(k.current(), Some(CLIENT));
+        k.signal_irq(0, 1).unwrap();
+        assert_eq!(k.current(), Some(SERVER), "higher priority preempts");
+        assert_eq!(k.thread(CLIENT).state, State::Ready);
+    }
+
+    #[test]
+    fn signal_irq_does_not_preempt_for_lower_priority() {
+        let mut k = K::new();
+        k.spawn(CLIENT, 5).unwrap();
+        k.schedule();
+        k.wait(0).unwrap(); // client waits; idle
+        k.spawn(SERVER, 10).unwrap();
+        k.schedule();
+        assert_eq!(k.current(), Some(SERVER));
+        k.signal_irq(0, 1).unwrap();
+        assert_eq!(k.current(), Some(SERVER), "lower-priority waiter queues");
+        assert_eq!(k.thread(CLIENT).state, State::Ready);
+        assert_eq!(k.thread(CLIENT).badge, 1);
+    }
+
+    #[test]
+    fn signal_irq_without_waiter_accumulates_bits() {
+        let mut k = K::new();
+        k.signal_irq(0, 0b01).unwrap();
+        k.signal_irq(0, 0b10).unwrap();
+        assert_eq!(k.current(), None);
+        k.spawn(CLIENT, 5).unwrap();
+        k.schedule();
+        k.wait(0).unwrap();
+        assert_eq!(k.current(), Some(CLIENT), "bits pending: no block");
+        assert_eq!(k.thread(CLIENT).badge, 0b11);
     }
 }

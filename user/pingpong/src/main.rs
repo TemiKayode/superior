@@ -6,9 +6,13 @@
 //! - role 1, the **client**: holds a badged copy with Write only. It
 //!   checks that the kernel enforces rights, then times call/reply round
 //!   trips and reports the result.
-//! - role 2, the **spinner**: loops forever without a system call. It
-//!   shares the client's priority, so the client only runs if the kernel
-//!   preempts it.
+//! - role 2, the **spinner**: spins without a system call. It shares the
+//!   client's priority, so the client only runs if the kernel preempts it.
+//!   Then it tells the client it is done and blocks for good.
+//!
+//! Finally the client sleeps on the timer notification. With every other
+//! thread blocked, that only returns if the kernel idles and the timer
+//! wakes it.
 //!
 //! Timings under QEMU's software emulation say nothing about real
 //! hardware; they are printed so the same binary can be measured on metal.
@@ -22,6 +26,14 @@ use superior_objects::abi::{Error, MSG_WORDS, Syscall};
 
 const EP: u64 = 0;
 const EMPTY_SLOT: u64 = 5;
+/// Client: the timer notification and the spinner's done signal.
+const TIMER: u64 = 1;
+const SPINNER_DONE: u64 = 2;
+/// Spinner: its done signal and a notification nobody signals.
+const DONE_OUT: u64 = 0;
+const PARK: u64 = 1;
+const SPIN_ITERATIONS: u64 = 100_000_000;
+const SLEEP_TICKS: u64 = 5;
 const CLIENT_BADGE: u64 = 0xC1;
 const WARMUP: u64 = 1_000;
 const ROUNDS: u64 = 20_000;
@@ -132,8 +144,12 @@ fn server() -> ! {
 
 fn spinner() -> ! {
     let mut n = 0u64;
+    while n < SPIN_ITERATIONS {
+        n = core::hint::black_box(n + 1);
+    }
+    syscall(Syscall::Signal, DONE_OUT, [0; 4]);
     loop {
-        n = core::hint::black_box(n.wrapping_add(1));
+        syscall(Syscall::Wait, PARK, [0; 4]);
     }
 }
 
@@ -203,6 +219,22 @@ fn client() -> ! {
     say!(
         "     cycles per round trip (QEMU, not representative): min {min}, mean {}",
         total / ROUNDS
+    );
+
+    // Wait for the spinner to finish, then sleep with nothing else runnable.
+    let r = syscall(Syscall::Wait, SPINNER_DONE, [0; 4]);
+    pass &= expect("spinner finished and signalled", r.status, 0);
+    let mut woke = 0;
+    for _ in 0..SLEEP_TICKS {
+        let r = syscall(Syscall::Wait, TIMER, [0; 4]);
+        if r.status == 0 && r.badge & 1 == 1 {
+            woke += 1;
+        }
+    }
+    pass &= expect(
+        "woken by the timer notification every time while idle",
+        woke,
+        SLEEP_TICKS,
     );
     finish(pass)
 }

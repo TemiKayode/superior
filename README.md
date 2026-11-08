@@ -21,6 +21,8 @@ Phase 0 (foundations). Working today, under QEMU on x86-64:
   threads that entered by system call leave by `sysret`, preempted threads by `iretq`.
 - Local APIC timer, calibrated against the PIT, at 100 Hz; round-robin time slices within
   a priority level, never handing the CPU to a lower priority.
+- Idle: with every thread blocked the kernel halts the CPU until an interrupt makes one
+  runnable. The timer signals a notification each tick, so threads sleep by waiting on it.
 - IPC engine: `Send`, `Call`, `Recv`, `Reply`, `ReplyRecv`, `Signal`, `Wait`, `Yield`;
   direct switch on call/reply (fast path); 64 fixed priorities.
 - Rights-checked capability lookup on every system call; badges delivered to servers.
@@ -28,9 +30,11 @@ Phase 0 (foundations). Working today, under QEMU on x86-64:
 - Boot self-test: a server and a client in separate address spaces do 20,000
   call/reply round trips, and the kernel refuses four kinds of rights violations. A
   spinner at the client's priority, queued ahead of it, never makes a system call, so the
-  client finishes only because the timer preempts it.
+  client finishes only because the timer preempts it. The client then sleeps on the timer
+  notification with every other thread blocked, so the CPU idles and the timer wakes it.
+  Self-test builds fail after 60 seconds instead of hanging.
 
-Not yet: an idle thread, scheduling contexts (MCS budgets), capability transfer in
+Not yet: scheduling contexts (MCS budgets), capability transfer in
 messages, retype into kernel objects from user space, SMP, an IPC benchmark on real hardware.
 
 The architectural specification lives in the Superior OS Architectural Specification doc:
