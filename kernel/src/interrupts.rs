@@ -38,9 +38,55 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
         idt[apic::TIMER_VECTOR]
             .set_handler_addr(VirtAddr::new(syscall::timer_entry as *const () as u64));
     }
+    // SAFETY: com1_entry is a naked interrupt entry like timer_entry.
+    unsafe {
+        idt[PIC_BASE + COM1_IRQ]
+            .set_handler_addr(VirtAddr::new(syscall::com1_entry as *const () as u64));
+    }
     idt[apic::SPURIOUS_VECTOR].set_handler_fn(spurious);
+    // The PIC's spurious IRQ 7 and 15.
+    idt[PIC_BASE + 7].set_handler_fn(spurious);
+    idt[PIC_BASE + 15].set_handler_fn(spurious);
     idt
 });
+
+/// Legacy PIC lines arrive on vectors `PIC_BASE + line`.
+pub const PIC_BASE: u8 = 0x20;
+/// COM1's interrupt line, handed to the serial driver.
+pub const COM1_IRQ: u8 = 4;
+/// Lines user space may own: only COM1 for now.
+pub fn irq_routable(line: u8) -> bool {
+    line == COM1_IRQ
+}
+
+/// Masks a line on the master PIC (lines 0-7).
+pub fn pic_mask(line: u8) {
+    use x86_64::instructions::port::Port;
+    let mut data = Port::<u8>::new(0x21);
+    // SAFETY: read-modify-write of the master PIC's mask register.
+    unsafe {
+        let m = data.read();
+        data.write(m | 1 << line);
+    }
+}
+
+/// Unmasks a line on the master PIC.
+pub fn pic_unmask(line: u8) {
+    use x86_64::instructions::port::Port;
+    let mut data = Port::<u8>::new(0x21);
+    // SAFETY: as in `pic_mask`.
+    unsafe {
+        let m = data.read();
+        data.write(m & !(1 << line));
+    }
+}
+
+/// End of interrupt on the master PIC.
+pub fn pic_eoi(_line: u8) {
+    use x86_64::instructions::port::Port;
+    // SAFETY: non-specific EOI to the master PIC's command port.
+    unsafe { Port::<u8>::new(0x20).write(0x20) };
+}
 
 pub fn init() {
     disable_legacy_pic();
@@ -49,8 +95,9 @@ pub fn init() {
 
 /// The 8259 PIC powers up delivering IRQ 0-7 on vectors 8-15, which
 /// collide with CPU exceptions (IRQ 0, the timer, would arrive as a
-/// "double fault"). Remap it to vectors 0x20-0x2f and mask every line:
-/// device interrupts will go through the APIC to user-space drivers.
+/// "double fault"). Remap it to vectors 0x20-0x2f and mask every line; a
+/// line is unmasked only when a user-space driver binds it to a
+/// notification (`IrqSetNotification`).
 fn disable_legacy_pic() {
     use x86_64::instructions::port::Port;
     let mut cmd1 = Port::<u8>::new(0x20);
@@ -67,7 +114,7 @@ fn disable_legacy_pic() {
         data2.write(2);
         data1.write(1); // ICW4: 8086 mode
         data2.write(1);
-        data1.write(0xff); // mask all lines
+        data1.write(!(1u8 << 2)); // mask all lines but the cascade
         data2.write(0xff);
     }
 }

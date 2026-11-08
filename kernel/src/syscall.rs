@@ -226,6 +226,34 @@ pub unsafe extern "C" fn timer_entry() {
     )
 }
 
+/// Entry for COM1's interrupt (legacy PIC line 4), delivered to the
+/// serial driver as a notification.
+#[unsafe(naked)]
+pub unsafe extern "C" fn com1_entry() {
+    naked_asm!(
+        "push r11",
+        "push rcx",
+        "push rax",
+        "push rbx",
+        "push rdx",
+        "push rsi",
+        "push rdi",
+        "push rbp",
+        "push r8",
+        "push r9",
+        "push r10",
+        "push r12",
+        "push r13",
+        "push r14",
+        "push r15",
+        "mov rdi, rsp",
+        "call {handler}",
+        "jmp {ret}",
+        handler = sym com1_handler,
+        ret = sym return_to_user,
+    )
+}
+
 // CPU exception entries. Each builds the same UserFrame as the timer entry
 // and passes the fault kind and error code. For exceptions that push an
 // error code, the code sits where the saved r11 belongs: swap them.
@@ -404,6 +432,14 @@ extern "C" fn syscall_handler(frame: &mut UserFrame) -> Exit {
 
 extern "C" fn fault_handler(frame: &mut UserFrame, kind: u64, code: u64) -> Exit {
     crate::task::handle_fault(frame, FaultKind::from_u64(kind).unwrap(), code)
+}
+
+extern "C" fn com1_handler(frame: &mut UserFrame) -> Exit {
+    // Masked until the driver acknowledges, so a level that stays raised
+    // cannot storm the kernel.
+    crate::interrupts::pic_mask(crate::interrupts::COM1_IRQ);
+    crate::interrupts::pic_eoi(crate::interrupts::COM1_IRQ);
+    crate::task::handle_irq(frame, crate::interrupts::COM1_IRQ)
 }
 
 extern "C" fn timer_handler(frame: &mut UserFrame) -> Exit {

@@ -132,6 +132,20 @@ pub enum Syscall {
     /// slot `rdi`. The thread holds its own copy of the CNode capability,
     /// so the CNode lives as long as the thread does (or until revoked).
     ThreadSetSpace = 25,
+    /// Delivers interrupts of the line in IRQ capability `rdi` as a signal
+    /// of the notification in slot `rsi` (Write right), with that
+    /// capability's badge, and unmasks the line.
+    IrqSetNotification = 26,
+    /// Unmasks the line in IRQ capability `rdi` after its interrupt was
+    /// handled. Each interrupt masks the line until acknowledged.
+    IrqAck = 27,
+    /// Reads I/O port `rsi` (in the range of the I/O-port capability in
+    /// `rdi`, Read right), `rdx` bytes wide (1, 2 or 4). The value is
+    /// returned in message word 0.
+    IoPortIn = 28,
+    /// Writes `r8` to I/O port `rsi` (in the range of the I/O-port
+    /// capability in `rdi`, Write right), `rdx` bytes wide (1, 2 or 4).
+    IoPortOut = 29,
     /// Debug build only: print a UTF-8 string. rdi = pointer, rsi = length.
     DebugPutStr = 0x100,
     /// Debug build only: report a self-test result. rdi = 0 for pass.
@@ -167,6 +181,10 @@ impl Syscall {
             23 => Syscall::CNodeDelete,
             24 => Syscall::CNodeRevoke,
             25 => Syscall::ThreadSetSpace,
+            26 => Syscall::IrqSetNotification,
+            27 => Syscall::IrqAck,
+            28 => Syscall::IoPortIn,
+            29 => Syscall::IoPortOut,
             0x100 => Syscall::DebugPutStr,
             0x101 => Syscall::DebugSelftestDone,
             _ => return None,

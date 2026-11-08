@@ -91,6 +91,8 @@ struct Kernel {
     cspace: [(u16, u16); MAX_THREADS],
     /// Live CNode objects, by first pool chunk: their slot-count bits.
     cnodes: [Option<u8>; CNODE_CHUNKS],
+    /// Notification (and badge) each interrupt line signals.
+    irq_ntfn: [Option<(u16, u64)>; 16],
     /// The capability this thread last called through had Grant or
     /// GrantReply, so its server's reply may carry a capability.
     reply_grant: [bool; MAX_THREADS],
@@ -134,6 +136,7 @@ static KERNEL: Mutex<Kernel> = Mutex::new(Kernel {
         c
     },
     cnodes: [None; CNODE_CHUNKS],
+    irq_ntfn: [None; 16],
     reply_grant: [false; MAX_THREADS],
     ep_used: [false; MAX_ENDPOINTS],
     mapped: [None; CAP_TABLE_SLOTS],
@@ -281,6 +284,10 @@ pub fn handle_syscall(frame: &mut UserFrame) -> Exit {
         Some(Syscall::ThreadCopyCap) => thread_copy_cap(k, cur, frame),
         Some(Syscall::ThreadSetSpace) => thread_set_space(k, cur, frame),
         Some(Syscall::CNodeCopy) => cnode_copy(k, cur, frame),
+        Some(Syscall::IrqSetNotification) => irq_set_notification(k, cur, frame),
+        Some(Syscall::IrqAck) => irq_cap(k, cur, frame.rdi).map(crate::interrupts::pic_unmask),
+        Some(Syscall::IoPortIn) => io_port_in(k, cur, frame),
+        Some(Syscall::IoPortOut) => io_port_out(k, cur, frame),
         Some(Syscall::CNodeDelete) => cnode_index(k, cur, frame).and_then(|s| delete_index(k, s)),
         Some(Syscall::CNodeRevoke) => cnode_index(k, cur, frame).and_then(|s| revoke_index(k, s)),
         Some(Syscall::CapMint) => cap_mint(k, cur, frame),
@@ -312,6 +319,25 @@ pub fn handle_timer(frame: &mut UserFrame) -> Exit {
     k.stats.ticks += 1;
     #[cfg(feature = "selftest")]
     if k.stats.ticks > SELFTEST_TIMEOUT_SECS * crate::apic::TICK_HZ as u64 {
+        // Say where every thread is stuck before giving up.
+        for t in 0..MAX_THREADS as Tid {
+            let tcb = k.ipc.thread(t);
+            if tcb.state != superior_objects::ipc::State::Inactive || k.thread_used[t as usize] {
+                kprintln!(
+                    "[state] thread {t}: {:?} prio {} passive {} sc {:?} rip {:#x}",
+                    tcb.state,
+                    tcb.prio,
+                    tcb.passive,
+                    k.ipc.sched_context(t),
+                    k.frames[t as usize].rip
+                );
+            }
+        }
+        kprintln!(
+            "[state] current {:?}, user mode {}",
+            k.ipc.current(),
+            frame.is_user_mode()
+        );
         drop(guard);
         kprintln!("[fail] self-test timed out after {SELFTEST_TIMEOUT_SECS} s");
         crate::qemu::exit(crate::qemu::ExitCode::Failure);
@@ -371,6 +397,114 @@ pub fn handle_fault(frame: &mut UserFrame, kind: FaultKind, code: u64) -> Exit {
         None => stop_thread(k, cur, kind, addr, frame.rip),
     }
     resume(guard, cur, frame)
+}
+
+/// A device interrupt (already masked and acknowledged at the PIC): signal
+/// the notification bound to its line. Like the timer, it can arrive in
+/// user mode or while the kernel idles.
+pub fn handle_irq(frame: &mut UserFrame, line: u8) -> Exit {
+    let mut guard = KERNEL.lock();
+    let k = &mut *guard;
+    let bound = k.irq_ntfn[line as usize];
+    if !frame.is_user_mode() {
+        if let Some((ntfn, badge)) = bound {
+            let _ = k.ipc.signal_irq(ntfn, badge);
+        }
+        return Exit::Iret;
+    }
+    let cur = k.ipc.current().expect("interrupt with no current thread");
+    k.frames[cur as usize] = *frame;
+    k.preempted[cur as usize] = true;
+    if let Some((ntfn, badge)) = bound {
+        let _ = k.ipc.signal_irq(ntfn, badge);
+    }
+    resume(guard, cur, frame)
+}
+
+/// The interrupt line an IRQ capability in the caller's slot names.
+fn irq_cap(k: &Kernel, cur: Tid, slot: u64) -> Result<u8, u64> {
+    let s = own_slot(k, cur, slot).ok_or(Error::InvalidCapability.code())?;
+    match k.caps.get(s).map(|c| c.object) {
+        Some(Object::Irq { line }) => Ok(line),
+        _ => Err(Error::InvalidCapability.code()),
+    }
+}
+
+/// `IrqSetNotification`: rdi = IRQ capability, rsi = notification (Write).
+fn irq_set_notification(k: &mut Kernel, cur: Tid, f: &UserFrame) -> Result<(), u64> {
+    let line = irq_cap(k, cur, f.rdi)?;
+    if !crate::interrupts::irq_routable(line) {
+        return Err(Error::InvalidArgument.code());
+    }
+    let s = own_slot(k, cur, f.rsi).ok_or(Error::InvalidCapability.code())?;
+    let cap = *k.caps.get(s).ok_or(Error::InvalidCapability.code())?;
+    let Object::Notification { id } = cap.object else {
+        return Err(Error::InvalidCapability.code());
+    };
+    if !cap.rights.contains(Rights::WRITE) {
+        return Err(Error::InsufficientRights.code());
+    }
+    // An unbadged signal would OR in nothing: use bit 0.
+    let badge = if cap.badge == 0 { 1 } else { cap.badge };
+    k.irq_ntfn[line as usize] = Some((id as u16, badge));
+    crate::interrupts::pic_unmask(line);
+    Ok(())
+}
+
+/// The port `rsi`, `rdx` bytes wide, checked against the I/O-port
+/// capability in `rdi` and the right `need`.
+fn io_port(k: &Kernel, cur: Tid, f: &UserFrame, need: Rights) -> Result<(u16, u64), u64> {
+    let s = own_slot(k, cur, f.rdi).ok_or(Error::InvalidCapability.code())?;
+    let cap = k.caps.get(s).ok_or(Error::InvalidCapability.code())?;
+    let Object::IoPort { base, count } = cap.object else {
+        return Err(Error::InvalidCapability.code());
+    };
+    if !cap.rights.contains(need) {
+        return Err(Error::InsufficientRights.code());
+    }
+    let width = f.rdx;
+    if !matches!(width, 1 | 2 | 4) {
+        return Err(Error::InvalidArgument.code());
+    }
+    let (lo, hi) = (base as u64, base as u64 + count as u64);
+    if f.rsi < lo || f.rsi + width > hi {
+        return Err(Error::InvalidArgument.code());
+    }
+    Ok((f.rsi as u16, width))
+}
+
+/// `IoPortIn`: rdi = I/O-port capability, rsi = port, rdx = width.
+fn io_port_in(k: &mut Kernel, cur: Tid, f: &UserFrame) -> Result<(), u64> {
+    use x86_64::instructions::port::Port;
+    let (port, width) = io_port(k, cur, f, Rights::READ)?;
+    // SAFETY: the capability grants this port range; port reads have no
+    // memory-safety effect on the kernel.
+    let v = unsafe {
+        match width {
+            1 => Port::<u8>::new(port).read() as u64,
+            2 => Port::<u16>::new(port).read() as u64,
+            _ => Port::<u32>::new(port).read() as u64,
+        }
+    };
+    k.ipc.set_msg_of(cur, [v, 0, 0, 0]);
+    Ok(())
+}
+
+/// `IoPortOut`: rdi = I/O-port capability, rsi = port, rdx = width, r8 =
+/// value.
+fn io_port_out(k: &mut Kernel, cur: Tid, f: &UserFrame) -> Result<(), u64> {
+    use x86_64::instructions::port::Port;
+    let (port, width) = io_port(k, cur, f, Rights::WRITE)?;
+    // SAFETY: as in `io_port_in`; the ports a capability can name are
+    // chosen at boot to be device ports, never ones the kernel relies on.
+    unsafe {
+        match width {
+            1 => Port::<u8>::new(port).write(f.r8 as u8),
+            2 => Port::<u16>::new(port).write(f.r8 as u16),
+            _ => Port::<u32>::new(port).write(f.r8 as u32),
+        }
+    }
+    Ok(())
 }
 
 fn stop_thread(k: &mut Kernel, t: Tid, kind: FaultKind, addr: u64, rip: u64) {
@@ -1027,7 +1161,10 @@ fn ipc_op(
         }
         (Syscall::Signal, Object::Notification { id }) => {
             need(Rights::WRITE)?;
-            ipc.signal(id as u16, cap.badge)
+            // An unbadged capability still has to leave a mark: OR-ing in
+            // no bits would lose a signal sent before anyone waits.
+            let bits = if cap.badge == 0 { 1 } else { cap.badge };
+            ipc.signal(id as u16, bits)
         }
         (Syscall::Wait, Object::Notification { id }) => {
             need(Rights::READ)?;

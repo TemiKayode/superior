@@ -1,0 +1,16 @@
+[package]
+name = "superior-shell"
+description = "The Superior boot shell, which is also its own serial driver."
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "superior-shell"
+test = false
+bench = false
+
+[dependencies]
+superior-objects = { path = "../../crates/objects" }

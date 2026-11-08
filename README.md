@@ -13,7 +13,8 @@ Superior is a capability-secure microkernel desktop operating system.
 
 Phase 0 (foundations). Working today, under QEMU on x86-64:
 
-- Boot, serial console, GDT/TSS, exception handlers, legacy PIC masked.
+- Boot, serial console, GDT/TSS, exception handlers; the legacy PIC remapped to vector
+  0x20 with every line masked until a driver claims one.
 - All usable physical memory handed to the root CNode as untyped capabilities; every
   page table and user page is retyped from them. There is no kernel heap.
 - `syscall`/`sysret` entry on a single kernel stack, with the seL4 model of saving user
@@ -81,7 +82,16 @@ Phase 0 (foundations). Working today, under QEMU on x86-64:
   message received was sent once, with its badge, and never after its sender was
   stopped). Every seed runs twice and must replay identically; a failure prints the seed
   and the last steps (`SIM_SEED`, `SIM_STEPS` replay it). `cargo xtask test` runs
-  10,000 seeds of 5,000 steps. It found six engine bugs, now fixed with regression tests.
+  10,000 seeds of 5,000 steps. It found six engine bugs, all fixed; three have their own regression tests.
+- A shell in user space (`user/shell/`), booted by default. It is also its own serial
+  driver: the kernel hands it COM1's I/O ports (`IoPortIn`, `IoPortOut` on an I/O-port
+  capability) and the UART's interrupt line (`IrqSetNotification`, `IrqAck` on an IRQ
+  capability). Each interrupt masks the line and signals a notification; the shell drains
+  the UART and acknowledges, which unmasks it. Commands: `help`, `about`, `echo`,
+  `sleep` (on the timer notification), `ipc` (times call/reply round trips to an echo
+  thread it makes from its own untyped memory) and `shutdown`. `cargo xtask test` types
+  a session into it over the serial port, byte by byte, checks every answer, and needs
+  `shutdown` to power QEMU off.
 - Static-pie user programs loaded into their own address spaces and relocated.
 - Boot self-test: a server and a client in separate address spaces do 20,000
   call/reply round trips, and the kernel refuses four kinds of rights violations. A
@@ -118,6 +128,7 @@ https://claude.ai/artifact/QKJS8qH5Dfbjzn58RStq1j
 | `kernel/` | The microkernel (`no_std`, target `x86_64-unknown-none`) |
 | `crates/objects/` | Pure kernel logic, unit-tested on the host: capabilities and CNodes, untyped memory, the IPC and scheduling state machine, the syscall ABI, an ELF reader |
 | `user/pingpong/` | Boot self-test program (IPC server, client and spinner) |
+| `user/shell/` | The boot shell and COM1 driver |
 | `xtask/` | Build driver: user program, kernel, disk image, QEMU boot |
 
 ## Building
@@ -125,8 +136,8 @@ https://claude.ai/artifact/QKJS8qH5Dfbjzn58RStq1j
 Needs Rust (the pinned nightly in `rust-toolchain.toml` installs itself) and QEMU.
 
 ```bash
-cargo xtask test   # host unit tests, model check, long simulation, then boot self-tests in QEMU
-cargo xtask run    # boot in QEMU with the serial console on this terminal
+cargo xtask test   # host unit tests, model check, long simulation, boot self-tests, shell session
+cargo xtask run    # boot the shell in QEMU, its console on this terminal
 cargo xtask image  # just build target/superior.img
 ```
 

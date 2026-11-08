@@ -26,8 +26,10 @@ use bootloader_api::{entry_point, BootInfo};
 use core::panic::PanicInfo;
 use superior_objects::cap::{Capability, Object, Rights};
 
-/// The boot user program, built by `cargo xtask` (empty if none).
+/// The boot self-test program, built by `cargo xtask` (empty if none).
 static USER_IMAGE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/user.elf"));
+/// The shell, built by `cargo xtask` (empty if none).
+static SHELL_IMAGE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shell.elf"));
 
 pub static BOOTLOADER_CONFIG: BootloaderConfig = {
     let mut config = BootloaderConfig::new_default();
@@ -83,14 +85,83 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     #[cfg(feature = "selftest")]
     selftest(mem.untyped_caps);
 
-    if USER_IMAGE.is_empty() {
-        kprintln!("no boot user program embedded; idle");
-        halt_forever();
-    }
-    if let Err(e) = start_pingpong() {
+    // Self-test builds run the self-test programs; others boot the shell.
+    let started = if cfg!(feature = "selftest") || SHELL_IMAGE.is_empty() {
+        if USER_IMAGE.is_empty() {
+            kprintln!("no boot user program embedded; idle");
+            halt_forever();
+        }
+        start_pingpong()
+    } else {
+        start_shell()
+    };
+    if let Err(e) = started {
         panic!("starting user programs: {e}");
     }
     task::start()
+}
+
+/// The shell: one process that is also the serial driver. It gets COM1's
+/// ports and interrupt line, a notification for that interrupt, the timer
+/// notification, memory to make objects from, and the QEMU exit port for
+/// `shutdown`. Nothing else: it has no other device and no other process.
+fn start_shell() -> Result<(), &'static str> {
+    let rw = Rights::READ | Rights::WRITE;
+    let base = memory::carve(16).ok_or("no memory for the shell's untyped block")?;
+    let caps = [
+        (
+            0,
+            Capability::new(
+                Object::IoPort {
+                    base: 0x3f8,
+                    count: 8,
+                },
+                rw,
+            ),
+        ),
+        (
+            1,
+            Capability::new(
+                Object::Irq {
+                    line: interrupts::COM1_IRQ,
+                },
+                rw,
+            ),
+        ),
+        (2, Capability::new(Object::Notification { id: 2 }, rw)),
+        (
+            3,
+            Capability::new(
+                Object::Notification {
+                    id: task::TIMER_NTFN as u32,
+                },
+                Rights::READ,
+            ),
+        ),
+        (
+            4,
+            Capability::new(
+                Object::Untyped {
+                    base,
+                    size_bits: 16,
+                },
+                Rights::ALL,
+            ),
+        ),
+        (
+            5,
+            Capability::new(
+                Object::IoPort {
+                    base: 0xf4,
+                    count: 4,
+                },
+                Rights::WRITE,
+            ),
+        ),
+    ];
+    task::spawn_process(0, SHELL_IMAGE, 10, 0, &caps)?;
+    kprintln!("[ok] shell loaded (serial driver in user space)");
+    Ok(())
 }
 
 /// Three processes, each in its own address space. The server and client

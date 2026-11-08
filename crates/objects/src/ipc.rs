@@ -473,6 +473,12 @@ impl<const T: usize, const E: usize, const N: usize> Ipc<T, E, N> {
         self.threads[t as usize].state == State::BlockedReply
     }
 
+    /// Sets the message words thread `t` will see when it next returns to
+    /// user mode (results of a system call that is not IPC).
+    pub fn set_msg_of(&mut self, t: Tid, msg: [u64; MSG_WORDS]) {
+        self.threads[t as usize].msg = msg;
+    }
+
     /// Sets the status thread `t` will see when it next returns to user
     /// mode: the result of the operation it just made.
     pub fn set_status_of(&mut self, t: Tid, status: u64) {

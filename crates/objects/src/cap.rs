@@ -109,6 +109,16 @@ pub enum Object {
         base: u32,
         size_bits: u8,
     },
+    /// The right to use I/O ports `base .. base + count`. Handed out by the
+    /// kernel at boot to driver processes; never made by retype.
+    IoPort {
+        base: u16,
+        count: u16,
+    },
+    /// The right to receive one interrupt line. Handed out at boot.
+    Irq {
+        line: u8,
+    },
 }
 
 impl Object {
