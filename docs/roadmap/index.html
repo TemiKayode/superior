@@ -108,7 +108,7 @@ const PHASES = [
         { t: "User space brought up on seL4 in parallel", s: "open", ev: "Not started: the same user programs on seL4 as a fallback kernel." },
       ]},
       { name: "Exit gate", tasks: [
-        { t: "Boots to a shell on x86-64", s: "open", ev: "Not started: an interactive shell on the serial console." },
+        { t: "Boots to a shell on x86-64", s: "done", ev: "A user-space shell that is its own COM1 driver (I/O-port and IRQ capabilities). <code>cargo xtask test</code> types a session over serial — help, echo, sleep, ipc, backspace editing — checks every answer, and requires <code>shutdown</code> to power QEMU off. Also fixed a lost-signal race that hung 1 boot in 5; 16/16 clean since. <code>097c782</code>" },
         { t: "Boots to a shell on AArch64", s: "open", ev: "Not started." },
         { t: "Tier 1 IPC within 1.5× of seL4", s: "open", ev: "Round trips are timed in the self-test, but not yet compared with seL4's published figures." },
       ]},
