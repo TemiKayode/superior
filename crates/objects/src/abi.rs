@@ -120,6 +120,18 @@ pub enum Syscall {
     /// Copies the caller's slot `rsi` into slot `rdx` of the CSpace of the
     /// thread in slot `rdi`, with rights mask `r8`.
     ThreadCopyCap = 21,
+    /// Copies the caller's slot `rdx` into index `rsi` of the CNode in slot
+    /// `rdi` (Write right), with rights mask `r8` and badge `r9` (0 = keep).
+    CNodeCopy = 22,
+    /// Empties index `rsi` of the CNode in slot `rdi` (Write right).
+    CNodeDelete = 23,
+    /// Removes everything derived from index `rsi` of the CNode in slot
+    /// `rdi` (Write right).
+    CNodeRevoke = 24,
+    /// Makes the CNode in slot `rsi` the CSpace of the inactive thread in
+    /// slot `rdi`. The thread holds its own copy of the CNode capability,
+    /// so the CNode lives as long as the thread does (or until revoked).
+    ThreadSetSpace = 25,
     /// Debug build only: print a UTF-8 string. rdi = pointer, rsi = length.
     DebugPutStr = 0x100,
     /// Debug build only: report a self-test result. rdi = 0 for pass.
@@ -151,6 +163,10 @@ impl Syscall {
             19 => Syscall::ThreadResume,
             20 => Syscall::ThreadSuspend,
             21 => Syscall::ThreadCopyCap,
+            22 => Syscall::CNodeCopy,
+            23 => Syscall::CNodeDelete,
+            24 => Syscall::CNodeRevoke,
+            25 => Syscall::ThreadSetSpace,
             0x100 => Syscall::DebugPutStr,
             0x101 => Syscall::DebugSelftestDone,
             _ => return None,
@@ -228,6 +244,10 @@ pub enum FaultReply {
 
 /// Frames are 4 KiB.
 pub const FRAME_BITS: u8 = 12;
+/// A CNode holds from 2^4 to 2^8 slots, each taking 2^5 bytes.
+pub const CNODE_MIN_BITS: u64 = 4;
+pub const CNODE_MAX_BITS: u64 = 8;
+pub const CNODE_SLOT_BITS: u8 = 5;
 
 /// Kernel object types for [`Syscall::Retype`].
 #[repr(u64)]
@@ -240,6 +260,9 @@ pub enum ObjectType {
     Frame = 3,
     /// A thread, inactive until configured and resumed.
     Thread = 4,
+    /// A table of capability slots, usable as a thread's CSpace. The size
+    /// argument is the slot count in bits; each slot takes 32 bytes.
+    CNode = 5,
 }
 
 impl ObjectType {
@@ -250,6 +273,7 @@ impl ObjectType {
             2 => ObjectType::Notification,
             3 => ObjectType::Frame,
             4 => ObjectType::Thread,
+            5 => ObjectType::CNode,
             _ => return None,
         })
     }
@@ -264,6 +288,10 @@ impl ObjectType {
             ObjectType::Notification => Some(5),
             ObjectType::Frame => Some(FRAME_BITS),
             ObjectType::Thread => Some(11),
+            ObjectType::CNode if requested >= CNODE_MIN_BITS && requested <= CNODE_MAX_BITS => {
+                Some(requested as u8 + CNODE_SLOT_BITS)
+            }
+            ObjectType::CNode => None,
         }
     }
 }

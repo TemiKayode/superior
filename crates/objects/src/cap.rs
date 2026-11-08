@@ -102,6 +102,12 @@ pub enum Object {
     Thread {
         id: u32,
     },
+    /// A CNode: `1 << size_bits` slots of the kernel's capability table,
+    /// starting at `base`.
+    CNode {
+        base: u32,
+        size_bits: u8,
+    },
 }
 
 impl Object {

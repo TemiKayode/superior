@@ -751,6 +751,109 @@ fn spinner() -> ! {
     finish(false)
 }
 
+/// CNode test slots (all free again after the thread tests revoke).
+const CN: u64 = 12;
+const TCB2: u64 = 10;
+const CN_BIG: u64 = 13;
+/// The worker's signal through its CNode carries this badge.
+const CN_BADGE: u64 = 0x2;
+
+fn cnode_op(op: Syscall, cnode: u64, args: [u64; 4]) -> u64 {
+    syscall(op, cnode, args).status
+}
+
+fn tcb2(op: Syscall, args: [u64; 4]) -> u64 {
+    syscall(op, TCB2, args).status
+}
+
+/// CNodes as objects: make one, fill it, make it a new thread's CSpace,
+/// and check it lives exactly as long as some capability (or thread)
+/// refers to it.
+fn cnode_tests() -> bool {
+    use ObjectType::{CNode, Endpoint, Frame, Notification, Thread};
+    let mut pass = true;
+    let made = retype(UNTYPED, CNode, 4, CN);
+    let too_big = retype(UNTYPED, CNode, 9, CN_BIG);
+    let no_room = retype(UNTYPED, CNode, 8, CN_BIG);
+    pass &= expect(
+        "a 16-slot CNode is made; oversized or unplaceable ones are refused",
+        ok(made == 0
+            && too_big == Error::InvalidArgument.code()
+            && no_room == Error::ObjectTableFull.code()),
+        1,
+    );
+
+    let setup = [
+        retype(UNTYPED, Thread, 0, TCB2),
+        retype(UNTYPED, Frame, 0, STACK_FRAME),
+        map(STACK_FRAME, VA_STACK, true),
+        retype(UNTYPED, Notification, 0, DONE_NTFN),
+        retype(UNTYPED, Endpoint, 0, PARK_EP),
+        cnode_op(
+            Syscall::CNodeCopy,
+            CN,
+            [W_DONE, DONE_NTFN, RIGHT_WRITE, CN_BADGE],
+        ),
+        cnode_op(Syscall::CNodeCopy, CN, [W_PARK, PARK_EP, RIGHT_READ, 0]),
+    ];
+    pass &= expect(
+        "capabilities are copied (and badged) into the CNode",
+        ok(setup.iter().all(|&s| s == 0)),
+        1,
+    );
+    let out = cnode_op(Syscall::CNodeCopy, CN, [16, PARK_EP, RIGHT_READ, 0]);
+    let full = cnode_op(Syscall::CNodeCopy, CN, [W_DONE, PARK_EP, RIGHT_READ, 0]);
+    let del = cnode_op(Syscall::CNodeDelete, CN, [W_PARK, 0, 0, 0]);
+    let again = cnode_op(Syscall::CNodeCopy, CN, [W_PARK, PARK_EP, RIGHT_READ, 0]);
+    let rv = cnode_op(Syscall::CNodeRevoke, CN, [W_PARK, 0, 0, 0]);
+    pass &= expect(
+        "indexes past the end and full slots are refused; delete frees a slot",
+        ok(out == Error::InvalidArgument.code()
+            && full == Error::SlotOccupied.code()
+            && del == 0
+            && again == 0
+            && rv == 0),
+        1,
+    );
+
+    let entry = worker as *const () as u64;
+    let top = VA_STACK + 0x1000;
+    let space = tcb2(Syscall::ThreadSetSpace, [CN, 0, 0, 0]);
+    let conf = tcb2(Syscall::ThreadConfigure, [entry, top, WORKER_ARG, 5]);
+    let run = tcb2(Syscall::ThreadResume, [0; 4]);
+    let w = syscall(Syscall::Wait, DONE_NTFN, [0; 4]);
+    pass &= expect(
+        "a thread runs with the CNode as its CSpace (its signal bears the CNode's badge)",
+        ok(space == 0 && conf == 0 && run == 0 && w.status == 0 && w.badge == CN_BADGE),
+        1,
+    );
+
+    // The thread holds the CNode: deleting this capability leaves it alive.
+    let gone = syscall(Syscall::CapDelete, CN, [0; 4]).status;
+    let stop = tcb2(Syscall::ThreadSuspend, [0; 4]);
+    let go = tcb2(Syscall::ThreadResume, [0; 4]);
+    let w = syscall(Syscall::Wait, DONE_NTFN, [0; 4]);
+    pass &= expect(
+        "the CNode outlives its creator's capability while a thread uses it",
+        ok(gone == 0 && stop == 0 && go == 0 && w.status == 0 && w.badge == CN_BADGE),
+        1,
+    );
+
+    // Destroying the thread drops the last reference: the whole pool is
+    // free again, so a CNode of every chunk fits.
+    let del = syscall(Syscall::CapDelete, TCB2, [0; 4]).status;
+    let whole = retype(UNTYPED, CNode, 8, CN_BIG);
+    let rv = syscall(Syscall::CapRevoke, UNTYPED, [0; 4]).status;
+    let whole_again = retype(UNTYPED, CNode, 8, CN_BIG);
+    let rv2 = syscall(Syscall::CapRevoke, UNTYPED, [0; 4]).status;
+    pass &= expect(
+        "destroying its last user frees the CNode, and revoke frees CNodes too",
+        ok(del == 0 && whole == 0 && rv == 0 && whole_again == 0 && rv2 == 0),
+        1,
+    );
+    pass
+}
+
 fn expect(what: &str, got: u64, want: u64) -> bool {
     if got == want {
         say!("ok   {what}");
@@ -795,6 +898,7 @@ fn client() -> ! {
     pass &= frame_tests();
     pass &= fault_tests();
     pass &= thread_tests();
+    pass &= cnode_tests();
 
     // Round trips through the server.
     let (mut min, mut total) = (u64::MAX, 0u64);

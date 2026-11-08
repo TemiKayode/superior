@@ -1,0 +1,200 @@
+<title>Superior Roadmap</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&family=Fraunces:opsz,wght@9..144,600&display=swap">
+<style>
+/* Layout: a single reading column; one band per phase, tasks as rows with a status chip and the evidence that proves it. */
+:root {
+  --bg: #f6f7f5; --panel: #ffffff; --fg: #1b1f1d; --muted: #5d6662; --rule: #dde2de;
+  --done: #1f7a44; --done-bg: #e3f3e8; --part: #9a6400; --part-bg: #fbefd6; --open: #66706b; --open-bg: #eceeec;
+  --accent: #2f5d50;
+  --display: "Fraunces", Georgia, serif; --body: "IBM Plex Sans", system-ui, sans-serif; --mono: "IBM Plex Mono", ui-monospace, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg: #131715; --panel: #1b201e; --fg: #e5ebe7; --muted: #9aa49f; --rule: #2c3330;
+  --done: #5fd18d; --done-bg: #173323; --part: #f0b44c; --part-bg: #3a2c12; --open: #a0aaa5; --open-bg: #262c29;
+  --accent: #8cc7b4; color-scheme: dark } }
+:root[data-theme="dark"] {
+  --bg: #131715; --panel: #1b201e; --fg: #e5ebe7; --muted: #9aa49f; --rule: #2c3330;
+  --done: #5fd18d; --done-bg: #173323; --part: #f0b44c; --part-bg: #3a2c12; --open: #a0aaa5; --open-bg: #262c29;
+  --accent: #8cc7b4; color-scheme: dark }
+body { background: var(--bg); color: var(--fg); font-family: var(--body); font-size: 15px; line-height: 1.5;
+  padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); padding-block: 32px 64px; }
+main { max-width: 920px; margin: 0 auto; display: grid; gap: 28px; }
+header { display: grid; gap: 8px; }
+h1 { font-family: var(--display); font-size: 2.1rem; line-height: 1.1; margin: 0; text-wrap: balance; }
+.lede { color: var(--muted); margin: 0; max-width: 65ch; }
+.summary { display: flex; flex-wrap: wrap; gap: 8px 18px; font-size: 0.9rem; color: var(--muted); }
+.summary b { color: var(--fg); font-variant-numeric: tabular-nums; }
+.legend { display: flex; flex-wrap: wrap; gap: 8px; }
+section.phase { background: var(--panel); border: 1px solid var(--rule); border-radius: 10px; overflow: hidden; }
+.phase-head { display: grid; grid-template-columns: 1fr auto; gap: 4px 16px; padding: 18px 20px 14px; border-bottom: 1px solid var(--rule); }
+.phase-head h2 { font-family: var(--display); font-size: 1.3rem; margin: 0; }
+.phase-head .months { font-family: var(--mono); font-size: 0.8rem; color: var(--muted); align-self: center; }
+.phase-head .gate { grid-column: 1 / -1; font-size: 0.88rem; color: var(--muted); margin: 0; }
+.phase-head .gate span { text-transform: uppercase; letter-spacing: 0.06em; font-size: 0.72rem; font-weight: 600; color: var(--fg); margin-right: 6px; }
+.bar { grid-column: 1 / -1; height: 6px; border-radius: 3px; background: var(--open-bg); overflow: hidden; display: flex; margin-top: 6px; }
+.bar i { display: block; height: 100%; }
+.bar .d { background: var(--done); } .bar .p { background: var(--part); }
+.group { padding: 10px 20px 4px; font-size: 0.72rem; letter-spacing: 0.07em; text-transform: uppercase; font-weight: 600; color: var(--accent); }
+ul { list-style: none; margin: 0; padding: 0 0 8px; }
+li { display: grid; grid-template-columns: 92px 1fr; gap: 4px 14px; padding: 10px 20px; border-top: 1px solid var(--rule); }
+.group + ul li:first-child { border-top: 0; }
+li .what { font-weight: 500; min-width: 0; }
+li .ev { grid-column: 2; font-size: 0.85rem; color: var(--muted); min-width: 0; overflow-wrap: anywhere; }
+li .ev code { font-family: var(--mono); font-size: 0.8rem; color: var(--fg); }
+.chip { display: inline-flex; align-items: center; gap: 6px; justify-self: start; align-self: start; font-size: 0.72rem; font-weight: 600; letter-spacing: 0.04em;
+  text-transform: uppercase; padding: 3px 8px; border-radius: 999px; white-space: nowrap; }
+.chip::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+.chip.done { color: var(--done); background: var(--done-bg); }
+.chip.part { color: var(--part); background: var(--part-bg); }
+.chip.open { color: var(--open); background: var(--open-bg); }
+footer { font-size: 0.85rem; color: var(--muted); }
+a { color: var(--accent); }
+@media (max-width: 520px) { li { grid-template-columns: 1fr; } li .ev { grid-column: 1; } h1 { font-size: 1.7rem; } }
+</style>
+
+<main>
+  <header>
+    <h1>Superior Roadmap</h1>
+    <p class="lede">Every phase of the architecture plan and the work in it. A task turns green only when an automated test proves it: the host unit tests plus the boot self-test in QEMU (<code>cargo xtask test</code>).</p>
+    <div class="summary" id="summary"></div>
+    <div class="legend">
+      <span class="chip done">Done, verified</span>
+      <span class="chip part">In progress</span>
+      <span class="chip open">Not started</span>
+    </div>
+  </header>
+  <div id="phases" style="display:grid;gap:28px"></div>
+  <footer>
+    Source: <a href="https://claude.ai/artifact/QKJS8qH5Dfbjzn58RStq1j">Superior OS Architectural Specification</a>, section 11. Code: <code>github.com/TemiKayode/superior</code> (private). Updated <span id="updated"></span>.
+  </footer>
+</main>
+
+<script>
+const UPDATED = "2026-11-08";
+// s: done | part | open. ev: the evidence (commit and test) for done items, or what is left.
+const PHASES = [
+  { id: "P0", name: "Foundations", months: "Months 0–6",
+    gate: "Boots to a shell on both ISAs; Tier 1 IPC within 1.5× of published seL4 figures.",
+    groups: [
+      { name: "Toolchain and boot", tasks: [
+        { t: "Rust toolchain and x86-64 target", s: "done", ev: "Pinned nightly in <code>rust-toolchain.toml</code>, target <code>x86_64-unknown-none</code>; every build in CI of <code>cargo xtask test</code>. <code>0654537</code>" },
+        { t: "Rust bootloader on x86-64", s: "done", ev: "Boots via the Rust <code>bootloader</code> 0.11 crate under QEMU; serial console, GDT/TSS, exception handlers. <code>0654537</code>" },
+        { t: "AArch64 target and boot", s: "open", ev: "Not started: <code>aarch64-unknown-none</code> kernel booting on QEMU <code>virt</code>." },
+      ]},
+      { name: "Kernel core on x86-64", tasks: [
+        { t: "Untyped memory, retype from user space", s: "done", ev: "All RAM handed out as untyped; no kernel heap. Boot self-test makes, revokes and re-makes objects. <code>131eec1</code>" },
+        { t: "Capability table: derivation, mint, revoke, transfer", s: "done", ev: "Rights-checked lookup on every syscall; cross-CSpace derivation tree; revoke removes every copy. Host tests and boot self-test. <code>75bf760</code>" },
+        { t: "CNodes as retypable objects", s: "open", ev: "Not started: CSpaces are still fixed 16-slot windows in one kernel table." },
+        { t: "IPC: send, call, receive, reply, fast path", s: "done", ev: "20,000 call/reply round trips across address spaces in the boot self-test; 68 host tests of the engine. <code>ef3b754</code>" },
+        { t: "Notifications", s: "done", ev: "Signal/wait with badges; timer notification wakes sleepers. Boot self-test. <code>ae8cb61</code>" },
+        { t: "Timer and preemption", s: "done", ev: "LAPIC at 100 Hz; a spinner that never yields is preempted or the test times out. <code>efc94de</code>" },
+        { t: "Idle", s: "done", ev: "CPU halts with every thread blocked and the timer wakes it; checked in the self-test. <code>ae8cb61</code>" },
+        { t: "Scheduling contexts (MCS budgets, passive servers)", s: "done", ev: "A top-priority hog on 2/10 ticks; removing its budget makes the test time out. Ticks charged to callers. <code>a256717</code>" },
+        { t: "Frames and mapping", s: "done", ev: "Zeroed 4 KiB frames, read-only copies, unmap on revoke; disabling zeroing fails the test. <code>803bde1</code>" },
+        { t: "User faults as IPC", s: "done", ev: "Page, GP, opcode and divide faults go to a handler that retries, resumes or stops; 5 handled, 1 unhandled. <code>f5222da</code>" },
+        { t: "Threads as objects", s: "done", ev: "Retype, configure, copy caps, suspend/resume (Interrupted), destroy on last cap; table refilled. <code>ab4b716</code>" },
+      ]},
+      { name: "Kernel core on AArch64", tasks: [
+        { t: "Exceptions, MMU, GIC timer, context switch", s: "open", ev: "Not started." },
+        { t: "Same self-tests passing on AArch64", s: "open", ev: "Not started." },
+      ]},
+      { name: "Assurance", tasks: [
+        { t: "Formal model of capability derivation", s: "open", ev: "Not started: an exhaustively checked model of derive, mint, revoke and delete." },
+        { t: "Deterministic simulation test harness", s: "open", ev: "Not started: seeded, replayable random runs of the kernel engine with invariant checks." },
+      ]},
+      { name: "User space", tasks: [
+        { t: "User space brought up on seL4 in parallel", s: "open", ev: "Not started: the same user programs on seL4 as a fallback kernel." },
+      ]},
+      { name: "Exit gate", tasks: [
+        { t: "Boots to a shell on x86-64", s: "open", ev: "Not started: an interactive shell on the serial console." },
+        { t: "Boots to a shell on AArch64", s: "open", ev: "Not started." },
+        { t: "Tier 1 IPC within 1.5× of seL4", s: "open", ev: "Round trips are timed in the self-test, but not yet compared with seL4's published figures." },
+      ]},
+    ]},
+  { id: "P1", name: "Core runtime and drivers", months: "Months 5–15",
+    gate: "Fault injection kills any non-core service under load with no lost acknowledged writes; IPC gate passed at month 12.",
+    groups: [{ name: "Deliverables", tasks: [
+      { t: "Component Manager", s: "open" }, { t: "Memory Server", s: "open" },
+      { t: "Filesystem server", s: "open" }, { t: "Network server", s: "open" },
+      { t: "Supervision and restart", s: "open" }, { t: "Driver framework v1", s: "open" },
+      { t: "NVMe, xHCI, HID and AHCI class drivers", s: "open" },
+      { t: "First Linux Driver Environment drivers", s: "open" },
+      { t: "Two reference laptops", s: "open" },
+    ]}]},
+  { id: "P2", name: "Graphics, UX and trust chain", months: "Months 12–24",
+    gate: "Daily-drivable on reference hardware; latency budgets met; power and driver gate passed at month 24.",
+    groups: [{ name: "Deliverables", tasks: [
+      { t: "GPU drivers through LDE plus Mesa Vulkan", s: "open" },
+      { t: "Display server, compositor, toolkit and shell", s: "open" },
+      { t: "Audio and input", s: "open" }, { t: "Wi-Fi", s: "open" },
+      { t: "Suspend and resume", s: "open" },
+      { t: "Verified boot, A/B updates, signed packages", s: "open" },
+    ]}]},
+  { id: "P3", name: "Compatibility", months: "Months 18–30",
+    gate: "70% or more of the top-200 corpus passes; compatibility and restart gate passed at month 30.",
+    groups: [{ name: "Deliverables", tasks: [
+      { t: "Linux personality running Firefox, Chromium, VS Code and toolchains", s: "open" },
+      { t: "VMM with Linux and Android guests", s: "open" },
+      { t: "Wine with DXVK on the Linux personality", s: "open" },
+      { t: "x86-64 translator", s: "open" },
+    ]}]},
+  { id: "P4", name: "Intelligence and hardening", months: "Months 24–34",
+    gate: "No open critical findings; RIE-off and RIE-on configurations both pass performance gates.",
+    groups: [{ name: "Deliverables", tasks: [
+      { t: "Scheduler Policy Service with HFI", s: "open" },
+      { t: "RIE with guardrails", s: "open" }, { t: "Sentinel", s: "open" },
+      { t: "Kernel proofs of capability and IPC invariants", s: "open" },
+      { t: "IPC-interface fuzzing", s: "open" },
+      { t: "External red team and bug bounty", s: "open" },
+    ]}]},
+  { id: "P5", name: "Preview readiness", months: "Months 30–36",
+    gate: "Developer Preview criteria met.",
+    groups: [
+      { name: "Deliverables", tasks: [
+        { t: "SDK and documentation", s: "open" }, { t: "Store beta", s: "open" },
+        { t: "Hardware certification list", s: "open" }, { t: "Opt-in telemetry", s: "open" },
+        { t: "Developer programme", s: "open" },
+      ]},
+      { name: "Developer Preview criteria", tasks: [
+        { t: "Atomic install and update on every certified laptop, rollback verified", s: "open" },
+        { t: "All latency budgets met at p99 on reference hardware", s: "open" },
+        { t: "99% of injected service crashes recovered without visible failure", s: "open" },
+        { t: "Top-200 corpus at 70%+, Linux developer toolchain at 95%+", s: "open" },
+        { t: "Battery life within 10% of Linux on the same laptops", s: "open" },
+        { t: "Kernel capability and IPC invariants machine-checked", s: "open" },
+      ]},
+    ]},
+];
+
+const LABEL = { done: "Done", part: "In progress", open: "Not started" };
+const esc = s => s.replace(/&(?!amp;|lt;|gt;)/g, "&amp;");
+let all = { done: 0, part: 0, open: 0 };
+const root = document.getElementById("phases");
+for (const p of PHASES) {
+  const tasks = p.groups.flatMap(g => g.tasks);
+  const c = { done: 0, part: 0, open: 0 };
+  tasks.forEach(t => { c[t.s]++; all[t.s]++; });
+  const n = tasks.length;
+  const sec = document.createElement("section");
+  sec.className = "phase";
+  sec.id = p.id.toLowerCase();
+  let html = `<div class="phase-head"><h2>${p.id} · ${p.name}</h2><div class="months">${p.months} · ${c.done}/${n} done</div>
+    <p class="gate"><span>Exit gate</span>${p.gate}</p>
+    <div class="bar" role="img" aria-label="${c.done} of ${n} done"><i class="d" style="width:${100*c.done/n}%"></i><i class="p" style="width:${100*c.part/n}%"></i></div></div>`;
+  for (const g of p.groups) {
+    html += `<div class="group">${g.name}</div><ul>`;
+    for (const t of g.tasks) {
+      html += `<li><span class="chip ${t.s}">${LABEL[t.s]}</span><span class="what">${esc(t.t)}</span>${t.ev ? `<span class="ev">${t.ev}</span>` : ""}</li>`;
+    }
+    html += `</ul>`;
+  }
+  sec.innerHTML = html;
+  root.appendChild(sec);
+}
+const total = all.done + all.part + all.open;
+document.getElementById("summary").innerHTML =
+  `<span><b>${all.done}</b> of <b>${total}</b> tasks done</span><span><b>${all.part}</b> in progress</span><span>Current phase <b>P0 Foundations</b></span>`;
+document.getElementById("updated").textContent = UPDATED;
+</script>
