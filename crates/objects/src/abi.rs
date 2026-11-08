@@ -95,6 +95,13 @@ pub enum Syscall {
     /// Copies the capability in slot `rdi` into the empty slot `rsi` with
     /// rights `rdx` (a mask: rights only shrink) and badge `r8` (0 = keep).
     CapMint = 14,
+    /// Maps the frame in slot `rdi` at page-aligned `rsi` in the caller's
+    /// own address space; `rdx` = 1 for writable. Needs the Map right (and
+    /// Write for writable). Never executable. A frame capability is mapped
+    /// at most once; map a copy to share the frame.
+    FrameMap = 15,
+    /// Unmaps the frame in slot `rdi`.
+    FrameUnmap = 16,
     /// Debug build only: print a UTF-8 string. rdi = pointer, rsi = length.
     DebugPutStr = 0x100,
     /// Debug build only: report a self-test result. rdi = 0 for pass.
@@ -119,6 +126,8 @@ impl Syscall {
             12 => Syscall::SchedPassive,
             13 => Syscall::Retype,
             14 => Syscall::CapMint,
+            15 => Syscall::FrameMap,
+            16 => Syscall::FrameUnmap,
             0x100 => Syscall::DebugPutStr,
             0x101 => Syscall::DebugSelftestDone,
             _ => return None,
@@ -150,7 +159,12 @@ pub enum Error {
     ObjectTableFull = 9,
     /// The object was destroyed while this thread waited on it.
     ObjectDestroyed = 10,
+    /// The frame capability is already mapped, or the address is in use.
+    AlreadyMapped = 11,
 }
+
+/// Frames are 4 KiB.
+pub const FRAME_BITS: u8 = 12;
 
 /// Kernel object types for [`Syscall::Retype`].
 #[repr(u64)]
@@ -159,6 +173,8 @@ pub enum ObjectType {
     Untyped = 0,
     Endpoint = 1,
     Notification = 2,
+    /// A 4 KiB page of memory, zeroed when made.
+    Frame = 3,
 }
 
 impl ObjectType {
@@ -167,6 +183,7 @@ impl ObjectType {
             0 => ObjectType::Untyped,
             1 => ObjectType::Endpoint,
             2 => ObjectType::Notification,
+            3 => ObjectType::Frame,
             _ => return None,
         })
     }
@@ -179,6 +196,7 @@ impl ObjectType {
             ObjectType::Untyped => None,
             ObjectType::Endpoint => Some(4),
             ObjectType::Notification => Some(5),
+            ObjectType::Frame => Some(FRAME_BITS),
         }
     }
 }

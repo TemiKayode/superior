@@ -12,8 +12,8 @@ use crate::memory::{ROOT_CNODE, ROOT_CNODE_SLOTS};
 use superior_objects::elf::Elf;
 use x86_64::registers::control::Cr3;
 use x86_64::structures::paging::{
-    FrameAllocator, Mapper, OffsetPageTable, Page, PageTable, PageTableFlags as F, PhysFrame,
-    Size4KiB,
+    mapper::MapToError, FrameAllocator, Mapper, OffsetPageTable, Page, PageTable,
+    PageTableFlags as F, PhysFrame, Size4KiB,
 };
 use x86_64::{PhysAddr, VirtAddr};
 
@@ -230,6 +230,71 @@ impl AddressSpace {
         if current != self.0 {
             // SAFETY: the address space maps the kernel identically.
             unsafe { Cr3::write(self.0, flags) };
+        }
+    }
+}
+
+/// Why mapping a frame failed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MapError {
+    /// Something is already mapped at the address.
+    InUse,
+    /// No memory for an intermediate page table.
+    OutOfMemory,
+}
+
+/// Zeroes the 4 KiB frame at `pa`, so memory handed to a new owner never
+/// carries a previous owner's data.
+pub fn zero_frame(pa: u64) {
+    // SAFETY: all physical memory is mapped at PHYS_OFFSET, and the caller
+    // owns this frame (just carved from untyped memory).
+    unsafe { core::ptr::write_bytes(phys_to_virt(PhysAddr::new(pa)), 0, PAGE as usize) };
+}
+
+impl AddressSpace {
+    /// Maps the frame at `pa` at user address `va` (page-aligned, in the
+    /// user window), never executable. Intermediate page tables come from
+    /// kernel memory.
+    pub fn map_frame(&self, va: u64, pa: u64, writable: bool) -> Result<(), MapError> {
+        debug_assert!(va.is_multiple_of(PAGE) && (USER_BASE..USER_END).contains(&va));
+        let mut mapper = self.mapper();
+        let page = Page::<Size4KiB>::containing_address(VirtAddr::new(va));
+        if mapper.translate_page(page).is_ok() {
+            return Err(MapError::InUse);
+        }
+        let frame = PhysFrame::containing_address(PhysAddr::new(pa));
+        let mut flags = F::PRESENT | F::USER_ACCESSIBLE | F::NO_EXECUTE;
+        if writable {
+            flags |= F::WRITABLE;
+        }
+        let parent = F::PRESENT | F::WRITABLE | F::USER_ACCESSIBLE;
+        // SAFETY: the page is in the user window and unmapped; the frame
+        // is a user frame object, never kernel memory.
+        let flush = unsafe {
+            mapper
+                .map_to_with_table_flags(page, frame, flags, parent, &mut UntypedFrames)
+                .map_err(|e| match e {
+                    MapToError::FrameAllocationFailed => MapError::OutOfMemory,
+                    _ => MapError::InUse,
+                })?
+        };
+        // A new mapping needs no flush (nothing was cached for it).
+        flush.ignore();
+        Ok(())
+    }
+
+    /// Removes the mapping at user address `va`, flushing the TLB entry if
+    /// this address space is the active one. (Other address spaces have no
+    /// cached user entries: switching CR3 flushes non-global entries.)
+    pub fn unmap(&self, va: u64) {
+        let mut mapper = self.mapper();
+        let page = Page::<Size4KiB>::containing_address(VirtAddr::new(va));
+        if let Ok((_, flush)) = mapper.unmap(page) {
+            if Cr3::read().0 == self.0 {
+                flush.flush();
+            } else {
+                flush.ignore();
+            }
         }
     }
 }

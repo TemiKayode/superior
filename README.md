@@ -27,6 +27,12 @@ Phase 0 (foundations). Working today, under QEMU on x86-64:
   on them with an error) and makes its memory reusable. `CapMint` copies a capability
   with fewer rights or a badge. Endpoint and notification state still lives in fixed
   kernel tables (8 of each) claimed at retype, not in the carved memory.
+- Frames: retype makes 4 KiB frames, zeroed when made. `FrameMap` maps one into the
+  caller's own address space (never executable; writable only with the Write right;
+  needs the Map right), and `FrameUnmap` undoes it. Each frame capability maps once;
+  mapping copies shares memory. Deleting or revoking a frame capability unmaps it first,
+  so memory is never reused while still mapped. Intermediate page tables still come from
+  kernel memory, not from the caller's untyped.
 - Scheduling contexts (MCS): each thread owns one, unlimited unless given a budget per
   period. Budgets are charged per tick and refilled each period (periodic, not yet
   sporadic); a thread that runs dry is throttled until the refill. A passive server
@@ -54,9 +60,12 @@ Phase 0 (foundations). Working today, under QEMU on x86-64:
   spins forever on a budget of 2 ticks in 10; without the budget nothing else runs and the
   test times out. The IPC server is passive, and the kernel checks that ticks were charged
   to its callers. The client gets 64 KiB of untyped memory and makes, uses, revokes and
-  re-makes objects from it, down to filling the notification table.
+  re-makes objects from it, down to filling the notification table. It maps frames,
+  shares one through a read-only copy, and checks that revoking unmaps them and that
+  reused memory comes back zeroed.
 
-Not yet: frames and mapping memory from user space, threads and CNodes as retypable
+Not yet: page tables paid for from user untyped memory, mapping into other address
+spaces, user-level page-fault handling, threads and CNodes as retypable
 objects, scheduling-context capabilities (budgets are set at boot), sporadic refills,
 timeout faults, SMP, an IPC benchmark on real hardware.
 

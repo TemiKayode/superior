@@ -333,14 +333,15 @@ impl<const N: usize> CNode<N> {
     /// so its memory is free again (unless the kernel carved some for
     /// itself).
     pub fn revoke(&mut self, slot: usize) -> Result<usize, CapError> {
-        self.revoke_each(slot, |_| {})
+        self.revoke_each(slot, |_, _| {})
     }
 
-    /// [`CNode::revoke`], calling `removed` with each capability removed.
+    /// [`CNode::revoke`], calling `removed` with the slot and capability of
+    /// each one removed (before it is gone, so its slot can be cleaned up).
     pub fn revoke_each(
         &mut self,
         slot: usize,
-        mut removed: impl FnMut(Capability),
+        mut removed: impl FnMut(usize, Capability),
     ) -> Result<usize, CapError> {
         self.get(slot).ok_or(self.missing(slot))?;
         // Mark first, then clear: clearing as we go would cut ancestor
@@ -351,9 +352,9 @@ impl<const N: usize> CNode<N> {
             }
         }
         let mut count = 0;
-        for s in self.slots.iter_mut().filter(|s| s.doomed) {
+        for (i, s) in self.slots.iter_mut().enumerate().filter(|(_, s)| s.doomed) {
             if let Some(c) = s.cap {
-                removed(c);
+                removed(i, c);
             }
             *s = EMPTY;
             count += 1;
@@ -613,7 +614,7 @@ mod tests {
         assert_eq!(c.carve(0, 12), Err(CapError::OutOfMemory));
 
         let mut gone = std::vec::Vec::new();
-        assert_eq!(c.revoke_each(0, |cap| gone.push(cap.object)), Ok(3));
+        assert_eq!(c.revoke_each(0, |_, cap| gone.push(cap.object)), Ok(3));
         assert!(gone.contains(&Object::Endpoint { id: 2 }));
         assert_eq!(c.untyped_free(0), Some(1 << 15), "watermark reset");
         assert_eq!(c.carve(0, 15), Ok(0x8000), "memory reusable");

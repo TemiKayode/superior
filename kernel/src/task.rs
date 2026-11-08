@@ -12,7 +12,10 @@
 //!
 //! Kernel objects: user space makes endpoints, notifications and smaller
 //! untyped blocks with `Retype`, which consumes memory from an untyped
-//! capability. The endpoint and notification state itself lives in the IPC
+//! capability, and 4 KiB frames they can map into their own address space
+//! (`FrameMap`). A frame capability records where it is mapped; deleting or
+//! revoking it unmaps it first, so memory is never reused while still
+//! mapped. The endpoint and notification state itself lives in the IPC
 //! engine's fixed tables; retype claims a free entry, and the entry is
 //! freed (waking anyone blocked on it with an error) once the last
 //! capability to the object is gone. The memory consumed is real
@@ -30,7 +33,7 @@
 //! [`TIMER_NTFN`] on every tick, so a thread can sleep by waiting on it.
 
 use crate::syscall::{self, Exit, UserFrame};
-use crate::vm::AddressSpace;
+use crate::vm::{self, AddressSpace, MapError, USER_BASE, USER_END};
 use crate::{kprint, kprintln};
 use spin::{Mutex, MutexGuard};
 use superior_objects::abi::{CapTransfer, Error, ObjectType, Syscall};
@@ -73,6 +76,9 @@ struct Kernel {
     /// Endpoint and notification table entries in use by some object.
     ep_used: [bool; MAX_ENDPOINTS],
     ntfn_used: [bool; MAX_NOTIFICATIONS],
+    /// Where the frame capability in each capability-table slot is mapped:
+    /// (thread whose address space, user address).
+    mapped: [Option<(Tid, u64)>; CAP_TABLE_SLOTS],
     /// Not yet run: its frame holds start registers (entry, stack, argument),
     /// not the results of a system call, and must be resumed untouched.
     fresh: [bool; MAX_THREADS],
@@ -89,6 +95,7 @@ static KERNEL: Mutex<Kernel> = Mutex::new(Kernel {
     caps: CNode::new(),
     reply_grant: [false; MAX_THREADS],
     ep_used: [false; MAX_ENDPOINTS],
+    mapped: [None; CAP_TABLE_SLOTS],
     // The timer's notification belongs to the kernel and is never freed.
     ntfn_used: {
         let mut u = [false; MAX_NOTIFICATIONS];
@@ -210,8 +217,10 @@ pub fn handle_syscall(frame: &mut UserFrame) -> Exit {
     let msg = [frame.rsi, frame.rdx, frame.r8, frame.r9];
     let result = match Syscall::from_u64(frame.rax) {
         None => Err(Error::IllegalOperation.code()),
-        Some(Syscall::CapRevoke) => cap_op(k, cur, frame.rdi, |c, s| c.revoke(s).map(|_| ())),
-        Some(Syscall::CapDelete) => cap_op(k, cur, frame.rdi, |c, s| c.delete(s)),
+        Some(Syscall::CapRevoke) => cap_revoke(k, cur, frame.rdi),
+        Some(Syscall::CapDelete) => cap_delete(k, cur, frame.rdi),
+        Some(Syscall::FrameMap) => frame_map(k, cur, frame),
+        Some(Syscall::FrameUnmap) => frame_unmap(k, cur, frame.rdi),
         Some(Syscall::CapMint) => cap_mint(k, cur, frame),
         Some(Syscall::Retype) => retype(k, cur, frame),
         Some(Syscall::DebugPutStr) => debug_put_str(k, cur, frame.rdi, frame.rsi),
@@ -322,20 +331,88 @@ fn complete_transfers(k: &mut Kernel) {
     }
 }
 
-/// Runs a CNode operation on the caller's slot `slot`.
-fn cap_op(
-    k: &mut Kernel,
-    cur: Tid,
-    slot: u64,
-    op: impl FnOnce(&mut CNode<CAP_TABLE_SLOTS>, usize) -> Result<(), CapError>,
-) -> Result<(), u64> {
-    let s = usize::try_from(slot)
-        .ok()
-        .and_then(|s| cap_slot(cur, s))
-        .ok_or(Error::InvalidCapability.code())?;
-    let r = op(&mut k.caps, s).map_err(cap_error);
+/// `CapRevoke`: removes everything derived from the caller's slot,
+/// unmapping any frames among them first.
+fn cap_revoke(k: &mut Kernel, cur: Tid, slot: u64) -> Result<(), u64> {
+    let s = own_slot(cur, slot).ok_or(Error::InvalidCapability.code())?;
+    let mut gone = [false; CAP_TABLE_SLOTS];
+    k.caps
+        .revoke_each(s, |i, _| gone[i] = true)
+        .map_err(cap_error)?;
+    for (i, _) in gone.iter().enumerate().filter(|(_, g)| **g) {
+        unmap_slot(k, i);
+    }
     reap(k);
-    r
+    Ok(())
+}
+
+/// `CapDelete`: empties the caller's slot, unmapping a frame first.
+fn cap_delete(k: &mut Kernel, cur: Tid, slot: u64) -> Result<(), u64> {
+    let s = own_slot(cur, slot).ok_or(Error::InvalidCapability.code())?;
+    k.caps.get(s).ok_or(Error::InvalidCapability.code())?;
+    unmap_slot(k, s);
+    k.caps.delete(s).map_err(cap_error)?;
+    reap(k);
+    Ok(())
+}
+
+/// Unmaps the frame whose capability is in table slot `s`, if mapped.
+fn unmap_slot(k: &mut Kernel, s: usize) {
+    if let Some((t, va)) = k.mapped[s].take() {
+        if let Some(space) = k.spaces[t as usize] {
+            space.unmap(va);
+        }
+    }
+}
+
+/// `FrameMap`: rdi = frame slot, rsi = user address, rdx = 1 for writable.
+fn frame_map(k: &mut Kernel, cur: Tid, f: &UserFrame) -> Result<(), u64> {
+    let s = own_slot(cur, f.rdi).ok_or(Error::InvalidCapability.code())?;
+    let cap = *k.caps.get(s).ok_or(Error::InvalidCapability.code())?;
+    let Object::Frame { paddr, .. } = cap.object else {
+        return Err(Error::InvalidCapability.code());
+    };
+    let writable = match f.rdx {
+        0 => false,
+        1 => true,
+        _ => return Err(Error::InvalidArgument.code()),
+    };
+    let needed = if writable {
+        Rights::MAP | Rights::WRITE
+    } else {
+        Rights::MAP | Rights::READ
+    };
+    if !cap.rights.contains(needed) {
+        return Err(Error::InsufficientRights.code());
+    }
+    let va = f.rsi;
+    if !va.is_multiple_of(4096) || !(USER_BASE..USER_END).contains(&va) {
+        return Err(Error::InvalidArgument.code());
+    }
+    if k.mapped[s].is_some() {
+        return Err(Error::AlreadyMapped.code());
+    }
+    let space = k.spaces[cur as usize].ok_or(Error::IllegalOperation.code())?;
+    space.map_frame(va, paddr, writable).map_err(|e| match e {
+        MapError::InUse => Error::AlreadyMapped.code(),
+        MapError::OutOfMemory => Error::NotEnoughMemory.code(),
+    })?;
+    k.mapped[s] = Some((cur, va));
+    Ok(())
+}
+
+/// `FrameUnmap`: rdi = frame slot.
+fn frame_unmap(k: &mut Kernel, cur: Tid, slot: u64) -> Result<(), u64> {
+    let s = own_slot(cur, slot).ok_or(Error::InvalidCapability.code())?;
+    let cap = k.caps.get(s).ok_or(Error::InvalidCapability.code())?;
+    if !matches!(cap.object, Object::Frame { .. }) {
+        return Err(Error::InvalidCapability.code());
+    }
+    if k.mapped[s].is_none() {
+        return Err(Error::InvalidArgument.code());
+    }
+    unmap_slot(k, s);
+    Ok(())
 }
 
 fn cap_error(e: CapError) -> u64 {
@@ -414,6 +491,7 @@ fn retype(k: &mut Kernel, cur: Tid, f: &UserFrame) -> Result<(), u64> {
         ObjectType::Untyped => None,
         ObjectType::Endpoint => Some(free(&k.ep_used).ok_or(Error::ObjectTableFull.code())?),
         ObjectType::Notification => Some(free(&k.ntfn_used).ok_or(Error::ObjectTableFull.code())?),
+        ObjectType::Frame => None,
     };
     let base = k.caps.carve(src, bits).map_err(cap_error)?;
     let ipc_rights = Rights::READ | Rights::WRITE | Rights::GRANT | Rights::GRANT_REPLY;
@@ -425,6 +503,16 @@ fn retype(k: &mut Kernel, cur: Tid, f: &UserFrame) -> Result<(), u64> {
         (ObjectType::Notification, Some(id)) => {
             k.ntfn_used[id] = true;
             Capability::new(Object::Notification { id: id as u32 }, ipc_rights)
+        }
+        (ObjectType::Frame, _) => {
+            vm::zero_frame(base);
+            Capability::new(
+                Object::Frame {
+                    paddr: base,
+                    size_bits: bits,
+                },
+                Rights::READ | Rights::WRITE | Rights::GRANT | Rights::MAP,
+            )
         }
         _ => Capability::new(
             Object::Untyped {

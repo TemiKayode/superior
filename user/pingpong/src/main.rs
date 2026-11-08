@@ -8,8 +8,9 @@
 //! - role 1, the **client**: holds a badged copy with Write only. It
 //!   checks that the kernel enforces rights, receives a capability in a
 //!   reply, uses it, watches the server revoke it, makes its own kernel
-//!   objects from untyped memory and reclaims it, then times call/reply
-//!   round trips and reports the result.
+//!   objects from untyped memory and reclaims it, maps frames of memory
+//!   into its address space, then times call/reply round trips and reports
+//!   the result.
 //! - role 2, the **spinner**: spins without a system call. It shares the
 //!   client's priority, so the client only runs if the kernel preempts it.
 //!   Then it tells the client it is done and blocks for good.
@@ -56,7 +57,18 @@ const SUB_UNTYPED: u64 = 8;
 const MINTED: u64 = 9;
 const SUB_NTFN: u64 = 10;
 /// Rights bits (see `superior_objects::cap::Rights`).
+const RIGHT_READ: u64 = 1 << 0;
 const RIGHT_WRITE: u64 = 1 << 1;
+const RIGHT_MAP: u64 = 1 << 4;
+/// Frame slots and where to map them: well clear of this program's image
+/// (at the window base) and its stack (just below base + 2 GiB).
+const FRAME_A: u64 = 6;
+const FRAME_RO: u64 = 7;
+const FRAME_B: u64 = 8;
+const USER_BASE: u64 = 0x7000_0000_0000;
+const VA_A: u64 = USER_BASE + 0x4000_0000;
+const VA_RO: u64 = VA_A + 0x1000;
+const WORDS: usize = 512;
 const RIGHTS_ALL: u64 = 0b1_1111;
 /// Requests in `msg[1]`.
 const OP_ECHO: u64 = 0;
@@ -312,6 +324,104 @@ fn retype_tests() -> bool {
     pass
 }
 
+fn map(frame: u64, va: u64, writable: bool) -> u64 {
+    syscall(Syscall::FrameMap, frame, [va, writable as u64, 0, 0]).status
+}
+
+fn page(va: u64) -> *mut u64 {
+    va as *mut u64
+}
+
+/// Reads every word of the page at `va`; true if all equal `f(i)`.
+fn page_is(va: u64, f: impl Fn(usize) -> u64) -> bool {
+    // SAFETY: the caller has just mapped a readable frame at `va`.
+    (0..WORDS).all(|i| unsafe { page(va).add(i).read_volatile() } == f(i))
+}
+
+fn pattern(i: usize) -> u64 {
+    0x5eed_0000_0000 ^ (i as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+}
+
+/// Frames: memory a thread maps into its own address space.
+fn frame_tests() -> bool {
+    use ObjectType::Frame;
+    let mut pass = true;
+    let in_use = Error::AlreadyMapped.code();
+
+    let made = retype(UNTYPED, Frame, 0, FRAME_A);
+    let mapped = map(FRAME_A, VA_A, true);
+    let zeroed = mapped == 0 && page_is(VA_A, |_| 0);
+    pass &= expect(
+        "a retyped frame maps writable and starts zeroed",
+        ok(made == 0 && zeroed),
+        1,
+    );
+    for i in 0..WORDS {
+        // SAFETY: FRAME_A is mapped writable at VA_A.
+        unsafe { page(VA_A).add(i).write_volatile(pattern(i)) };
+    }
+    pass &= expect("the mapped frame holds data", ok(page_is(VA_A, pattern)), 1);
+
+    let minted = mint(FRAME_A, FRAME_RO, RIGHT_READ | RIGHT_MAP, 0);
+    let rw = map(FRAME_RO, VA_RO, true);
+    let ro = map(FRAME_RO, VA_RO, false);
+    pass &= expect(
+        "a read-only copy cannot map writable, but maps read-only",
+        ok(minted == 0 && rw == Error::InsufficientRights.code() && ro == 0),
+        1,
+    );
+    pass &= expect(
+        "both mappings see the same memory",
+        ok(page_is(VA_RO, pattern)),
+        1,
+    );
+
+    pass &= expect(
+        "a frame capability maps only once",
+        map(FRAME_A, VA_A + 0x2000, true),
+        in_use,
+    );
+    let made = retype(UNTYPED, Frame, 0, FRAME_B);
+    let over = map(FRAME_B, VA_A, true);
+    let code = map(FRAME_B, USER_BASE, true);
+    pass &= expect(
+        "mapping over a used address (data or program code) is refused",
+        ok(made == 0 && over == in_use && code == in_use),
+        1,
+    );
+    let unaligned = map(FRAME_B, VA_A + 0x2008, true);
+    let kernel = map(FRAME_B, 0xffff_8000_0000_0000, true);
+    pass &= expect(
+        "unaligned and kernel addresses are refused",
+        ok(unaligned == Error::InvalidArgument.code() && kernel == Error::InvalidArgument.code()),
+        1,
+    );
+
+    let un = syscall(Syscall::FrameUnmap, FRAME_RO, [0; 4]).status;
+    let again = map(FRAME_RO, VA_RO, false);
+    pass &= expect(
+        "unmap frees the address for another mapping",
+        ok(un == 0 && again == 0 && page_is(VA_RO, pattern)),
+        1,
+    );
+
+    // Revoking the untyped block destroys the frames, which must unmap
+    // them; the same memory then comes back zeroed in a new frame.
+    let rv = syscall(Syscall::CapRevoke, UNTYPED, [0; 4]).status;
+    let made = retype(UNTYPED, Frame, 0, FRAME_A);
+    let remap = map(FRAME_A, VA_A, true);
+    let made_b = retype(UNTYPED, Frame, 0, FRAME_B);
+    let freed = map(FRAME_B, VA_RO, false);
+    pass &= expect(
+        "revoke unmaps every copy's mapping, and reused memory comes back zeroed",
+        ok(rv == 0 && made == 0 && remap == 0 && page_is(VA_A, |_| 0) && made_b == 0 && freed == 0),
+        1,
+    );
+    let rv = syscall(Syscall::CapRevoke, UNTYPED, [0; 4]).status;
+    pass &= expect("cleanup revoke", rv, 0);
+    pass
+}
+
 /// Calls the server with request `op`, offering `accept` for a capability.
 fn request(op: u64, accept: Option<u16>) -> Ret {
     syscall_x(
@@ -457,6 +567,7 @@ fn client() -> ! {
     );
     pass &= transfer_tests();
     pass &= retype_tests();
+    pass &= frame_tests();
 
     // Round trips through the server.
     let (mut min, mut total) = (u64::MAX, 0u64);
