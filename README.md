@@ -33,6 +33,11 @@ Phase 0 (foundations). Working today, under QEMU on x86-64:
   mapping copies shares memory. Deleting or revoking a frame capability unmaps it first,
   so memory is never reused while still mapped. Intermediate page tables still come from
   kernel memory, not from the caller's untyped.
+- User faults as messages: a thread names a fault endpoint (`SetFaultHandler`); a page
+  fault, general-protection fault, invalid opcode or divide error in user mode becomes a
+  `Call` to it (kind, address, rip, error code). The handler's reply retries the
+  instruction, resumes at a new rip with a value in `rax`, or stops the thread. A thread
+  with no handler is stopped and logged; a kernel-mode fault still panics.
 - Scheduling contexts (MCS): each thread owns one, unlimited unless given a budget per
   period. Budgets are charged per tick and refilled each period (periodic, not yet
   sporadic); a thread that runs dry is throttled until the refill. A passive server
@@ -62,10 +67,12 @@ Phase 0 (foundations). Working today, under QEMU on x86-64:
   to its callers. The client gets 64 KiB of untyped memory and makes, uses, revokes and
   re-makes objects from it, down to filling the notification table. It maps frames,
   shares one through a read-only copy, and checks that revoking unmaps them and that
-  reused memory comes back zeroed.
+  reused memory comes back zeroed. The server doubles as the client's fault handler and
+  emulates a faulting load, a store to a read-only page, `hlt` and `ud2`; the spinner
+  ends by faulting with no handler and is stopped.
 
 Not yet: page tables paid for from user untyped memory, mapping into other address
-spaces, user-level page-fault handling, threads and CNodes as retypable
+spaces, threads and CNodes as retypable
 objects, scheduling-context capabilities (budgets are set at boot), sporadic refills,
 timeout faults, SMP, an IPC benchmark on real hardware.
 

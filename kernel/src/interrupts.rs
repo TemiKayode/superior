@@ -1,22 +1,30 @@
 //! Interrupt descriptor table: CPU exception handlers.
 //!
-//! In the finished kernel, a fault taken in user mode becomes a fault
-//! message to the faulting thread's handler (its supervisor). A fault in
-//! kernel mode is always a kernel bug, so for now every handler logs and
-//! halts.
+//! A fault taken in user mode becomes a fault message to the faulting
+//! thread's handler (see `task::handle_fault`). A fault in kernel mode is
+//! always a kernel bug and panics.
 
 use crate::{apic, gdt, kprintln, syscall};
 use spin::Lazy;
-use x86_64::registers::control::Cr2;
-use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
+use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame};
 use x86_64::VirtAddr;
 
 static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
     let mut idt = InterruptDescriptorTable::new();
     idt.breakpoint.set_handler_fn(breakpoint);
-    idt.general_protection_fault
-        .set_handler_fn(general_protection);
-    idt.page_fault.set_handler_fn(page_fault);
+    // SAFETY: each entry is a naked stub that saves a full UserFrame and
+    // leaves through return_to_user.
+    unsafe {
+        let addr = |f: unsafe extern "C" fn()| VirtAddr::new(f as *const () as u64);
+        idt.page_fault
+            .set_handler_addr(addr(syscall::page_fault_entry));
+        idt.general_protection_fault
+            .set_handler_addr(addr(syscall::general_protection_entry));
+        idt.invalid_opcode
+            .set_handler_addr(addr(syscall::invalid_opcode_entry));
+        idt.divide_error
+            .set_handler_addr(addr(syscall::divide_error_entry));
+    }
     // SAFETY: the IST index refers to a stack set up in gdt::TSS and used
     // by no other handler.
     unsafe {
@@ -73,15 +81,6 @@ extern "x86-interrupt" fn breakpoint(frame: InterruptStackFrame) {
 
 /// A spurious APIC interrupt needs no EOI and no action.
 extern "x86-interrupt" fn spurious(_frame: InterruptStackFrame) {}
-
-extern "x86-interrupt" fn general_protection(frame: InterruptStackFrame, code: u64) {
-    panic!("general protection fault (code {code:#x})\n{frame:#?}");
-}
-
-extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, code: PageFaultErrorCode) {
-    let addr = Cr2::read_raw();
-    panic!("kernel page fault at {addr:#x} ({code:?})\n{frame:#?}");
-}
 
 extern "x86-interrupt" fn double_fault(frame: InterruptStackFrame, _code: u64) -> ! {
     panic!("double fault\n{frame:#?}");

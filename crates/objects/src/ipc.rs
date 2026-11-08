@@ -329,6 +329,20 @@ impl<const T: usize, const E: usize, const N: usize> Ipc<T, E, N> {
         self.threads[t as usize].caller
     }
 
+    /// Stops the current thread for good (it becomes inactive), e.g. after
+    /// a fault nobody handles. Anything it owed or awaited is dropped.
+    pub fn suspend_current(&mut self) {
+        if let Some(c) = self.current.take() {
+            let tcb = &mut self.threads[c as usize];
+            tcb.state = State::Inactive;
+            if let Some(caller) = tcb.caller.take() {
+                self.threads[caller as usize].status = Error::ReplyAbandoned.code();
+                self.make_ready(caller);
+            }
+            self.schedule();
+        }
+    }
+
     /// Sets the status thread `t` will see when it next returns to user
     /// mode: the result of the operation it just made.
     pub fn set_status_of(&mut self, t: Tid, status: u64) {
@@ -1394,5 +1408,20 @@ mod tests {
         k.destroy_notification(2).unwrap();
         k.wait(2).unwrap();
         assert_eq!(k.current(), None, "pending bits were discarded");
+    }
+    #[test]
+    fn suspend_current_stops_it_and_releases_its_caller() {
+        let mut k = K::new();
+        k.spawn(SERVER, 10).unwrap();
+        k.spawn(CLIENT, 5).unwrap();
+        k.schedule();
+        k.recv(0, true).unwrap();
+        k.call(0, 0, [0; 4]).unwrap();
+        assert_eq!(k.current(), Some(SERVER));
+        k.suspend_current();
+        assert_eq!(k.thread(SERVER).state, State::Inactive);
+        assert_eq!(k.current(), Some(CLIENT));
+        assert_eq!(k.thread(CLIENT).status, Error::ReplyAbandoned.code());
+        assert!(!k.tick() || k.current() == Some(CLIENT));
     }
 }

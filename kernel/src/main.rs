@@ -106,7 +106,8 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 /// CPU only if the timer preempts the spinner, so the test passing proves
 /// preemption.
 ///
-/// Afterwards the spinner signals the client and parks; the client then
+/// Afterwards the spinner signals the client and stops itself with a fault
+/// it has no handler for; the client then
 /// sleeps on the timer notification with every other thread blocked, so
 /// the CPU must idle and the timer must wake it.
 fn start_pingpong() -> Result<(), &'static str> {
@@ -126,16 +127,12 @@ fn start_pingpong() -> Result<(), &'static str> {
         Rights::READ,
     );
     let spinner_done = Object::Notification { id: 1 };
-    let park = Object::Notification { id: 2 };
     task::spawn_process(
         1,
         USER_IMAGE,
         5,
         2,
-        &[
-            (0, Capability::new(spinner_done, Rights::WRITE)),
-            (1, Capability::new(park, Rights::READ)),
-        ],
+        &[(0, Capability::new(spinner_done, Rights::WRITE))],
     )?;
     task::spawn_process(
         2,
@@ -145,6 +142,8 @@ fn start_pingpong() -> Result<(), &'static str> {
         &[(1, timer), (2, Capability::new(spinner_done, Rights::READ))],
     )?;
     task::derive_cap(0, 0, 2, 0, Rights::WRITE | Rights::GRANT_REPLY, Some(0xC1))?;
+    // The server is also the client's fault handler, told apart by badge.
+    task::derive_cap(0, 0, 2, 11, Rights::WRITE, Some(0xFA))?;
     // 64 KiB of untyped memory for the client to make its own objects from.
     let base = memory::carve(16).ok_or("no memory for the client's untyped block")?;
     task::grant_root(

@@ -36,7 +36,7 @@ use crate::syscall::{self, Exit, UserFrame};
 use crate::vm::{self, AddressSpace, MapError, USER_BASE, USER_END};
 use crate::{kprint, kprintln};
 use spin::{Mutex, MutexGuard};
-use superior_objects::abi::{CapTransfer, Error, ObjectType, Syscall};
+use superior_objects::abi::{CapTransfer, Error, FaultKind, FaultReply, ObjectType, Syscall};
 use superior_objects::cap::{CNode, CapError, Capability, Object, Rights};
 use superior_objects::ipc::{Ipc, Tid};
 use x86_64::instructions::interrupts;
@@ -61,6 +61,9 @@ struct Stats {
     preemptions: u64,
     /// Times the CPU halted because no thread could run.
     idle_halts: u64,
+    /// User faults sent to a handler, and faults that stopped a thread.
+    faults_handled: u64,
+    faults_unhandled: u64,
 }
 
 struct Kernel {
@@ -79,6 +82,10 @@ struct Kernel {
     /// Where the frame capability in each capability-table slot is mapped:
     /// (thread whose address space, user address).
     mapped: [Option<(Tid, u64)>; CAP_TABLE_SLOTS],
+    /// Each thread's fault handler: endpoint and badge.
+    fault_ep: [Option<(u16, u64)>; MAX_THREADS],
+    /// Blocked in a fault call: the reply says how to resume.
+    in_fault: [bool; MAX_THREADS],
     /// Not yet run: its frame holds start registers (entry, stack, argument),
     /// not the results of a system call, and must be resumed untouched.
     fresh: [bool; MAX_THREADS],
@@ -96,6 +103,8 @@ static KERNEL: Mutex<Kernel> = Mutex::new(Kernel {
     reply_grant: [false; MAX_THREADS],
     ep_used: [false; MAX_ENDPOINTS],
     mapped: [None; CAP_TABLE_SLOTS],
+    fault_ep: [None; MAX_THREADS],
+    in_fault: [false; MAX_THREADS],
     // The timer's notification belongs to the kernel and is never freed.
     ntfn_used: {
         let mut u = [false; MAX_NOTIFICATIONS];
@@ -108,6 +117,8 @@ static KERNEL: Mutex<Kernel> = Mutex::new(Kernel {
         ticks: 0,
         preemptions: 0,
         idle_halts: 0,
+        faults_handled: 0,
+        faults_unhandled: 0,
     },
 });
 
@@ -221,6 +232,7 @@ pub fn handle_syscall(frame: &mut UserFrame) -> Exit {
         Some(Syscall::CapDelete) => cap_delete(k, cur, frame.rdi),
         Some(Syscall::FrameMap) => frame_map(k, cur, frame),
         Some(Syscall::FrameUnmap) => frame_unmap(k, cur, frame.rdi),
+        Some(Syscall::SetFaultHandler) => set_fault_handler(k, cur, frame.rdi),
         Some(Syscall::CapMint) => cap_mint(k, cur, frame),
         Some(Syscall::Retype) => retype(k, cur, frame),
         Some(Syscall::DebugPutStr) => debug_put_str(k, cur, frame.rdi, frame.rsi),
@@ -275,6 +287,86 @@ pub fn handle_timer(frame: &mut UserFrame) -> Exit {
     resume(guard, cur, frame)
 }
 
+/// A CPU exception. From user mode it becomes a `Call` from the faulting
+/// thread to its fault handler, or stops the thread if it has none; in
+/// kernel mode it is a kernel bug.
+pub fn handle_fault(frame: &mut UserFrame, kind: FaultKind, code: u64) -> Exit {
+    let addr = match kind {
+        FaultKind::PageFault => x86_64::registers::control::Cr2::read_raw(),
+        _ => 0,
+    };
+    if !frame.is_user_mode() {
+        panic!(
+            "kernel {kind:?} at rip {:#x}, address {addr:#x}, code {code:#x}",
+            frame.rip
+        );
+    }
+    let mut guard = KERNEL.lock();
+    let k = &mut *guard;
+    let cur = k.ipc.current().expect("user fault with no current thread");
+    k.frames[cur as usize] = *frame;
+    // Resume (if ever) with every register exactly as it was.
+    k.preempted[cur as usize] = true;
+    match k.fault_ep[cur as usize] {
+        Some((ep, badge)) => {
+            k.stats.faults_handled += 1;
+            k.in_fault[cur as usize] = true;
+            k.ipc.set_transfer(CapTransfer::NONE);
+            let msg = [kind as u64, addr, frame.rip, code];
+            if k.ipc.call(ep, badge, msg).is_err() {
+                k.in_fault[cur as usize] = false;
+                stop_thread(k, cur, kind, addr, frame.rip);
+            }
+        }
+        None => stop_thread(k, cur, kind, addr, frame.rip),
+    }
+    resume(guard, cur, frame)
+}
+
+fn stop_thread(k: &mut Kernel, t: Tid, kind: FaultKind, addr: u64, rip: u64) {
+    kprintln!("[fault] thread {t}: unhandled {kind:?} at rip {rip:#x}, address {addr:#x}; stopped");
+    k.stats.faults_unhandled += 1;
+    k.ipc.suspend_current();
+}
+
+/// Applies a fault handler's reply to thread `t`. Returns false if the
+/// thread must stop instead of resuming.
+fn apply_fault_reply(k: &mut Kernel, t: Tid) -> bool {
+    let tcb = k.ipc.thread(t);
+    if tcb.status != 0 {
+        return false; // the handler went away without replying
+    }
+    let msg = tcb.msg;
+    match msg[0] {
+        x if x == FaultReply::Retry as u64 => true,
+        x if x == FaultReply::ResumeAt as u64 => {
+            // iretq to a non-canonical rip would fault in the kernel.
+            if !(USER_BASE..USER_END).contains(&msg[1]) {
+                return false;
+            }
+            let f = &mut k.frames[t as usize];
+            f.rip = msg[1];
+            f.rax = msg[2];
+            true
+        }
+        _ => false,
+    }
+}
+
+/// `SetFaultHandler`: rdi = slot of an endpoint capability with Write.
+fn set_fault_handler(k: &mut Kernel, cur: Tid, slot: u64) -> Result<(), u64> {
+    let s = own_slot(cur, slot).ok_or(Error::InvalidCapability.code())?;
+    let cap = *k.caps.get(s).ok_or(Error::InvalidCapability.code())?;
+    let Object::Endpoint { id } = cap.object else {
+        return Err(Error::InvalidCapability.code());
+    };
+    if !cap.rights.contains(Rights::WRITE) {
+        return Err(Error::InsufficientRights.code());
+    }
+    k.fault_ep[cur as usize] = Some((id as u16, cap.badge));
+    Ok(())
+}
+
 /// Loads the registers of the thread the IPC engine chose into `frame`,
 /// switches address space if needed, and says how to return to it. If no
 /// thread can run, halts until an interrupt makes one runnable.
@@ -282,6 +374,13 @@ fn resume(mut guard: MutexGuard<'_, Kernel>, cur: Tid, frame: &mut UserFrame) ->
     let next = loop {
         guard.ipc.schedule();
         if let Some(next) = guard.ipc.current() {
+            let k = &mut *guard;
+            if core::mem::take(&mut k.in_fault[next as usize]) && !apply_fault_reply(k, next) {
+                kprintln!("[fault] thread {next}: handler said stop (or failed); stopped");
+                k.stats.faults_unhandled += 1;
+                k.ipc.suspend_current();
+                continue;
+            }
             break next;
         }
         guard.stats.idle_halts += 1;
@@ -436,6 +535,13 @@ fn reap(k: &mut Kernel) {
             .any(|c| c.object == Object::Endpoint { id: id as u32 });
         if k.ep_used[id] && !live {
             k.ep_used[id] = false;
+            // A fault handler naming this endpoint must not follow its id
+            // to whatever object reuses the table entry.
+            for h in k.fault_ep.iter_mut() {
+                if matches!(h, Some((e, _)) if *e as usize == id) {
+                    *h = None;
+                }
+            }
             let _ = k.ipc.destroy_endpoint(id as u16);
         }
     }
@@ -663,6 +769,7 @@ fn selftest_done(cur: Tid, code: u64, stats: Stats) -> ! {
         ticks,
         preemptions,
         idle_halts,
+        ..
     } = stats;
     if code == 0 {
         kprintln!("[pass] user self-test reported success (thread {cur})");
@@ -681,6 +788,22 @@ fn selftest_done(cur: Tid, code: u64, stats: Stats) -> ! {
     let code = if SCHED_OK.load(core::sync::atomic::Ordering::Relaxed) {
         code
     } else {
+        code.max(1)
+    };
+    // The client's faults all went to its handler; the spinner's one
+    // fault had no handler and stopped it.
+    let code = if stats.faults_handled > 0 && stats.faults_unhandled == 1 {
+        kprintln!(
+            "[pass] faults: {} handled by IPC, 1 unhandled stopped its thread",
+            stats.faults_handled
+        );
+        code
+    } else {
+        kprintln!(
+            "[fail] faults: {} handled, {} unhandled (want >0 and 1)",
+            stats.faults_handled,
+            stats.faults_unhandled
+        );
         code.max(1)
     };
     // The client sleeps on the timer notification after every other

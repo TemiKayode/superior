@@ -13,7 +13,11 @@
 //!   the result.
 //! - role 2, the **spinner**: spins without a system call. It shares the
 //!   client's priority, so the client only runs if the kernel preempts it.
-//!   Then it tells the client it is done and blocks for good.
+//!   Then it tells the client it is done and touches unmapped memory with
+//!   no fault handler, which stops it.
+//!
+//! The server is also the client's fault handler: faults arrive as calls
+//! with the fault badge, and it emulates or skips the faulting instruction.
 //!
 //! - role 3, the **hog**: spins forever above every other thread. Only its
 //!   scheduling context's budget (2 ticks in 10) lets anything else run.
@@ -30,16 +34,22 @@
 
 use core::arch::asm;
 use core::fmt::{self, Write};
-use superior_objects::abi::{CapTransfer, Error, MSG_WORDS, ObjectType, Syscall};
+use superior_objects::abi::{
+    CapTransfer, Error, FaultKind, FaultReply, MSG_WORDS, ObjectType, Syscall,
+};
 
 const EP: u64 = 0;
 const EMPTY_SLOT: u64 = 5;
 /// Client: the timer notification and the spinner's done signal.
 const TIMER: u64 = 1;
 const SPINNER_DONE: u64 = 2;
-/// Spinner: its done signal and a notification nobody signals.
+/// Spinner: its done signal.
 const DONE_OUT: u64 = 0;
-const PARK: u64 = 1;
+/// Client: a badged endpoint capability that makes the server its fault
+/// handler, and an address nothing is mapped at.
+const FAULT_EP: u64 = 11;
+const FAULT_BADGE: u64 = 0xFA;
+const UNMAPPED: u64 = 0x7000_6000_0000;
 const SPIN_ITERATIONS: u64 = 100_000_000;
 const SLEEP_TICKS: u64 = 5;
 /// Server: the notification it hands out.
@@ -189,6 +199,10 @@ fn server() -> ! {
     syscall(Syscall::SchedPassive, 0, [0; 4]);
     let mut r = syscall(Syscall::Recv, EP, [0; 4]);
     loop {
+        if r.badge == FAULT_BADGE {
+            r = syscall(Syscall::ReplyRecv, EP, fault_reply(r.msg));
+            continue;
+        }
         let (reply, xfer) = match r.msg[1] {
             OP_GIVE => (
                 [0; 4],
@@ -305,7 +319,9 @@ fn retype_tests() -> bool {
     // The kernel's notification table is finite; revoking frees entries.
     let mut made = 0;
     let mut last = 0;
-    for slot in NEW_NTFN..=SUB_NTFN {
+    // Enough empty slots to outnumber the free table entries (slot 11
+    // holds the fault endpoint).
+    for slot in [6, 7, 8, 9, 10, 12, 13, 14, 15] {
         last = retype(UNTYPED, Notification, 0, slot);
         if last != 0 {
             break;
@@ -422,6 +438,85 @@ fn frame_tests() -> bool {
     pass
 }
 
+/// The server as fault handler. It knows the client's test instructions
+/// (a 3-byte load or store, `hlt`, `ud2`) and skips them, handing back in
+/// `rax` what the kernel reported so the client can check it.
+fn fault_reply([kind, addr, rip, code]: [u64; 4]) -> [u64; 4] {
+    let resume = |len: u64, rax: u64| [FaultReply::ResumeAt as u64, rip + len, rax, 0];
+    match FaultKind::from_u64(kind) {
+        Some(FaultKind::PageFault) if code & 2 != 0 => resume(3, code),
+        Some(FaultKind::PageFault) => resume(3, addr),
+        Some(FaultKind::GeneralProtection) => resume(1, kind),
+        Some(FaultKind::InvalidOpcode) => resume(2, kind),
+        _ => [FaultReply::Stop as u64, 0, 0, 0],
+    }
+}
+
+/// Faults: delivered to the handler as IPC, resumed by its reply.
+fn fault_tests() -> bool {
+    let mut pass = true;
+    pass &= expect(
+        "the server becomes this thread's fault handler",
+        syscall(Syscall::SetFaultHandler, FAULT_EP, [0; 4]).status,
+        0,
+    );
+
+    let (value, kept): (u64, u64);
+    // SAFETY: the load faults; the handler skips it and supplies rax.
+    // `mov rax, [rdi]` is exactly 3 bytes (48 8b 07).
+    unsafe {
+        asm!(
+            "mov rax, qword ptr [rdi]",
+            in("rdi") UNMAPPED,
+            out("rax") value,
+            inout("r12") 0x1234_5678u64 => kept,
+            options(nostack),
+        );
+    }
+    pass &= expect(
+        "a page fault reaches the handler with its address, and the thread resumes",
+        ok(value == UNMAPPED && kept == 0x1234_5678),
+        1,
+    );
+
+    // A store to a read-only mapping: error code present|write|user = 7.
+    use ObjectType::Frame;
+    let made = retype(UNTYPED, Frame, 0, FRAME_A);
+    let ro = mint(FRAME_A, FRAME_RO, RIGHT_READ | RIGHT_MAP, 0);
+    let mapped = map(FRAME_RO, VA_RO, false);
+    let code: u64;
+    // SAFETY: the store faults (read-only page); the handler skips it.
+    // `mov [rdi], rax` is exactly 3 bytes (48 89 07).
+    unsafe {
+        asm!(
+            "mov qword ptr [rdi], rax",
+            in("rdi") VA_RO,
+            inout("rax") 0u64 => code,
+            options(nostack),
+        );
+    }
+    let untouched = page_is(VA_RO, |_| 0);
+    let rv = syscall(Syscall::CapRevoke, UNTYPED, [0; 4]).status;
+    pass &= expect(
+        "a store to a read-only page faults as a write, and memory is untouched",
+        ok(made == 0 && ro == 0 && mapped == 0 && code == 7 && untouched && rv == 0),
+        1,
+    );
+
+    let (gp, ud): (u64, u64);
+    // SAFETY: both instructions fault in user mode; the handler skips them.
+    unsafe {
+        asm!("hlt", inout("rax") 0u64 => gp, options(nostack, nomem));
+        asm!("ud2", inout("rax") 0u64 => ud, options(nostack, nomem));
+    }
+    pass &= expect(
+        "a privileged instruction and an invalid opcode reach the handler",
+        ok(gp == FaultKind::GeneralProtection as u64 && ud == FaultKind::InvalidOpcode as u64),
+        1,
+    );
+    pass
+}
+
 /// Calls the server with request `op`, offering `accept` for a capability.
 fn request(op: u64, accept: Option<u16>) -> Ret {
     syscall_x(
@@ -521,9 +616,11 @@ fn spinner() -> ! {
         n = core::hint::black_box(n + 1);
     }
     syscall(Syscall::Signal, DONE_OUT, [0; 4]);
-    loop {
-        syscall(Syscall::Wait, PARK, [0; 4]);
-    }
+    // No fault handler: the kernel stops this thread here.
+    // SAFETY: deliberately faults; nothing is mapped at UNMAPPED.
+    unsafe { core::ptr::read_volatile(UNMAPPED as *const u64) };
+    put_str("FAIL spinner survived an unhandled fault\n");
+    finish(false)
 }
 
 fn expect(what: &str, got: u64, want: u64) -> bool {
@@ -568,6 +665,7 @@ fn client() -> ! {
     pass &= transfer_tests();
     pass &= retype_tests();
     pass &= frame_tests();
+    pass &= fault_tests();
 
     // Round trips through the server.
     let (mut min, mut total) = (u64::MAX, 0u64);

@@ -102,6 +102,11 @@ pub enum Syscall {
     FrameMap = 15,
     /// Unmaps the frame in slot `rdi`.
     FrameUnmap = 16,
+    /// Makes the endpoint in slot `rdi` (Write right needed) the caller's
+    /// fault handler: a user-mode fault becomes a `Call` to it with the
+    /// message [`FaultKind`], address, rip, error code, and the badge of
+    /// that capability. The reply says how to go on ([`FaultReply`]).
+    SetFaultHandler = 17,
     /// Debug build only: print a UTF-8 string. rdi = pointer, rsi = length.
     DebugPutStr = 0x100,
     /// Debug build only: report a self-test result. rdi = 0 for pass.
@@ -128,6 +133,7 @@ impl Syscall {
             14 => Syscall::CapMint,
             15 => Syscall::FrameMap,
             16 => Syscall::FrameUnmap,
+            17 => Syscall::SetFaultHandler,
             0x100 => Syscall::DebugPutStr,
             0x101 => Syscall::DebugSelftestDone,
             _ => return None,
@@ -161,6 +167,44 @@ pub enum Error {
     ObjectDestroyed = 10,
     /// The frame capability is already mapped, or the address is in use.
     AlreadyMapped = 11,
+}
+
+/// What a fault message (`msg[0]`) reports.
+#[repr(u64)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FaultKind {
+    /// `msg[1]` = faulting address, `msg[3]` = x86 page-fault error code
+    /// (bit 0 present, 1 write, 2 user, 4 instruction fetch).
+    PageFault = 1,
+    /// `msg[3]` = error code (usually 0).
+    GeneralProtection = 2,
+    InvalidOpcode = 3,
+    DivideError = 4,
+}
+
+impl FaultKind {
+    pub const fn from_u64(n: u64) -> Option<FaultKind> {
+        Some(match n {
+            1 => FaultKind::PageFault,
+            2 => FaultKind::GeneralProtection,
+            3 => FaultKind::InvalidOpcode,
+            4 => FaultKind::DivideError,
+            _ => return None,
+        })
+    }
+}
+
+/// The fault handler's reply, `msg[0]`.
+#[repr(u64)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FaultReply {
+    /// Run the faulting instruction again (after fixing the cause).
+    Retry = 0,
+    /// Continue at `msg[1]` (in the user window) with `rax` = `msg[2]`:
+    /// enough to emulate or skip the faulting instruction.
+    ResumeAt = 1,
+    /// Stop the thread. Any other value, or a failed reply, also stops it.
+    Stop = 2,
 }
 
 /// Frames are 4 KiB.

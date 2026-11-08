@@ -17,6 +17,7 @@
 
 use crate::gdt;
 use core::arch::naked_asm;
+use superior_objects::abi::FaultKind;
 use x86_64::registers::model_specific::{Efer, EferFlags, LStar, SFMask, Star};
 use x86_64::registers::rflags::RFlags;
 use x86_64::VirtAddr;
@@ -225,6 +226,126 @@ pub unsafe extern "C" fn timer_entry() {
     )
 }
 
+// CPU exception entries. Each builds the same UserFrame as the timer entry
+// and passes the fault kind and error code. For exceptions that push an
+// error code, the code sits where the saved r11 belongs: swap them.
+
+#[unsafe(naked)]
+pub unsafe extern "C" fn page_fault_entry() {
+    naked_asm!(
+        "xchg [rsp], r11", // error code out, saved r11 in its slot
+        "push rcx",
+        "push rax",
+        "push rbx",
+        "push rdx",
+        "push rsi",
+        "push rdi",
+        "push rbp",
+        "push r8",
+        "push r9",
+        "push r10",
+        "push r12",
+        "push r13",
+        "push r14",
+        "push r15",
+        "mov rdi, rsp",
+        "mov esi, {kind}",
+        "mov rdx, r11",
+        "call {handler}",
+        "jmp {ret}",
+        kind = const FaultKind::PageFault as u64,
+        handler = sym fault_handler,
+        ret = sym return_to_user,
+    )
+}
+
+#[unsafe(naked)]
+pub unsafe extern "C" fn general_protection_entry() {
+    naked_asm!(
+        "xchg [rsp], r11", // error code out, saved r11 in its slot
+        "push rcx",
+        "push rax",
+        "push rbx",
+        "push rdx",
+        "push rsi",
+        "push rdi",
+        "push rbp",
+        "push r8",
+        "push r9",
+        "push r10",
+        "push r12",
+        "push r13",
+        "push r14",
+        "push r15",
+        "mov rdi, rsp",
+        "mov esi, {kind}",
+        "mov rdx, r11",
+        "call {handler}",
+        "jmp {ret}",
+        kind = const FaultKind::GeneralProtection as u64,
+        handler = sym fault_handler,
+        ret = sym return_to_user,
+    )
+}
+
+#[unsafe(naked)]
+pub unsafe extern "C" fn invalid_opcode_entry() {
+    naked_asm!(
+        "push r11",
+        "push rcx",
+        "push rax",
+        "push rbx",
+        "push rdx",
+        "push rsi",
+        "push rdi",
+        "push rbp",
+        "push r8",
+        "push r9",
+        "push r10",
+        "push r12",
+        "push r13",
+        "push r14",
+        "push r15",
+        "mov rdi, rsp",
+        "mov esi, {kind}",
+        "xor edx, edx",
+        "call {handler}",
+        "jmp {ret}",
+        kind = const FaultKind::InvalidOpcode as u64,
+        handler = sym fault_handler,
+        ret = sym return_to_user,
+    )
+}
+
+#[unsafe(naked)]
+pub unsafe extern "C" fn divide_error_entry() {
+    naked_asm!(
+        "push r11",
+        "push rcx",
+        "push rax",
+        "push rbx",
+        "push rdx",
+        "push rsi",
+        "push rdi",
+        "push rbp",
+        "push r8",
+        "push r9",
+        "push r10",
+        "push r12",
+        "push r13",
+        "push r14",
+        "push r15",
+        "mov rdi, rsp",
+        "mov esi, {kind}",
+        "xor edx, edx",
+        "call {handler}",
+        "jmp {ret}",
+        kind = const FaultKind::DivideError as u64,
+        handler = sym fault_handler,
+        ret = sym return_to_user,
+    )
+}
+
 /// Leaves the kernel with the [`UserFrame`] at rsp. `rax` selects the exit:
 /// [`Exit::Sysret`] or [`Exit::Iret`].
 ///
@@ -279,6 +400,10 @@ unsafe extern "C" fn return_to_user() -> ! {
 
 extern "C" fn syscall_handler(frame: &mut UserFrame) -> Exit {
     crate::task::handle_syscall(frame)
+}
+
+extern "C" fn fault_handler(frame: &mut UserFrame, kind: u64, code: u64) -> Exit {
+    crate::task::handle_fault(frame, FaultKind::from_u64(kind).unwrap(), code)
 }
 
 extern "C" fn timer_handler(frame: &mut UserFrame) -> Exit {
