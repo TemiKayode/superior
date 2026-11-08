@@ -1,0 +1,14 @@
+//! Superior kernel object model.
+//!
+//! This crate holds the parts of the kernel that are pure logic: capability
+//! storage and derivation, and carving physical memory into untyped blocks.
+//! It is `no_std`, allocates nothing, and is unit-tested on the host so the
+//! rules that guard authority are checked without booting anything.
+
+#![no_std]
+
+#[cfg(test)]
+extern crate std;
+
+pub mod cap;
+pub mod untyped;

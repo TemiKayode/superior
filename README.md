@@ -11,8 +11,32 @@ Superior is a capability-secure microkernel desktop operating system.
 
 ## Status
 
-Design phase. The architectural specification lives in the Superior OS Architectural Specification doc:
+Phase 0 (foundations). The kernel boots on x86-64 under QEMU, loads its GDT/TSS and
+exception handlers, and hands all usable physical memory to the root task as untyped
+capabilities. There is no kernel heap.
+
+The architectural specification lives in the Superior OS Architectural Specification doc:
 https://claude.ai/artifact/QKJS8qH5Dfbjzn58RStq1j
+
+## Layout
+
+| Path | What it is |
+| --- | --- |
+| `kernel/` | The microkernel (`no_std`, target `x86_64-unknown-none`) |
+| `crates/objects/` | Kernel object model: capabilities, CNodes, untyped memory. Pure logic, unit-tested on the host |
+| `xtask/` | Build driver: kernel build, disk image, QEMU boot |
+
+## Building
+
+Needs Rust (the pinned nightly in `rust-toolchain.toml` installs itself) and QEMU.
+
+```bash
+cargo xtask test   # host unit tests, then boot self-tests in QEMU
+cargo xtask run    # boot in QEMU with the serial console on this terminal
+cargo xtask image  # just build target/superior.img
+```
+
+QEMU is found via `$QEMU`, then `C:\Program Files\qemu`, then `PATH`.
 
 ## Roadmap
 

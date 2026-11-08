@@ -1,0 +1,9 @@
+[package]
+name = "superior-objects"
+description = "Kernel object model for Superior: capabilities, CNodes and untyped memory. no_std, host-testable."
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+edition = "2024"
+
+[dependencies]
