@@ -1,13 +1,19 @@
-//! `syscall` / `sysret` entry and exit.
+//! Kernel entry and exit: `syscall`, hardware interrupts, `sysret`, `iretq`.
 //!
-//! Entry saves the full user register state into a [`UserFrame`] on the
-//! kernel stack and calls [`crate::task::handle_syscall`], which copies it
-//! into the current thread's TCB, runs the operation, and overwrites the
-//! frame with the registers of whichever thread should run next. Exit pops
-//! that frame and `sysret`s, so a thread switch is just a different frame.
+//! Both entry paths build the same [`UserFrame`] on the kernel stack. Its
+//! top five words are exactly what the CPU pushes on an interrupt from ring
+//! 3 (`ss`, `rsp`, `rflags`, `cs`, `rip`); the `syscall` entry pushes the
+//! same five by hand. The Rust handler copies the frame into the current
+//! thread's TCB, does its work, overwrites the frame with the registers of
+//! the thread to run next, and returns how to leave:
 //!
-//! Interrupts stay disabled for the whole kernel entry (SFMASK clears IF);
-//! the kernel is single-core and non-preemptible for now.
+//! - [`Exit::Sysret`] (fast): for threads that last left user mode through
+//!   `syscall`, whose `rcx`/`r11` are dead by the ABI, or that never ran.
+//! - [`Exit::Iret`] (complete): for threads that were interrupted, whose
+//!   every register must come back exactly.
+//!
+//! Interrupts stay disabled for the whole kernel entry; the kernel is
+//! single-core and non-preemptible, and only user mode is interruptible.
 
 use crate::gdt;
 use core::arch::naked_asm;
@@ -15,9 +21,11 @@ use x86_64::registers::model_specific::{Efer, EferFlags, LStar, SFMask, Star};
 use x86_64::registers::rflags::RFlags;
 use x86_64::VirtAddr;
 
-/// User registers as pushed by [`syscall_entry`], lowest address first.
-/// `rcx` and `r11` are not saved: `syscall` overwrites them with the
-/// user `rip` and `rflags`, which are saved instead.
+/// User segment selectors (GDT index 3 and 4, RPL 3), checked in [`init`].
+pub const USER_SS: u64 = 0x1b;
+pub const USER_CS: u64 = 0x23;
+
+/// Saved user registers, lowest address first.
 #[repr(C)]
 #[derive(Clone, Copy, Default, Debug)]
 pub struct UserFrame {
@@ -34,51 +42,84 @@ pub struct UserFrame {
     pub rdx: u64,
     pub rbx: u64,
     pub rax: u64,
+    pub rcx: u64,
+    pub r11: u64,
+    // The interrupt-return frame.
     pub rip: u64,
+    pub cs: u64,
     pub rflags: u64,
     pub rsp: u64,
+    pub ss: u64,
 }
 
 impl UserFrame {
+    pub const ZERO: UserFrame = UserFrame {
+        r15: 0,
+        r14: 0,
+        r13: 0,
+        r12: 0,
+        r10: 0,
+        r9: 0,
+        r8: 0,
+        rbp: 0,
+        rdi: 0,
+        rsi: 0,
+        rdx: 0,
+        rbx: 0,
+        rax: 0,
+        rcx: 0,
+        r11: 0,
+        rip: 0,
+        cs: 0,
+        rflags: 0,
+        rsp: 0,
+        ss: 0,
+    };
+
     /// A fresh thread: interrupts enabled, `rdi` = its start argument.
     /// `rsp` is 8 below a 16-byte boundary, as if `entry` had been called.
     pub fn new_thread(entry: u64, stack_top: u64, arg: u64) -> Self {
         UserFrame {
             rip: entry,
+            cs: USER_CS,
             rsp: stack_top - 8,
+            ss: USER_SS,
             rflags: (RFlags::INTERRUPT_FLAG | RFlags::from_bits_retain(1 << 1)).bits(),
             rdi: arg,
-            ..Default::default()
+            ..UserFrame::ZERO
         }
     }
+
+    pub fn is_user_mode(&self) -> bool {
+        self.cs & 3 == 3
+    }
+}
+
+/// How to return to user mode; the handler's return value in `rax`.
+#[repr(u64)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Exit {
+    Sysret = 0,
+    Iret = 1,
 }
 
 static mut USER_RSP_SCRATCH: u64 = 0;
 static mut KERNEL_STACK_TOP: u64 = 0;
 /// Frame used for the very first entry to user mode.
-static mut FIRST_FRAME: UserFrame = UserFrame {
-    r15: 0,
-    r14: 0,
-    r13: 0,
-    r12: 0,
-    r10: 0,
-    r9: 0,
-    r8: 0,
-    rbp: 0,
-    rdi: 0,
-    rsi: 0,
-    rdx: 0,
-    rbx: 0,
-    rax: 0,
-    rip: 0,
-    rflags: 0,
-    rsp: 0,
-};
+static mut FIRST_FRAME: UserFrame = UserFrame::ZERO;
 
 pub fn init() {
     // SAFETY: single-threaded boot; written once before any syscall.
     unsafe { (&raw mut KERNEL_STACK_TOP).write(gdt::kernel_stack_top()) };
     let s = gdt::selectors();
+    assert_eq!(
+        s.user_data.0 as u64, USER_SS,
+        "GDT user data selector moved"
+    );
+    assert_eq!(
+        s.user_code.0 as u64, USER_CS,
+        "GDT user code selector moved"
+    );
     Star::write(s.user_code, s.user_data, s.kernel_code, s.kernel_data)
         .expect("GDT layout incompatible with sysret");
     LStar::write(VirtAddr::new(syscall_entry as *const () as u64));
@@ -97,7 +138,7 @@ pub fn init() {
 /// Enters user mode for the first time with `frame`'s registers.
 pub fn enter_user(frame: UserFrame) -> ! {
     // SAFETY: FIRST_FRAME is only touched here, with interrupts disabled,
-    // and is fully consumed by restore_user before anything else runs.
+    // and is fully consumed by return_to_user before anything else runs.
     unsafe {
         (&raw mut FIRST_FRAME).write(frame);
         enter_user_asm(&raw const FIRST_FRAME)
@@ -106,7 +147,13 @@ pub fn enter_user(frame: UserFrame) -> ! {
 
 #[unsafe(naked)]
 unsafe extern "C" fn enter_user_asm(_frame: *const UserFrame) -> ! {
-    naked_asm!("mov rsp, rdi", "jmp {restore}", restore = sym restore_user)
+    naked_asm!(
+        "mov rsp, rdi",
+        "mov eax, {iret}",
+        "jmp {ret}",
+        iret = const Exit::Iret as u64,
+        ret = sym return_to_user,
+    )
 }
 
 /// The LSTAR target. On entry: rcx = user rip, r11 = user rflags,
@@ -116,9 +163,15 @@ unsafe extern "C" fn syscall_entry() {
     naked_asm!(
         "mov [rip + {scratch}], rsp",
         "mov rsp, [rip + {kstack}]",
-        "push qword ptr [rip + {scratch}]", // rsp
-        "push r11",                         // rflags
-        "push rcx",                         // rip
+        // The interrupt-return frame, built by hand.
+        "push {ss}",
+        "push qword ptr [rip + {scratch}]",
+        "push r11", // rflags
+        "push {cs}",
+        "push rcx", // rip
+        // General registers, same order as the interrupt entry.
+        "push r11",
+        "push rcx",
         "push rax",
         "push rbx",
         "push rdx",
@@ -133,30 +186,102 @@ unsafe extern "C" fn syscall_entry() {
         "push r14",
         "push r15",
         "mov rdi, rsp",
-        "call {dispatch}",
-        "jmp {restore}",
+        "call {handler}",
+        "jmp {ret}",
         scratch = sym USER_RSP_SCRATCH,
         kstack = sym KERNEL_STACK_TOP,
-        dispatch = sym syscall_dispatch,
-        restore = sym restore_user,
+        ss = const USER_SS,
+        cs = const USER_CS,
+        handler = sym syscall_handler,
+        ret = sym return_to_user,
     )
 }
 
-/// Pops a [`UserFrame`] at rsp and returns to user mode.
-///
-/// `sysret` with a non-canonical rip faults in ring 0 on Intel CPUs. The
-/// rip here always comes from a `syscall` instruction or from an ELF entry
-/// point checked to lie in the user window, so it is canonical.
+/// Entry for the timer interrupt. The CPU has switched to the kernel stack
+/// (TSS rsp0) and pushed the interrupt-return frame.
 #[unsafe(naked)]
-unsafe extern "C" fn restore_user() -> ! {
+pub unsafe extern "C" fn timer_entry() {
     naked_asm!(
-        "pop r15", "pop r14", "pop r13", "pop r12", "pop r10", "pop r9", "pop r8", "pop rbp",
-        "pop rdi", "pop rsi", "pop rdx", "pop rbx", "pop rax", "pop rcx", // rip
-        "pop r11", // rflags
-        "pop rsp", "sysretq",
+        "push r11",
+        "push rcx",
+        "push rax",
+        "push rbx",
+        "push rdx",
+        "push rsi",
+        "push rdi",
+        "push rbp",
+        "push r8",
+        "push r9",
+        "push r10",
+        "push r12",
+        "push r13",
+        "push r14",
+        "push r15",
+        "mov rdi, rsp",
+        "call {handler}",
+        "jmp {ret}",
+        handler = sym timer_handler,
+        ret = sym return_to_user,
     )
 }
 
-extern "C" fn syscall_dispatch(frame: &mut UserFrame) {
-    crate::task::handle_syscall(frame);
+/// Leaves the kernel with the [`UserFrame`] at rsp. `rax` selects the exit:
+/// [`Exit::Sysret`] or [`Exit::Iret`].
+///
+/// `sysret` with a non-canonical rip faults in ring 0 on Intel CPUs. A rip
+/// on the sysret path always comes from a `syscall` instruction or from an
+/// ELF entry point checked to lie in the user window, so it is canonical.
+#[unsafe(naked)]
+unsafe extern "C" fn return_to_user() -> ! {
+    naked_asm!(
+        "test rax, rax",
+        "jnz 2f",
+        // sysret: rcx/r11 carry rip/rflags; their saved values are dead.
+        "pop r15",
+        "pop r14",
+        "pop r13",
+        "pop r12",
+        "pop r10",
+        "pop r9",
+        "pop r8",
+        "pop rbp",
+        "pop rdi",
+        "pop rsi",
+        "pop rdx",
+        "pop rbx",
+        "pop rax",
+        "add rsp, 16", // saved rcx, r11
+        "pop rcx",     // rip
+        "add rsp, 8",  // cs
+        "pop r11",     // rflags
+        "pop rsp",
+        "sysretq",
+        "2:",
+        // iretq: restore every register exactly.
+        "pop r15",
+        "pop r14",
+        "pop r13",
+        "pop r12",
+        "pop r10",
+        "pop r9",
+        "pop r8",
+        "pop rbp",
+        "pop rdi",
+        "pop rsi",
+        "pop rdx",
+        "pop rbx",
+        "pop rax",
+        "pop rcx",
+        "pop r11",
+        "iretq",
+    )
+}
+
+extern "C" fn syscall_handler(frame: &mut UserFrame) -> Exit {
+    crate::task::handle_syscall(frame)
+}
+
+extern "C" fn timer_handler(frame: &mut UserFrame) -> Exit {
+    crate::apic::end_of_interrupt();
+    crate::task::handle_timer(frame)
 }

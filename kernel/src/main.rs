@@ -4,12 +4,14 @@
 //! console, GDT/TSS, exception handlers and the `syscall` path, hands all
 //! usable physical memory to the root task as untyped capabilities (no
 //! kernel heap, ever), then starts the boot user programs in their own
-//! address spaces. From then on the kernel runs only on system calls.
+//! address spaces. From then on the kernel runs only on system calls and
+//! timer interrupts.
 
 #![no_std]
 #![no_main]
 #![feature(abi_x86_interrupt)]
 
+mod apic;
 mod gdt;
 mod interrupts;
 mod memory;
@@ -71,6 +73,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         .expect("bootloader did not map physical memory");
     vm::init(offset);
     kprintln!("[ok] physical memory mapped at {offset:#x}");
+    let timer_hz = apic::init();
+    kprintln!(
+        "[ok] local APIC timer: {} kHz input, {} Hz tick",
+        timer_hz / 1000,
+        apic::TICK_HZ
+    );
 
     #[cfg(feature = "selftest")]
     selftest(mem.untyped_caps);
@@ -85,9 +93,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     task::start()
 }
 
-/// Two processes, each in its own address space, sharing one endpoint.
-/// The server holds it with Read+Write; the client holds a badged copy
-/// with Write only, so it can call but not receive.
+/// Three processes, each in its own address space. The server and client
+/// share one endpoint: the server holds it with Read+Write, the client a
+/// badged copy with Write only, so it can call but not receive.
+///
+/// The spinner has the client's priority, is ahead of it in the ready
+/// queue, and never makes a system call. The client gets the CPU only if
+/// the timer preempts the spinner, so the test passing proves preemption.
 fn start_pingpong() -> Result<(), &'static str> {
     // Until cross-CNode capability copy exists, the kernel mints these
     // two endpoint capabilities directly at boot.
@@ -98,8 +110,11 @@ fn start_pingpong() -> Result<(), &'static str> {
         ..Capability::new(endpoint, Rights::WRITE | Rights::GRANT_REPLY)
     };
     task::spawn_process(0, USER_IMAGE, 10, 0, &[(0, server_cap)])?;
-    task::spawn_process(1, USER_IMAGE, 5, 1, &[(0, client_cap)])?;
-    kprintln!("[ok] server (prio 10) and client (prio 5) loaded in separate address spaces");
+    task::spawn_process(1, USER_IMAGE, 5, 2, &[])?;
+    task::spawn_process(2, USER_IMAGE, 5, 1, &[(0, client_cap)])?;
+    kprintln!(
+        "[ok] server (prio 10), spinner and client (prio 5) loaded in separate address spaces"
+    );
     Ok(())
 }
 

@@ -5,10 +5,11 @@
 //! kernel mode is always a kernel bug, so for now every handler logs and
 //! halts.
 
-use crate::{gdt, kprintln};
+use crate::{apic, gdt, kprintln, syscall};
 use spin::Lazy;
 use x86_64::registers::control::Cr2;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
+use x86_64::VirtAddr;
 
 static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
     let mut idt = InterruptDescriptorTable::new();
@@ -23,6 +24,13 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
             .set_handler_fn(double_fault)
             .set_stack_index(gdt::DOUBLE_FAULT_IST_INDEX);
     }
+    // SAFETY: timer_entry is a naked interrupt entry that saves a full
+    // UserFrame and leaves through return_to_user (iretq or sysret).
+    unsafe {
+        idt[apic::TIMER_VECTOR]
+            .set_handler_addr(VirtAddr::new(syscall::timer_entry as *const () as u64));
+    }
+    idt[apic::SPURIOUS_VECTOR].set_handler_fn(spurious);
     idt
 });
 
@@ -62,6 +70,9 @@ extern "x86-interrupt" fn breakpoint(frame: InterruptStackFrame) {
         frame.instruction_pointer.as_u64()
     );
 }
+
+/// A spurious APIC interrupt needs no EOI and no action.
+extern "x86-interrupt" fn spurious(_frame: InterruptStackFrame) {}
 
 extern "x86-interrupt" fn general_protection(frame: InterruptStackFrame, code: u64) {
     panic!("general protection fault (code {code:#x})\n{frame:#?}");

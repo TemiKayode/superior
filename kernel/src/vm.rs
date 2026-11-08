@@ -234,6 +234,43 @@ impl AddressSpace {
     }
 }
 
+/// Makes the 4 KiB device page at `pa` reachable at `PHYS_OFFSET + pa` in
+/// the kernel's page tables (uncached, not executable, supervisor only)
+/// and returns that address. The bootloader maps only RAM there, so
+/// device memory usually needs a new mapping.
+///
+/// Call before creating address spaces: they copy the kernel's top-level
+/// entries, so a mapping that needs a new top-level table would be missed.
+pub fn map_mmio(pa: PhysAddr) -> Result<VirtAddr, &'static str> {
+    use x86_64::structures::paging::Translate;
+    let va = VirtAddr::new(phys_offset() + pa.as_u64());
+    let (kernel_pml4, _) = Cr3::read();
+    // SAFETY: the active PML4, with physical memory mapped at PHYS_OFFSET.
+    let mut mapper =
+        unsafe { OffsetPageTable::new(table(kernel_pml4), VirtAddr::new(phys_offset())) };
+    if mapper.translate_addr(va).is_some() {
+        return Ok(va);
+    }
+    let page = Page::<Size4KiB>::containing_address(va);
+    let frame = PhysFrame::containing_address(pa);
+    let flags = F::PRESENT | F::WRITABLE | F::NO_CACHE | F::WRITE_THROUGH | F::NO_EXECUTE;
+    // SAFETY: the page was unmapped, and the frame is device memory that
+    // nothing else maps.
+    unsafe {
+        mapper
+            .map_to_with_table_flags(
+                page,
+                frame,
+                flags,
+                F::PRESENT | F::WRITABLE,
+                &mut UntypedFrames,
+            )
+            .map_err(|_| "mapping device memory failed")?
+            .flush();
+    }
+    Ok(va)
+}
+
 /// # Safety
 /// `frame` must hold a page table and physical memory must be mapped at PHYS_OFFSET.
 unsafe fn table(frame: PhysFrame) -> &'static mut PageTable {

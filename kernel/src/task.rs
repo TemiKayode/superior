@@ -4,8 +4,13 @@
 //! CNode as its capability space. A system call names a capability by slot;
 //! this module resolves it, checks rights, and passes the object index to
 //! the IPC engine in `superior_objects::ipc`, which decides who runs next.
+//!
+//! The kernel is entered two ways, a system call or a timer interrupt, and
+//! both end in [`resume`]. A thread that entered by system call gets its
+//! results in registers and leaves by `sysret`; a thread that was
+//! preempted gets its exact registers back by `iretq`.
 
-use crate::syscall::{self, UserFrame};
+use crate::syscall::{self, Exit, UserFrame};
 use crate::vm::AddressSpace;
 use crate::{kprint, kprintln, qemu};
 use spin::Mutex;
@@ -27,31 +32,23 @@ struct Kernel {
     /// Not yet run: its frame holds start registers (entry, stack, argument),
     /// not the results of a system call, and must be resumed untouched.
     fresh: [bool; MAX_THREADS],
+    /// Last left user mode by interrupt: its frame is complete and must be
+    /// resumed untouched, including `rcx` and `r11`.
+    preempted: [bool; MAX_THREADS],
+    ticks: u64,
+    /// Timer ticks that took the CPU from one thread and gave it to another.
+    preemptions: u64,
 }
 
 static KERNEL: Mutex<Kernel> = Mutex::new(Kernel {
     ipc: Ipc::new(),
-    frames: [UserFrame {
-        r15: 0,
-        r14: 0,
-        r13: 0,
-        r12: 0,
-        r10: 0,
-        r9: 0,
-        r8: 0,
-        rbp: 0,
-        rdi: 0,
-        rsi: 0,
-        rdx: 0,
-        rbx: 0,
-        rax: 0,
-        rip: 0,
-        rflags: 0,
-        rsp: 0,
-    }; MAX_THREADS],
+    frames: [UserFrame::ZERO; MAX_THREADS],
     spaces: [None; MAX_THREADS],
     cspaces: [const { CNode::new() }; MAX_THREADS],
     fresh: [false; MAX_THREADS],
+    preempted: [false; MAX_THREADS],
+    ticks: 0,
+    preemptions: 0,
 });
 
 /// Creates a thread in a new address space running `image`, with `arg` in
@@ -100,41 +97,73 @@ pub fn start() -> ! {
     syscall::enter_user(frame)
 }
 
-pub fn handle_syscall(frame: &mut UserFrame) {
+pub fn handle_syscall(frame: &mut UserFrame) -> Exit {
     let mut guard = KERNEL.lock();
     let k = &mut *guard;
     let cur = k.ipc.current().expect("system call with no current thread");
     k.frames[cur as usize] = *frame;
+    k.preempted[cur as usize] = false;
 
     let msg = [frame.rsi, frame.rdx, frame.r8, frame.r9];
     let result = match Syscall::from_u64(frame.rax) {
         None => Err(Error::IllegalOperation.code()),
         Some(Syscall::DebugPutStr) => debug_put_str(k, cur, frame.rdi, frame.rsi),
         Some(Syscall::DebugSelftestDone) => {
+            let (ticks, preemptions) = (k.ticks, k.preemptions);
             drop(guard);
-            selftest_done(cur, frame.rdi)
+            selftest_done(cur, frame.rdi, ticks, preemptions)
         }
         Some(op) => ipc_op(k, cur, op, frame.rdi as usize, msg),
     };
     k.ipc.set_status(result.err().unwrap_or(0));
+    resume(guard, cur, frame)
+}
 
+/// The timer fired while `frame`'s thread ran in user mode.
+pub fn handle_timer(frame: &mut UserFrame) -> Exit {
+    assert!(frame.is_user_mode(), "timer interrupt in kernel mode");
+    let mut guard = KERNEL.lock();
+    let k = &mut *guard;
+    let cur = k
+        .ipc
+        .current()
+        .expect("timer interrupt with no current thread");
+    k.frames[cur as usize] = *frame;
+    k.preempted[cur as usize] = true;
+    k.ticks += 1;
+    if k.ipc.tick() {
+        k.preemptions += 1;
+    }
+    resume(guard, cur, frame)
+}
+
+/// Loads the registers of the thread the IPC engine chose into `frame`,
+/// switches address space if needed, and says how to return to it.
+fn resume(mut guard: spin::MutexGuard<'_, Kernel>, cur: Tid, frame: &mut UserFrame) -> Exit {
+    let k = &mut *guard;
     let Some(next) = k.ipc.current() else {
         drop(guard);
         no_runnable_threads();
     };
-    let mut out = k.frames[next as usize];
-    if core::mem::take(&mut k.fresh[next as usize]) {
-        // First run: keep the start registers.
+    let n = next as usize;
+    let mut out = k.frames[n];
+    let exit = if core::mem::take(&mut k.fresh[n]) {
+        // First run: start registers, no results to deliver.
+        Exit::Sysret
+    } else if k.preempted[n] {
+        Exit::Iret
     } else {
         let t = k.ipc.thread(next);
         out.rax = t.status;
         out.rdi = t.badge;
         [out.rsi, out.rdx, out.r8, out.r9] = t.msg;
-    }
+        Exit::Sysret
+    };
     if next != cur {
-        k.spaces[next as usize].unwrap().activate();
+        k.spaces[n].unwrap().activate();
     }
     *frame = out;
+    exit
 }
 
 fn ipc_op(k: &mut Kernel, cur: Tid, op: Syscall, slot: usize, msg: [u64; 4]) -> Result<(), u64> {
@@ -197,12 +226,21 @@ fn debug_put_str(k: &Kernel, cur: Tid, ptr: u64, len: u64) -> Result<(), u64> {
     Ok(())
 }
 
-fn selftest_done(cur: Tid, code: u64) -> ! {
+fn selftest_done(cur: Tid, code: u64, ticks: u64, preemptions: u64) -> ! {
     if code == 0 {
         kprintln!("[pass] user self-test reported success (thread {cur})");
     } else {
         kprintln!("[fail] user self-test reported failure {code} (thread {cur})");
     }
+    // The spinner never yields, so the client finishing at all means the
+    // timer preempted it; check the kernel's own count agrees.
+    let code = if preemptions == 0 {
+        kprintln!("[fail] no thread was ever preempted ({ticks} timer ticks)");
+        code.max(1)
+    } else {
+        kprintln!("[pass] timer preemption: {ticks} ticks, {preemptions} preemptive switches");
+        code
+    };
     #[cfg(feature = "selftest")]
     {
         if code == 0 {

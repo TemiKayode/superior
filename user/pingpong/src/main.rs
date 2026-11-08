@@ -6,6 +6,9 @@
 //! - role 1, the **client**: holds a badged copy with Write only. It
 //!   checks that the kernel enforces rights, then times call/reply round
 //!   trips and reports the result.
+//! - role 2, the **spinner**: loops forever without a system call. It
+//!   shares the client's priority, so the client only runs if the kernel
+//!   preempts it.
 //!
 //! Timings under QEMU's software emulation say nothing about real
 //! hardware; they are printed so the same binary can be measured on metal.
@@ -114,7 +117,8 @@ fn rdtsc() -> u64 {
 pub extern "C" fn _start(role: u64) -> ! {
     match role {
         0 => server(),
-        _ => client(),
+        1 => client(),
+        _ => spinner(),
     }
 }
 
@@ -123,6 +127,13 @@ fn server() -> ! {
     loop {
         let reply = [r.msg[0].wrapping_add(1), r.badge, 0, 0];
         r = syscall(Syscall::ReplyRecv, EP, reply);
+    }
+}
+
+fn spinner() -> ! {
+    let mut n = 0u64;
+    loop {
+        n = core::hint::black_box(n.wrapping_add(1));
     }
 }
 
@@ -137,7 +148,7 @@ fn expect(what: &str, got: u64, want: u64) -> bool {
 }
 
 fn client() -> ! {
-    say!("client: up in its own address space");
+    say!("client: up in its own address space (the spinner was preempted)");
     let mut pass = true;
 
     // The kernel must refuse what this capability space does not allow.

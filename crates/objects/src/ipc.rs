@@ -14,8 +14,10 @@
 //! - `Call` to a waiting server and `ReplyRecv` back to a waiting caller
 //!   switch threads directly, without going through the ready queues
 //!   (the IPC fast path), unless a higher-priority thread is ready.
-//! - Strict fixed priorities (64 levels), FIFO within a level. Scheduling
-//!   contexts with budgets (MCS) come later and slot in at `switch_to`.
+//! - Strict fixed priorities (64 levels), FIFO within a level, and
+//!   round-robin time slices within a level driven by [`Ipc::tick`].
+//!   Scheduling contexts with budgets (MCS) come later and slot in at
+//!   `switch_to`.
 //!
 //! Message delivery always fills `msg`, `badge` and `status` of the thread
 //! being woken; the kernel copies them into that thread's registers.
@@ -24,6 +26,9 @@ use crate::abi::{Error, MSG_WORDS};
 
 pub type Tid = u16;
 pub const PRIORITIES: usize = 64;
+/// Timer ticks a thread runs before yielding to a ready peer of the same
+/// (or higher) priority.
+pub const TIMESLICE_TICKS: u32 = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
@@ -58,6 +63,8 @@ pub struct Tcb {
     caller: Option<Tid>,
     /// Link in whichever queue this thread is on.
     next: Option<Tid>,
+    /// Ticks left in this thread's time slice.
+    slice: u32,
 }
 
 const IDLE_TCB: Tcb = Tcb {
@@ -68,6 +75,7 @@ const IDLE_TCB: Tcb = Tcb {
     status: 0,
     caller: None,
     next: None,
+    slice: TIMESLICE_TICKS,
 };
 
 #[derive(Clone, Copy, Default, Debug)]
@@ -219,8 +227,34 @@ impl<const T: usize, const E: usize, const N: usize> Ipc<T, E, N> {
             return Err(IpcError::BadPriority);
         }
         tcb.prio = prio;
+        tcb.slice = TIMESLICE_TICKS;
         self.make_ready(t);
         Ok(())
+    }
+
+    /// One timer tick. Charges the current thread; when its slice is used
+    /// up, it is refilled and the thread rotates behind any ready thread
+    /// of equal or higher priority. Returns true if the current thread changed.
+    pub fn tick(&mut self) -> bool {
+        let Some(c) = self.current else {
+            return false;
+        };
+        let tcb = &mut self.threads[c as usize];
+        if tcb.slice > 1 {
+            tcb.slice -= 1;
+            return false;
+        }
+        tcb.slice = TIMESLICE_TICKS;
+        let prio = tcb.prio;
+        match self.highest_ready() {
+            Some(p) if p >= prio => {
+                self.current = None;
+                self.make_ready(c);
+                self.schedule();
+                self.current != Some(c)
+            }
+            _ => false,
+        }
     }
 
     /// Picks a thread if none is running. After every operation `current`
@@ -690,5 +724,48 @@ mod tests {
         k.schedule();
         assert_eq!(k.send(99, 0, [0; 4], true), Err(IpcError::BadObject));
         assert_eq!(k.wait(99), Err(IpcError::BadObject));
+    }
+    #[test]
+    fn tick_rotates_equal_priority_threads_after_slice() {
+        let mut k = K::new();
+        k.spawn(CLIENT, 5).unwrap();
+        k.spawn(OTHER, 5).unwrap();
+        k.schedule();
+        assert_eq!(k.current(), Some(CLIENT));
+        for _ in 1..TIMESLICE_TICKS {
+            assert!(!k.tick(), "slice not used up yet");
+            assert_eq!(k.current(), Some(CLIENT));
+        }
+        assert!(k.tick());
+        assert_eq!(k.current(), Some(OTHER));
+        assert_eq!(k.thread(CLIENT).state, State::Ready);
+        for _ in 0..TIMESLICE_TICKS {
+            k.tick();
+        }
+        assert_eq!(k.current(), Some(CLIENT), "round robin comes back");
+    }
+
+    #[test]
+    fn tick_never_hands_cpu_to_lower_priority() {
+        let mut k = K::new();
+        k.spawn(SERVER, 10).unwrap();
+        k.spawn(CLIENT, 5).unwrap();
+        k.schedule();
+        for _ in 0..10 * TIMESLICE_TICKS {
+            assert!(!k.tick());
+            assert_eq!(k.current(), Some(SERVER));
+        }
+    }
+
+    #[test]
+    fn tick_with_nothing_running_is_harmless() {
+        let mut k = K::new();
+        assert!(!k.tick());
+        k.spawn(CLIENT, 5).unwrap();
+        k.schedule();
+        for _ in 0..5 {
+            assert!(!k.tick(), "alone: keeps running");
+        }
+        assert_eq!(k.current(), Some(CLIENT));
     }
 }
