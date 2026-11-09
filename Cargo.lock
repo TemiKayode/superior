@@ -441,6 +441,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "superior-hid"
+version = "0.1.0"
+dependencies = [
+ "superior-objects",
+ "superior-sys",
+]
+
+[[package]]
 name = "superior-kernel"
 version = "0.1.0"
 dependencies = [
@@ -531,6 +539,15 @@ dependencies = [
 
 [[package]]
 name = "superior-virtio-net"
+version = "0.1.0"
+dependencies = [
+ "superior-driver",
+ "superior-objects",
+ "superior-sys",
+]
+
+[[package]]
+name = "superior-xhci"
 version = "0.1.0"
 dependencies = [
  "superior-driver",

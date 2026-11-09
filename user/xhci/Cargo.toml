@@ -1,0 +1,18 @@
+[package]
+name = "superior-xhci"
+description = "An xHCI (USB 3) host controller driver, serving the usb interface."
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "superior-xhci"
+test = false
+bench = false
+
+[dependencies]
+superior-objects = { path = "../../crates/objects" }
+superior-sys = { path = "../../crates/sys" }
+superior-driver = { path = "../../crates/driver" }

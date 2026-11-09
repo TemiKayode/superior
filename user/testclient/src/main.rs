@@ -53,7 +53,7 @@
 use core::sync::atomic::{AtomicU32, Ordering, fence};
 use superior_objects::abi::{CapTransfer, Error, ObjectType, Syscall, root};
 use superior_objects::interfaces::fs::ring;
-use superior_objects::interfaces::{Status, block, fs, mem, net, pci};
+use superior_objects::interfaces::{Status, block, fs, input, mem, net, pci};
 use superior_sys::{Called, USER_BASE, call_retry, print_line, syscall, syscall_x};
 
 const ECHO: u64 = 0;
@@ -66,6 +66,15 @@ macro_rules! say {
 
 fn client() -> ! {
     let mut failures = 0;
+    #[cfg(target_arch = "x86_64")]
+    {
+        let (ok, ticks, rounds) = direction_flag_survives();
+        say!(
+            "[{}] client: direction flag set across {ticks} timer ticks ({rounds} rounds): kernel unharmed, flag and registers intact",
+            if ok { "pass" } else { "fail" }
+        );
+        failures += !ok as u64;
+    }
     for k in 1..=3u64 {
         let sent = 100 * k;
         let r = syscall(Syscall::Call, ECHO, [sent, 0, 0, 0]);
@@ -83,6 +92,67 @@ fn client() -> ! {
         failures += !ok as u64;
     }
     syscall(Syscall::Call, CONTROL, [OP_SHUTDOWN, failures, 0, 0]);
+    loop {
+        syscall(Syscall::Yield, 0, [0; 4]);
+    }
+}
+
+/// Spins with the direction flag set (as user code does mid-way through a
+/// backward copy) until the timer has interrupted it for 20 ticks. The
+/// kernel's own code needs the flag clear: an interrupt entry that kept it
+/// set made every kernel `memcpy` run backwards and wrecked the saved
+/// registers. Each round also checks the flag and callee-saved registers
+/// come back as they were. Returns (ok, ticks spanned, rounds).
+#[cfg(target_arch = "x86_64")]
+fn direction_flag_survives() -> (bool, u64, u64) {
+    const PATTERN: u64 = 0x5eed_df00_d1f0_0d00;
+    const SPIN: u64 = 2_000_000;
+    let start = ticks();
+    let mut rounds = 0;
+    let mut ok = true;
+    while ticks() < start + 20 && rounds < 10_000 {
+        let flags: u64;
+        let (b, c): (u64, u64);
+        // SAFETY: the flag is set and cleared within the block, and no
+        // string instruction or call runs while it is set.
+        unsafe {
+            core::arch::asm!(
+                "push rbx",
+                "mov rbx, {p}",
+                "std",
+                "2:",
+                "dec {n}",
+                "jnz 2b",
+                "pushfq",
+                "pop {f}",
+                "cld",
+                "mov {b}, rbx",
+                "pop rbx",
+                p = in(reg) PATTERN,
+                n = inout(reg) SPIN => _,
+                f = out(reg) flags,
+                b = out(reg) b,
+                inout("r12") PATTERN => c,
+            );
+        }
+        ok &= flags & 1 << 10 != 0 && b == PATTERN && c == PATTERN;
+        rounds += 1;
+    }
+    (ok && ticks() >= start + 20, ticks() - start, rounds)
+}
+
+/// Competes with the client for the CPU, both with the direction flag
+/// set, so every timer tick switches between them and each resumes from
+/// the registers the kernel saved for it.
+fn df_spinner() -> ! {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let (ok, ticks, rounds) = direction_flag_survives();
+        say!(
+            "[{}] spinner: direction flag set across {ticks} timer ticks ({rounds} rounds): flag and registers intact",
+            if ok { "pass" } else { "fail" }
+        );
+    }
     loop {
         syscall(Syscall::Yield, 0, [0; 4]);
     }
@@ -1593,6 +1663,106 @@ fn net_client() -> ! {
     }
 }
 
+const INPUT: u64 = 0;
+const INPUT_CONTROL: u64 = 1;
+/// The subscription's notification arrives here.
+const INPUT_NTFN: u64 = 3;
+/// The word the host types, again and again, with a space after each.
+const WORD: &[u8] = b"superior";
+/// Whole words that must come through, and for at least how long.
+const WORDS: u64 = 10;
+const TYPING_TICKS: u64 = 1500;
+const TYPING_LIMIT: u64 = 9000;
+
+fn subscribe() -> bool {
+    for _ in 0..2000 {
+        syscall(Syscall::CapDelete, INPUT_NTFN, [0; 4]);
+        let x = CapTransfer {
+            grant: None,
+            accept: Some(INPUT_NTFN as u16),
+        };
+        let r = syscall_x(Syscall::Call, INPUT, [input::SUBSCRIBE, input::VERSION, 0, 0], x);
+        if r.status == 0 && r.msg[0] == OK && r.cap == Some(INPUT_NTFN as u16) {
+            return true;
+        }
+        syscall(Syscall::Yield, 0, [0; 4]);
+    }
+    false
+}
+
+/// The host types "superior " over and over on a USB keyboard while the
+/// injector kills the HID driver and the xHCI driver. Every word typed
+/// between restarts must come through whole, and nothing but the keys
+/// typed may ever arrive.
+fn keyboard_client() -> ! {
+    let mut t = Checks(0, "keyboard");
+    t.check(subscribe(), format_args!("subscribed to the keyboard"));
+    let (mut whole, mut broken, mut strays, mut resubscribed) = (0u64, 0u64, 0u64, 0u64);
+    let mut word = [0u8; 16];
+    let mut len = 0;
+    let start = ticks();
+    let mut first = None;
+    'typing: while (whole < WORDS || ticks() < start + TYPING_TICKS) && ticks() < start + TYPING_LIMIT {
+        loop {
+            let r = syscall(Syscall::Call, INPUT, [input::READ, 0, 0, 0]);
+            if r.status != 0 || (r.msg[0] != OK && r.msg[0] != Status::Empty as u64) {
+                // Restarted: subscribe again.
+                resubscribed += 1;
+                subscribe();
+                continue 'typing;
+            }
+            if r.msg[0] == Status::Empty as u64 {
+                break;
+            }
+            let (key, pressed) = (r.msg[1], r.msg[2] == 1);
+            if !pressed {
+                continue;
+            }
+            match key {
+                0x2c => {
+                    if &word[..len] == WORD {
+                        whole += 1;
+                        if first.is_none() {
+                            first = Some(ticks());
+                            say!("keyboard: the first whole word came through");
+                        }
+                    } else if len > 0 {
+                        broken += 1;
+                    }
+                    len = 0;
+                }
+                4..=29 => {
+                    let c = b'a' + (key - 4) as u8;
+                    if !WORD.contains(&c) {
+                        strays += 1;
+                    }
+                    if len < word.len() {
+                        word[len] = c;
+                        len += 1;
+                    }
+                }
+                _ => strays += 1,
+            }
+        }
+        syscall(Syscall::TimerSignal, INPUT_NTFN, [20, 0, 0, 0]);
+        if syscall(Syscall::Wait, INPUT_NTFN, [0; 4]).status != 0 {
+            // The notification is gone: the driver restarted.
+            resubscribed += 1;
+            subscribe();
+        }
+    }
+    t.check(
+        whole >= WORDS && strays == 0,
+        format_args!(
+            "{whole} words typed on the USB keyboard came through whole, no key that was not typed ({broken} broken by restarts, {strays} stray keys, {resubscribed} subscriptions again)"
+        ),
+    );
+    syscall(Syscall::Call, INPUT_CONTROL, [OP_SHUTDOWN, t.0, 0, 0]);
+    loop {
+        syscall(Syscall::Yield, 0, [0; 4]);
+    }
+}
+
 fn ticks() -> u64 {
     syscall(Syscall::Ticks, 0, [0; 4]).msg[0]
 }
@@ -1617,6 +1787,8 @@ pub extern "C" fn _start(role: u64) -> ! {
         11 => block_client([pci::OPEN_CLASS, pci::VERSION, 0x01_08_02, 0]),
         12 => block_client([pci::OPEN_CLASS, pci::VERSION, 0x01_06_01, 0]),
         13 => net_client(),
+        14 => keyboard_client(),
+        15 => df_spinner(),
         5 => memory_client(),
         6 => hog(),
         7 => fs_client(),

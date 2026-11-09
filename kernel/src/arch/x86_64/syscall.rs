@@ -233,6 +233,7 @@ unsafe extern "C" fn syscall_entry() {
         "push r13",
         "push r14",
         "push r15",
+        "cld", // the ABI wants DF clear; user code may have set it
         "mov rdi, rsp",
         "call {handler}",
         "jmp {ret}",
@@ -265,6 +266,7 @@ pub unsafe extern "C" fn timer_entry() {
         "push r13",
         "push r14",
         "push r15",
+        "cld", // the ABI wants DF clear; user code may have set it
         "mov rdi, rsp",
         "call {handler}",
         "jmp {ret}",
@@ -293,6 +295,7 @@ pub unsafe extern "C" fn com1_entry() {
         "push r13",
         "push r14",
         "push r15",
+        "cld", // the ABI wants DF clear; user code may have set it
         "mov rdi, rsp",
         "call {handler}",
         "jmp {ret}",
@@ -323,6 +326,7 @@ pub unsafe extern "C" fn page_fault_entry() {
         "push r13",
         "push r14",
         "push r15",
+        "cld", // the ABI wants DF clear; user code may have set it
         "mov rdi, rsp",
         "mov esi, {kind}",
         "mov rdx, r11",
@@ -352,6 +356,7 @@ pub unsafe extern "C" fn general_protection_entry() {
         "push r13",
         "push r14",
         "push r15",
+        "cld", // the ABI wants DF clear; user code may have set it
         "mov rdi, rsp",
         "mov esi, {kind}",
         "mov rdx, r11",
@@ -381,6 +386,7 @@ pub unsafe extern "C" fn invalid_opcode_entry() {
         "push r13",
         "push r14",
         "push r15",
+        "cld", // the ABI wants DF clear; user code may have set it
         "mov rdi, rsp",
         "mov esi, {kind}",
         "xor edx, edx",
@@ -410,6 +416,7 @@ pub unsafe extern "C" fn divide_error_entry() {
         "push r13",
         "push r14",
         "push r15",
+        "cld", // the ABI wants DF clear; user code may have set it
         "mov rdi, rsp",
         "mov esi, {kind}",
         "xor edx, edx",
@@ -517,7 +524,8 @@ macro_rules! msi_entries {
                     "push r13",
                     "push r14",
                     "push r15",
-                    "mov rdi, rsp",
+                    "cld", // the ABI wants DF clear; user code may have set it
+        "mov rdi, rsp",
                     "call {handler}",
                     "jmp {ret}",
                     handler = sym $handler,

@@ -2,7 +2,9 @@
 #
 # The probe starts first, at a higher priority, so its fault is handled
 # before the client finishes. echo and spare are lazy: echo starts on the
-# client's first call; nothing ever calls spare, so it never starts.
+# client's first call; nothing ever calls spare, so it never starts. The
+# spinner competes with the client for the CPU, both with the direction
+# flag set, so a kernel entry that leaves the flag set shows up.
 
 component probe
   image testclient
@@ -10,6 +12,11 @@ component probe
   priority 11
   restart never
   control 1
+
+component spinner
+  image testclient
+  arg 15
+  restart never
 
 component client
   image testclient

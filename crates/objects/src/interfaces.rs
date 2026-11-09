@@ -215,6 +215,63 @@ pub mod net {
     }
 }
 
+/// USB: what a host controller driver serves to class drivers.
+///
+/// The host controller driver finds and addresses the devices on its root
+/// ports; a class driver (HID, mass storage) reads their descriptors with
+/// control transfers and has interrupt-IN endpoints polled for it. A
+/// device belongs to the first client that claims it (`ATTACH`), and only
+/// that client may use it; any client may read a device's descriptors
+/// (`GET_DESCRIPTOR`) to decide whether to claim it. Devices are numbered from 0 in root-port order.
+/// A restarted host controller driver finds the devices again but has no
+/// endpoints configured: `READ` answers `NotFound`, and the class driver
+/// sets the device up again.
+pub mod usb {
+    pub const VERSION: u64 = 1;
+
+    /// `[INFO, VERSION]`: reply `[status, devices found, 0, 0]`.
+    pub const INFO: u64 = 1;
+    /// `[DEVICE, n]`: reply `[status, root port | speed << 8, vendor << 16
+    /// | product, class << 16 | subclass << 8 | protocol]` (from the device
+    /// descriptor). Speeds: 1 full, 2 low, 3 high, 4 super.
+    pub const DEVICE: u64 = 2;
+    /// `[ATTACH, n]` with a notification granted: claims device `n`; its
+    /// interrupt-IN endpoints signal the notification when they have data.
+    /// `InUse` if another client has it.
+    pub const ATTACH: u64 = 3;
+    /// `[CONTROL, n, setup packet (its 8 bytes, little-endian)]` with a page
+    /// lent: a control transfer on endpoint 0, its data stage (`wLength`
+    /// bytes, at most a page) in the page. Reply `[status, bytes moved]`.
+    pub const CONTROL: u64 = 4;
+    /// `[ENDPOINT, n, address | max packet << 8 | bInterval << 24]`: adds
+    /// the interrupt-IN endpoint with this descriptor and starts polling
+    /// it. Reply `[status]`.
+    pub const ENDPOINT: u64 = 5;
+    /// `[READ, n, address]` with a page lent: the oldest transfer an
+    /// interrupt-IN endpoint completed, copied into the page. Reply
+    /// `[status, length]`: `Empty` if none is waiting, `NotFound` if the
+    /// endpoint is not configured (the driver restarted).
+    pub const READ: u64 = 6;
+}
+
+/// Input: what an input driver (a HID keyboard) serves.
+///
+/// A subscriber gets a notification of the driver's, signalled when
+/// events arrive; a driver restart deletes it, which wakes the
+/// subscriber to subscribe again. Every subscriber sees every event from
+/// when it subscribed; one that falls far behind loses the oldest.
+pub mod input {
+    pub const VERSION: u64 = 1;
+
+    /// `[SUBSCRIBE, VERSION]`: reply `[status]` and the notification.
+    pub const SUBSCRIBE: u64 = 1;
+    /// `[READ]`: the subscriber's next event. Reply `[status, key, pressed,
+    /// modifiers]`: `key` is a USB HID usage (keyboard page: 4 is `a`, 0x2c
+    /// space; 0xe0 to 0xe7 the modifiers), `pressed` 1 or 0, `modifiers`
+    /// the modifier byte after it. `Empty` if there is none.
+    pub const READ: u64 = 2;
+}
+
 /// Files: what the filesystem server serves.
 ///
 /// There is no global namespace: each component sees only its own

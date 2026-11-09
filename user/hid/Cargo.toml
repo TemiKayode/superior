@@ -1,0 +1,17 @@
+[package]
+name = "superior-hid"
+description = "A USB HID keyboard driver, serving the input interface."
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "superior-hid"
+test = false
+bench = false
+
+[dependencies]
+superior-objects = { path = "../../crates/objects" }
+superior-sys = { path = "../../crates/sys" }

@@ -1,0 +1,48 @@
+# The USB keyboard test (cargo xtask keyboard-test).
+#
+# The xHCI driver serves the usb interface to the HID driver, which finds
+# the boot keyboard and serves input to the client. The host types words
+# on QEMU's USB keyboard (through QMP) while the injector kills the xHCI
+# driver and the HID driver at pseudo-random moments: words typed between
+# restarts must come through whole, and no key that was not typed may
+# arrive. Component numbers matter: the injector kills components 1 and 2.
+
+component pcibus
+  image pcibus
+  priority 12
+  provides pci 0
+  device pci-config 1
+  device pci-mmio 2
+  device msi 3
+  device iommu 11
+  untyped 18 12
+
+component xhci
+  image xhci
+  priority 11
+  uses pci 0
+  provides usb 1
+  notification 2
+  untyped 17 3
+
+component hid
+  image hid
+  priority 10
+  uses usb 0
+  provides input 1
+  untyped 14 2
+
+component client
+  image testclient
+  arg 14
+  priority 8
+  uses input 0
+  control 1
+
+component injector
+  image testclient
+  arg 10
+  priority 8
+  control 0
+  fault-injector
+  notification 1

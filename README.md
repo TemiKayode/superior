@@ -341,6 +341,36 @@ holds the rest):
   must have been killed at least 10 times, among the pings and among the echoes. A
   run does about 1,000 to 3,000 pings and 2,000 to 3,600 echoes through some 35
   kills of each.
+- USB: an xHCI host controller driver (`user/xhci/`) and a HID keyboard driver
+  (`user/hid/`).
+  - The xHCI driver opens the first function of class 0c:03:30, resets the controller,
+    sets up the command ring, one event ring and the device context array, and on each
+    root port with a device resets the port, enables a slot, addresses the device and
+    reads its device descriptor. It serves the versioned `usb` interface: any client
+    may read a device's descriptors to decide whether to claim it; one that claims it
+    makes control transfers (data through a page it lends) and adds interrupt-IN
+    endpoints, which the controller polls into the driver's buffers, signalling the
+    client when reports arrive. The controller reaches only the driver's DMA pages,
+    through the IOMMU domain; its MSI-X vector is bound to the driver's thread.
+  - The HID driver finds the first boot-protocol keyboard (interface class 3, 1, 1),
+    claims it, has its endpoint polled, selects the boot protocol and turns each
+    8-byte report into presses and releases. It serves `input`: subscribers read
+    events from a ring at their own pace and are signalled when there are more. A
+    100 ms timer drains reports and sets the keyboard up again after the xHCI driver
+    restarts.
+  `cargo xtask keyboard-test` boots `boot/keyboard.manifest` with QEMU's xHCI
+  controller and a USB keyboard, and xtask types "superior" followed by a space, over
+  and over, through QEMU's monitor. Meanwhile the injector kills the xHCI and HID
+  drivers every 30 to 150 ms. The client must see 10 words come through whole, and
+  never a key that was not typed (a word cut by a restart counts as broken, not
+  wrong); each driver must have been killed at least 10 times, 20 of them while words
+  came through. A run sees 80 to 260 kills of each.
+- Interrupt and exception entries clear the direction flag. User code may be
+  interrupted mid-way through a backward copy, with the flag set; the kernel's own
+  copies need it clear, and without the `cld` they ran backwards, wrecking saved
+  registers. The Component Manager test checks it: the client and a spinner at the
+  same priority both hold the flag set for 20 timer ticks, so every tick switches
+  between them and each resumes from the registers the kernel saved.
 - Static-pie user programs loaded into their own address spaces and relocated.
 - Boot self-test: a server and a client in separate address spaces do 20,000
   call/reply round trips, and the kernel refuses four kinds of rights violations. A
@@ -374,7 +404,8 @@ silently), buses behind bridges in the IOMMU (requester IDs on bus 0 only); Func
 Level Reset is exercised only by the NVMe controller (QEMU's virtio devices on
 these buses have none); several queues and commands in flight in the NVMe driver,
 namespaces other than 1, several commands (NCQ) and ports in the AHCI driver, ATAPI
-and port multipliers, and the xHCI and HID class drivers; in the network server
+and port multipliers; in the xHCI driver isochronous and bulk endpoints, USB 3 streams,
+hubs and more than one interrupter, and HID devices other than boot keyboards; in the network server
 DHCP, TCP, IPv6, fragments, DNS, routes beyond one gateway, and rings in place of a
 call per frame; buses behind bridges; the async executor, buffer pools and
 power callbacks of the SDK; an IDL compiler for the interfaces; escalating a component
@@ -409,8 +440,10 @@ https://claude.ai/artifact/QKJS8qH5Dfbjzn58RStq1j
 | `user/ahci/` | The AHCI (SATA) class driver |
 | `user/virtio-net/` | The virtio network driver |
 | `user/net/` | The network server |
+| `user/xhci/` | The xHCI (USB) host controller driver |
+| `user/hid/` | The USB HID keyboard driver |
 | `user/echo/`, `user/counter/`, `user/testclient/` | Test components for the Component Manager, supervision and drivers |
-| `boot/` | Component manifests: `shell.manifest` (normal boot), `test.manifest` (`cm-test`), `supervise.manifest` (`supervise-test`) , `drivers.manifest` (`drivers-test`) , `memory.manifest` (`memory-test`), `fs.manifest` and `fs-verify.manifest` (`fs-test`), `net.manifest` (`net-test`) |
+| `boot/` | Component manifests: `shell.manifest` (normal boot), `test.manifest` (`cm-test`), `supervise.manifest` (`supervise-test`) , `drivers.manifest` (`drivers-test`) , `memory.manifest` (`memory-test`), `fs.manifest` and `fs-verify.manifest` (`fs-test`), `net.manifest` (`net-test`), `keyboard.manifest` (`keyboard-test`) |
 | `sel4/` | Docker build of seL4 and rust-sel4's kernel loader, for running the shell on seL4 |
 | `xtask/` | Build driver: user program, kernel, disk image, QEMU boot |
 
@@ -419,7 +452,7 @@ https://claude.ai/artifact/QKJS8qH5Dfbjzn58RStq1j
 Needs Rust (the pinned nightly in `rust-toolchain.toml` installs itself) and QEMU.
 
 ```bash
-cargo xtask test           # host tests, model check, simulation; on both ISAs the boot self-tests, the Component Manager, supervision, driver, Memory Server and filesystem tests (the disk tests on all three disk drivers), the network test and a shell session; then the shell on seL4
+cargo xtask test           # host tests, model check, simulation; on both ISAs the boot self-tests, the Component Manager, supervision, driver, Memory Server and filesystem tests (the disk tests on all three disk drivers), the network and USB keyboard tests and a shell session; then the shell on seL4
 cargo xtask cm-test        # just the Component Manager test (add aarch64 for that ISA)
 cargo xtask supervise-test # just the supervision test (add aarch64 for that ISA)
 cargo xtask drivers-test   # just the driver framework test (add aarch64 for that ISA)
@@ -428,6 +461,7 @@ cargo xtask fs-test        # just the filesystem test, two boots (add aarch64 fo
 cargo xtask nvme-test      # the driver and filesystem tests on an NVMe disk (add aarch64 for that ISA)
 cargo xtask ahci-test      # the same on a SATA disk behind AHCI (add aarch64 for that ISA)
 cargo xtask net-test       # just the network test (add aarch64 for that ISA)
+cargo xtask keyboard-test  # just the USB keyboard test (add aarch64 for that ISA)
 cargo xtask run            # boot the shell in QEMU (x86-64), its console on this terminal
 cargo xtask run aarch64    # the same on QEMU's AArch64 virt machine
 cargo xtask image  # just build target/superior.img

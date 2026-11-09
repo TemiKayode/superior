@@ -104,6 +104,9 @@ struct Image {
     /// A virtio network device on QEMU's user-mode network (the network
     /// test).
     net: bool,
+    /// A USB keyboard on an xHCI controller, typed on through QEMU's
+    /// monitor (the keyboard test).
+    keyboard: bool,
 }
 
 /// The disk drivers, each with the PCI function its test disk appears as
@@ -144,6 +147,7 @@ fn main() -> ExitCode {
                         .and_then(|_| disk_test(a, "nvme"))
                         .and_then(|_| disk_test(a, "ahci"))
                         .and_then(|_| net_test(a))
+                        .and_then(|_| keyboard_test(a))
                         .and_then(|_| image(false, a))
                         .and_then(|img| shell_session(&img))
                 })
@@ -164,12 +168,13 @@ fn main() -> ExitCode {
         Some("nvme-test") => disk_test(arch, "nvme"),
         Some("ahci-test") => disk_test(arch, "ahci"),
         Some("net-test") => net_test(arch),
+        Some("keyboard-test") => keyboard_test(arch),
         Some("memory-test") => {
             image_with(false, arch, "memory").and_then(|img| memory_test(&img))
         }
         Some("bench") => image(false, Arch::X86_64).and_then(|img| bench(&img)),
         _ => Err(
-            "usage: cargo xtask <image | run | test | boot-test | shell-test | cm-test | supervise-test | drivers-test | memory-test | fs-test | nvme-test | ahci-test | net-test | bench | sel4-test> [x86_64 | aarch64]"
+            "usage: cargo xtask <image | run | test | boot-test | shell-test | cm-test | supervise-test | drivers-test | memory-test | fs-test | nvme-test | ahci-test | net-test | keyboard-test | bench | sel4-test> [x86_64 | aarch64]"
                 .into(),
         ),
     });
@@ -286,6 +291,8 @@ fn bundle(arch: Arch, manifest: &str, driver: &str) -> Result<PathBuf, String> {
         ("ahci", "superior-ahci"),
         ("virtio-net", "superior-virtio-net"),
         ("net", "superior-net"),
+        ("xhci", "superior-xhci"),
+        ("hid", "superior-hid"),
         ("memserver", "superior-memserver"),
         ("fs", "superior-fs"),
         ("testclient", "superior-testclient"),
@@ -409,6 +416,7 @@ fn image_for(
         writable: fs,
         driver,
         net: manifest == "net",
+        keyboard: manifest == "keyboard",
     })
 }
 
@@ -501,6 +509,7 @@ fn sel4_image() -> Result<Image, String> {
         writable: false,
         driver: "virtio-blk",
         net: false,
+        keyboard: false,
     })
 }
 
@@ -526,7 +535,7 @@ fn qemu_command(img: &Image) -> Command {
             // Images with a disk are driver tests: they need an IOMMU,
             // which QEMU emulates (VT-d) only on its q35 machine. Interrupt
             // remapping stays off: MSIs reach the local APIC directly.
-            if img.disk.is_some() || img.net {
+            if img.disk.is_some() || img.net || img.keyboard {
                 q.args(["-machine", "q35", "-device", "intel-iommu,intremap=off"]);
             }
             if img.disk.is_some() && img.driver == "ahci" {
@@ -550,7 +559,7 @@ fn qemu_command(img: &Image) -> Command {
             // Driver tests get an SMMUv3 in front of PCI.
             let machine = if img.sel4 {
                 SEL4_MACHINE
-            } else if img.disk.is_some() || img.net {
+            } else if img.disk.is_some() || img.net || img.keyboard {
                 "virt,highmem=off,iommu=smmuv3"
             } else {
                 "virt,highmem=off"
@@ -627,6 +636,18 @@ fn qemu_command(img: &Image) -> Command {
             "virtio-net-pci,netdev=n0,disable-legacy=on,iommu_platform=on",
         ]);
     }
+    if img.keyboard {
+        // A USB keyboard on an xHCI controller (its DMA through the
+        // IOMMU), and the monitor the test types through.
+        q.args([
+            "-device",
+            "qemu-xhci,id=xhci",
+            "-device",
+            "usb-kbd,id=kbd0,bus=xhci.0",
+            "-qmp",
+        ])
+        .arg(format!("tcp:127.0.0.1:{QMP_PORT},server=on,wait=off"));
+    }
     q.args(["-serial", "stdio", "-no-reboot"]);
     q
 }
@@ -669,7 +690,7 @@ fn cm_test(img: &Image) -> Result<(), String> {
     let bundle_va = 0x7001_0000_0000u64;
     // In order.
     let steps = [
-        "[cm] manifest: 4 components".to_string(),
+        "[cm] manifest: 5 components".to_string(),
         "[cm] started probe (boot)".to_string(),
         "[cm] started client (boot)".to_string(),
         format!("probe: reading {bundle_va:#x}"),
@@ -694,6 +715,11 @@ fn cm_test(img: &Image) -> Result<(), String> {
                 ));
             }
         }
+    }
+    // An interrupt that lands while user code has the direction flag set
+    // must not run the kernel with it set (x86-64 only).
+    if img.arch == Arch::X86_64 && !out.contains("[pass] client: direction flag set across") {
+        return Err("Component Manager test: the direction-flag check did not pass".into());
     }
     for bad in ["[fail]", "started spare", "could not start", "panic"] {
         if out.contains(bad) {
@@ -1034,6 +1060,114 @@ fn net_test(arch: Arch) -> Result<(), String> {
         echoed.load(Ordering::Relaxed)
     );
     println!("== network test passed ({})", arch.name());
+    Ok(())
+}
+
+/// The port QEMU's monitor (QMP) listens on in the keyboard test.
+const QMP_PORT: u16 = 47011;
+
+/// Types `word` and a space, again and again, on the USB keyboard `kbd0`
+/// through QEMU's monitor, until `stop`. Returns the words typed.
+fn type_words(
+    word: &str,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> u64 {
+    use std::io::{BufRead, BufReader};
+    use std::net::TcpStream;
+    use std::sync::atomic::Ordering;
+    let mut stream = None;
+    while stream.is_none() && !stop.load(Ordering::Relaxed) {
+        stream = TcpStream::connect(("127.0.0.1", QMP_PORT)).ok();
+        if stream.is_none() {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+    let Some(mut s) = stream else { return 0 };
+    // Answers are read (and dropped) on their own thread, so QEMU never
+    // blocks on a full socket.
+    if let Ok(r) = s.try_clone() {
+        std::thread::spawn(move || for _ in BufReader::new(r).lines().map_while(Result::ok) {});
+    }
+    let _ = s.write_all(b"{\"execute\":\"qmp_capabilities\"}\n");
+    // Give the guest time to boot and find the keyboard.
+    std::thread::sleep(Duration::from_secs(2));
+    let mut typed = 0;
+    let keys: Vec<String> = word
+        .chars()
+        .map(|c| c.to_string())
+        .chain(["spc".to_string()])
+        .collect();
+    while !stop.load(Ordering::Relaxed) {
+        for key in &keys {
+            for down in [true, false] {
+                let cmd = format!(
+                    "{{\"execute\":\"input-send-event\",\"arguments\":{{\"events\":[{{\"type\":\"key\",\"data\":{{\"down\":{down},\"key\":{{\"type\":\"qcode\",\"data\":\"{key}\"}}}}}}]}}}}\n"
+                );
+                if s.write_all(cmd.as_bytes()).is_err() {
+                    return typed;
+                }
+                std::thread::sleep(Duration::from_millis(KEY_GAP_MS));
+            }
+        }
+        typed += 1;
+    }
+    typed
+}
+
+/// Milliseconds between key events: more than the keyboard's polling
+/// interval, so its 16-event queue never overflows.
+const KEY_GAP_MS: u64 = 12;
+
+/// Boots `boot/keyboard.manifest` with a USB keyboard on QEMU's xHCI
+/// controller, types "superior " on it over and over through QMP, and
+/// checks that whole words came through while the injector killed the
+/// xHCI and HID drivers, and that no key that was not typed arrived.
+fn keyboard_test(arch: Arch) -> Result<(), String> {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let img = image_with(false, arch, "keyboard")?;
+    println!("== keyboard test on {}", img.path.display());
+    let stop = Arc::new(AtomicBool::new(false));
+    let typist = {
+        let stop = stop.clone();
+        std::thread::spawn(move || type_words("superior", stop))
+    };
+    let out = run_to_exit(&img, Duration::from_secs(150));
+    stop.store(true, Ordering::Relaxed);
+    let typed = typist.join().unwrap_or(0);
+    let out = out?;
+    let steps = [
+        "xhci: ready:",
+        "device 0627:0001 class 000000",
+        "hid: ready: a boot keyboard on device 0",
+        "[pass] keyboard: subscribed to the keyboard",
+        "[cm] fault injection: killing",
+        "keyboard: the first whole word came through",
+        "words typed on the USB keyboard came through whole, no key that was not typed",
+        "[cm] client asked to shut down (pass)",
+    ];
+    check_log("keyboard test", &out, &steps)?;
+    let kills = |what: &str| {
+        out.matches(&format!("[cm] fault injection: killing {what}\n"))
+            .count()
+            + out
+                .matches(&format!("[cm] fault injection: killing {what}\r\n"))
+                .count()
+    };
+    let (xhci, hid) = (kills("xhci"), kills("hid"));
+    // Kills land while words are coming through.
+    let between = |a: &str, b: &str| match (out.find(a), out.find(b)) {
+        (Some(i), Some(j)) if i < j => out[i..j].matches("[cm] fault injection: killing").count(),
+        _ => 0,
+    };
+    let during = between("the first whole word came through", "words typed on the USB keyboard");
+    if xhci < 10 || hid < 10 || during < 20 {
+        return Err(format!(
+            "keyboard test: the xHCI driver was killed {xhci} times and the HID driver {hid}, {during} while words came through; want 10, 10 and 20"
+        ));
+    }
+    println!("== the xHCI driver was killed {xhci} times and the HID driver {hid}; the host typed {typed} words");
+    println!("== keyboard test passed ({})", arch.name());
     Ok(())
 }
 
