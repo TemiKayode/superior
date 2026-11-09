@@ -33,8 +33,10 @@
 //! - `arg 7`, the file client under load (`boot/fs.manifest`): appends
 //!   records to a file through the filesystem server (slot 0) while the
 //!   injector kills the server and the disk driver, retrying calls cut
-//!   off by a restart; checks every acknowledged record reads back, then
-//!   appends one more and shuts the machine down at once (a power cut).
+//!   off by a restart; checks every acknowledged record reads back; then
+//!   a large file, truncation, unlinking, the directory tree and renames;
+//!   then appends one more record and renames a file, and shuts the
+//!   machine down at once (a power cut).
 //!   Control in slot 1, memory in slot 2.
 //! - `arg 8`, the file client after the power cut (`boot/fs-verify.manifest`):
 //!   checks every acknowledged record is on the disk. Same slots.
@@ -561,10 +563,46 @@ fn fs_setup(memory: u64) -> bool {
         && syscall(Syscall::FrameMap, FS_BUFFER, [FS_BUFFER_VA, 1, 0, 0]).status == 0
 }
 
-fn fs_open(name: &str, create: bool) -> [u64; 4] {
-    let n = fs::name(name).unwrap();
-    let op = if create { fs::CREATE } else { fs::OPEN };
-    fs_call([op, n[0], n[1], n[2]], false).0
+fn fs_bytes() -> &'static mut [u8] {
+    // SAFETY: the buffer frame is mapped at FS_BUFFER_VA.
+    unsafe { core::slice::from_raw_parts_mut(FS_BUFFER_VA as *mut u8, 4096) }
+}
+
+const OK: u64 = Status::Ok as u64;
+
+/// A call naming `path` (in the buffer): `[op, path length, extra]`.
+fn fs_path(op: u64, path: &str, extra: u64) -> ([u64; 4], u64) {
+    let len = fs::put_path(fs_bytes(), path).unwrap();
+    fs_call([op, len, extra, 0], true)
+}
+
+/// `[status, handle, size, kind]`.
+fn fs_open(path: &str, flags: u64) -> [u64; 4] {
+    fs_path(fs::OPEN, path, flags).0
+}
+
+/// A status, where a retried `UNLINK` or `RENAME` answering `NotFound`
+/// had already happened before the restart cut it off.
+fn done(r: ([u64; 4], u64)) -> u64 {
+    match r {
+        (m, tries) if tries > 0 && m[0] == Status::NotFound as u64 => OK,
+        (m, _) => m[0],
+    }
+}
+
+fn fs_rename(from: &str, to: &str) -> u64 {
+    let b = fs_bytes();
+    let l1 = fs::put_path(b, from).unwrap();
+    let l2 = fs::put_path(&mut b[l1 as usize..], to).unwrap();
+    done(fs_call([fs::RENAME, l1, l2, 0], true))
+}
+
+fn fs_unlink(path: &str) -> u64 {
+    done(fs_path(fs::UNLINK, path, 0))
+}
+
+fn fs_statfs() -> [u64; 4] {
+    fs_call([fs::STATFS, 0, 0, 0], false).0
 }
 
 /// Appends record `k`. Returns whether it was acknowledged, and retries.
@@ -574,7 +612,7 @@ fn append(h: u64, k: u64) -> (bool, u64) {
         b[j as usize] = record_word(k, j);
     }
     let (r, tries) = fs_call([fs::WRITE, h, k * RECORD, RECORD], true);
-    (r[0] == Status::Ok as u64, tries)
+    (r[0] == OK, tries)
 }
 
 /// Checks records `0..n` of the file read back right. Returns the first
@@ -584,7 +622,7 @@ fn check_records(h: u64, n: u64) -> Result<(), u64> {
     let mut k = 0;
     while k < n {
         let (r, _) = fs_call([fs::READ, h, k * RECORD, fs::BLOCK], true);
-        if r[0] != Status::Ok as u64 {
+        if r[0] != OK {
             return Err(k);
         }
         let b = fs_buffer();
@@ -601,16 +639,95 @@ fn check_records(h: u64, n: u64) -> Result<(), u64> {
     Ok(())
 }
 
+/// The big file's byte at `p`.
+fn big_byte(p: u64) -> u8 {
+    ((p % 251) ^ (p / 4096 * 17)) as u8
+}
+
+/// Bytes of the big file; written in unaligned 4000-byte pieces, so most
+/// writes span two blocks, and through the indirect block.
+const BIG: u64 = 70 * 4000;
+const PIECE: u64 = 4000;
+
+fn write_big(h: u64) -> bool {
+    let mut off = 0;
+    while off < BIG {
+        let b = fs_bytes();
+        for i in 0..PIECE {
+            b[i as usize] = big_byte(off + i);
+        }
+        if fs_call([fs::WRITE, h, off, PIECE], true).0[0] != OK {
+            return false;
+        }
+        off += PIECE;
+    }
+    true
+}
+
+/// Checks bytes `[from, to)` of the big file, read in unaligned pieces:
+/// `big_byte`, except zero in `[zero_from, zero_to)`.
+fn check_big(h: u64, from: u64, to: u64, zero_from: u64, zero_to: u64) -> Result<(), u64> {
+    let mut off = from;
+    while off < to {
+        let want = (to - off).min(3001);
+        let (r, _) = fs_call([fs::READ, h, off, want], true);
+        if r[0] != OK || r[1] != want {
+            return Err(off);
+        }
+        let b = fs_bytes();
+        for i in 0..want {
+            let p = off + i;
+            let expect = if (zero_from..zero_to).contains(&p) {
+                0
+            } else {
+                big_byte(p)
+            };
+            if b[i as usize] != expect {
+                return Err(p);
+            }
+        }
+        off += want;
+    }
+    Ok(())
+}
+
+/// Lists directory `h`: how many entries, and whether each of `names`
+/// is among them.
+fn list(h: u64, names: &[&str]) -> (u64, bool) {
+    let (mut total, mut found) = (0, 0u64);
+    let mut cookie = 0;
+    loop {
+        let (r, _) = fs_call([fs::READDIR, h, cookie, 0], true);
+        if r[0] != OK || r[1] == 0 {
+            break;
+        }
+        let b = fs_bytes();
+        for i in 0..r[1] as usize {
+            let e = fs::Entry(&b[i * fs::ENTRY..(i + 1) * fs::ENTRY]);
+            for (k, n) in names.iter().enumerate() {
+                if e.name() == n.as_bytes() {
+                    found |= 1 << k;
+                }
+            }
+        }
+        total += r[1];
+        cookie = r[2];
+    }
+    (total, found == (1u64 << names.len()) - 1)
+}
+
+/// The file client under fault injection (`arg 7`).
 fn fs_client() -> ! {
     let mut t = Checks(0, "fs");
     t.check(
         fs_setup(FS_MEMORY),
         format_args!("a buffer page of its own"),
     );
-    let r = fs_open("log", true);
+    let made = fs_path(fs::MKDIR, "logs", 0).0[0];
+    let r = fs_open("/logs/app.log", fs::CREATE | fs::TRUNC);
     t.check(
-        r[0] == Status::Ok as u64 && r[2] == 0,
-        format_args!("created an empty file"),
+        made == OK && r[0] == OK && r[2] == 0 && r[3] == fs::KIND_FILE,
+        format_args!("created an empty logs/app.log"),
     );
     let h = r[1];
     let (mut acked, mut retried) = (0, 0);
@@ -641,12 +758,130 @@ fn fs_client() -> ! {
         r[1] == acked * RECORD,
         format_args!("the file is {} bytes", r[1]),
     );
-    // One more, acknowledged, then the machine stops at once: the server
-    // gets no chance to write it home.
-    let (ok, _) = append(h, RECORDS);
+
+    // A file past the direct blocks, written in pieces spanning blocks.
+    fs_path(fs::MKDIR, "data", 0);
+    let big = fs_open("data/big", fs::CREATE | fs::TRUNC)[1];
+    let wrote = write_big(big);
+    let c = check_big(big, 0, BIG, BIG, BIG);
     t.check(
-        ok,
-        format_args!("record {RECORDS} acknowledged; cutting the power"),
+        wrote && c.is_ok(),
+        format_args!(
+            "a {BIG}-byte file (through its indirect block) reads back (first wrong byte: {})",
+            c.err().map_or(-1, |k| k as i64)
+        ),
+    );
+    // Truncate, then write past the end: the gap reads as zero.
+    let cut = fs_call([fs::TRUNCATE, big, 10_000, 0], false).0[0];
+    let b = fs_bytes();
+    for i in 0..4u64 {
+        b[i as usize] = big_byte(20_000 + i);
+    }
+    let w = fs_call([fs::WRITE, big, 20_000, 4], true).0[0];
+    let size = fs_call([fs::STAT, big, 0, 0], false).0[1];
+    let c = check_big(big, 0, 20_004, 10_000, 20_000);
+    t.check(
+        cut == OK && w == OK && size == 20_004 && c.is_ok(),
+        format_args!("truncated to 10000 and written at 20000: {size} bytes, zeros between"),
+    );
+
+    // Blocks come back when a file goes, and its handle stays dead.
+    let before = fs_statfs();
+    let tmp = fs_open("tmp", fs::CREATE)[1];
+    let mut off = 0;
+    while off < 50_000 {
+        fs_call([fs::WRITE, tmp, off, 4096], true);
+        off += 4096;
+    }
+    let during = fs_statfs();
+    let gone = fs_unlink("tmp");
+    let after = fs_statfs();
+    fs_open("tmp2", fs::CREATE);
+    let stale = fs_call([fs::STAT, tmp, 0, 0], false).0[0];
+    t.check(
+        gone == OK
+            && during[1] + 14 == before[1]
+            && after[1] == before[1]
+            && after[2] == before[2]
+            && stale == Status::NotFound as u64,
+        format_args!(
+            "unlinking a 53248-byte file returned its {} blocks; its handle is dead",
+            before[1] - during[1]
+        ),
+    );
+    fs_unlink("tmp2");
+
+    // The tree.
+    for d in ["a", "a/b", "a/b/c"] {
+        fs_path(fs::MKDIR, d, 0);
+    }
+    let f = fs_open("a/b/c/f", fs::CREATE)[1];
+    fs_call([fs::WRITE, f, 0, 100], true);
+    let excl = fs_open("a/b/c/f", fs::CREATE | fs::EXCL)[0];
+    let through = fs_open("a/b/c/f/x", 0)[0];
+    let missing = fs_open("a/nope/f", fs::CREATE)[0];
+    let dotdot = fs_open("a/../a", 0)[0];
+    t.check(
+        excl == Status::Exists as u64
+            && through == Status::NotDir as u64
+            && missing == Status::NotFound as u64
+            && dotdot == Status::Invalid as u64,
+        format_args!(
+            "a/b/c/f: exclusive create refused, no path through a file, no missing parent, no .."
+        ),
+    );
+    let mv = fs_rename("a/b/c/f", "a/g");
+    let old = fs_open("a/b/c/f", 0)[0];
+    let new = fs_open("a/g", 0);
+    let into = fs_rename("a", "a/b/a2");
+    t.check(
+        mv == OK
+            && old == Status::NotFound as u64
+            && new[0] == OK
+            && new[1] == f
+            && new[2] == 100
+            && into == Status::Invalid as u64,
+        format_args!("renamed a/b/c/f to a/g (the same file); a cannot move into itself"),
+    );
+    let full = fs_unlink("a/b");
+    let a = fs_open("a", fs::DIRECTORY)[1];
+    let (n1, both) = list(a, &["b", "g"]);
+    let rm = (fs_unlink("a/b/c"), fs_unlink("a/b"));
+    let (n2, only_g) = list(a, &["g"]);
+    t.check(
+        full == Status::NotEmpty as u64 && n1 == 2 && both && rm == (OK, OK) && n2 == 1 && only_g,
+        format_args!("a non-empty directory stays; a lists b and g, then g alone"),
+    );
+    // A directory past one block of entries.
+    fs_path(fs::MKDIR, "many", 0);
+    let mut names = [[0u8; 8]; 70];
+    let mut made = 0;
+    for (i, n) in names.iter_mut().enumerate() {
+        *n = *b"many/f00";
+        n[6] = b'0' + (i / 10) as u8;
+        n[7] = b'0' + (i % 10) as u8;
+        let p = core::str::from_utf8(n).unwrap_or("");
+        made += (fs_open(p, fs::CREATE)[0] == OK) as u64;
+    }
+    let many = fs_open("many", fs::DIRECTORY)[1];
+    let (n70, ends) = list(many, &["f00", "f69"]);
+    let mut removed = 0;
+    for n in &names {
+        removed += (fs_unlink(core::str::from_utf8(n).unwrap_or("")) == OK) as u64;
+    }
+    let (n0, _) = list(many, &[]);
+    t.check(
+        made == 70 && n70 == 70 && ends && removed == 70 && n0 == 0,
+        format_args!("70 files in one directory (two blocks of entries) listed, then removed"),
+    );
+
+    // One more record, then a rename, both acknowledged; then the machine
+    // stops at once: the rename never goes home before the power cut.
+    let (ok, _) = append(h, RECORDS);
+    let mv = fs_rename("a/g", "g2");
+    t.check(
+        ok && mv == OK,
+        format_args!("record {RECORDS} and a rename of a/g to g2 acknowledged; cutting the power"),
     );
     syscall(Syscall::Call, FS_CONTROL, [OP_SHUTDOWN, t.0, 0, 0]);
     loop {
@@ -654,17 +889,18 @@ fn fs_client() -> ! {
     }
 }
 
+/// The file client after the power cut (`arg 8`).
 fn fs_verify() -> ! {
     let mut t = Checks(0, "fs");
     t.check(
         fs_setup(FS_MEMORY),
         format_args!("a buffer page of its own"),
     );
-    let r = fs_open("log", false);
+    let r = fs_open("logs/app.log", 0);
     let n = RECORDS + 1;
     t.check(
-        r[0] == Status::Ok as u64 && r[2] == n * RECORD,
-        format_args!("after the power cut the file is {} bytes", r[2]),
+        r[0] == OK && r[2] == n * RECORD,
+        format_args!("after the power cut logs/app.log is {} bytes", r[2]),
     );
     let c = check_records(r[1], n);
     t.check(
@@ -674,26 +910,47 @@ fn fs_verify() -> ! {
             c.err().map_or(-1, |k| k as i64)
         ),
     );
+    let g2 = fs_open("g2", 0);
+    let ag = fs_open("a/g", 0)[0];
+    let root = fs_open("/", fs::DIRECTORY);
+    let (count, all) = list(root[1], &["logs", "data", "a", "many", "g2"]);
+    t.check(
+        g2[0] == OK && g2[2] == 100 && ag == Status::NotFound as u64 && count == 5 && all,
+        format_args!(
+            "the last rename survived: g2 is there, a/g is not; the root lists {count} entries"
+        ),
+    );
+    let big = fs_open("data/big", 0);
+    let c = check_big(big[1], 0, 20_004, 10_000, 20_000);
+    t.check(
+        big[0] == OK && big[2] == 20_004 && c.is_ok(),
+        format_args!("data/big survived: {} bytes", big[2]),
+    );
     syscall(Syscall::Call, FS_CONTROL, [OP_SHUTDOWN, t.0, 0, 0]);
     loop {
         syscall(Syscall::Yield, 0, [0; 4]);
     }
 }
 
+/// Another component (`arg 9`): its own container.
 fn fs_other() -> ! {
     let mut t = Checks(0, "fs other");
     t.check(fs_setup(1), format_args!("a buffer page of its own"));
-    let r = fs_open("log", false);
+    let theirs = fs_open("logs/app.log", 0)[0];
+    let root = fs_open("", 0)[0];
     t.check(
-        r[0] == Status::NotFound as u64,
-        format_args!("another component's \"log\" is not in its container"),
+        theirs == Status::NotFound as u64 && root == Status::NotFound as u64,
+        format_args!("another component's logs/app.log is not in its container, which is empty"),
     );
-    let r = fs_open("log", true);
+    fs_path(fs::MKDIR, "logs", 0);
+    let r = fs_open("logs/app.log", fs::CREATE);
     let (ok, _) = append(r[1], 7);
     let (st, _) = fs_call([fs::STAT, r[1], 0, 0], false);
+    let root = fs_open("", fs::DIRECTORY)[1];
+    let (count, logs) = list(root, &["logs"]);
     t.check(
-        r[0] == Status::Ok as u64 && ok && st[1] == 8 * RECORD,
-        format_args!("its own \"log\" is a separate file"),
+        r[0] == OK && ok && st[1] == 8 * RECORD && count == 1 && logs,
+        format_args!("its own logs/app.log is a separate file, alone in its tree"),
     );
     loop {
         syscall(Syscall::Wait, 2, [0; 4]);
@@ -708,7 +965,8 @@ fn injector() -> ! {
     while ticks() < start + 10 {
         syscall(Syscall::Yield, 0, [0; 4]);
     }
-    for n in 0..8 {
+    // Until the client cuts the power: through every phase of its test.
+    for n in 0.. {
         seed ^= seed << 13;
         seed ^= seed >> 7;
         seed ^= seed << 17;
@@ -720,10 +978,7 @@ fn injector() -> ! {
         let target = if n % 2 == 0 { FS_INDEX } else { DRIVER_INDEX };
         syscall(Syscall::Call, 0, [OP_KILL, target, 0, 0]);
     }
-    say!("injector: done");
-    loop {
-        syscall(Syscall::Wait, 1, [0; 4]);
-    }
+    unreachable!()
 }
 
 fn ticks() -> u64 {

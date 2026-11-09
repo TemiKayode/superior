@@ -225,28 +225,47 @@ holds the rest):
   - it frees one, and the capability is gone;
   - a hog touches more heap than its quota and is restarted, with all 8 pages back
     in the pool; its next instance gets those same pages, zeroed.
-- The filesystem server, v1 (`user/fs/`), over the block interface (which now has
+- The filesystem server, v2 (`user/fs/`), over the block interface (which has
   `WRITE` and `FLUSH`; the virtio-blk driver negotiates the device's write cache).
-  - No global namespace: each component sees only its own container of files,
+  - No global namespace: each component sees only its own tree, under a root
     picked by the badge on its capability, so the same component finds the same
     files after a restart.
-  - Crash-only, with a write-ahead journal. Changed blocks go to the journal, then a
-    flush, then a header with their home addresses and a checksum, then a flush:
-    only then is the write acknowledged. The blocks go home after the reply. Mount
-    replays a committed transaction an instance (or the machine) left unfinished;
-    a torn one fails its checksum and was never acknowledged.
-  - Every operation is idempotent, so clients retry calls cut off by a restart,
-    and the server retries block calls cut off by a driver restart.
-  - v1 limits: 128 files, 32 KiB each, one block per read or write.
+  - POSIX-shaped: `/`-separated, case-sensitive paths (lent in a frame);
+    directories; `OPEN` with create, exclusive and truncate flags; `MKDIR`,
+    `UNLINK` (files and empty directories), `RENAME` (replacing a target of the
+    same kind; a directory cannot move into itself), `READDIR`, `TRUNCATE`,
+    `STAT`, `STATFS`. Files to a little over 4 MiB (9 direct blocks and one
+    indirect block); a read or write of up to 4 KiB may span two blocks.
+    Handles carry a generation, so a handle to a removed file never reaches the
+    inode's next owner.
+  - Crash-only, with a write-ahead journal of up to 8 blocks per change. Changed
+    blocks go to the journal, then a flush, then a header with their home
+    addresses and a checksum, then a flush: only then is the change acknowledged.
+    The blocks go home after the reply. Mount replays a committed transaction an
+    instance (or the machine) left unfinished (a torn one fails its checksum and
+    was never acknowledged), then checks that every block belongs to exactly one
+    inode, every inode to exactly one directory, and the bitmap agrees.
+  - Clients retry calls cut off by a restart (a retried `UNLINK` or `RENAME`
+    answering `NotFound` had already happened); the server retries block calls
+    cut off by a driver restart.
+  - Limits: 511 files and directories, 58-byte names, one request at a time.
   - Fault injection: a manifest `fault-injector` component may ask the Component
-    Manager to kill another (it is restarted as if it had crashed).
-  `cargo xtask fs-test` boots a fresh disk twice:
-  - while a client appends 400 records, the injector kills the filesystem server and
-    the disk driver 8 times at pseudo-random moments; every acknowledged record
-    reads back;
-  - one more record is acknowledged and the machine stops at once (a power cut);
-  - the second boot finds all 401 records, often by replaying the journal, and
-    another component's container does not have the file.
+    Manager to kill another (it is restarted as if it had crashed; such kills do
+    not count towards the restart limit, which is there to stop crash loops).
+  `cargo xtask fs-test` boots a fresh 16 MiB disk twice. The injector kills the
+  filesystem server and the disk driver every 3 to 14 ticks until the power cut
+  (about 50 to 90 kills a run):
+  - a client appends 400 records and every acknowledged one reads back; then
+    a 280,000-byte file written in unaligned pieces, truncated and extended;
+    a removed file's blocks come back and its handle is dead; nested
+    directories, renames, refused operations (exclusive create, a path through
+    a file, `..`, a directory into itself, removing a non-empty directory);
+    70 files in one directory, listed and removed;
+  - one more record and a rename are acknowledged and the machine stops at once
+    (a power cut);
+  - the second boot finds all 401 records, the rename, the big file and the
+    tree, and another component's tree does not have them. Every mount's check
+    must pass.
 - Static-pie user programs loaded into their own address spaces and relocated.
 - Boot self-test: a server and a client in separate address spaces do 20,000
   call/reply round trips, and the kernel refuses four kinds of rights violations. A

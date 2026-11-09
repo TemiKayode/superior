@@ -29,6 +29,16 @@ pub enum Status {
     Invalid = 4,
     /// The device failed the request.
     DeviceError = 5,
+    /// The name is already taken.
+    Exists = 6,
+    /// The directory is not empty.
+    NotEmpty = 7,
+    /// A path component, or the target, is not a directory.
+    NotDir = 8,
+    /// The target is a directory.
+    IsDir = 9,
+    /// No free blocks or inodes, or the file would pass its largest size.
+    NoSpace = 10,
 }
 
 impl Status {
@@ -39,6 +49,11 @@ impl Status {
             2 => Status::InUse,
             3 => Status::Denied,
             5 => Status::DeviceError,
+            6 => Status::Exists,
+            7 => Status::NotEmpty,
+            8 => Status::NotDir,
+            9 => Status::IsDir,
+            10 => Status::NoSpace,
             _ => Status::Invalid,
         }
     }
@@ -112,20 +127,45 @@ pub mod block {
 /// the whole machine stopping at any instant. Every operation is
 /// idempotent, so a client retries one that failed with `PeerRestarted`.
 pub mod fs {
-    pub const VERSION: u64 = 1;
-    /// Bytes in a file name, NUL-padded, packed little-endian into three
-    /// message words ([`name`]).
-    pub const MAX_NAME: usize = 24;
-    /// Bytes in a block; one `READ` or `WRITE` stays inside one.
-    pub const BLOCK: u64 = 4096;
-    /// Largest file, in bytes.
-    pub const MAX_FILE: u64 = 8 * BLOCK;
+    //! Paths are UTF-8, `/`-separated and relative to the caller's own
+    //! container (a leading `/` is allowed); `.` and empty components are
+    //! skipped, `..` is refused (the POSIX view resolves it). Operations
+    //! taking a path have it at the start of a granted frame.
+    //!
+    //! Every operation may be retried after `PeerRestarted` (the server was
+    //! restarted): `OPEN`, `MKDIR`, `READ`, `WRITE` and `TRUNCATE` give
+    //! the same result again; a retried `UNLINK` or `RENAME` that had
+    //! already happened answers `NotFound`, which the caller takes as done.
 
-    /// `[CREATE, name...]`: opens the named file in the caller's container,
-    /// making it empty if there is none. Reply `[status, handle, size]`.
+    pub const VERSION: u64 = 2;
+    /// Bytes in one path component.
+    pub const MAX_NAME: usize = 58;
+    /// Bytes in a block; one `READ` or `WRITE` moves at most this many
+    /// (it may span two blocks).
+    pub const BLOCK: u64 = 4096;
+    /// Blocks a file can hold: 9 direct and 1024 through one indirect
+    /// block.
+    pub const MAX_BLOCKS: u64 = 9 + BLOCK / 4;
+    /// Largest file, in bytes (a little over 4 MiB).
+    pub const MAX_FILE: u64 = MAX_BLOCKS * BLOCK;
+
+    /// What a handle or directory entry is.
+    pub const KIND_FILE: u64 = 1;
+    pub const KIND_DIR: u64 = 2;
+
+    /// `OPEN` flags.
     pub const CREATE: u64 = 1;
-    /// `[OPEN, name...]`: as `CREATE`, but `NotFound` if there is none.
-    pub const OPEN: u64 = 2;
+    /// With `CREATE`: `Exists` if it is already there.
+    pub const EXCL: u64 = 2;
+    /// Empties a file opened for writing.
+    pub const TRUNC: u64 = 4;
+    /// `NotDir` unless it is a directory.
+    pub const DIRECTORY: u64 = 8;
+
+    /// `[OPEN, path length, flags]`, path granted: opens a file or
+    /// directory (`""` or `"/"` is the container's root). `CREATE` makes
+    /// an empty file. Reply `[status, handle, size, kind]`.
+    pub const OPEN: u64 = 1;
     /// `[READ, handle, offset, length]` with a frame granted: copies the
     /// bytes into the start of the frame. Reply `[status, bytes read]`.
     pub const READ: u64 = 3;
@@ -133,30 +173,67 @@ pub mod fs {
     /// first `length` bytes of the frame. Reply `[status]`, sent only once
     /// the write is durable.
     pub const WRITE: u64 = 4;
-    /// `[STAT, handle]`: reply `[status, size]`.
+    /// `[STAT, handle]`: reply `[status, size, kind]`.
     pub const STAT: u64 = 5;
+    /// `[MKDIR, path length]`, path granted: `Exists` if the name is taken
+    /// by a file; `Ok` if it is already a directory.
+    pub const MKDIR: u64 = 6;
+    /// `[UNLINK, path length]`, path granted: removes a file or an empty
+    /// directory (`NotEmpty` otherwise). Handles to it stop working.
+    pub const UNLINK: u64 = 7;
+    /// `[RENAME, from length, to length]`, granted frame holding both
+    /// paths back to back: moves the entry, replacing a file (or empty
+    /// directory) of the same kind at `to`. A directory cannot move into
+    /// itself.
+    pub const RENAME: u64 = 8;
+    /// `[READDIR, handle, cookie]` with a frame granted: fills it with up
+    /// to 64 [`Entry`] records from position `cookie` (start with 0).
+    /// Reply `[status, entries, next cookie]`; no entries means the end.
+    pub const READDIR: u64 = 9;
+    /// `[TRUNCATE, handle, size]`: sets a file's size; bytes past the old
+    /// end read as zero.
+    pub const TRUNCATE: u64 = 10;
+    /// `[STATFS]`: reply `[status, free blocks, free inodes]`.
+    pub const STATFS: u64 = 11;
 
-    /// A file name packed into message words; `None` if it is empty, too
-    /// long, or contains a NUL.
-    pub fn name(s: &str) -> Option<[u64; 3]> {
-        let b = s.as_bytes();
-        if b.is_empty() || b.len() > MAX_NAME || b.contains(&0) {
-            return None;
+    /// A directory entry as `READDIR` returns it: 64 bytes.
+    pub const ENTRY: usize = 64;
+
+    /// One `READDIR` record.
+    pub struct Entry<'a>(pub &'a [u8]);
+
+    impl<'a> Entry<'a> {
+        pub fn kind(&self) -> u64 {
+            self.0[4] as u64
         }
-        let mut w = [0u64; 3];
-        for (i, &c) in b.iter().enumerate() {
-            w[i / 8] |= (c as u64) << (8 * (i % 8));
+        pub fn name(&self) -> &'a [u8] {
+            let n = (self.0[5] as usize).min(MAX_NAME);
+            &self.0[6..6 + n]
         }
-        Some(w)
+    }
+
+    /// Writes `path` at the start of `frame`; its length, or `None` if it
+    /// does not fit.
+    pub fn put_path(frame: &mut [u8], path: &str) -> Option<u64> {
+        let b = path.as_bytes();
+        let f = frame.get_mut(..b.len())?;
+        f.copy_from_slice(b);
+        Some(b.len() as u64)
     }
 
     #[cfg(test)]
     #[test]
-    fn names_pack_into_three_words() {
-        assert_eq!(name("ab"), Some([0x6261, 0, 0]));
-        assert_eq!(name("abcdefghi").unwrap()[1], 0x69);
-        assert!(name("").is_none());
-        assert!(name("0123456789abcdefghijklmnX").is_none());
+    fn entries_and_paths() {
+        let mut e = [0u8; ENTRY];
+        e[4] = KIND_DIR as u8;
+        e[5] = 3;
+        e[6..9].copy_from_slice(b"abc");
+        assert_eq!(Entry(&e).kind(), KIND_DIR);
+        assert_eq!(Entry(&e).name(), b"abc");
+        let mut f = [0u8; 8];
+        assert_eq!(put_path(&mut f, "a/b"), Some(3));
+        assert_eq!(&f[..3], b"a/b");
+        assert_eq!(put_path(&mut f, "too/long/path"), None);
     }
 }
 

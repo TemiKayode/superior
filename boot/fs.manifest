@@ -30,7 +30,7 @@ component fs
   priority 10
   uses block 0
   provides fs 1
-  untyped 16 2
+  untyped 17 2
 
 component client
   image testclient

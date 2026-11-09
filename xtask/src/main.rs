@@ -745,35 +745,59 @@ fn fs_test(arch: Arch) -> Result<(), String> {
     let first = image_with(false, arch, "fs")?;
     let second = image_with(false, arch, "fs-verify")?;
     let disk = fs_disk();
-    std::fs::write(&disk, vec![0u8; 4 << 20])
+    std::fs::write(&disk, vec![0u8; 16 << 20])
         .map_err(|e| format!("writing {}: {e}", disk.display()))?;
     println!("== filesystem test, first boot: {}", first.path.display());
     let out = run_to_exit(&first, Duration::from_secs(120))?;
     let steps = [
         "fs: formatted",
         "fs: mounted in",
-        "[pass] fs: created an empty file",
+        "fs: check: 0 blocks used by 0 files and 0 directories; all accounted for",
+        "[pass] fs: created an empty logs/app.log",
         "[cm] fault injection: killing fs",
         "[cm] fault injection: killing virtio-blk",
-        "injector: done",
         "[pass] fs: 400 records written under fault injection",
         "[pass] fs: every acknowledged record reads back",
         "[pass] fs: the file is 25600 bytes",
-        "[pass] fs: record 400 acknowledged; cutting the power",
+        "[pass] fs: a 280000-byte file (through its indirect block) reads back",
+        "[pass] fs: truncated to 10000 and written at 20000: 20004 bytes, zeros between",
+        "[pass] fs: unlinking a 53248-byte file returned its 14 blocks; its handle is dead",
+        "[pass] fs: a/b/c/f: exclusive create refused",
+        "[pass] fs: renamed a/b/c/f to a/g (the same file); a cannot move into itself",
+        "[pass] fs: a non-empty directory stays; a lists b and g, then g alone",
+        "[pass] fs: 70 files in one directory (two blocks of entries) listed, then removed",
+        "[pass] fs: record 400 and a rename of a/g to g2 acknowledged; cutting the power",
         "[cm] client asked to shut down (pass)",
     ];
     check_log("filesystem test (first boot)", &out, &steps)?;
     let kills = out.matches("[cm] fault injection: killing").count();
+    // Kills land in the later phases too (the tree, renames, unlinks).
+    let later = out
+        .find("[pass] fs: the file is 25600 bytes")
+        .map_or(0, |i| {
+            out[i..].matches("[cm] fault injection: killing fs").count()
+        });
+    if kills < 8 || later < 2 {
+        return Err(format!(
+            "filesystem test: {kills} kills, {later} of the server after the appends; want 8 and 2"
+        ));
+    }
     let replays = out.matches("replayed a committed transaction").count();
-    println!("== {kills} services killed under load; {replays} mounts replayed the journal");
+    let checks = out.matches("all accounted for").count();
+    println!(
+        "== {kills} services killed under load ({later} of the server after the appends); {replays} mounts replayed the journal; {checks} mount checks passed"
+    );
     println!("== filesystem test, second boot: {}", second.path.display());
     let out = run_to_exit(&second, Duration::from_secs(60))?;
     let steps = [
         "fs: mounted in",
-        "[pass] fs other: another component's \"log\" is not in its container",
-        "[pass] fs other: its own \"log\" is a separate file",
-        "[pass] fs: after the power cut the file is 25664 bytes",
+        "all accounted for",
+        "[pass] fs other: another component's logs/app.log is not in its container, which is empty",
+        "[pass] fs other: its own logs/app.log is a separate file, alone in its tree",
+        "[pass] fs: after the power cut logs/app.log is 25664 bytes",
         "[pass] fs: all 401 acknowledged records survived",
+        "[pass] fs: the last rename survived: g2 is there, a/g is not; the root lists 5 entries",
+        "[pass] fs: data/big survived: 20004 bytes",
         "[cm] client asked to shut down (pass)",
     ];
     // The two clients run side by side: their lines interleave.
@@ -796,7 +820,7 @@ fn check_log(what: &str, out: &str, steps: &[&str]) -> Result<(), String> {
             None => return Err(format!("{what}: missing (in order) {step:?}")),
         }
     }
-    for bad in ["[fail]", "could not", "panic"] {
+    for bad in ["[fail]", "could not", "panic", "check FAILED"] {
         if out.contains(bad) {
             return Err(format!("{what}: log contains {bad:?}"));
         }

@@ -350,8 +350,9 @@ impl<'a> Manager<'a> {
     }
 
     /// Component `i` faulted (its thread is stopped): applies its restart
-    /// policy.
-    fn supervise(&mut self, i: usize) {
+    /// policy. A kill by a fault injector (`injected`) does not count
+    /// towards the restart limit, which is there to stop crash loops.
+    fn supervise(&mut self, i: usize, injected: bool) {
         let c = *self.component(i);
         let name = c.name;
         let policy = match c.restart {
@@ -363,7 +364,7 @@ impl<'a> Manager<'a> {
             Restart::OneForOne => "one-for-one",
             Restart::RestForOne => "rest-for-one",
         };
-        if !self.may_restart(i) {
+        if !injected && !self.may_restart(i) {
             self.stop(i);
             self.status[i] = Status::Failed;
             say!("{name}: more than {MAX_RESTARTS} restarts in 60 s; giving up");
@@ -795,7 +796,7 @@ pub extern "C" fn _start(bundle_len: u64) -> ! {
                     say!("the Memory Server failed; the system must restart");
                     shutdown(false);
                 }
-                m.supervise(i);
+                m.supervise(i, false);
                 None
             }
             BADGE_REPORT
@@ -810,7 +811,7 @@ pub extern "C" fn _start(bundle_len: u64) -> ! {
                 if killable {
                     say!("fault injection: killing {}", m.component(t).name);
                     m.status[t] = Status::Stopped;
-                    m.supervise(t);
+                    m.supervise(t, true);
                 }
                 Some([!killable as u64, 0, 0, 0])
             }
