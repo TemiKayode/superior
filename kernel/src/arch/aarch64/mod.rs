@@ -1,7 +1,7 @@
 //! AArch64 on QEMU's `virt` machine: entered at EL1 with the MMU off, at
 //! the link address, with the device tree at the start of RAM. The kernel
-//! runs at EL1 and user threads at EL0. Devices: a PL011 UART, a GICv2
-//! interrupt controller and the architected generic timer.
+//! runs at EL1 and user threads at EL0. Devices: a PL011 UART, a GICv3
+//! interrupt controller with an ITS, and the architected generic timer.
 //!
 //! One translation table base (`TTBR0_EL1`) serves both: every address
 //! space shares the kernel's first top-level entry, an identity map of
@@ -166,7 +166,8 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
     let hz = timer::init();
     gic::unmask(timer::INTID);
     kprintln!(
-        "[ok] GICv2, generic timer: {} kHz counter, {} Hz tick",
+        "[ok] GICv3{}, generic timer: {} kHz counter, {} Hz tick",
+        if gic::its_present() { " with ITS" } else { "" },
         hz / 1000,
         TICK_HZ
     );
@@ -211,13 +212,10 @@ pub fn idle_wait() {
     };
 }
 
-/// MSI lines: the first [`MSI_COUNT`] interrupt IDs of the GICv2m frame.
-const MSI_COUNT: u32 = 8;
-
+/// MSI lines: one LPI each, through the ITS (none without one).
 fn msi_lines() -> core::ops::Range<u8> {
-    let (first, count) = gic::msi_spis();
-    let count = count.min(MSI_COUNT);
-    first as u8..(first + count) as u8
+    let count = if gic::its_present() { gic::MSI_COUNT } else { 0 };
+    gic::MSI_LINE_BASE..gic::MSI_LINE_BASE + count
 }
 
 pub fn irq_routable(line: u8) -> bool {
@@ -225,11 +223,10 @@ pub fn irq_routable(line: u8) -> bool {
 }
 
 /// The message a device writes to raise MSI line `line`, if it is one:
-/// the line's interrupt ID, written to the GICv2m doorbell.
-pub fn msi_message(line: u8) -> Option<(u64, u64)> {
-    msi_lines()
-        .contains(&line)
-        .then_some((gic::MSI_DOORBELL, line as u64))
+/// an event ID written to the ITS, which the ITS maps to the line for
+/// device `source` alone (or for no device).
+pub fn msi_message(line: u8, source: Option<u16>) -> Option<(u64, u64)> {
+    gic::route(line, source)
 }
 
 /// For the root task's PCI bus server: the ECAM configuration window

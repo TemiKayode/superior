@@ -522,8 +522,14 @@ impl Bus {
         if !on {
             return Ok(());
         }
-        let v = self.funcs[i].unwrap().msi[0].ok_or(Status::Invalid)?;
-        let r = syscall(Syscall::IrqMsiMessage, MSI + v as u64, [0; 4]);
+        let f = self.funcs[i].unwrap();
+        let v = f.msi[0].ok_or(Status::Invalid)?;
+        // Raisable by this function alone, where interrupts are remapped.
+        let source = match f.domain {
+            Some(d) if f.dma => DOMAINS + d as u64,
+            _ => u64::MAX,
+        };
+        let r = syscall(Syscall::IrqMsiMessage, MSI + v as u64, [source, 0, 0, 0]);
         if r.status != 0 {
             return Err(Status::DeviceError);
         }

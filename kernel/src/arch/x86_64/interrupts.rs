@@ -74,11 +74,22 @@ pub fn is_msi(line: u8) -> bool {
     (MSI_LINE_BASE..MSI_LINE_BASE + MSI_COUNT).contains(&line)
 }
 
-/// The message that raises MSI line `line` on this CPU: address
-/// 0xfee0_0000 (the local APIC, destination ID 0, physical mode), data =
-/// the vector (fixed delivery, edge).
-pub fn msi_message(line: u8) -> Option<(u64, u64)> {
-    is_msi(line).then(|| (0xfee0_0000, (MSI_VECTOR_BASE + line - MSI_LINE_BASE) as u64))
+/// The message that raises MSI line `line` on this CPU. With interrupt
+/// remapping, the line's remapping entry is pointed at its vector for
+/// requester `source` alone (or for nobody) and the message names that
+/// entry. Without, it is the vector itself: address 0xfee0_0000 (the
+/// local APIC, destination ID 0, physical mode), data = the vector (fixed
+/// delivery, edge).
+pub fn msi_message(line: u8, source: Option<u16>) -> Option<(u64, u64)> {
+    if !is_msi(line) {
+        return None;
+    }
+    let vector = MSI_VECTOR_BASE + line - MSI_LINE_BASE;
+    Some(if super::iommu::remapping() {
+        super::iommu::route((line - MSI_LINE_BASE) as u16, vector, source)
+    } else {
+        (0xfee0_0000, vector as u64)
+    })
 }
 
 pub fn irq_routable(line: u8) -> bool {

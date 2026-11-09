@@ -157,7 +157,13 @@ pub enum Syscall {
     /// capability `rdi`: the address in message word 0, the data in word 1.
     /// A driver programs these into its device's MSI-X table, then binds
     /// the vector to a notification with [`Syscall::IrqSetNotification`].
-    /// Fails with `InvalidArgument` for a line that is not an MSI vector.
+    /// `rsi` is the I/O address space (Write right) of the function that
+    /// may raise it: where interrupts are remapped (VT-d's remapping table,
+    /// the GICv3 ITS), the vector is from then on routed for that
+    /// function's requester ID alone, and a message from any other device
+    /// raises nothing. `rsi` = `u64::MAX` routes it for no device. Fails
+    /// with `InvalidArgument` for a line that is not an MSI vector or a
+    /// space bound to no function.
     IrqMsiMessage = 34,
     /// The address a device uses to reach the frame in slot `rdi` (Map
     /// right), in message word 0, for programming DMA. Today that is the
@@ -208,8 +214,9 @@ pub enum Syscall {
     /// to the I/O address space in slot `rdi` (Read right) since the last
     /// call, and forgets them: message word 0 is how many, word 1 the
     /// first one's page address (0 if the IOMMU gave none) and word 2 is 1
-    /// if it was a write. Without this, a device aimed outside its domain
-    /// fails without anyone hearing of it.
+    /// if it was a write; word 3 counts interrupt messages it blocked
+    /// (VT-d only: the ITS drops them without a report). Without this, a
+    /// device aimed outside its domain fails without anyone hearing of it.
     IoFaults = 42,
     /// Maps the frame in slot `rdi` at page-aligned `rsi` in the address
     /// space in slot `r8` (Write right). `rdx` = [`MAP_WRITE`] and/or

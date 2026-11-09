@@ -11,6 +11,7 @@
 //! every timer tick ([`take_faults`]); its interrupt stays off.
 
 use super::{fdt, gic, vm};
+use crate::iommu::IoFault;
 use crate::{kprintln, memory};
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -170,8 +171,9 @@ pub fn sync_tables() {
     dsb();
 }
 
-/// Pages every I/O address space maps: the GICv2m doorbell, so the
-/// function's MSI writes get through.
+/// Pages every I/O address space maps: the ITS's translation register, so
+/// the function's MSI writes get through (the ITS then decides whether
+/// they raise anything).
 pub fn fixed_pages() -> &'static [u64] {
     const PAGES: [u64; 1] = [gic::MSI_DOORBELL & !0xfff];
     &PAGES
@@ -230,8 +232,9 @@ pub fn attach(sid: u16, _domain: u16, header: u64, _root: u64) {
     flush();
 }
 
-/// Blocks stream `sid`'s DMA altogether.
+/// Blocks stream `sid`'s DMA altogether, interrupts included.
 pub fn detach(sid: u16) {
+    gic::unroute(sid);
     if !valid_sid(sid) {
         return;
     }
@@ -252,9 +255,9 @@ pub fn flush() {
 }
 
 /// Hands each fault event since the last call to `f`, as (stream ID,
-/// page address, whether it was a write), and consumes it. Returns whether
-/// events were lost to overflow.
-pub fn take_faults(mut f: impl FnMut(u16, u64, bool)) -> bool {
+/// what it was), and consumes it. Returns whether events were lost to
+/// overflow.
+pub fn take_faults(mut f: impl FnMut(u16, IoFault)) -> bool {
     if !present() {
         return false;
     }
@@ -283,7 +286,12 @@ pub fn take_faults(mut f: impl FnMut(u16, u64, bool)) -> bool {
         // say) is reported at address 0.
         let kind = dw0 & 0xff;
         let addr = if (0x10..=0x13).contains(&kind) { addr & !0xfff } else { 0 };
-        f((dw0 >> 32) as u16, addr, dw1 & 1 << 34 == 0);
+        let fault = if dw1 & 1 << 34 != 0 {
+            IoFault::Read(addr)
+        } else {
+            IoFault::Write(addr)
+        };
+        f((dw0 >> 32) as u16, fault);
         cons = (cons + 1) & mask;
     }
     let lost = prod & Q_OVERFLOW != r32(EVTQ_CONS) & Q_OVERFLOW;

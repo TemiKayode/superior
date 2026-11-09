@@ -137,16 +137,30 @@ impl Pci {
 
     /// Takes MSI vector `n` into `slot`, binds it to the notification in
     /// `notification`, and returns the message the device must write to
-    /// raise it: (address, data).
-    pub fn msi_vector(&self, n: u64, slot: u64, notification: u64) -> Result<(u64, u64), Failure> {
+    /// raise it: (address, data). Where interrupts are remapped, only the
+    /// function bound to the I/O address space in `domain` can raise it.
+    pub fn msi_vector(
+        &self,
+        n: u64,
+        slot: u64,
+        notification: u64,
+        domain: u64,
+    ) -> Result<(u64, u64), Failure> {
+        self.take_msi_vector(n, slot)?;
+        let m = msi_message(slot, Some(domain))?;
+        sys(Syscall::IrqSetNotification, slot, [notification, 0, 0, 0])
+            .map_err(|e| ("binding the MSI vector", e))?;
+        Ok(m)
+    }
+
+    /// Takes MSI vector `n` into `slot` and nothing more: the vector is
+    /// routed for no device until [`msi_message`] says otherwise.
+    pub fn take_msi_vector(&self, n: u64, slot: u64) -> Result<(), Failure> {
         let r = self.call([pci::MSI_VECTOR, n, 0, 0], Some(slot))?;
         if r.cap != Some(slot as u16) {
             return Err(("no MSI vector arrived", 0));
         }
-        let m = sys(Syscall::IrqMsiMessage, slot, [0; 4]).map_err(|e| ("MSI message", e))?;
-        sys(Syscall::IrqSetNotification, slot, [notification, 0, 0, 0])
-            .map_err(|e| ("binding the MSI vector", e))?;
-        Ok((m.msg[0], m.msg[1]))
+        Ok(())
     }
 
     /// Walks the function's capability list for capability `id`, starting
@@ -261,9 +275,34 @@ pub fn io_unmap(slot: u64) -> Result<(), Failure> {
 /// The DMA requests the IOMMU blocked for the function bound to `domain`
 /// since the last call: how many, and the first one's page address and
 /// whether it was a write.
-pub fn io_faults(domain: u64) -> Result<(u64, u64, bool), Failure> {
+/// The message that raises the MSI vector in `slot`, which only the
+/// function bound to the I/O address space in `source` may then send (or,
+/// with `None`, no device at all).
+pub fn msi_message(slot: u64, source: Option<u64>) -> Result<(u64, u64), Failure> {
+    sys(Syscall::IrqMsiMessage, slot, [source.unwrap_or(u64::MAX), 0, 0, 0])
+        .map(|m| (m.msg[0], m.msg[1]))
+        .map_err(|e| ("MSI message", e))
+}
+
+/// What the IOMMU blocked for the function bound to `domain` since the
+/// last call.
+pub struct IoFaults {
+    /// DMA requests, and the first one's page and whether it was a write.
+    pub dma: u64,
+    pub first_page: u64,
+    pub first_write: bool,
+    /// Interrupt messages it was not allowed to send.
+    pub interrupts: u64,
+}
+
+pub fn io_faults(domain: u64) -> Result<IoFaults, Failure> {
     sys(Syscall::IoFaults, domain, [0; 4])
-        .map(|r| (r.msg[0], r.msg[1], r.msg[2] != 0))
+        .map(|r| IoFaults {
+            dma: r.msg[0],
+            first_page: r.msg[1],
+            first_write: r.msg[2] != 0,
+            interrupts: r.msg[3],
+        })
         .map_err(|e| ("reading IOMMU faults", e))
 }
 
@@ -271,8 +310,10 @@ pub fn io_faults(domain: u64) -> Result<(u64, u64, bool), Failure> {
 /// `page`: whether it was reported, and a phrase saying so.
 pub fn stray_reported(domain: u64, page: u64) -> (bool, &'static str) {
     match io_faults(domain) {
-        Ok((n, at, true)) if n > 0 && at == page => (true, "the IOMMU reported a blocked write to it"),
-        Ok((0, _, _)) => (false, "the IOMMU reported NOTHING"),
+        Ok(f) if f.dma > 0 && f.first_write && f.first_page == page => {
+            (true, "the IOMMU reported a blocked write to it")
+        }
+        Ok(f) if f.dma == 0 => (false, "the IOMMU reported NOTHING"),
         Ok(_) => (false, "the IOMMU reported some OTHER fault"),
         Err(_) => (false, "reading the IOMMU's faults FAILED"),
     }

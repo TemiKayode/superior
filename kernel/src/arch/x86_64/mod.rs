@@ -102,9 +102,11 @@ pub fn irq_routable(line: u8) -> bool {
     interrupts::irq_routable(line)
 }
 
-/// The message a device writes to raise MSI line `line`, if it is one.
-pub fn msi_message(line: u8) -> Option<(u64, u64)> {
-    interrupts::msi_message(line)
+/// The message a device writes to raise MSI line `line`, if it is one,
+/// with the line raisable by requester `source` alone (or by no device)
+/// where interrupts are remapped.
+pub fn msi_message(line: u8, source: Option<u16>) -> Option<(u64, u64)> {
+    interrupts::msi_message(line, source)
 }
 
 /// For the root task's PCI bus server: configuration space (the legacy

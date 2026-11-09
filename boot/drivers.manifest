@@ -5,8 +5,9 @@
 # domain. The virtio-blk driver opens its one device through it and
 # serves the block interface; the client reads the test disk through it,
 # checks the bus server will not give it the driver's device, has the
-# driver point its device at memory outside its domain (which must stay
-# untouched), crashes the driver and reads again once the manager has
+# driver make its device raise an MSI vector routed to no device (which
+# must not arrive) and point it at memory outside its domain (which must
+# stay untouched), crashes the driver and reads again once the manager has
 # restarted it.
 
 component pcibus

@@ -10,6 +10,20 @@
 use crate::arch::{iommu, vm};
 use crate::memory::TablePool;
 
+/// A request the IOMMU blocked, as its `take_faults` reports it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IoFault {
+    /// DMA from or to a page the device's space does not map (or maps
+    /// read-only, for a write).
+    Read(u64),
+    Write(u64),
+    /// An interrupt message the device may not send: one for a vector not
+    /// bound to it, or in a format remapping does not allow. (Only VT-d
+    /// reports these; the ITS drops them.)
+    #[cfg_attr(target_arch = "aarch64", allow(dead_code))]
+    Interrupt,
+}
+
 /// Why a mapping failed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IoMapError {

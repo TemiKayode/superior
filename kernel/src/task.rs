@@ -42,6 +42,7 @@
 
 use crate::arch::vm::{self, AddressSpace, USER_BASE, USER_END};
 use crate::arch::{self, Args, Exit, UserFrame, iommu};
+use crate::iommu::IoFault;
 use crate::memory::{MapError, TablePool};
 use crate::{kprint, kprintln};
 use spin::{Mutex, MutexGuard};
@@ -134,11 +135,12 @@ struct IoDomain {
     base: u64,
     pool: TablePool,
     sid: Option<u16>,
-    /// Requests the IOMMU blocked since the holder last asked
+    /// DMA requests the IOMMU blocked since the holder last asked
     /// (`IoFaults`), and the first of them: page address and whether it
-    /// was a write.
+    /// was a write; and interrupt messages it blocked.
     faults: u64,
     first_fault: (u64, bool),
+    irq_faults: u64,
 }
 
 impl IoDomain {
@@ -420,7 +422,7 @@ pub fn handle_syscall(frame: &mut UserFrame) -> Exit {
             k.ipc.set_msg_of(cur, [ticks, 0, 0, 0]);
             Ok(())
         }
-        Some(Syscall::IrqMsiMessage) => irq_msi_message(k, cur, a.a0),
+        Some(Syscall::IrqMsiMessage) => irq_msi_message(k, cur, &a),
         Some(Syscall::FrameDmaAddress) => frame_dma_address(k, cur, a.a0),
         Some(Syscall::DeviceFrame) => device_frame(k, cur, &a),
         Some(Syscall::IoSpaceBind) => io_space_bind(k, cur, &a),
@@ -583,10 +585,20 @@ fn irq_cap(k: &Kernel, cur: Tid, slot: u64) -> Result<u8, u64> {
     }
 }
 
-/// `IrqMsiMessage`: rdi = IRQ capability for an MSI vector.
-fn irq_msi_message(k: &mut Kernel, cur: Tid, slot: u64) -> Result<(), u64> {
-    let line = irq_cap(k, cur, slot)?;
-    let (address, data) = arch::msi_message(line).ok_or(Error::InvalidArgument.code())?;
+/// `IrqMsiMessage`: rdi = IRQ capability for an MSI vector, rsi = the I/O
+/// address space (Write) of the function that may raise it, or
+/// `u64::MAX` for none.
+fn irq_msi_message(k: &mut Kernel, cur: Tid, f: &Args) -> Result<(), u64> {
+    let line = irq_cap(k, cur, f.a0)?;
+    let source = if f.a1 == u64::MAX {
+        None
+    } else {
+        let id = io_space_cap(k, cur, f.a1)?;
+        let d = k.io_spaces[id].ok_or(Error::InvalidCapability.code())?;
+        Some(d.sid.ok_or(Error::InvalidArgument.code())?)
+    };
+    let (address, data) =
+        arch::msi_message(line, source).ok_or(Error::InvalidArgument.code())?;
     k.ipc.set_msg_of(cur, [address, data, 0, 0]);
     Ok(())
 }
@@ -701,17 +713,24 @@ fn fire_timers(k: &mut Kernel) {
 /// the function that made it.
 fn collect_io_faults(k: &mut Kernel) {
     let (spaces, stats) = (&mut k.io_spaces, &mut k.stats);
-    let lost = iommu::take_faults(|sid, page, write| {
+    let lost = iommu::take_faults(|sid, fault| {
         stats.io_faults += 1;
-        match spaces.iter_mut().flatten().find(|d| d.sid == Some(sid)) {
-            Some(d) => {
-                if d.faults == 0 {
-                    d.first_fault = (page, write);
-                }
-                d.faults += 1;
+        let Some(d) = spaces.iter_mut().flatten().find(|d| d.sid == Some(sid)) else {
+            stats.io_faults_unowned += 1;
+            return;
+        };
+        let (page, write) = match fault {
+            IoFault::Interrupt => {
+                d.irq_faults += 1;
+                return;
             }
-            None => stats.io_faults_unowned += 1,
+            IoFault::Read(page) => (page, false),
+            IoFault::Write(page) => (page, true),
+        };
+        if d.faults == 0 {
+            d.first_fault = (page, write);
         }
+        d.faults += 1;
     });
     if lost {
         stats.io_faults_unowned += 1;
@@ -733,9 +752,15 @@ fn io_faults(k: &mut Kernel, cur: Tid, slot: u64) -> Result<(), u64> {
     let d = k.io_spaces[id as usize]
         .as_mut()
         .ok_or(Error::InvalidCapability.code())?;
-    let reply = [d.faults, d.first_fault.0, d.first_fault.1 as u64, 0];
+    let reply = [
+        d.faults,
+        d.first_fault.0,
+        d.first_fault.1 as u64,
+        d.irq_faults,
+    ];
     d.faults = 0;
     d.first_fault = (0, false);
+    d.irq_faults = 0;
     k.ipc.set_msg_of(cur, reply);
     Ok(())
 }
@@ -1666,6 +1691,7 @@ fn retype(k: &mut Kernel, cur: Tid, f: &Args) -> Result<(), u64> {
                 sid: None,
                 faults: 0,
                 first_fault: (0, false),
+                irq_faults: 0,
             };
             iommu::init_space(base, d.root(), id as u16 + 1);
             for &pa in iommu::fixed_pages() {

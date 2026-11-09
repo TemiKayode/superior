@@ -187,7 +187,7 @@ fn start() -> Result<Disk, Failure> {
         return Err(("DMA pages above 4 GiB, and no 64-bit addressing", top));
     }
     // Plain MSI (this controller has no MSI-X).
-    let (_, data) = pci.msi_vector(0, MSI, NOTIFY)?;
+    let (_, data) = pci.msi_vector(0, MSI, NOTIFY, DOMAIN)?;
     pci.msi(true)?;
     pci.bus_master(true)?;
 

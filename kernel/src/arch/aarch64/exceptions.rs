@@ -311,19 +311,20 @@ extern "C" fn el1_sync(frame: &mut UserFrame, _kind: u64) {
 }
 
 extern "C" fn irq(frame: &mut UserFrame, _kind: u64) {
-    let Some((iar, id)) = super::gic::acknowledge() else {
+    let Some(id) = super::gic::acknowledge() else {
         return; // spurious
     };
     if id == super::timer::INTID {
         super::timer::rearm();
-        super::gic::end_of_interrupt(iar);
+        super::gic::end_of_interrupt(id);
         crate::task::handle_timer(frame);
     } else {
         // Masked until the driver acknowledges, so a level that stays
-        // raised cannot storm the kernel.
-        super::gic::mask(id);
-        super::gic::end_of_interrupt(iar);
-        crate::task::handle_irq(frame, id as u8);
+        // raised cannot storm the kernel (MSIs, being messages, are not).
+        let line = super::gic::line_of(id);
+        super::gic::mask(line);
+        super::gic::end_of_interrupt(id);
+        crate::task::handle_irq(frame, line as u8);
     }
 }
 

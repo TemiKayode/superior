@@ -220,7 +220,7 @@ fn start() -> Result<Nic, Failure> {
     let entry = Mmio {
         base: bars.map(table & 7, table & !7, 16)?,
     };
-    let (address, data) = pci.msi_vector(0, MSI, NOTIFY)?;
+    let (address, data) = pci.msi_vector(0, MSI, NOTIFY, DOMAIN)?;
     entry.write32(0, address as u32);
     entry.write32(4, (address >> 32) as u32);
     entry.write32(8, data as u32);

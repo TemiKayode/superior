@@ -533,10 +533,10 @@ fn qemu_command(img: &Image) -> Command {
     match img.arch {
         Arch::X86_64 => {
             // Images with a disk are driver tests: they need an IOMMU,
-            // which QEMU emulates (VT-d) only on its q35 machine. Interrupt
-            // remapping stays off: MSIs reach the local APIC directly.
+            // which QEMU emulates (VT-d) only on its q35 machine, with
+            // interrupt remapping.
             if img.disk.is_some() || img.net || img.keyboard {
-                q.args(["-machine", "q35", "-device", "intel-iommu,intremap=off"]);
+                q.args(["-machine", "q35", "-device", "intel-iommu,intremap=on"]);
             }
             if img.disk.is_some() && img.driver == "ahci" {
                 // The boot disk would be q35's AHCI port 0, the first disk the
@@ -560,9 +560,9 @@ fn qemu_command(img: &Image) -> Command {
             let machine = if img.sel4 {
                 SEL4_MACHINE
             } else if img.disk.is_some() || img.net || img.keyboard {
-                "virt,highmem=off,iommu=smmuv3"
+                "virt,highmem=off,gic-version=3,iommu=smmuv3"
             } else {
-                "virt,highmem=off"
+                "virt,highmem=off,gic-version=3"
             };
             q.args(["-machine", machine, "-cpu", "cortex-a72", "-kernel"])
                 .arg(&img.path);
@@ -812,6 +812,9 @@ fn test_disk() -> Result<PathBuf, String> {
 ///   brings it up with an MSI-X interrupt;
 /// - the client reads the disk by DMA into its own page, every word right;
 /// - the bus server refuses the client the driver's device and its BARs;
+/// - MSIs are remapped, and (virtio-blk) a device made to raise a vector
+///   routed to no device raises nothing, which VT-d reports;
+/// - DMA aimed outside the device's domain does not land and is reported;
 /// - a crashed driver is restarted, its device reset and reopened, and
 ///   reads work again.
 fn drivers_test(img: &Image) -> Result<(), String> {
@@ -822,8 +825,24 @@ fn drivers_test(img: &Image) -> Result<(), String> {
     let stray = format!("{d}: stray DMA: page untouched");
     let crashing = format!("{d}: crashing (fault injection)");
     let restarting = format!("[cm] restarting {d} (one-for-one)");
+    // MSIs are remapped: VT-d's remapping table, or the GICv3 ITS.
+    let (remap, remap_at) = match img.arch {
+        Arch::X86_64 => ("IOMMU: Intel VT-d, interrupt remapping", ""),
+        Arch::Aarch64 => ("[ok] GICv3 with ITS", "IOMMU: "),
+    };
+    // virtio-blk also has its device raise a vector routed to no device:
+    // nothing may arrive, and VT-d must report it.
+    let forged = format!(
+        "{d}: forged MSI: a vector routed to no device was not raised, request completed; {}",
+        match img.arch {
+            Arch::X86_64 => "the IOMMU reported the blocked interrupt",
+            Arch::Aarch64 => "the ITS mapped it for no device",
+        }
+    );
+    let forged: &str = if d == "virtio-blk" { &forged } else { "" };
     let steps: &[&str] = &[
-        "IOMMU: ",
+        remap,
+        remap_at,
         "[cm] manifest: 3 components",
         "pci: BAR window at",
         device,
@@ -837,6 +856,7 @@ fn drivers_test(img: &Image) -> Result<(), String> {
         "may not have",
         "[pass] block: the bus server will not give it the driver's device",
         "[pass] block: nor any BAR page",
+        forged,
         &stray,
         "the IOMMU reported a blocked write to it",
         &crashing,

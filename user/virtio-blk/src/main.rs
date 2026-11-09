@@ -42,6 +42,13 @@ const MAX_BAR_PAGES: u64 = 16;
 const BUFFER: u64 = BAR_SLOTS + MAX_BAR_PAGES;
 /// A page of the driver's own, never mapped for DMA (fault injection).
 const CANARY: u64 = BUFFER + 1;
+/// Fault injection: a second MSI vector, routed to no device, and copies
+/// of the notification badged for it and for a timeout.
+const FORGED_IRQ: u64 = CANARY + 1;
+const FORGED_NTFN: u64 = CANARY + 2;
+const TIMEOUT_NTFN: u64 = CANARY + 3;
+const FORGED_BIT: u64 = 2;
+const TIMEOUT_BIT: u64 = 4;
 
 const BAR_VA: u64 = USER_BASE + 0x4000_0000;
 const QUEUE_VA: u64 = USER_BASE + 0x5000_0000;
@@ -50,9 +57,10 @@ const CANARY_VA: u64 = QUEUE_VA + 0x2000;
 
 /// Fault injection (with `arg 1`): crash on receipt.
 const OP_CRASH: u64 = 0xdead;
-/// Fault injection: program the device to DMA into a page outside its
-/// domain, reply whether the page was touched, then crash (the device
-/// may be wedged), so the driver restarts on a freshly reset one.
+/// Fault injection: program the device to raise an MSI vector it was not
+/// given, then to DMA into a page outside its domain; reply whether
+/// either landed, then crash (the device may be wedged), so the driver
+/// restarts on a freshly reset one.
 const OP_STRAY: u64 = 0x57a7;
 const CANARY_WORD: u64 = 0xcafe_f00d_cafe_f00d;
 
@@ -105,6 +113,12 @@ struct Device {
     queue: Queue,
     request: DmaPage,
     capacity: u64,
+    /// The MSI-X table entry for queue 0, and the message it holds.
+    msix: Mmio,
+    message: (u64, u64),
+    /// With fault injection: the message of a vector the driver holds but
+    /// that is routed to no device.
+    forged: Option<(u64, u64)>,
 }
 
 /// Maps BAR pages as needed, one slot each.
@@ -140,7 +154,7 @@ impl Bars {
     }
 }
 
-fn start() -> Result<Device, Failure> {
+fn start(faults: bool) -> Result<Device, Failure> {
     let pci = Pci { slot: PCI };
     let (bdf, _) = pci.open(0x1af4, 0x1042, 0, DOMAIN)?;
     let mut bars = Bars {
@@ -204,7 +218,8 @@ fn start() -> Result<Device, Failure> {
     let entry = Mmio {
         base: bars.map(table & 7, table & !7, 16)?,
     };
-    let (address, data) = pci.msi_vector(0, MSI, NOTIFY)?;
+    let (address, data) = pci.msi_vector(0, MSI, NOTIFY, DOMAIN)?;
+    let forged = if faults { Some(forge_vector(&pci)?) } else { None };
     entry.write32(0, address as u32);
     entry.write32(4, (address >> 32) as u32);
     entry.write32(8, data as u32);
@@ -250,7 +265,26 @@ fn start() -> Result<Device, Failure> {
         queue,
         request,
         capacity,
+        msix: entry,
+        message: (address, data),
+        forged,
     })
+}
+
+/// Takes a second MSI vector, bound to the notification with its own bit
+/// but routed to no device, and returns its message.
+fn forge_vector(pci: &Pci) -> Result<(u64, u64), Failure> {
+    pci.take_msi_vector(1, FORGED_IRQ)?;
+    let m = superior_driver::msi_message(FORGED_IRQ, None)?;
+    for (slot, badge) in [(FORGED_NTFN, FORGED_BIT), (TIMEOUT_NTFN, TIMEOUT_BIT)] {
+        if syscall(Syscall::CapMint, NOTIFY, [slot, 0xff, badge, 0]).status != 0 {
+            return Err(("minting a copy of the notification", badge));
+        }
+    }
+    if syscall(Syscall::IrqSetNotification, FORGED_IRQ, [FORGED_NTFN, 0, 0, 0]).status != 0 {
+        return Err(("binding the second vector", 0));
+    }
+    Ok(m)
 }
 
 impl Device {
@@ -321,6 +355,46 @@ impl Device {
         }
     }
 
+    /// Points the device's MSI-X entry at `message`.
+    fn program_msix(&self, (address, data): (u64, u64)) {
+        self.msix.write32(12, 1); // masked while it changes
+        self.msix.write32(0, address as u32);
+        self.msix.write32(4, (address >> 32) as u32);
+        self.msix.write32(8, data as u32);
+        self.msix.write32(12, 0);
+    }
+
+    /// Has the device raise the vector routed to no device: points its
+    /// MSI-X entry at that vector's message and runs a read. Returns (the
+    /// vector was raised, the read completed, interrupt messages the
+    /// IOMMU reported blocking).
+    fn forge(&mut self, message: (u64, u64)) -> Result<(bool, bool, u64), Failure> {
+        // Start the count afresh.
+        superior_driver::io_faults(DOMAIN)?;
+        self.program_msix(message);
+        let buffer = self.request.dma + 512;
+        self.submit(0, 1, buffer);
+        let start = ticks();
+        let mut done = false;
+        while ticks() < start + 100 {
+            if self.queue.take_used().is_some() {
+                done = true;
+                break;
+            }
+            syscall(Syscall::Yield, 0, [0; 4]);
+        }
+        // Give a stray interrupt time to arrive, then see which bits the
+        // notification collected.
+        syscall(Syscall::TimerSignal, TIMEOUT_NTFN, [10, 0, 0, 0]);
+        let mut bits = 0;
+        while bits & TIMEOUT_BIT == 0 {
+            bits |= syscall(Syscall::Wait, NOTIFY, [0; 4]).badge;
+        }
+        self.program_msix(self.message);
+        let blocked = superior_driver::io_faults(DOMAIN)?.interrupts;
+        Ok((bits & FORGED_BIT != 0, done, blocked))
+    }
+
     /// Aims a read at a page of the driver's own that is not in the
     /// device's domain. Returns (page untouched, request completed, its
     /// status byte).
@@ -361,6 +435,28 @@ impl Device {
         Ok((untouched, done, self.request_status(), pa))
     }
 
+    /// The forged interrupt, then the stray DMA. Returns whether the
+    /// interrupt was held back (and, where the IOMMU reports interrupts,
+    /// reported), and the stray DMA's result.
+    fn forge_then_stray(&mut self) -> Result<(bool, (bool, bool, u8, u64)), Failure> {
+        let message = self.forged.ok_or(("no second vector", 0))?;
+        let (raised, done, blocked) = self.forge(message)?;
+        // VT-d records blocked interrupts; the ITS drops them silently.
+        let must_report = cfg!(target_arch = "x86_64");
+        say!(
+            "forged MSI: a vector routed to no device was {}, request {}; {}",
+            if raised { "RAISED" } else { "not raised" },
+            if done { "completed" } else { "never completed" },
+            match (blocked, must_report) {
+                (0, true) => "the IOMMU reported NOTHING",
+                (_, true) => "the IOMMU reported the blocked interrupt",
+                (_, false) => "the ITS mapped it for no device",
+            }
+        );
+        let held = !raised && done && (blocked > 0 || !must_report);
+        Ok((held, self.stray()?))
+    }
+
     fn serve(&mut self, m: [u64; 4], lent: bool, faults: bool) -> [u64; 4] {
         let status = |s: Status| [s as u64, 0, 0, 0];
         match m[0] {
@@ -391,15 +487,16 @@ impl Device {
                 }
             }
             OP_CRASH if faults => crash(),
-            OP_STRAY if faults => match self.stray() {
-                Ok((untouched, done, st, page)) => {
+            OP_STRAY if faults => match self.forge_then_stray() {
+                Ok((held, (untouched, done, st, page))) => {
                     let (reported, report) = superior_driver::stray_reported(DOMAIN, page);
                     say!(
                         "stray DMA: page {}, request {} (status {st:#x}); {report}",
                         if untouched { "untouched" } else { "WRITTEN" },
                         if done { "completed" } else { "never completed" }
                     );
-                    [Status::Ok as u64, (untouched && reported) as u64, done as u64, st as u64]
+                    let ok = held && untouched && reported;
+                    [Status::Ok as u64, ok as u64, done as u64, st as u64]
                 }
                 Err((what, code)) => {
                     say!("[fail] {what} ({code})");
@@ -427,7 +524,7 @@ fn crash() -> ! {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(arg: u64) -> ! {
-    let mut dev = match start() {
+    let mut dev = match start(arg == 1) {
         Ok(d) => d,
         Err((what, code)) => {
             say!("[fail] {what} ({code})");

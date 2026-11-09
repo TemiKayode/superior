@@ -19,7 +19,7 @@ holds the rest):
 - AArch64 on QEMU's `virt` machine: entered at EL1 from the kernel ELF, MMU and caches on
   before any Rust runs, an identity map of devices and RAM for EL1 only, 4-level page
   tables for user address spaces at the same user window as x86-64, the device tree read
-  for RAM, a GICv2, the generic timer at 100 Hz, EL0/EL1 exception vectors (`svc`, aborts,
+  for RAM, a GICv3 with an ITS, the generic timer at 100 Hz, EL0/EL1 exception vectors (`svc`, aborts,
   undefined instructions, trapped `wfi`, interrupts, `brk`), and semihosting for the exit
   status. The same user programs (built as static PIE for `aarch64-unknown-none-softfloat`)
   pass the same boot self-tests and shell session; faults are reported in the same terms
@@ -177,8 +177,15 @@ holds the rest):
   - Kernel: device-memory capabilities (`DeviceUntyped`), which make only frames,
     never zeroed and never kernel objects; `DeviceFrame` picks the page.
   - Kernel: MSI vectors delivered as notification signals, with `IrqMsiMessage`
-    saying what the device must write (local APIC vectors on x86-64, GICv2m on
-    AArch64).
+    saying what the device must write. MSIs are remapped, since an MSI is just a
+    DMA write: `IrqMsiMessage` also names the I/O address space of the function
+    that may raise the vector, and only that function's requester ID can. On
+    x86-64 each vector has a VT-d interrupt remapping table entry that checks the
+    requester ID (compatibility-format messages are blocked; invalidation goes
+    through VT-d's invalidation queue). On AArch64 the GICv3 ITS keeps a
+    translation table per device, so a device's message raises an LPI only if
+    that device's table maps it. Unbinding a function's space takes its
+    vectors away too.
   - Kernel: the IOMMU. Intel VT-d on x86-64 (QEMU q35 with `intel-iommu`) and Arm
     SMMUv3 on AArch64 (`virt,iommu=smmuv3`) share one I/O page-table walker
     (`kernel/src/iommu.rs`). Once the kernel turns the IOMMU on, no PCI function
@@ -191,7 +198,8 @@ holds the rest):
     on every timer tick the kernel drains VT-d's fault recording registers or the
     SMMU's event queue and credits each fault to the space bound to its requester
     ID; `IoFaults` tells the space's holder how many there were since it last
-    asked, and the first one's page and whether it was a write.
+    asked, the first one's page and whether it was a write, and how many
+    interrupt messages VT-d blocked (the ITS drops them without a report).
   - The root task gets PCI configuration space (ports 0xcf8-0xcff, or ECAM), a BAR
     window and eight MSI vectors, and gives them to the PCI bus server
     (`user/pcibus/`), the only component that touches configuration space. It finds
@@ -227,6 +235,10 @@ holds the rest):
   `cargo xtask drivers-test` boots `boot/drivers.manifest` with a test disk:
   - the client reads it and checks every word;
   - the bus server refuses the client the driver's device and its BARs;
+  - (virtio-blk) the driver takes a second vector, routed to no device, and points
+    its device's MSI-X entry at it: that vector must not be raised, and VT-d must
+    report the blocked interrupt (with interrupt remapping turned off, the vector
+    is raised and the test fails);
   - the driver points its device at a page of its own outside the domain, and the
     page must stay untouched (it does on both ISAs; with QEMU's virtio IOMMU
     bypass left on, the same test fails), and the IOMMU must report a blocked
@@ -403,8 +415,7 @@ holds the rest):
   notifications, a 256-slot CNode pool) so filling them stays quick; normal kernels have
   32 of each, 32 address spaces and a 4096-slot pool.
 
-Not yet: interrupt remapping (a device can still write any MSI message, though only
-to the interrupt controller), an interrupt for IOMMU faults (they are collected on
+Not yet: an interrupt for IOMMU faults (they are collected on
 the timer tick), buses behind bridges in the IOMMU (requester IDs on bus 0 only); Function
 Level Reset is exercised only by the NVMe controller (QEMU's virtio devices on
 these buses have none); several queues and commands in flight in the NVMe driver,
