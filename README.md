@@ -187,7 +187,11 @@ holds the rest):
     requester ID with the IOMMU-control capability (`IoSpaceBind`). `IoMap` puts a
     page of RAM (never device memory) into it, and deleting or revoking that frame
     capability takes it out again. Destroying the space unbinds the function first,
-    so its DMA stops before anything else happens.
+    so its DMA stops before anything else happens. Blocked requests are reported:
+    on every timer tick the kernel drains VT-d's fault recording registers or the
+    SMMU's event queue and credits each fault to the space bound to its requester
+    ID; `IoFaults` tells the space's holder how many there were since it last
+    asked, and the first one's page and whether it was a write.
   - The root task gets PCI configuration space (ports 0xcf8-0xcff, or ECAM), a BAR
     window and eight MSI vectors, and gives them to the PCI bus server
     (`user/pcibus/`), the only component that touches configuration space. It finds
@@ -225,7 +229,8 @@ holds the rest):
   - the bus server refuses the client the driver's device and its BARs;
   - the driver points its device at a page of its own outside the domain, and the
     page must stay untouched (it does on both ISAs; with QEMU's virtio IOMMU
-    bypass left on, the same test fails);
+    bypass left on, the same test fails), and the IOMMU must report a blocked
+    write to exactly that page;
   - the driver is crashed, restarted, its device reset and reopened, and reads work
     again.
   `cargo xtask nvme-test` and `cargo xtask ahci-test` run that test and the
@@ -399,8 +404,8 @@ holds the rest):
   32 of each, 32 address spaces and a 4096-slot pool.
 
 Not yet: interrupt remapping (a device can still write any MSI message, though only
-to the interrupt controller), IOMMU fault reporting (blocked DMA is dropped
-silently), buses behind bridges in the IOMMU (requester IDs on bus 0 only); Function
+to the interrupt controller), an interrupt for IOMMU faults (they are collected on
+the timer tick), buses behind bridges in the IOMMU (requester IDs on bus 0 only); Function
 Level Reset is exercised only by the NVMe controller (QEMU's virtio devices on
 these buses have none); several queues and commands in flight in the NVMe driver,
 namespaces other than 1, several commands (NCQ) and ports in the AHCI driver, ATAPI

@@ -204,6 +204,13 @@ pub enum Syscall {
     /// the notification. Fails with `ObjectTableFull` when every kernel
     /// timer is in use.
     TimerSignal = 41,
+    /// Reports the DMA requests the IOMMU blocked for the function bound
+    /// to the I/O address space in slot `rdi` (Read right) since the last
+    /// call, and forgets them: message word 0 is how many, word 1 the
+    /// first one's page address (0 if the IOMMU gave none) and word 2 is 1
+    /// if it was a write. Without this, a device aimed outside its domain
+    /// fails without anyone hearing of it.
+    IoFaults = 42,
     /// Maps the frame in slot `rdi` at page-aligned `rsi` in the address
     /// space in slot `r8` (Write right). `rdx` = [`MAP_WRITE`] and/or
     /// [`MAP_EXEC`], never both. Needs the frame's Map right, plus Write
@@ -271,6 +278,7 @@ impl Syscall {
             39 => Syscall::IoUnmap,
             40 => Syscall::NotificationBind,
             41 => Syscall::TimerSignal,
+            42 => Syscall::IoFaults,
             0x100 => Syscall::DebugPutStr,
             0x101 => Syscall::DebugSelftestDone,
             _ => return None,

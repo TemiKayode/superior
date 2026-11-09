@@ -364,12 +364,13 @@ fn block_client(open: [u64; 4]) -> ! {
         format_args!("nor any BAR page"),
     );
     // The device can reach only what its driver maps into its IOMMU
-    // domain: aimed at another page of the driver's, the DMA must not land.
+    // domain: aimed at another page of the driver's, the DMA must not land,
+    // and the IOMMU must report the blocked write to the driver.
     let r = syscall(Syscall::Call, BLOCK, [0x57a7, 0, 0, 0]);
     t.check(
         r.status == 0 && r.msg[0] == Status::Ok as u64 && r.msg[1] == 1,
         format_args!(
-            "DMA aimed outside the device's IOMMU domain did not land (request {})",
+            "DMA aimed outside the device's IOMMU domain did not land and was reported (request {})",
             match (r.msg[2], r.msg[3]) {
                 (0, _) => "never completed",
                 (_, 0) => "completed but wrote nothing there",

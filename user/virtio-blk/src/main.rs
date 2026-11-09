@@ -324,7 +324,7 @@ impl Device {
     /// Aims a read at a page of the driver's own that is not in the
     /// device's domain. Returns (page untouched, request completed, its
     /// status byte).
-    fn stray(&mut self) -> Result<(bool, bool, u8), Failure> {
+    fn stray(&mut self) -> Result<(bool, bool, u8, u64), Failure> {
         let made = syscall(
             Syscall::Retype,
             UNTYPED,
@@ -358,7 +358,7 @@ impl Device {
         }
         dma_barrier();
         let untouched = page.iter().all(|&w| w == CANARY_WORD);
-        Ok((untouched, done, self.request_status()))
+        Ok((untouched, done, self.request_status(), pa))
     }
 
     fn serve(&mut self, m: [u64; 4], lent: bool, faults: bool) -> [u64; 4] {
@@ -392,13 +392,14 @@ impl Device {
             }
             OP_CRASH if faults => crash(),
             OP_STRAY if faults => match self.stray() {
-                Ok((untouched, done, st)) => {
+                Ok((untouched, done, st, page)) => {
+                    let (reported, report) = superior_driver::stray_reported(DOMAIN, page);
                     say!(
-                        "stray DMA: page {}, request {} (status {st:#x})",
+                        "stray DMA: page {}, request {} (status {st:#x}); {report}",
                         if untouched { "untouched" } else { "WRITTEN" },
                         if done { "completed" } else { "never completed" }
                     );
-                    [Status::Ok as u64, untouched as u64, done as u64, st as u64]
+                    [Status::Ok as u64, (untouched && reported) as u64, done as u64, st as u64]
                 }
                 Err((what, code)) => {
                     say!("[fail] {what} ({code})");

@@ -7,7 +7,8 @@
 //! granule tables (39-bit I/O addresses).
 //!
 //! Once the SMMU is on, a stream whose entry is not valid can reach no
-//! memory at all. The event queue stays off: faults are dropped.
+//! memory at all. Faults go to the event queue, which the kernel drains on
+//! every timer tick ([`take_faults`]); its interrupt stays off.
 
 use super::{fdt, gic, vm};
 use crate::{kprintln, memory};
@@ -22,8 +23,13 @@ const STRTAB_BASE_CFG: u64 = 0x88;
 const CMDQ_BASE: u64 = 0x90;
 const CMDQ_PROD: u64 = 0x98;
 const CMDQ_CONS: u64 = 0x9c;
+const EVTQ_BASE: u64 = 0xa0;
+/// The event queue's indices live in the second register page.
+const EVTQ_PROD: u64 = 0x1_00a8;
+const EVTQ_CONS: u64 = 0x1_00ac;
 
 const CR0_SMMUEN: u32 = 1;
+const CR0_EVTQEN: u32 = 1 << 2;
 const CR0_CMDQEN: u32 = 1 << 3;
 /// Table and queue walks: inner-shareable, write-back cacheable.
 const CR1_WB_ISH: u32 = 1 | (1 << 2) | (3 << 4) | (1 << 6) | (1 << 8) | (3 << 10);
@@ -33,6 +39,10 @@ const READ_ALLOCATE: u64 = 1 << 62;
 const STRTAB_LOG2: u64 = 8;
 /// Command queue: 2^5 commands of 16 bytes.
 const CMDQ_LOG2: u32 = 5;
+/// Event queue: 2^7 events of 32 bytes (one page).
+const EVTQ_LOG2: u32 = 7;
+/// Queue index overflow flag.
+const Q_OVERFLOW: u32 = 1 << 31;
 
 const CMD_CFGI_STE: u64 = 0x03;
 const CMD_TLBI_NSNH_ALL: u64 = 0x30;
@@ -42,6 +52,7 @@ const CMD_SYNC: u64 = 0x46;
 static REGS: AtomicU64 = AtomicU64::new(0);
 static STRTAB: AtomicU64 = AtomicU64::new(0);
 static CMDQ: AtomicU64 = AtomicU64::new(0);
+static EVTQ: AtomicU64 = AtomicU64::new(0);
 
 fn r32(off: u64) -> u32 {
     // SAFETY: the SMMU's registers lie in the kernel's device identity map.
@@ -113,6 +124,9 @@ pub fn init(dtb: u64) -> Option<&'static str> {
     }
     let cmdq = memory::carve(12)?;
     vm::zero_frame(cmdq);
+    let evtq = memory::carve(12)?;
+    vm::zero_frame(evtq);
+    EVTQ.store(evtq, Ordering::Relaxed);
     STRTAB.store(strtab, Ordering::Relaxed);
     CMDQ.store(cmdq, Ordering::Relaxed);
     set_cr0(0);
@@ -122,10 +136,13 @@ pub fn init(dtb: u64) -> Option<&'static str> {
     w64(CMDQ_BASE, cmdq | READ_ALLOCATE | CMDQ_LOG2 as u64);
     w32(CMDQ_PROD, 0);
     w32(CMDQ_CONS, 0);
-    set_cr0(CR0_CMDQEN);
+    w64(EVTQ_BASE, evtq | READ_ALLOCATE | EVTQ_LOG2 as u64);
+    w32(EVTQ_PROD, 0);
+    w32(EVTQ_CONS, 0);
+    set_cr0(CR0_CMDQEN | CR0_EVTQEN);
     command(CMD_TLBI_NSNH_ALL, 0);
     sync();
-    set_cr0(CR0_CMDQEN | CR0_SMMUEN);
+    set_cr0(CR0_CMDQEN | CR0_EVTQEN | CR0_SMMUEN);
     Some("Arm SMMUv3")
 }
 
@@ -173,6 +190,7 @@ pub fn init_space(header: u64, root: u64, domain: u16) {
         | 1 << 31 // V
         | 2 << 32 // IPS: 40 bits
         | 1 << 41 // AA64
+        | 1 << 45 // R: faults are recorded in the event queue
         | 1 << 46 // A: aborts are reported, not stalled
         | (domain as u64) << 48;
     // SAFETY: the header page belongs to the new space, identity-mapped.
@@ -231,4 +249,45 @@ pub fn flush() {
     }
     command(CMD_TLBI_NSNH_ALL, 0);
     sync();
+}
+
+/// Hands each fault event since the last call to `f`, as (stream ID,
+/// page address, whether it was a write), and consumes it. Returns whether
+/// events were lost to overflow.
+pub fn take_faults(mut f: impl FnMut(u16, u64, bool)) -> bool {
+    if !present() {
+        return false;
+    }
+    let q = EVTQ.load(Ordering::Relaxed);
+    let mask = (2u32 << EVTQ_LOG2) - 1;
+    let prod = r32(EVTQ_PROD);
+    let mut cons = r32(EVTQ_CONS) & mask;
+    if prod & mask == cons {
+        return false;
+    }
+    dsb();
+    while prod & mask != cons {
+        let slot = (cons & ((1 << EVTQ_LOG2) - 1)) as u64;
+        // SAFETY: the queue page is ours, identity-mapped RAM, and the SMMU
+        // wrote this entry before moving PROD past it.
+        let e = unsafe { core::slice::from_raw_parts((q + 32 * slot) as *const u64, 4) };
+        let (dw0, dw1, addr) = unsafe {
+            (
+                core::ptr::read_volatile(&e[0]),
+                core::ptr::read_volatile(&e[1]),
+                core::ptr::read_volatile(&e[2]),
+            )
+        };
+        // Translation, address size, access flag and permission faults
+        // carry the address; any other event (a bad stream table entry,
+        // say) is reported at address 0.
+        let kind = dw0 & 0xff;
+        let addr = if (0x10..=0x13).contains(&kind) { addr & !0xfff } else { 0 };
+        f((dw0 >> 32) as u16, addr, dw1 & 1 << 34 == 0);
+        cons = (cons + 1) & mask;
+    }
+    let lost = prod & Q_OVERFLOW != r32(EVTQ_CONS) & Q_OVERFLOW;
+    // Acknowledge the overflow, if any, along with the entries read.
+    w32(EVTQ_CONS, cons | (prod & Q_OVERFLOW));
+    lost
 }

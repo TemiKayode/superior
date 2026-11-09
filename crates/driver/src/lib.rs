@@ -258,6 +258,26 @@ pub fn io_unmap(slot: u64) -> Result<(), Failure> {
         .map_err(|e| ("unmapping a page from DMA", e))
 }
 
+/// The DMA requests the IOMMU blocked for the function bound to `domain`
+/// since the last call: how many, and the first one's page address and
+/// whether it was a write.
+pub fn io_faults(domain: u64) -> Result<(u64, u64, bool), Failure> {
+    sys(Syscall::IoFaults, domain, [0; 4])
+        .map(|r| (r.msg[0], r.msg[1], r.msg[2] != 0))
+        .map_err(|e| ("reading IOMMU faults", e))
+}
+
+/// How a test describes the IOMMU's report of a stray DMA write aimed at
+/// `page`: whether it was reported, and a phrase saying so.
+pub fn stray_reported(domain: u64, page: u64) -> (bool, &'static str) {
+    match io_faults(domain) {
+        Ok((n, at, true)) if n > 0 && at == page => (true, "the IOMMU reported a blocked write to it"),
+        Ok((0, _, _)) => (false, "the IOMMU reported NOTHING"),
+        Ok(_) => (false, "the IOMMU reported some OTHER fault"),
+        Err(_) => (false, "reading the IOMMU's faults FAILED"),
+    }
+}
+
 /// The physical address of the frame in `slot` (with an IOMMU, a device
 /// reaches it only once it is mapped into the device's domain).
 pub fn dma_address(slot: u64) -> Result<u64, Failure> {

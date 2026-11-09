@@ -111,6 +111,10 @@ struct Stats {
     /// User faults sent to a handler, and faults that stopped a thread.
     faults_handled: u64,
     faults_unhandled: u64,
+    /// DMA requests the IOMMU blocked, and those from functions bound to
+    /// no I/O address space (or lost to a full fault log).
+    io_faults: u64,
+    io_faults_unowned: u64,
 }
 
 /// An address space and where its page tables come from.
@@ -130,6 +134,11 @@ struct IoDomain {
     base: u64,
     pool: TablePool,
     sid: Option<u16>,
+    /// Requests the IOMMU blocked since the holder last asked
+    /// (`IoFaults`), and the first of them: page address and whether it
+    /// was a write.
+    faults: u64,
+    first_fault: (u64, bool),
 }
 
 impl IoDomain {
@@ -231,6 +240,8 @@ static KERNEL: Mutex<Kernel> = Mutex::new(Kernel {
         idle_halts: 0,
         faults_handled: 0,
         faults_unhandled: 0,
+        io_faults: 0,
+        io_faults_unowned: 0,
     },
 });
 
@@ -417,6 +428,7 @@ pub fn handle_syscall(frame: &mut UserFrame) -> Exit {
         Some(Syscall::IoUnmap) => io_unmap(k, cur, a.a0),
         Some(Syscall::NotificationBind) => notification_bind(k, cur, a.a0),
         Some(Syscall::TimerSignal) => timer_signal(k, cur, a.a0, a.a1),
+        Some(Syscall::IoFaults) => io_faults(k, cur, a.a0),
         Some(Syscall::ThreadSetVSpace) => thread_set_vspace(k, cur, &a),
         Some(Syscall::ThreadSetFaultHandler) => thread_set_fault_handler(k, cur, &a),
         Some(Syscall::SetFaultHandler) => set_fault_handler(k, cur, a.a0),
@@ -459,6 +471,7 @@ pub fn handle_timer(frame: &mut UserFrame) -> Exit {
     let mut guard = KERNEL.lock();
     let k = &mut *guard;
     k.stats.ticks += 1;
+    collect_io_faults(k);
     #[cfg(feature = "selftest")]
     if k.stats.ticks > SELFTEST_TIMEOUT_SECS * arch::TICK_HZ as u64 {
         // Say where every thread is stuck before giving up.
@@ -682,6 +695,49 @@ fn fire_timers(k: &mut Kernel) {
             }
         }
     }
+}
+
+/// Credits each DMA request the IOMMU blocked to the I/O address space of
+/// the function that made it.
+fn collect_io_faults(k: &mut Kernel) {
+    let (spaces, stats) = (&mut k.io_spaces, &mut k.stats);
+    let lost = iommu::take_faults(|sid, page, write| {
+        stats.io_faults += 1;
+        match spaces.iter_mut().flatten().find(|d| d.sid == Some(sid)) {
+            Some(d) => {
+                if d.faults == 0 {
+                    d.first_fault = (page, write);
+                }
+                d.faults += 1;
+            }
+            None => stats.io_faults_unowned += 1,
+        }
+    });
+    if lost {
+        stats.io_faults_unowned += 1;
+    }
+}
+
+/// `IoFaults`: rdi = I/O address space (Read). Returns the requests the
+/// IOMMU blocked since the last call, and the first one's page and kind.
+fn io_faults(k: &mut Kernel, cur: Tid, slot: u64) -> Result<(), u64> {
+    let s = own_slot(k, cur, slot).ok_or(Error::InvalidCapability.code())?;
+    let cap = *k.caps.get(s).ok_or(Error::InvalidCapability.code())?;
+    let Object::IoSpace { id } = cap.object else {
+        return Err(Error::InvalidCapability.code());
+    };
+    if !cap.rights.contains(Rights::READ) {
+        return Err(Error::InsufficientRights.code());
+    }
+    collect_io_faults(k);
+    let d = k.io_spaces[id as usize]
+        .as_mut()
+        .ok_or(Error::InvalidCapability.code())?;
+    let reply = [d.faults, d.first_fault.0, d.first_fault.1 as u64, 0];
+    d.faults = 0;
+    d.first_fault = (0, false);
+    k.ipc.set_msg_of(cur, reply);
+    Ok(())
 }
 
 /// `NotificationBind`: rdi = notification (Read), bound to the caller.
@@ -1608,6 +1664,8 @@ fn retype(k: &mut Kernel, cur: Tid, f: &Args) -> Result<(), u64> {
                     end: base + (1 << bits),
                 },
                 sid: None,
+                faults: 0,
+                first_fault: (0, false),
             };
             iommu::init_space(base, d.root(), id as u16 + 1);
             for &pa in iommu::fixed_pages() {

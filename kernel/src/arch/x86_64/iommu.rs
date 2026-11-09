@@ -7,6 +7,10 @@
 //! memory at all; one bound to an I/O address space reaches only what is
 //! mapped in it. Interrupt remapping is not used: MSI writes go straight
 //! to the local APIC.
+//!
+//! Blocked requests are logged in the unit's fault recording registers;
+//! the kernel drains them on every timer tick ([`take_faults`]), with the
+//! fault event interrupt left masked.
 
 use super::vm;
 use crate::memory;
@@ -21,6 +25,8 @@ const GCMD: u64 = 0x18;
 const GSTS: u64 = 0x1c;
 const RTADDR: u64 = 0x20;
 const CCMD: u64 = 0x28;
+const FSTS: u64 = 0x34;
+const FECTL: u64 = 0x38;
 
 const GCMD_TE: u32 = 1 << 31;
 const GCMD_SRTP: u32 = 1 << 30;
@@ -35,6 +41,14 @@ const IOTLB_DRAIN: u64 = (1 << 49) | (1 << 48);
 /// matching address width.
 const SAGAW_39: u64 = 1 << 9;
 const AW_39: u64 = 1;
+/// FSTS: primary fault overflow (write 1 to clear).
+const FSTS_PFO: u32 = 1;
+/// FECTL: fault event interrupt masked.
+const FECTL_IM: u32 = 1 << 31;
+/// A fault recording register's high half: valid (write 1 to clear), and
+/// the request was a read.
+const FRCD_F: u64 = 1 << 63;
+const FRCD_READ: u64 = 1 << 62;
 
 /// Kernel virtual address of the registers (0 if there is no IOMMU), and
 /// the root table's physical address.
@@ -98,6 +112,7 @@ pub fn init() -> Option<&'static str> {
     command(GCMD_SRTP);
     flush_context();
     flush();
+    w32(FECTL, FECTL_IM);
     command(GCMD_TE);
     Some("Intel VT-d")
 }
@@ -186,4 +201,36 @@ pub fn flush() {
     while r64(reg) & IOTLB_IVT != 0 {
         core::hint::spin_loop();
     }
+}
+
+/// Hands each request the unit blocked since the last call to `f`, as
+/// (requester ID, page address, whether it was a write), and frees its
+/// record. Returns whether records were lost to overflow.
+pub fn take_faults(mut f: impl FnMut(u16, u64, bool)) -> bool {
+    if !present() {
+        return false;
+    }
+    let status = r32(FSTS);
+    if status & 3 == 0 {
+        return false;
+    }
+    let cap = r64(CAP);
+    let records = ((cap >> 40) & 0xff) + 1;
+    let first = ((cap >> 24) & 0x3ff) * 16;
+    // Records fill from the index FSTS names, wrapping; any may be valid.
+    for i in 0..records {
+        let at = first + 16 * i;
+        let hi = r64(at + 8);
+        if hi & FRCD_F == 0 {
+            continue;
+        }
+        let lo = r64(at);
+        f(hi as u16, lo & !0xfff, hi & FRCD_READ == 0);
+        w64(at + 8, FRCD_F);
+    }
+    let lost = status & FSTS_PFO != 0;
+    if lost {
+        w32(FSTS, FSTS_PFO);
+    }
+    lost
 }

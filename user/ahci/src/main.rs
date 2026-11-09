@@ -390,7 +390,7 @@ impl Disk {
     /// Aims a read at a page of the driver's own that is not in the
     /// controller's domain. Returns (page untouched, command completed,
     /// the task file status if it failed).
-    fn stray(&mut self) -> Result<(bool, bool, u32), Failure> {
+    fn stray(&mut self) -> Result<(bool, bool, u32, u64), Failure> {
         let made = syscall(
             Syscall::Retype,
             UNTYPED,
@@ -414,9 +414,9 @@ impl Disk {
         dma_barrier();
         let untouched = page.iter().all(|&w| w == CANARY_WORD);
         Ok(match outcome {
-            Outcome::Done => (untouched, true, 0),
-            Outcome::Failed(tfd) => (untouched, true, tfd),
-            Outcome::TimedOut => (untouched, false, 0),
+            Outcome::Done => (untouched, true, 0, pa),
+            Outcome::Failed(tfd) => (untouched, true, tfd, pa),
+            Outcome::TimedOut => (untouched, false, 0, pa),
         })
     }
 
@@ -455,13 +455,14 @@ impl Disk {
             }
             OP_CRASH if faults => crash(),
             OP_STRAY if faults => match self.stray() {
-                Ok((untouched, done, tfd)) => {
+                Ok((untouched, done, tfd, page)) => {
+                    let (reported, report) = superior_driver::stray_reported(DOMAIN, page);
                     say!(
-                        "stray DMA: page {}, command {} (task file {tfd:#x})",
+                        "stray DMA: page {}, command {} (task file {tfd:#x}); {report}",
                         if untouched { "untouched" } else { "WRITTEN" },
                         if done { "completed" } else { "never completed" }
                     );
-                    [Status::Ok as u64, untouched as u64, done as u64, tfd as u64]
+                    [Status::Ok as u64, (untouched && reported) as u64, done as u64, tfd as u64]
                 }
                 Err((what, code)) => {
                     say!("[fail] {what} ({code})");
