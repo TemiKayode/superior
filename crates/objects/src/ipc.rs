@@ -463,10 +463,33 @@ impl<const T: usize, const E: usize, const N: usize> Ipc<T, E, N> {
 
     /// Wakes `caller` with `ReplyAbandoned` if it still waits for a reply.
     fn abandon(&mut self, caller: Tid) {
+        self.fail_caller(caller, Error::ReplyAbandoned);
+    }
+
+    /// Wakes `caller` with `err` if it still waits for a reply.
+    fn fail_caller(&mut self, caller: Tid, err: Error) {
         if self.threads[caller as usize].state == State::BlockedReply {
-            self.threads[caller as usize].status = Error::ReplyAbandoned.code();
+            self.threads[caller as usize].status = err.code();
             self.wake(caller);
         }
+    }
+
+    /// Stops thread `t` because it is being destroyed. As [`Ipc::suspend`],
+    /// except that a caller it owed a reply gets [`Error::PeerRestarted`]:
+    /// the call was received and may or may not have been acted on, and
+    /// the server is gone (a supervisor may be starting a new instance on
+    /// the same endpoint).
+    pub fn destroy(&mut self, t: Tid) -> Result<(), IpcError> {
+        let caller = self
+            .threads
+            .get_mut(t as usize)
+            .ok_or(IpcError::BadThread)?
+            .caller
+            .take();
+        if let Some(c) = caller {
+            self.fail_caller(c, Error::PeerRestarted);
+        }
+        self.suspend(t)
     }
 
     fn awaits_reply(&self, t: Tid) -> bool {
@@ -1878,6 +1901,30 @@ mod tests {
         assert_eq!(k.current(), Some(SERVER));
         k.suspend(SERVER).unwrap();
         assert_eq!(k.current(), Some(CLIENT));
+        assert_eq!(k.thread(CLIENT).status, Error::ReplyAbandoned.code());
+    }
+
+    #[test]
+    fn destroying_a_server_fails_its_caller_with_peer_restarted() {
+        let mut k = K::new();
+        k.spawn(SERVER, 10).unwrap();
+        k.spawn(CLIENT, 5).unwrap();
+        k.schedule();
+        k.recv(EP, true).unwrap(); // the server waits
+        k.call(EP, 7, [1, 2, 3, 4]).unwrap(); // the client calls; the server has it
+        assert_eq!(k.current(), Some(SERVER));
+        assert_eq!(k.caller_of(SERVER), Some(CLIENT));
+        k.destroy(SERVER).unwrap();
+        assert_eq!(k.thread(CLIENT).status, Error::PeerRestarted.code());
+        assert_eq!(k.current(), Some(CLIENT));
+        // A suspended (not destroyed) server still means ReplyAbandoned.
+        let mut k = K::new();
+        k.spawn(SERVER, 10).unwrap();
+        k.spawn(CLIENT, 5).unwrap();
+        k.schedule();
+        k.recv(EP, true).unwrap();
+        k.call(EP, 7, [0; 4]).unwrap();
+        k.suspend(SERVER).unwrap();
         assert_eq!(k.thread(CLIENT).status, Error::ReplyAbandoned.code());
     }
 

@@ -292,7 +292,8 @@ impl Sim {
             Op::Irq { ntfn, bits } => self.k.signal_irq(ntfn, bits),
             Op::Suspend(t) => self.k.suspend(t),
             Op::Recreate { t, prio } => {
-                let _ = self.k.suspend(t);
+                // As the kernel destroys a thread object.
+                let _ = self.k.destroy(t);
                 self.k.reset_thread(t).unwrap();
                 self.k.spawn(t, prio)
             }
@@ -445,6 +446,9 @@ pub fn coverage(seeds: u64, steps: u64) -> HashMap<&'static str, u64> {
             }
             if k.thread(0).status == Error::ReplyAbandoned.code() {
                 *c.entry("reply abandoned").or_insert(0) += 1;
+            }
+            if (0..4).any(|t| k.thread(t).status == Error::PeerRestarted.code()) {
+                *c.entry("peer restarted").or_insert(0) += 1;
             }
         }
         *c.entry("messages received").or_insert(0) += sim.received.len() as u64;

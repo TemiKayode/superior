@@ -23,6 +23,19 @@
 //!   relays the reply, so the first client never sees the difference.
 //! - **Faults come here.** Every component's fault handler is the
 //!   manager's control endpoint, badged with its number.
+//! - **Supervision.** A component that faults is restarted by its
+//!   `restart` policy: `one-for-one` rebuilds just it; `rest-for-one`
+//!   also rebuilds every running component after it in the manifest;
+//!   `never` leaves it stopped. Rebuilding revokes the instance's untyped
+//!   block (the kernel fails any call it was serving with
+//!   `PeerRestarted`) and builds a new instance from the same block,
+//!   attached to the same endpoints. More than five restarts within
+//!   sixty seconds and the manager gives up: the component stays down and
+//!   a tombstone answers its services with `SERVICE_UNAVAILABLE`, so
+//!   clients fail fast instead of hanging.
+//! - **State is external.** A `state` capability is a page the manager
+//!   makes once and hands to every instance, so a new instance finds what
+//!   the last one wrote (a journal of the requests it applied, say).
 //!
 //! Capabilities from the kernel are in `superior_objects::abi::root`.
 
@@ -30,12 +43,13 @@
 #![no_main]
 
 use superior_objects::abi::{
-    FaultKind, FaultReply, MAP_EXEC, MAP_WRITE, ObjectType, Syscall, root,
+    FaultKind, FaultReply, MAP_EXEC, MAP_WRITE, ObjectType, SERVICE_UNAVAILABLE, Syscall, TICK_HZ,
+    root,
 };
 use superior_objects::bundle::{Bundle, BundleError};
 use superior_objects::elf::{Elf, Machine};
 use superior_objects::manifest::{
-    CSPACE_BITS, CapKind, Component, MAX_COMPONENTS, Manifest, Start,
+    CSPACE_BITS, CapKind, Component, MAX_COMPONENTS, Manifest, Restart, Start,
 };
 use superior_sys::{Ret, USER_BASE, syscall};
 
@@ -60,6 +74,14 @@ const WATCHER_SCRATCH: u64 = WATCHER_STACK + 2 * MAX_SERVICES as u64;
 const WATCHER_CONTROL: u64 = WATCHER_SCRATCH + MAX_SERVICES as u64;
 /// Each component's fault-handler capability (control, badged).
 const FAULT_CAP: u64 = WATCHER_CONTROL + MAX_SERVICES as u64;
+/// Tombstone threads, one per service of a component given up on, and
+/// their stacks.
+const TOMB_TCB: u64 = FAULT_CAP + MAX_COMPONENTS as u64;
+const TOMB_STACK: u64 = TOMB_TCB + MAX_SERVICES as u64;
+/// Each component's state page, if it has one: made once, outliving
+/// every instance.
+const STATE_PAGE: u64 = TOMB_STACK + 2 * MAX_SERVICES as u64;
+const _: () = assert!(STATE_PAGE + MAX_COMPONENTS as u64 <= BLOCKS);
 /// Each component's block of slots: its untyped memory, then the objects
 /// of its current instance.
 const BLOCKS: u64 = 512;
@@ -90,6 +112,8 @@ const BUNDLE_VA: u64 = USER_BASE + root::BUNDLE_OFFSET;
 const SCRATCH_VA: u64 = USER_BASE + 0x2_0000_0000;
 /// Watcher stacks, 64 KiB apart (two pages each, the rest unmapped).
 const WATCHER_STACKS_VA: u64 = USER_BASE + 0x3_0000_0000;
+/// Tombstone stacks, laid out the same way.
+const TOMB_STACKS_VA: u64 = USER_BASE + 0x3_1000_0000;
 
 // ---- in a component's address space ------------------------------------
 
@@ -97,6 +121,13 @@ const PAGE: u64 = 4096;
 const STACK_TOP: u64 = USER_BASE + 0x8000_0000;
 
 const WATCHER_PRIORITY: u64 = root::PRIORITY as u64 - 1;
+
+// ---- restart intensity (spec section 4) ---------------------------------
+
+/// More than this many restarts of one component...
+const MAX_RESTARTS: usize = 5;
+/// ...within this many ticks, and the manager gives up on it.
+const RESTART_WINDOW: u64 = 60 * TICK_HZ;
 
 // ---- system calls -------------------------------------------------------
 
@@ -138,6 +169,8 @@ enum Status {
     NotStarted,
     Running,
     Stopped,
+    /// Given up on: too many restarts. Its services are tombstoned.
+    Failed,
 }
 
 struct Manager<'a> {
@@ -146,6 +179,12 @@ struct Manager<'a> {
     status: [Status; MAX_COMPONENTS],
     /// Services in manifest order: (name, providing component).
     services: [Option<(&'a str, usize)>; MAX_SERVICES],
+    /// Whether the component's untyped block (and state page) exist yet.
+    made: [bool; MAX_COMPONENTS],
+    /// The ticks of each component's last [`MAX_RESTARTS`] restarts, as a
+    /// ring indexed by the restart count.
+    restarts: [[u64; MAX_RESTARTS]; MAX_COMPONENTS],
+    restart_count: [usize; MAX_COMPONENTS],
 }
 
 impl<'a> Manager<'a> {
@@ -159,14 +198,23 @@ impl<'a> Manager<'a> {
         self.manifest.components[i].as_ref().unwrap()
     }
 
-    /// Builds and starts an instance of component `i`.
+    /// Builds and starts an instance of component `i`. Its untyped block
+    /// (and state page) are made the first time and kept: a later instance
+    /// is built from the same block once [`Manager::stop`] has emptied it.
     fn start(&mut self, i: usize) -> Result<(), Failure> {
         let c = *self.component(i);
         let block = BLOCKS + i as u64 * BLOCK;
         let ut = block + B_UNTYPED;
         let (vspace, cnode, tcb) = (block + B_VSPACE, block + B_CNODE, block + B_THREAD);
-        retype(root::UNTYPED, ObjectType::Untyped, c.memory_bits as u64, ut)
-            .map_err(|e| ("no memory for the component", e))?;
+        if !self.made[i] {
+            retype(root::UNTYPED, ObjectType::Untyped, c.memory_bits as u64, ut)
+                .map_err(|e| ("no memory for the component", e))?;
+            if c.caps().any(|x| x.kind == CapKind::State) {
+                retype(root::UNTYPED, ObjectType::Frame, 0, STATE_PAGE + i as u64)
+                    .map_err(|e| ("no memory for the state page", e))?;
+            }
+            self.made[i] = true;
+        }
         retype(ut, ObjectType::AddressSpace, 16, vspace).map_err(|e| ("address space", e))?;
         retype(ut, ObjectType::CNode, CSPACE_BITS as u64, cnode).map_err(|e| ("CNode", e))?;
         retype(ut, ObjectType::Thread, 0, tcb).map_err(|e| ("thread", e))?;
@@ -202,6 +250,7 @@ impl<'a> Manager<'a> {
                 CapKind::Control => {
                     cnode_copy(cnode, slot, CONTROL, WRITE, BADGE_REPORT + i as u64)
                 }
+                CapKind::State => cnode_copy(cnode, slot, STATE_PAGE + i as u64, ALL, 0),
             };
             r.map_err(|e| ("placing a capability", e))?;
         }
@@ -232,6 +281,93 @@ impl<'a> Manager<'a> {
             }
         }
     }
+
+    /// Destroys component `i`'s current instance by revoking everything
+    /// made from its untyped block. A call the instance was serving fails
+    /// with `PeerRestarted`; calls still queued on its endpoints wait for
+    /// the next instance.
+    fn stop(&mut self, i: usize) {
+        if self.made[i] {
+            let ut = BLOCKS + i as u64 * BLOCK + B_UNTYPED;
+            let _ = sys(Syscall::CapRevoke, ut, [0; 4]);
+        }
+        self.status[i] = Status::Stopped;
+    }
+
+    /// Records a restart of component `i` now. False if it would be more
+    /// than [`MAX_RESTARTS`] within [`RESTART_WINDOW`].
+    fn may_restart(&mut self, i: usize) -> bool {
+        let now = ticks();
+        let n = self.restart_count[i];
+        // The oldest of the last MAX_RESTARTS restarts, overwritten now.
+        let oldest = &mut self.restarts[i][n % MAX_RESTARTS];
+        if n >= MAX_RESTARTS && now.saturating_sub(*oldest) < RESTART_WINDOW {
+            return false;
+        }
+        *oldest = now;
+        self.restart_count[i] = n + 1;
+        true
+    }
+
+    /// Component `i` faulted (its thread is stopped): applies its restart
+    /// policy.
+    fn supervise(&mut self, i: usize) {
+        let c = *self.component(i);
+        let name = c.name;
+        let policy = match c.restart {
+            Restart::Never => {
+                self.stop(i);
+                say!("{name} stays stopped (restart never)");
+                return;
+            }
+            Restart::OneForOne => "one-for-one",
+            Restart::RestForOne => "rest-for-one",
+        };
+        if !self.may_restart(i) {
+            self.stop(i);
+            self.status[i] = Status::Failed;
+            say!("{name}: more than {MAX_RESTARTS} restarts in 60 s; giving up");
+            self.tombstone(i);
+            return;
+        }
+        // Who goes down with it: for rest-for-one, every running component
+        // after it. They stop last-started first, and start in order.
+        let mut group = [false; MAX_COMPONENTS];
+        group[i] = true;
+        if c.restart == Restart::RestForOne {
+            for (j, g) in group.iter_mut().enumerate().skip(i + 1) {
+                *g = self.status[j] == Status::Running;
+            }
+        }
+        for j in (0..MAX_COMPONENTS).rev().filter(|&j| group[j]) {
+            self.stop(j);
+        }
+        let others = group.iter().filter(|g| **g).count() - 1;
+        if others == 0 {
+            say!("restarting {name} ({policy})");
+        } else {
+            say!("restarting {name} and {others} after it ({policy})");
+        }
+        for j in (0..MAX_COMPONENTS).filter(|&j| group[j]) {
+            self.start_logged(j, "restart");
+        }
+    }
+
+    /// Answers every service of component `i` with `SERVICE_UNAVAILABLE`
+    /// from now on.
+    fn tombstone(&mut self, i: usize) {
+        for s in 0..MAX_SERVICES {
+            if let Some((name, owner)) = self.services[s] {
+                if owner == i && start_tombstone(s as u64).is_err() {
+                    say!("could not tombstone service {name}");
+                }
+            }
+        }
+    }
+}
+
+fn ticks() -> u64 {
+    syscall(Syscall::Ticks, 0, [0; 4]).msg[0]
 }
 
 /// The manager's slot holding the device capability called `name`.
@@ -386,6 +522,36 @@ fn start_watcher(s: u64) -> Result<(), u64> {
     sys(Syscall::ThreadResume, tcb, [0; 4]).map(drop)
 }
 
+/// Serves service `s` of a component the manager gave up on: every call
+/// fails fast with `SERVICE_UNAVAILABLE`.
+extern "C" fn tombstone(s: u64) -> ! {
+    let ep = SERVICES + s;
+    let reply = [SERVICE_UNAVAILABLE, 0, 0, 0];
+    syscall(Syscall::Recv, ep, [0; 4]);
+    loop {
+        syscall(Syscall::ReplyRecv, ep, reply);
+    }
+}
+
+fn start_tombstone(s: u64) -> Result<(), u64> {
+    let tcb = TOMB_TCB + s;
+    let stack = TOMB_STACKS_VA + s * 0x1_0000;
+    retype(root::UNTYPED, ObjectType::Thread, 0, tcb)?;
+    for p in 0..2 {
+        let f = TOMB_STACK + 2 * s + p;
+        retype(root::UNTYPED, ObjectType::Frame, 0, f)?;
+        sys(Syscall::FrameMap, f, [stack + p * PAGE, 1, 0, 0])?;
+    }
+    let entry = tombstone as *const () as u64;
+    sys(
+        Syscall::ThreadConfigure,
+        tcb,
+        [entry, stack + 2 * PAGE, s, WATCHER_PRIORITY],
+    )?;
+    sys(Syscall::ThreadSetSpace, tcb, [root::SELF_CNODE, 0, 0, 0])?;
+    sys(Syscall::ThreadResume, tcb, [0; 4]).map(drop)
+}
+
 /// Names for messages. (No `{:?}`: on AArch64 the prebuilt core library's
 /// Debug machinery cannot be linked into a position-independent program.)
 fn fault_name(kind: u64) -> &'static str {
@@ -445,6 +611,9 @@ pub extern "C" fn _start(bundle_len: u64) -> ! {
         manifest,
         status: [Status::NotStarted; MAX_COMPONENTS],
         services: [None; MAX_SERVICES],
+        made: [false; MAX_COMPONENTS],
+        restarts: [[0; MAX_RESTARTS]; MAX_COMPONENTS],
+        restart_count: [0; MAX_COMPONENTS],
     };
     say!(
         "manifest: {} components, bundle of {} files",
@@ -497,18 +666,22 @@ pub extern "C" fn _start(bundle_len: u64) -> ! {
                     m.start_logged(owner, "lazy: first call to its service");
                     let _ = service;
                 }
-                [(m.status[owner] != Status::Running) as u64, 0, 0, 0]
+                Some([(m.status[owner] != Status::Running) as u64, 0, 0, 0])
             }
             BADGE_FAULT if i < MAX_COMPONENTS => {
                 let name = m.component(i).name;
                 let what = fault_name(msg.msg[0]);
                 say!(
-                    "{name} faulted: {what} at pc {:#x}, address {:#x}; stopped",
+                    "{name} faulted: {what} at pc {:#x}, address {:#x}",
                     msg.msg[2],
                     msg.msg[1]
                 );
+                // Answer the fault first (the thread stops), so the manager
+                // owes no reply to an instance about to be destroyed.
+                syscall(Syscall::Reply, 0, [FaultReply::Stop as u64, 0, 0, 0]);
                 m.status[i] = Status::Stopped;
-                [FaultReply::Stop as u64, 0, 0, 0]
+                m.supervise(i);
+                None
             }
             BADGE_REPORT if i < MAX_COMPONENTS && msg.msg[0] == OP_SHUTDOWN => {
                 let name = m.component(i).name;
@@ -526,10 +699,13 @@ pub extern "C" fn _start(bundle_len: u64) -> ! {
             }
             _ => {
                 say!("unexpected message, badge {badge:#x}");
-                [u64::MAX, 0, 0, 0]
+                Some([u64::MAX, 0, 0, 0])
             }
         };
-        msg = syscall(Syscall::ReplyRecv, CONTROL, reply);
+        msg = match reply {
+            Some(r) => syscall(Syscall::ReplyRecv, CONTROL, r),
+            None => syscall(Syscall::Recv, CONTROL, [0; 4]),
+        };
     }
 }
 

@@ -400,6 +400,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "superior-counter"
+version = "0.1.0"
+dependencies = [
+ "superior-objects",
+ "superior-sys",
+]
+
+[[package]]
 name = "superior-echo"
 version = "0.1.0"
 dependencies = [

@@ -1,0 +1,36 @@
+# The Component Manager's supervision test (cargo xtask supervise-test).
+#
+# counter keeps its value and request journal in a state page and is
+# crashed twice under calls (one-for-one). crasher faults every time it
+# starts, so the manager gives up on it after five restarts and
+# tombstones its service. Crashing base (rest-for-one) restarts after,
+# which comes after it, too.
+
+component client
+  image testclient
+  arg 2
+  uses counter 0
+  uses crashy 1
+  uses base 2
+  uses after 3
+  control 4
+
+component counter
+  image counter
+  provides counter 0
+  state 1
+
+component crasher
+  image testclient
+  arg 3
+  provides crashy 0
+
+component base
+  image counter
+  restart rest-for-one
+  provides base 0
+  state 1
+
+component after
+  image echo
+  provides after 0

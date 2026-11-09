@@ -1,0 +1,17 @@
+[package]
+name = "superior-counter"
+description = "A test service for supervision: a counter whose state and request journal live in a page that outlives its instances."
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "superior-counter"
+test = false
+bench = false
+
+[dependencies]
+superior-objects = { path = "../../crates/objects" }
+superior-sys = { path = "../../crates/sys" }

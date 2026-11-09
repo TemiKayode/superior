@@ -58,6 +58,7 @@ use superior_objects::ipc::{Ipc, Tid};
 pub const MAX_THREADS: usize = 32;
 #[cfg(feature = "selftest")]
 pub const MAX_THREADS: usize = 8;
+const _: () = assert!(arch::TICK_HZ as u64 == superior_objects::abi::TICK_HZ);
 pub const CSPACE_SLOTS: usize = 16;
 /// Layout of the one capability table: each thread's own window, then one
 /// hidden slot per thread holding its CNode CSpace's capability (which keeps
@@ -373,6 +374,11 @@ pub fn handle_syscall(frame: &mut UserFrame) -> Exit {
         Some(Syscall::FrameMap) => frame_map(k, cur, &a),
         Some(Syscall::FrameUnmap) => frame_unmap(k, cur, a.a0),
         Some(Syscall::FrameMapInto) => frame_map_into(k, cur, &a),
+        Some(Syscall::Ticks) => {
+            let ticks = k.stats.ticks;
+            k.ipc.set_msg_of(cur, [ticks, 0, 0, 0]);
+            Ok(())
+        }
         Some(Syscall::ThreadSetVSpace) => thread_set_vspace(k, cur, &a),
         Some(Syscall::ThreadSetFaultHandler) => thread_set_fault_handler(k, cur, &a),
         Some(Syscall::SetFaultHandler) => set_fault_handler(k, cur, a.a0),
@@ -927,6 +933,15 @@ fn reap(k: &mut Kernel) {
         for id in 0..MAX_NOTIFICATIONS {
             if id != TIMER_NTFN as usize && k.ntfn_used[id] && !live.ntfns[id] {
                 k.ntfn_used[id] = false;
+                // An interrupt line bound to it must not follow its id to
+                // whatever notification reuses the entry. Unbound, the line
+                // masks itself at its next interrupt and stays masked
+                // until a driver binds it again.
+                for line in 0..MAX_IRQS {
+                    if matches!(k.irq_ntfn[line], Some((n, _)) if n as usize == id) {
+                        k.irq_ntfn[line] = None;
+                    }
+                }
                 let _ = k.ipc.destroy_notification(id as u16);
             }
         }
@@ -974,7 +989,8 @@ impl Live {
 /// Stops thread `t`, empties its CSpace and frees its table entry. Its
 /// address space belongs to its creator and stays.
 fn destroy_thread(k: &mut Kernel, t: Tid) {
-    let _ = k.ipc.suspend(t);
+    // A caller it owed a reply learns the server is gone (PeerRestarted).
+    let _ = k.ipc.destroy(t);
     let (base, size) = window(t as usize);
     let own = base as usize..(base + size) as usize;
     for s in own.chain([ROOT_SLOTS + t as usize, VSPACE_SLOTS + t as usize]) {

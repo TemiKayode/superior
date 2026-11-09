@@ -91,8 +91,8 @@ pub enum Syscall {
     /// `rsi` = [`ObjectType`], `rdx` = size in bits (untyped, CNode and
     /// address space), `r8` = the empty slot for the new capability, which
     /// becomes a child of the untyped one (revoking it destroys the
-    /// object). `r9` = 0 puts it in the caller's own CSpace; otherwise `r9`
-    /// - 1 is the slot of a CNode (Write right) and `r8` an index in it, so
+    /// object). `r9` = 0 puts it in the caller's own CSpace; otherwise
+    /// `r9 - 1` is the slot of a CNode (Write right) and `r8` an index in it, so
     /// a parent can give a child an original capability, such as untyped
     /// memory it can retype in turn.
     Retype = 13,
@@ -150,6 +150,9 @@ pub enum Syscall {
     /// Writes `r8` to I/O port `rsi` (in the range of the I/O-port
     /// capability in `rdi`, Write right), `rdx` bytes wide (1, 2 or 4).
     IoPortOut = 29,
+    /// Timer ticks since boot ([`TICK_HZ`] a second), in message word 0.
+    /// Supervisors use it to count restarts per unit of time.
+    Ticks = 33,
     /// Maps the frame in slot `rdi` at page-aligned `rsi` in the address
     /// space in slot `r8` (Write right). `rdx` = [`MAP_WRITE`] and/or
     /// [`MAP_EXEC`], never both. Needs the frame's Map right, plus Write
@@ -208,6 +211,7 @@ impl Syscall {
             30 => Syscall::FrameMapInto,
             31 => Syscall::ThreadSetVSpace,
             32 => Syscall::ThreadSetFaultHandler,
+            33 => Syscall::Ticks,
             0x100 => Syscall::DebugPutStr,
             0x101 => Syscall::DebugSelftestDone,
             _ => return None,
@@ -243,6 +247,11 @@ pub enum Error {
     AlreadyMapped = 11,
     /// The thread was suspended while blocked; its system call was cancelled.
     Interrupted = 12,
+    /// The server that received this call was destroyed before replying
+    /// (it crashed, or its supervisor restarted it). The call may or may
+    /// not have taken effect: retry it if it is idempotent, or with the
+    /// same request id so the new instance can recognise it.
+    PeerRestarted = 13,
 }
 
 /// What a fault message (`msg[0]`) reports.
@@ -282,6 +291,14 @@ pub enum FaultReply {
     /// Stop the thread. Any other value, or a failed reply, also stops it.
     Stop = 2,
 }
+
+/// The kernel's timer rate on every architecture.
+pub const TICK_HZ: u64 = 100;
+
+/// Message word 0 of every reply from a service the Component Manager
+/// has given up on (too many restarts): the call reached nobody who can
+/// serve it. Clients should stop retrying.
+pub const SERVICE_UNAVAILABLE: u64 = u64::MAX;
 
 /// Frames are 4 KiB.
 pub const FRAME_BITS: u8 = 12;

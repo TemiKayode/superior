@@ -21,6 +21,7 @@
 //!   device uart 2           # a device capability the CM was given
 //!   notification 3          # a fresh notification
 //!   untyped 16 4            # a fresh 2^16-byte untyped block
+//!   state 5                 # a page the manager keeps across restarts
 //! ```
 //!
 //! Slots are in the component's own CSpace, a CNode of [`CSPACE_SLOTS`].
@@ -64,6 +65,11 @@ pub enum CapKind<'a> {
     Notification,
     Untyped(u8),
     Control,
+    /// A 4 KiB page that outlives instances: the manager makes it once and
+    /// gives every instance of the component a copy, so a restarted
+    /// instance finds what the last one wrote (spec section 4: "state is
+    /// external"). At most one per component.
+    State,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -249,6 +255,12 @@ impl<'a> Manifest<'a> {
                 }
                 "notification" => Some((CapKind::Notification, arg("notification needs a slot")?)),
                 "control" => Some((CapKind::Control, arg("control needs a slot")?)),
+                "state" => {
+                    if c.caps().any(|x| x.kind == CapKind::State) {
+                        return Err(err("only one state page per component", key));
+                    }
+                    Some((CapKind::State, arg("state needs a slot")?))
+                }
                 "untyped" => {
                     let w = arg("untyped needs a size in bits")?;
                     let bits = match number(w)? {
@@ -331,6 +343,7 @@ component client   # comment after a directive
   device uart 2
   notification 3
   untyped 16 4
+  state 5
 ";
 
     #[test]
@@ -373,6 +386,10 @@ component client   # comment after a directive
                 CapSpec {
                     kind: CapKind::Untyped(16),
                     slot: 4
+                },
+                CapSpec {
+                    kind: CapKind::State,
+                    slot: 5
                 },
             ]
         );
@@ -419,6 +436,15 @@ component client   # comment after a directive
         assert_eq!(
             error("component a\n image a\n control 1 2"),
             (3, "unexpected word")
+        );
+        assert_eq!(
+            error(
+                "component a
+ image a
+ state 1
+ state 2"
+            ),
+            (4, "only one state page per component")
         );
         assert_eq!(error("component a"), (0, "component has no image"));
         assert_eq!(

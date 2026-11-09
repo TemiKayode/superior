@@ -12,6 +12,9 @@
 //!   cargo xtask shell-test [arch]  just the shell session
 //!   cargo xtask cm-test [arch]     the Component Manager's boot test: boot
 //!                                  `boot/test.manifest` and check the log
+//!   cargo xtask supervise-test [arch]  supervision: boot
+//!                                  `boot/supervise.manifest` (restarts, state,
+//!                                  retries, giving up) and check the log
 //!   cargo xtask bench              time IPC under hardware virtualization
 //!                                  (WHPX or KVM, x86-64) and check it against
 //!                                  seL4's published figures
@@ -93,6 +96,8 @@ fn main() -> ExitCode {
                         .and_then(|img| boot(&img, true))
                         .and_then(|_| image_with(false, a, "test"))
                         .and_then(|img| cm_test(&img))
+                        .and_then(|_| image_with(false, a, "supervise"))
+                        .and_then(|img| supervise_test(&img))
                         .and_then(|_| image(false, a))
                         .and_then(|img| shell_session(&img))
                 })
@@ -103,9 +108,12 @@ fn main() -> ExitCode {
         Some("boot-test") => image(true, arch).and_then(|img| boot(&img, true)),
         Some("shell-test") => image(false, arch).and_then(|img| shell_session(&img)),
         Some("cm-test") => image_with(false, arch, "test").and_then(|img| cm_test(&img)),
+        Some("supervise-test") => {
+            image_with(false, arch, "supervise").and_then(|img| supervise_test(&img))
+        }
         Some("bench") => image(false, Arch::X86_64).and_then(|img| bench(&img)),
         _ => Err(
-            "usage: cargo xtask <image | run | test | boot-test | shell-test | cm-test | bench | sel4-test> [x86_64 | aarch64]"
+            "usage: cargo xtask <image | run | test | boot-test | shell-test | cm-test | supervise-test | bench | sel4-test> [x86_64 | aarch64]"
                 .into(),
         ),
     });
@@ -202,6 +210,7 @@ fn bundle(arch: Arch, manifest: &str) -> Result<PathBuf, String> {
     for (name, package) in [
         ("shell", "superior-shell"),
         ("echo", "superior-echo"),
+        ("counter", "superior-counter"),
         ("testclient", "superior-testclient"),
     ] {
         let path = user_program(package, arch)?;
@@ -478,7 +487,8 @@ fn cm_test(img: &Image) -> Result<(), String> {
         "[cm] started client (boot)".to_string(),
         format!("probe: reading {bundle_va:#x}"),
         "[cm] probe faulted: page fault at pc".to_string(),
-        format!("address {bundle_va:#x}; stopped"),
+        format!("address {bundle_va:#x}"),
+        "[cm] probe stays stopped (restart never)".to_string(),
         "[cm] started echo (lazy: first call to its service)".to_string(),
         "echo: running in its own address space".to_string(),
         "[pass] client: call 1: sent 100, got 101".to_string(),
@@ -504,6 +514,63 @@ fn cm_test(img: &Image) -> Result<(), String> {
         }
     }
     println!("== Component Manager test passed ({})", img.arch.name());
+    Ok(())
+}
+
+/// Boots `boot/supervise.manifest` and checks that the manager
+/// - restarts a crashed one-for-one component, whose state page survives
+///   and whose journal answers a retried request instead of applying it
+///   twice (the client's own checks, `[pass]` lines);
+/// - gives up on a component after five restarts and tombstones its
+///   service;
+/// - restarts the component after a crashed rest-for-one one.
+fn supervise_test(img: &Image) -> Result<(), String> {
+    println!("== supervision test on {}", img.path.display());
+    let out = run_to_exit(img, Duration::from_secs(60))?;
+    let steps = [
+        "[cm] manifest: 5 components",
+        "[pass] supervise: counter starts at 0 (instance 1)",
+        "[pass] supervise: add 5 (request 1): 5",
+        "[cm] counter faulted: page fault",
+        "[cm] restarting counter (one-for-one)",
+        "[pass] supervise: the counter crashed under a call",
+        "counter: instance 2 starting, value 5",
+        "[pass] supervise: after the restart: value 5 (instance 2)",
+        "counter: instance 3 starting, value 15",
+        "[pass] supervise: add 10 (request 2), crashed before replying, retried: 15 (from the journal: 1)",
+        "[pass] supervise: applied once: value 15 (instance 3)",
+        "[pass] supervise: a service given up on answers unavailable",
+        "[pass] supervise: after: call 1 of its instance",
+        "[cm] restarting base and 1 after it (rest-for-one)",
+        "[cm] started after (restart)",
+        "[pass] supervise: base crashed under a call",
+        "[pass] supervise: after was restarted with base: call 1 of a new instance",
+        "[cm] client asked to shut down (pass)",
+    ];
+    let mut at = 0;
+    for step in steps {
+        match out[at..].find(step) {
+            Some(i) => at += i + step.len(),
+            None => return Err(format!("supervision test: missing (in order) {step:?}")),
+        }
+    }
+    // Independent of the client's order: the crasher's five restarts and
+    // the manager giving up.
+    let restarts = out.matches("[cm] restarting crasher (one-for-one)").count();
+    if restarts != 5 {
+        return Err(format!(
+            "supervision test: crasher restarted {restarts} times, not 5"
+        ));
+    }
+    if !out.contains("[cm] crasher: more than 5 restarts in 60 s; giving up") {
+        return Err("supervision test: the manager never gave up on crasher".into());
+    }
+    for bad in ["[fail]", "could not", "panic"] {
+        if out.contains(bad) {
+            return Err(format!("supervision test: log contains {bad:?}"));
+        }
+    }
+    println!("== supervision test passed ({})", img.arch.name());
     Ok(())
 }
 

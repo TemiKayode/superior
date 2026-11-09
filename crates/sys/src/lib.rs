@@ -20,7 +20,7 @@
 #[cfg(all(feature = "sel4", target_arch = "aarch64"))]
 mod sel4;
 
-use superior_objects::abi::{CapTransfer, MSG_WORDS, Syscall};
+use superior_objects::abi::{CapTransfer, Error, MSG_WORDS, SERVICE_UNAVAILABLE, Syscall};
 
 /// What a system call returns.
 #[derive(Clone, Copy, Debug)]
@@ -156,4 +156,39 @@ pub fn print_line(args: core::fmt::Arguments) {
         l.buf.as_ptr() as u64,
         [l.len as u64, 0, 0, 0],
     );
+}
+
+/// How a [`call_retry`] ended.
+#[derive(Clone, Copy, Debug)]
+pub enum Called {
+    /// The service answered (the call's own status may still be an error).
+    Answered(Ret),
+    /// The Component Manager gave up on the service: it answered
+    /// [`SERVICE_UNAVAILABLE`]. Retrying will not help.
+    Unavailable,
+    /// The server was restarted under the call more times than allowed.
+    GaveUp,
+}
+
+/// Calls the endpoint in `slot`, calling again while the server is
+/// restarted under the call (`PeerRestarted`, spec section 4), at most
+/// `tries` times in all. Only for calls that are safe to repeat:
+/// idempotent ones, or ones carrying a request id the service checks
+/// against its journal, so a call that was applied before the server died
+/// is answered from the journal instead of applied twice.
+///
+/// Endpoints outlive instances, so the repeated call simply waits on the
+/// endpoint until the new instance receives it.
+pub fn call_retry(slot: u64, msg: [u64; MSG_WORDS], tries: u32) -> Called {
+    for _ in 0..tries {
+        let r = syscall(Syscall::Call, slot, msg);
+        if r.status == Error::PeerRestarted.code() {
+            continue;
+        }
+        if r.status == 0 && r.msg[0] == SERVICE_UNAVAILABLE {
+            return Called::Unavailable;
+        }
+        return Called::Answered(r);
+    }
+    Called::GaveUp
 }

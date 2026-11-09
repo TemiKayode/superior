@@ -145,6 +145,23 @@ holds the rest):
   the manager's memory faults and the manager is told; the lazy `echo` starts only on
   the client's first call, which is answered (forwarded under the client's badge 2);
   `spare`, which nothing calls, never starts.
+- Supervision (spec section 4). A component that faults is restarted by its manifest's
+  `restart` policy: `one-for-one` (the default) rebuilds just it, `rest-for-one` also
+  rebuilds every running component after it, `never` leaves it stopped. The manager
+  revokes the instance's untyped block and builds a new instance from the same block,
+  attached to the same endpoints, so queued calls wait for it. The kernel fails a call
+  the dead instance was serving with `PeerRestarted`; `superior_sys::call_retry`
+  repeats such calls, for idempotent requests or ones carrying a request id. More than
+  five restarts within sixty seconds (counted with the new `Ticks` call) and the
+  manager gives up: a tombstone thread answers the component's services with
+  `SERVICE_UNAVAILABLE`. A `state` capability is a page made once and handed to every
+  instance, so state outlives instances. `cargo xtask supervise-test` boots
+  `boot/supervise.manifest`: a `counter` service keeps its value and a per-client
+  request journal in its state page, is crashed under a call and finds its value
+  again, and is crashed after applying a request but before replying, whose retry is
+  answered from the journal instead of applied twice; a component that faults at every
+  start is restarted five times, then given up on, and its client is told so; crashing
+  a rest-for-one component restarts the one after it.
 - Static-pie user programs loaded into their own address spaces and relocated.
 - Boot self-test: a server and a client in separate address spaces do 20,000
   call/reply round trips, and the kernel refuses four kinds of rights violations. A
@@ -172,8 +189,9 @@ holds the rest):
   notifications, a 256-slot CNode pool) so filling them stays quick; normal kernels have
   32 of each, 32 address spaces and a 4096-slot pool.
 
-Not yet: supervision and restart (faults reach the Component Manager, which stops the
-component), the Memory Server, page tables for boot processes paid for from user memory,
+Not yet: escalating a component given up on to a supervisor above it (today the
+manager is the only one), restarting the Component Manager or Memory Server (spec: fast
+reboot instead), the Memory Server, page tables for boot processes paid for from user memory,
 multi-level CSpaces, the first call's capability forwarded by a lazy-start watcher, scheduling-context capabilities (budgets are set at boot), sporadic refills,
 timeout faults, SMP, an IPC benchmark on bare metal.
 
@@ -191,8 +209,8 @@ https://claude.ai/artifact/QKJS8qH5Dfbjzn58RStq1j
 | `user/pingpong/` | Boot self-test program (IPC server, client and spinner) |
 | `user/cm/` | The Component Manager: the root task, which starts every component from the boot manifest |
 | `user/shell/` | The boot shell and COM1 driver, started as a component |
-| `user/echo/`, `user/testclient/` | Test components for the Component Manager |
-| `boot/` | Component manifests: `shell.manifest` (normal boot) and `test.manifest` (`cm-test`) |
+| `user/echo/`, `user/counter/`, `user/testclient/` | Test components for the Component Manager and supervision |
+| `boot/` | Component manifests: `shell.manifest` (normal boot), `test.manifest` (`cm-test`) and `supervise.manifest` (`supervise-test`) |
 | `sel4/` | Docker build of seL4 and rust-sel4's kernel loader, for running the shell on seL4 |
 | `xtask/` | Build driver: user program, kernel, disk image, QEMU boot |
 
@@ -201,8 +219,9 @@ https://claude.ai/artifact/QKJS8qH5Dfbjzn58RStq1j
 Needs Rust (the pinned nightly in `rust-toolchain.toml` installs itself) and QEMU.
 
 ```bash
-cargo xtask test           # host tests, model check, simulation; on both ISAs the boot self-tests, the Component Manager test and a shell session; then the shell on seL4
+cargo xtask test           # host tests, model check, simulation; on both ISAs the boot self-tests, the Component Manager and supervision tests and a shell session; then the shell on seL4
 cargo xtask cm-test        # just the Component Manager test (add aarch64 for that ISA)
+cargo xtask supervise-test # just the supervision test (add aarch64 for that ISA)
 cargo xtask run            # boot the shell in QEMU (x86-64), its console on this terminal
 cargo xtask run aarch64    # the same on QEMU's AArch64 virt machine
 cargo xtask image  # just build target/superior.img
