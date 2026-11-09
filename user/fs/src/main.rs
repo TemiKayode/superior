@@ -38,13 +38,27 @@
 //! Directory entry, 64 bytes: inode (u32), kind (u8), name length (u8),
 //! name.
 //!
+//! **Rings.** A client may also submit requests through a ring (spec
+//! section 3, Tier 2): a page of submission and completion queues and data
+//! pages, shared with this server ([`fs::ring`]). The server takes
+//! submissions while there are any, and sleeps only after saying so in
+//! the ring's flags; a client that submits then rings its doorbell, a
+//! notification bound to this server's thread, so one `Recv` waits for
+//! both calls and doorbells. A completion is posted only once the change
+//! is committed, and the client's completion notification is signalled
+//! only if it said it sleeps. The ring pages belong to the manager, not
+//! the client, so a client restarting cannot unmap them from under this
+//! server.
+//!
 //! Slots: 0 the `block` service, 1 the `fs` endpoint (receive), 2 untyped
 //! memory, 3 where a client's frame arrives.
 
 #![no_std]
 #![no_main]
 
+use core::sync::atomic::{AtomicU32, Ordering, fence};
 use superior_objects::abi::{CapTransfer, Error, ObjectType, Syscall};
+use superior_objects::interfaces::fs::ring;
 use superior_objects::interfaces::{Status, block, fs};
 use superior_sys::{USER_BASE, print_line, syscall, syscall_x};
 
@@ -73,6 +87,24 @@ const NTX: u64 = 6;
 const BUFS: u64 = B_TX + NTX - BUF0;
 const BUF_VA: u64 = USER_BASE + 0x4000_0000;
 const LENT_VA: u64 = USER_BASE + 0x5000_0000;
+
+/// Rings, one per client container at most.
+const MAX_RINGS: usize = 4;
+/// Each ring's pages, `ring::PAGES` slots per ring.
+const RING_PAGES: u64 = B_TX + NTX;
+/// Each ring's completion notification.
+const RING_NTFN: u64 = RING_PAGES + MAX_RINGS as u64 * ring::PAGES;
+/// The doorbell: a notification bound to this thread.
+const DOORBELL: u64 = RING_NTFN + MAX_RINGS as u64;
+/// A capability being granted in a reply.
+const MINT: u64 = DOORBELL + 1;
+/// Ring `r`'s pages are mapped at `RING_VA + r * RING_STRIDE`.
+const RING_VA: u64 = USER_BASE + 0x7000_0000;
+const RING_STRIDE: u64 = 0x10_0000;
+// Rights masks.
+const READ: u64 = 1;
+const WRITE: u64 = 2;
+const ALL: u64 = 0x1f;
 
 // Disk layout, in blocks.
 const SUPER: u64 = 0;
@@ -197,6 +229,38 @@ fn lent_bytes() -> &'static mut [u8] {
     // SAFETY: called only while the client's frame is mapped at LENT_VA
     // (writable when written).
     unsafe { core::slice::from_raw_parts_mut(LENT_VA as *mut u8, 4096) }
+}
+
+/// Where a request's data is: the frame a call lent, or a ring's data
+/// pages (a byte range of them).
+#[derive(Clone, Copy)]
+enum Io {
+    None,
+    Lent,
+    Shared { va: u64, len: usize },
+}
+
+impl Io {
+    /// The data, mapped; `None` if there is none or it cannot be mapped.
+    /// Every call is paired with [`Io::end`].
+    fn begin(self, writable: bool) -> Option<&'static mut [u8]> {
+        match self {
+            Io::None => None,
+            Io::Lent => map_lent(writable).then(lent_bytes),
+            // SAFETY: a ring's pages stay mapped while it is attached, and
+            // the range lies inside its data pages. The client may change
+            // them meanwhile; that only garbles its own request.
+            Io::Shared { va, len } => {
+                Some(unsafe { core::slice::from_raw_parts_mut(va as *mut u8, len) })
+            }
+        }
+    }
+
+    fn end(self) {
+        if let Io::Lent = self {
+            unmap_lent();
+        }
+    }
 }
 
 type R<T> = Result<T, Status>;
@@ -353,6 +417,28 @@ struct Fs {
     /// Committed but not yet written home: (home block, buffer).
     pending: [(u64, u64); JMAX],
     npending: usize,
+    rings: [Option<Ring>; MAX_RINGS],
+    /// Requests taken from rings, doorbells that woke this server, and
+    /// completion signals sent.
+    ring_ops: u64,
+    wakeups: u64,
+    signals: u64,
+}
+
+/// A client's ring.
+#[derive(Clone, Copy)]
+struct Ring {
+    container: u64,
+    /// Pages attached so far.
+    attached: u64,
+    started: bool,
+}
+
+/// A word of a ring's header.
+fn hdr(page: u64, off: usize) -> &'static AtomicU32 {
+    // SAFETY: the ring page is mapped while the ring is attached, and the
+    // offsets are inside it and aligned.
+    unsafe { &*((page + off as u64) as *const AtomicU32) }
 }
 
 impl Fs {
@@ -380,7 +466,25 @@ impl Fs {
             seq: 0,
             pending: [(0, 0); JMAX],
             npending: 0,
+            rings: [None; MAX_RINGS],
+            ring_ops: 0,
+            wakeups: 0,
+            signals: 0,
         };
+        // The doorbell, and each ring's completion notification.
+        for slot in (RING_NTFN..RING_NTFN + MAX_RINGS as u64).chain([DOORBELL]) {
+            let made = syscall(
+                Syscall::Retype,
+                UNTYPED,
+                [ObjectType::Notification as u64, 0, slot, 0],
+            );
+            if made.status != 0 {
+                crash("no memory for notifications");
+            }
+        }
+        if syscall(Syscall::NotificationBind, DOORBELL, [0; 4]).status != 0 {
+            crash("cannot bind the doorbell");
+        }
         read_block(SUPER, B_SCRATCH);
         if word(buf(B_SCRATCH), 0) != SUPER_MAGIC {
             f.format();
@@ -795,19 +899,20 @@ impl Fs {
 
     // ---- operations ----
 
-    /// Copies the path(s) out of the client's frame.
-    fn take_path(len: u64, lent: bool) -> R<&'static [u8]> {
-        if !lent || len > fs::BLOCK || !map_lent(false) {
-            return Err(Status::Invalid);
+    /// Copies the path(s) out of the request's data.
+    fn take_path(len: u64, io: Io) -> R<&'static [u8]> {
+        let src = io.begin(false).ok_or(Status::Invalid)?;
+        let ok = len <= fs::BLOCK && len as usize <= src.len();
+        let p = &mut buf(B_PATH)[..len.min(fs::BLOCK) as usize];
+        if ok {
+            p.copy_from_slice(&src[..len as usize]);
         }
-        let p = &mut buf(B_PATH)[..len as usize];
-        p.copy_from_slice(&lent_bytes()[..len as usize]);
-        unmap_lent();
-        Ok(p)
+        io.end();
+        ok.then_some(&*p).ok_or(Status::Invalid)
     }
 
-    fn open(&mut self, c: u64, m: [u64; 4], lent: bool) -> R<[u64; 3]> {
-        let path = Fs::take_path(m[1], lent)?;
+    fn open(&mut self, c: u64, m: [u64; 4], io: Io) -> R<[u64; 3]> {
+        let path = Fs::take_path(m[1], io)?;
         let flags = m[2];
         let create = flags & fs::CREATE != 0;
         let root = match create {
@@ -846,8 +951,8 @@ impl Fs {
         Ok([n.handle(), n.size(), n.kind() as u64])
     }
 
-    fn mkdir(&mut self, c: u64, m: [u64; 4], lent: bool) -> R<[u64; 3]> {
-        let path = Fs::take_path(m[1], lent)?;
+    fn mkdir(&mut self, c: u64, m: [u64; 4], io: Io) -> R<[u64; 3]> {
+        let path = Fs::take_path(m[1], io)?;
         let root = self.ensure_root(c)?;
         let (dir, name) = self.parent_of(root, path)?.ok_or(Status::Exists)?;
         if let Some(f) = self.lookup(dir, name) {
@@ -863,8 +968,8 @@ impl Fs {
         self.finish(tx, r).map(|_| [0; 3])
     }
 
-    fn unlink(&mut self, c: u64, m: [u64; 4], lent: bool) -> R<[u64; 3]> {
-        let path = Fs::take_path(m[1], lent)?;
+    fn unlink(&mut self, c: u64, m: [u64; 4], io: Io) -> R<[u64; 3]> {
+        let path = Fs::take_path(m[1], io)?;
         let root = self.root(c).ok_or(Status::NotFound)?;
         let (dir, name) = self.parent_of(root, path)?.ok_or(Status::Invalid)?;
         let f = self.lookup(dir, name).ok_or(Status::NotFound)?;
@@ -878,9 +983,9 @@ impl Fs {
         self.finish(tx, Ok([0; 3]))
     }
 
-    fn rename(&mut self, c: u64, m: [u64; 4], lent: bool) -> R<[u64; 3]> {
+    fn rename(&mut self, c: u64, m: [u64; 4], io: Io) -> R<[u64; 3]> {
         let (l1, l2) = (m[1], m[2]);
-        let both = Fs::take_path(l1.saturating_add(l2), lent)?;
+        let both = Fs::take_path(l1.saturating_add(l2), io)?;
         let (from, to) = both.split_at(l1 as usize);
         let root = self.root(c).ok_or(Status::NotFound)?;
         let (sdir, sname) = self.parent_of(root, from)?.ok_or(Status::Invalid)?;
@@ -975,17 +1080,19 @@ impl Fs {
         ]
     }
 
-    fn read(&mut self, c: u64, m: [u64; 4], lent: bool) -> R<[u64; 3]> {
+    fn read(&mut self, c: u64, m: [u64; 4], io: Io) -> R<[u64; 3]> {
         let n = self.node(c, m[1])?;
         let (off, len) = (m[2], m[3]);
         if n.kind() != KIND_FILE {
             return Err(Status::IsDir);
         }
-        if !lent || len > fs::BLOCK {
+        if len > fs::BLOCK {
             return Err(Status::Invalid);
         }
         let len = len.min(n.size().saturating_sub(off));
-        if !map_lent(true) {
+        let out = io.begin(true).ok_or(Status::Invalid)?;
+        if out.len() < len as usize {
+            io.end();
             return Err(Status::Invalid);
         }
         let mut at = 0;
@@ -993,7 +1100,7 @@ impl Fs {
             if k == 0 {
                 continue;
             }
-            let dst = &mut lent_bytes()[at..at + k];
+            let dst = &mut out[at..at + k];
             match self.bmap(n, bi) {
                 0 => dst.fill(0),
                 b => {
@@ -1003,29 +1110,33 @@ impl Fs {
             }
             at += k;
         }
-        unmap_lent();
+        io.end();
         Ok([len, 0, 0])
     }
 
-    fn write(&mut self, c: u64, m: [u64; 4], lent: bool) -> R<[u64; 3]> {
+    fn write(&mut self, c: u64, m: [u64; 4], io: Io) -> R<[u64; 3]> {
         let n = self.node(c, m[1])?;
         let (off, len) = (m[2], m[3]);
         if n.kind() != KIND_FILE {
             return Err(Status::IsDir);
         }
-        if !lent || len == 0 || len > fs::BLOCK {
+        if len == 0 || len > fs::BLOCK {
             return Err(Status::Invalid);
         }
         if off.saturating_add(len) > fs::MAX_FILE {
             return Err(Status::NoSpace);
         }
-        // The data first: a client's frame it cannot map is refused
-        // before anything changes.
-        if !map_lent(false) {
+        // The data first: data it cannot reach is refused before anything
+        // changes. (A copy: a ring client may change its pages meanwhile.)
+        let src = io.begin(false).ok_or(Status::Invalid)?;
+        let ok = src.len() >= len as usize;
+        if ok {
+            buf(B_DATA)[..len as usize].copy_from_slice(&src[..len as usize]);
+        }
+        io.end();
+        if !ok {
             return Err(Status::Invalid);
         }
-        buf(B_DATA)[..len as usize].copy_from_slice(&lent_bytes()[..len as usize]);
-        unmap_lent();
         let mut tx = Tx::new();
         let mut at = 0;
         let mut r = Ok(());
@@ -1049,18 +1160,17 @@ impl Fs {
         self.finish(tx, r).map(|_| [0; 3])
     }
 
-    fn readdir(&mut self, c: u64, m: [u64; 4], lent: bool) -> R<[u64; 3]> {
+    fn readdir(&mut self, c: u64, m: [u64; 4], io: Io) -> R<[u64; 3]> {
         let n = self.node(c, m[1])?;
         if n.kind() != KIND_DIR {
             return Err(Status::NotDir);
         }
-        if !lent || !map_lent(true) {
-            return Err(Status::Invalid);
-        }
+        let out = io.begin(true).ok_or(Status::Invalid)?;
+        let room = out.len().min(fs::BLOCK as usize) / fs::ENTRY;
         let total = n.size() / fs::BLOCK * ENTRIES;
         let (mut i, mut count) = (m[2], 0usize);
         let mut loaded = u64::MAX;
-        while i < total && count < (fs::BLOCK as usize / fs::ENTRY) {
+        while i < total && count < room {
             let bi = i / ENTRIES;
             if bi != loaded {
                 match self.bmap(n, bi) {
@@ -1072,12 +1182,12 @@ impl Fs {
             let idx = (i % ENTRIES) as usize;
             let e = &buf(B_LOOK)[idx * fs::ENTRY..(idx + 1) * fs::ENTRY];
             if u32_at(e, 0) != 0 {
-                lent_bytes()[count * fs::ENTRY..(count + 1) * fs::ENTRY].copy_from_slice(e);
+                out[count * fs::ENTRY..(count + 1) * fs::ENTRY].copy_from_slice(e);
                 count += 1;
             }
             i += 1;
         }
-        unmap_lent();
+        io.end();
         Ok([count as u64, i, 0])
     }
 
@@ -1182,24 +1292,253 @@ impl Fs {
         }
     }
 
-    fn serve(&mut self, badge: u64, m: [u64; 4], lent: bool) -> [u64; 4] {
-        let c = badge & 0xffff;
-        if c == 0 {
-            return reply(Err(Status::Denied));
-        }
+    /// One request of container `c`, from a call or a ring.
+    fn op(&mut self, c: u64, m: [u64; 4], io: Io) -> [u64; 4] {
         reply(match m[0] {
-            fs::OPEN => self.open(c, m, lent),
-            fs::READ => self.read(c, m, lent),
-            fs::WRITE => self.write(c, m, lent),
+            fs::OPEN => self.open(c, m, io),
+            fs::READ => self.read(c, m, io),
+            fs::WRITE => self.write(c, m, io),
             fs::STAT => self.node(c, m[1]).map(|n| [n.size(), n.kind() as u64, 0]),
-            fs::MKDIR => self.mkdir(c, m, lent),
-            fs::UNLINK => self.unlink(c, m, lent),
-            fs::RENAME => self.rename(c, m, lent),
-            fs::READDIR => self.readdir(c, m, lent),
+            fs::MKDIR => self.mkdir(c, m, io),
+            fs::UNLINK => self.unlink(c, m, io),
+            fs::RENAME => self.rename(c, m, io),
+            fs::READDIR => self.readdir(c, m, io),
             fs::TRUNCATE => self.truncate(c, m),
             fs::STATFS => Ok(self.statfs()),
             _ => Err(Status::Invalid),
         })
+    }
+
+    /// A call: the reply, and a capability to grant with it.
+    fn serve(&mut self, badge: u64, m: [u64; 4], lent: bool) -> ([u64; 4], Option<u64>) {
+        let c = badge & 0xffff;
+        if c == 0 {
+            return (reply(Err(Status::Denied)), None);
+        }
+        match m[0] {
+            fs::RING_ATTACH => (reply(self.ring_attach(c, m[1], lent)), None),
+            fs::RING_START => match self.ring_start(c) {
+                Ok(g) => (reply(Ok([0; 3])), Some(g)),
+                Err(e) => (reply(Err(e)), None),
+            },
+            fs::RING_DOORBELL => match self.ring_doorbell(c) {
+                Ok(g) => (reply(Ok([0; 3])), Some(g)),
+                Err(e) => (reply(Err(e)), None),
+            },
+            _ => {
+                let io = if lent { Io::Lent } else { Io::None };
+                (self.op(c, m, io), None)
+            }
+        }
+    }
+
+    // ---- rings ----
+
+    fn ring_of(&self, c: u64) -> Option<usize> {
+        self.rings
+            .iter()
+            .position(|r| r.is_some_and(|r| r.container == c))
+    }
+
+    /// Takes page `page` of container `c`'s ring, lent in this call.
+    fn ring_attach(&mut self, c: u64, page: u64, lent: bool) -> R<[u64; 3]> {
+        if !lent || page >= ring::PAGES {
+            return Err(Status::Invalid);
+        }
+        if page == 0 {
+            if let Some(r) = self.ring_of(c) {
+                self.detach(r);
+            }
+            let r = self
+                .rings
+                .iter()
+                .position(|r| r.is_none())
+                .ok_or(Status::InUse)?;
+            self.rings[r] = Some(Ring {
+                container: c,
+                attached: 0,
+                started: false,
+            });
+        }
+        let r = self.ring_of(c).ok_or(Status::Invalid)?;
+        let mut g = self.rings[r].unwrap();
+        if g.started || page != g.attached {
+            return Err(Status::Invalid);
+        }
+        let slot = RING_PAGES + r as u64 * ring::PAGES + page;
+        // A copy of what was lent: the lent capability goes after the call.
+        if syscall(Syscall::CapMint, LENT, [slot, ALL, 0, 0]).status != 0 {
+            return Err(Status::Invalid);
+        }
+        let va = RING_VA + r as u64 * RING_STRIDE + page * 4096;
+        if syscall(Syscall::FrameMap, slot, [va, 1, 0, 0]).status != 0 {
+            syscall(Syscall::CapDelete, slot, [0; 4]);
+            return Err(Status::Invalid);
+        }
+        g.attached += 1;
+        self.rings[r] = Some(g);
+        Ok([0; 3])
+    }
+
+    /// Drops ring `r`: its pages, and the client's copies of its
+    /// completion notification.
+    fn detach(&mut self, r: usize) {
+        let Some(g) = self.rings[r].take() else {
+            return;
+        };
+        for p in 0..g.attached {
+            // Deleting the capability unmaps the page.
+            syscall(
+                Syscall::CapDelete,
+                RING_PAGES + r as u64 * ring::PAGES + p,
+                [0; 4],
+            );
+        }
+        syscall(Syscall::CapRevoke, RING_NTFN + r as u64, [0; 4]);
+    }
+
+    /// Starts container `c`'s ring; the completion notification to grant.
+    fn ring_start(&mut self, c: u64) -> R<u64> {
+        let r = self.ring_of(c).ok_or(Status::NotFound)?;
+        let mut g = self.rings[r].unwrap();
+        if g.started || g.attached != ring::PAGES {
+            return Err(Status::Invalid);
+        }
+        let page = RING_VA + r as u64 * RING_STRIDE;
+        for off in (0..ring::SQ).step_by(4) {
+            hdr(page, off).store(0, Ordering::Relaxed);
+        }
+        fence(Ordering::SeqCst);
+        g.started = true;
+        self.rings[r] = Some(g);
+        Fs::mint(RING_NTFN + r as u64, READ, 0)
+    }
+
+    /// The doorbell, badged with ring `r`'s bit, to grant.
+    fn ring_doorbell(&mut self, c: u64) -> R<u64> {
+        let r = self.ring_of(c).ok_or(Status::NotFound)?;
+        if !self.rings[r].unwrap().started {
+            return Err(Status::Invalid);
+        }
+        Fs::mint(DOORBELL, WRITE, 1 << r)
+    }
+
+    fn mint(src: u64, rights: u64, badge: u64) -> R<u64> {
+        syscall(Syscall::CapDelete, MINT, [0; 4]);
+        match syscall(Syscall::CapMint, src, [MINT, rights, badge, 0]).status {
+            0 => Ok(MINT),
+            _ => Err(Status::Invalid),
+        }
+    }
+
+    /// Takes every submission there is room to complete. Returns whether
+    /// there were any.
+    fn poll_rings(&mut self) -> bool {
+        let mut any = false;
+        for r in 0..MAX_RINGS {
+            let Some(g) = self.rings[r].filter(|g| g.started) else {
+                continue;
+            };
+            let page = RING_VA + r as u64 * RING_STRIDE;
+            let mut posted = false;
+            loop {
+                let head = hdr(page, ring::SQ_HEAD).load(Ordering::Relaxed);
+                let tail = hdr(page, ring::SQ_TAIL).load(Ordering::Acquire);
+                let cq_tail = hdr(page, ring::CQ_TAIL).load(Ordering::Relaxed);
+                let cq_head = hdr(page, ring::CQ_HEAD).load(Ordering::Acquire);
+                if head == tail {
+                    break;
+                }
+                if tail.wrapping_sub(head) > ring::ENTRIES
+                    || cq_tail.wrapping_sub(cq_head) > ring::ENTRIES
+                {
+                    say!("ring {r}: indices out of range; dropping it");
+                    self.detach(r);
+                    break;
+                }
+                if cq_tail.wrapping_sub(cq_head) == ring::ENTRIES {
+                    break; // no room for the completion: the client reaps first
+                }
+                let sqe = page as usize + ring::SQ + (head % ring::ENTRIES) as usize * ring::SQE;
+                // SAFETY: inside the ring page, mapped while attached.
+                let w = |i: usize| unsafe { ((sqe + 8 * i) as *const u64).read_volatile() };
+                let (op, tag, m, off) = (w(0), w(1), [w(0), w(2), w(3), w(4)], w(5));
+                let reply = if op >= fs::RING_ATTACH || off >= ring::DATA {
+                    reply(Err(Status::Invalid))
+                } else {
+                    let io = Io::Shared {
+                        va: page + 4096 + off,
+                        len: (ring::DATA - off).min(fs::BLOCK) as usize,
+                    };
+                    self.op(g.container, m, io)
+                };
+                let cqe = page as usize + ring::CQ + (cq_tail % ring::ENTRIES) as usize * ring::CQE;
+                for (i, v) in [tag, reply[0], reply[1], reply[2], reply[3]]
+                    .iter()
+                    .enumerate()
+                {
+                    // SAFETY: inside the ring page, mapped while attached.
+                    unsafe { ((cqe + 8 * i) as *mut u64).write_volatile(*v) };
+                }
+                // Committed already: the completion is the acknowledgement.
+                hdr(page, ring::CQ_TAIL).store(cq_tail.wrapping_add(1), Ordering::Release);
+                hdr(page, ring::SQ_HEAD).store(head.wrapping_add(1), Ordering::Release);
+                self.checkpoint();
+                self.ring_ops += 1;
+                posted = true;
+                any = true;
+                // Coalesced: wake a sleeping client once it has as many
+                // completions as it asked for.
+                let pending = cq_tail.wrapping_add(1).wrapping_sub(cq_head);
+                self.wake_client(r, page, pending);
+            }
+            // Out of work (or room): wake a sleeping client whatever it
+            // asked for, so it can refill the queue.
+            if posted && self.rings[r].is_some() {
+                fence(Ordering::SeqCst);
+                self.wake_client(r, page, ring::ENTRIES);
+            }
+        }
+        any
+    }
+
+    /// Signals ring `r`'s client if it sleeps waiting for at most
+    /// `pending` completions; clears its request, so it is signalled once.
+    fn wake_client(&mut self, r: usize, page: u64, pending: u32) {
+        let w = hdr(page, ring::CLIENT_WAITING);
+        let want = w.load(Ordering::Acquire);
+        if want != 0
+            && want <= pending
+            && w.compare_exchange(want, 0, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+        {
+            syscall(Syscall::Signal, RING_NTFN + r as u64, [0; 4]);
+            self.signals += 1;
+        }
+    }
+
+    /// Whether some ring has a submission it has room to complete.
+    fn ring_work(&self) -> bool {
+        (0..MAX_RINGS).any(|r| {
+            let page = RING_VA + r as u64 * RING_STRIDE;
+            self.rings[r].is_some_and(|g| g.started)
+                && hdr(page, ring::SQ_HEAD).load(Ordering::Relaxed)
+                    != hdr(page, ring::SQ_TAIL).load(Ordering::Acquire)
+                && hdr(page, ring::CQ_TAIL)
+                    .load(Ordering::Relaxed)
+                    .wrapping_sub(hdr(page, ring::CQ_HEAD).load(Ordering::Acquire))
+                    < ring::ENTRIES
+        })
+    }
+
+    /// Tells every ring's client whether this server sleeps.
+    fn need_wakeup(&self, on: bool) {
+        for r in 0..MAX_RINGS {
+            if self.rings[r].is_some_and(|g| g.started) {
+                let page = RING_VA + r as u64 * RING_STRIDE;
+                hdr(page, ring::FLAGS).store(on as u32 * ring::NEED_WAKEUP, Ordering::Relaxed);
+            }
+        }
     }
 }
 
@@ -1211,17 +1550,49 @@ pub extern "C" fn _start(_: u64) -> ! {
         accept: Some(LENT as u16),
     };
     loop {
+        // Under load, take ring submissions without sleeping.
+        if f.poll_rings() {
+            continue;
+        }
+        // About to sleep: ask for the doorbell, then look once more, so a
+        // submission made meanwhile is either seen here or rings it.
+        f.need_wakeup(true);
+        fence(Ordering::SeqCst);
+        if f.ring_work() {
+            f.need_wakeup(false);
+            continue;
+        }
         let r = syscall_x(Syscall::Recv, SERVICE, [0; 4], accept);
+        f.need_wakeup(false);
+        if r.status == Error::Notified.code() {
+            f.wakeups += 1;
+            if f.wakeups % 64 == 0 {
+                say!(
+                    "rings: {} requests, {} doorbells, {} completion signals",
+                    f.ring_ops,
+                    f.wakeups,
+                    f.signals
+                );
+            }
+            continue;
+        }
         if r.status != 0 {
             continue;
         }
         let lent = r.cap == Some(LENT as u16);
-        let reply = f.serve(r.badge, r.msg, lent);
+        let (reply, grant) = f.serve(r.badge, r.msg, lent);
         if lent {
             syscall(Syscall::CapDelete, LENT, [0; 4]);
         }
         // Committed: acknowledge, then write the blocks home.
-        syscall(Syscall::Reply, 0, reply);
+        let x = CapTransfer {
+            grant: grant.map(|g| g as u16),
+            accept: None,
+        };
+        syscall_x(Syscall::Reply, 0, reply, x);
+        if grant.is_some() {
+            syscall(Syscall::CapDelete, MINT, [0; 4]);
+        }
         f.checkpoint();
     }
 }

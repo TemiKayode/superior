@@ -196,6 +196,73 @@ pub mod fs {
     /// `[STATFS]`: reply `[status, free blocks, free inodes]`.
     pub const STATFS: u64 = 11;
 
+    /// `[RING_ATTACH, page]` with page `page` of the caller's ring granted
+    /// (pages 0 to [`ring::PAGES`] - 1, in order; page 0 drops a ring the
+    /// caller had). The pages should be ones the manager keeps across
+    /// restarts (`shared`), so neither side's restart unmaps the other's.
+    pub const RING_ATTACH: u64 = 12;
+    /// `[RING_START]` once every page is attached: the server clears the
+    /// ring header and starts taking requests from it. The reply grants
+    /// the completion notification (Read) the caller sleeps on. It belongs
+    /// to the server: if the server is restarted it is destroyed, and a
+    /// caller waiting on it wakes with `ObjectDestroyed`, its cue to set
+    /// the ring up again and submit what had no completion.
+    pub const RING_START: u64 = 13;
+    /// `[RING_DOORBELL]`: the reply grants the doorbell (Write), signalled
+    /// when the server has said it is going to sleep.
+    pub const RING_DOORBELL: u64 = 14;
+
+    /// Tier 2 rings (spec section 3): a submission and a completion queue
+    /// in a page shared with the server, single-producer single-consumer,
+    /// and data pages after it. Under load neither side makes a system
+    /// call per request: the server polls the submission queue while it
+    /// has work and asks for the doorbell ([`ring::NEED_WAKEUP`]) only
+    /// before it sleeps; the caller asks for a completion signal
+    /// ([`ring::CLIENT_WAITING`]) only before it sleeps.
+    ///
+    /// A submission is the words of a call (`[op, a, b, c]`, any operation
+    /// above but the `RING_` ones) with a tag the completion carries back,
+    /// and the offset in the data pages of what the call would have lent:
+    /// a path, or data to write, or room for data read. A completion is
+    /// the tag and the reply's words. It is posted only once the change is
+    /// durable. The caller keeps at most [`ring::ENTRIES`] requests in
+    /// flight.
+    pub mod ring {
+        pub const ENTRIES: u32 = 16;
+        pub const DATA_PAGES: u64 = 15;
+        /// The ring page and the data pages.
+        pub const PAGES: u64 = 1 + DATA_PAGES;
+        /// Bytes of data area (the pages after the ring page).
+        pub const DATA: u64 = DATA_PAGES * 4096;
+
+        // Header words (u32), a cache line apart.
+        /// Next submission the server takes (server writes).
+        pub const SQ_HEAD: usize = 0;
+        /// Next free submission slot (caller writes).
+        pub const SQ_TAIL: usize = 64;
+        /// Next completion the caller takes (caller writes).
+        pub const CQ_HEAD: usize = 128;
+        /// Next free completion slot (server writes).
+        pub const CQ_TAIL: usize = 192;
+        /// [`NEED_WAKEUP`] (server writes).
+        pub const FLAGS: usize = 256;
+        /// While the caller sleeps on the completion notification: how
+        /// many completions it waits for (caller writes; the server clears
+        /// it as it signals). Asking for several coalesces the signals.
+        pub const CLIENT_WAITING: usize = 320;
+        /// The server sleeps: signal the doorbell after submitting.
+        pub const NEED_WAKEUP: u32 = 1;
+
+        /// Submission queue: `ENTRIES` of [`SQE`] bytes.
+        pub const SQ: usize = 1024;
+        /// Completion queue: `ENTRIES` of [`CQE`] bytes.
+        pub const CQ: usize = 2048;
+        /// Submission words: op, tag, a, b, c, data offset.
+        pub const SQE: usize = 64;
+        /// Completion words: tag, status, then the reply's three words.
+        pub const CQE: usize = 64;
+    }
+
     /// A directory entry as `READDIR` returns it: 64 bytes.
     pub const ENTRY: usize = 64;
 

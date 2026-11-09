@@ -89,7 +89,11 @@ const TOMB_STACK: u64 = TOMB_TCB + MAX_SERVICES as u64;
 /// Each component's state page, if it has one: made once, outliving
 /// every instance.
 const STATE_PAGE: u64 = TOMB_STACK + 2 * MAX_SERVICES as u64;
-const _: () = assert!(STATE_PAGE + MAX_COMPONENTS as u64 <= BLOCKS);
+/// Pages components share with servers (`shared`): made once, handed out
+/// from here in manifest order, outliving every instance on both sides.
+const SHARED_PAGES: u64 = STATE_PAGE + MAX_COMPONENTS as u64;
+const SHARED_SLOTS: u64 = 160;
+const _: () = assert!(SHARED_PAGES + SHARED_SLOTS <= BLOCKS);
 /// Each component's block of slots: its untyped memory, then the objects
 /// of its current instance.
 const BLOCKS: u64 = 512;
@@ -192,6 +196,10 @@ struct Manager<'a> {
     services: [Option<(&'a str, usize)>; MAX_SERVICES],
     /// Whether the component's untyped block (and state page) exist yet.
     made: [bool; MAX_COMPONENTS],
+    /// Where each component's shared pages start, once made.
+    shared: [u64; MAX_COMPONENTS],
+    /// The next free slot for shared pages.
+    shared_next: u64,
     /// The ticks of each component's last [`MAX_RESTARTS`] restarts, as a
     /// ring indexed by the restart count.
     restarts: [[u64; MAX_RESTARTS]; MAX_COMPONENTS],
@@ -223,6 +231,20 @@ impl<'a> Manager<'a> {
             if c.caps().any(|x| x.kind == CapKind::State) {
                 retype(root::UNTYPED, ObjectType::Frame, 0, STATE_PAGE + i as u64)
                     .map_err(|e| ("no memory for the state page", e))?;
+            }
+            if let Some(n) = c.caps().find_map(|x| match x.kind {
+                CapKind::Shared(n) => Some(n as u64),
+                _ => None,
+            }) {
+                if self.shared_next + n > SHARED_PAGES + SHARED_SLOTS {
+                    return Err(("no room for shared pages", 0));
+                }
+                self.shared[i] = self.shared_next;
+                for p in 0..n {
+                    retype(root::UNTYPED, ObjectType::Frame, 0, self.shared_next + p)
+                        .map_err(|e| ("no memory for shared pages", e))?;
+                }
+                self.shared_next += n;
             }
             self.made[i] = true;
         }
@@ -277,6 +299,8 @@ impl<'a> Manager<'a> {
                     cnode_copy(cnode, slot, CONTROL, WRITE, BADGE_REPORT + i as u64)
                 }
                 CapKind::State => cnode_copy(cnode, slot, STATE_PAGE + i as u64, ALL, 0),
+                CapKind::Shared(n) => (0..n as u64)
+                    .try_for_each(|p| cnode_copy(cnode, slot + p, self.shared[i] + p, ALL, 0)),
             };
             r.map_err(|e| ("placing a capability", e))?;
         }
@@ -701,6 +725,8 @@ pub extern "C" fn _start(bundle_len: u64) -> ! {
         status: [Status::NotStarted; MAX_COMPONENTS],
         services: [None; MAX_SERVICES],
         made: [false; MAX_COMPONENTS],
+        shared: [0; MAX_COMPONENTS],
+        shared_next: SHARED_PAGES,
         restarts: [[0; MAX_RESTARTS]; MAX_COMPONENTS],
         restart_count: [0; MAX_COMPONENTS],
     };

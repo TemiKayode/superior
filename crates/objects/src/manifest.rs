@@ -22,6 +22,8 @@
 //!   notification 3          # a fresh notification
 //!   untyped 16 4            # a fresh 2^16-byte untyped block
 //!   state 5                 # a page the manager keeps across restarts
+//!   shared 9 16             # 9 pages (slots 16-24) kept across restarts,
+//!                           # to share with a server (rings, buffers)
 //!   cspace 9                # a CSpace of 2^9 slots (default 2^6)
 //!   quota 64                # pages the Memory Server may give it
 //!   heap 32                 # a demand-zero heap of 32 pages
@@ -78,7 +80,15 @@ pub enum CapKind<'a> {
     /// instance finds what the last one wrote (spec section 4: "state is
     /// external"). At most one per component.
     State,
+    /// `n` pages in consecutive slots, made once like [`CapKind::State`]:
+    /// memory a component shares with a server (rings and buffers). The
+    /// manager holds the originals, so when either side is restarted only
+    /// its own copies go, and the other side's mappings stay.
+    Shared(u8),
 }
+
+/// Most pages one `shared` directive may ask for.
+pub const MAX_SHARED_PAGES: u8 = 16;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CapSpec<'a> {
@@ -308,6 +318,17 @@ impl<'a> Manifest<'a> {
                     }
                     Some((CapKind::State, arg("state needs a slot")?))
                 }
+                "shared" => {
+                    if c.caps().any(|x| matches!(x.kind, CapKind::Shared(_))) {
+                        return Err(err("only one shared directive per component", key));
+                    }
+                    let w = arg("shared needs a page count")?;
+                    let n = match number(w)? {
+                        n @ 1..=MAX_SHARED_PAGES_U64 => n as u8,
+                        _ => return Err(err("shared must be 1 to 16 pages", w)),
+                    };
+                    Some((CapKind::Shared(n), arg("shared needs a slot")?))
+                }
                 "untyped" => {
                     let w = arg("untyped needs a size in bits")?;
                     let bits = match number(w)? {
@@ -373,6 +394,7 @@ impl<'a> Manifest<'a> {
 }
 
 const MEMORY_MAX_BITS_U64: u64 = MEMORY_MAX_BITS as u64;
+const MAX_SHARED_PAGES_U64: u64 = MAX_SHARED_PAGES as u64;
 
 #[cfg(test)]
 mod tests {
@@ -509,6 +531,35 @@ component memserver
  state 2"
             ),
             (4, "only one state page per component")
+        );
+        assert_eq!(
+            error(
+                "component a
+ image a
+ shared 17 1"
+            ),
+            (3, "shared must be 1 to 16 pages")
+        );
+        assert_eq!(
+            error(
+                "component a
+ image a
+ shared 2 1
+ shared 1 9"
+            ),
+            (4, "only one shared directive per component")
+        );
+        let m = Manifest::parse(
+            "component a
+ image a
+ shared 9 16",
+        )
+        .unwrap();
+        assert!(
+            m.components[0]
+                .unwrap()
+                .caps()
+                .any(|c| c.kind == CapKind::Shared(9) && c.slot == 16)
         );
         assert_eq!(
             error("component a\n image a\n cspace 11"),

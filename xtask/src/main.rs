@@ -766,6 +766,8 @@ fn fs_test(arch: Arch) -> Result<(), String> {
         "[pass] fs: renamed a/b/c/f to a/g (the same file); a cannot move into itself",
         "[pass] fs: a non-empty directory stays; a lists b and g, then g alone",
         "[pass] fs: 70 files in one directory (two blocks of entries) listed, then removed",
+        "[pass] fs: ring: 376 requests, 15 in flight, every write acknowledged and read back",
+        "fs: ring: ",
         "[pass] fs: record 400 and a rename of a/g to g2 acknowledged; cutting the power",
         "[cm] client asked to shut down (pass)",
     ];
@@ -796,7 +798,9 @@ fn fs_test(arch: Arch) -> Result<(), String> {
         "[pass] fs other: its own logs/app.log is a separate file, alone in its tree",
         "[pass] fs: after the power cut logs/app.log is 25664 bytes",
         "[pass] fs: all 401 acknowledged records survived",
-        "[pass] fs: the last rename survived: g2 is there, a/g is not; the root lists 5 entries",
+        "[pass] fs: the last rename survived: g2 is there, a/g is not; the root lists 6 entries",
+        "[pass] fs: ring.log survived: 307200 bytes",
+        "[pass] fs: ring, no faults: 300 reads with",
         "[pass] fs: data/big survived: 20004 bytes",
         "[cm] client asked to shut down (pass)",
     ];

@@ -189,6 +189,13 @@ pub enum Syscall {
     /// Unmaps the frame in slot `rdi` from the I/O address space it was
     /// mapped into, and waits until the IOMMU has forgotten it.
     IoUnmap = 39,
+    /// Binds the notification in slot `rdi` (Read right) to the calling
+    /// thread: its `Recv` and `ReplyRecv` then also return when the
+    /// notification is signalled, with status [`Error::Notified`] and the
+    /// bits as the badge. A thread binds at most one notification, and a
+    /// notification is bound to at most one thread, for as long as both
+    /// exist.
+    NotificationBind = 40,
     /// Maps the frame in slot `rdi` at page-aligned `rsi` in the address
     /// space in slot `r8` (Write right). `rdx` = [`MAP_WRITE`] and/or
     /// [`MAP_EXEC`], never both. Needs the frame's Map right, plus Write
@@ -254,6 +261,7 @@ impl Syscall {
             37 => Syscall::IoSpaceBind,
             38 => Syscall::IoMap,
             39 => Syscall::IoUnmap,
+            40 => Syscall::NotificationBind,
             0x100 => Syscall::DebugPutStr,
             0x101 => Syscall::DebugSelftestDone,
             _ => return None,
@@ -294,6 +302,10 @@ pub enum Error {
     /// not have taken effect: retry it if it is idempotent, or with the
     /// same request id so the new instance can recognise it.
     PeerRestarted = 13,
+    /// Not a failure: a `Recv` or `ReplyRecv` returned because the
+    /// thread's bound notification was signalled; the badge holds its
+    /// bits and no message or capability arrived.
+    Notified = 14,
 }
 
 /// What a fault message (`msg[0]`) reports.

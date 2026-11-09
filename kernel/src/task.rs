@@ -409,6 +409,7 @@ pub fn handle_syscall(frame: &mut UserFrame) -> Exit {
         Some(Syscall::IoSpaceBind) => io_space_bind(k, cur, &a),
         Some(Syscall::IoMap) => io_map(k, cur, &a),
         Some(Syscall::IoUnmap) => io_unmap(k, cur, a.a0),
+        Some(Syscall::NotificationBind) => notification_bind(k, cur, a.a0),
         Some(Syscall::ThreadSetVSpace) => thread_set_vspace(k, cur, &a),
         Some(Syscall::ThreadSetFaultHandler) => thread_set_fault_handler(k, cur, &a),
         Some(Syscall::SetFaultHandler) => set_fault_handler(k, cur, a.a0),
@@ -628,6 +629,21 @@ fn irq_set_notification(k: &mut Kernel, cur: Tid, f: &Args) -> Result<(), u64> {
     k.irq_ntfn[line as usize] = Some((id as u16, badge));
     arch::irq_unmask(line);
     Ok(())
+}
+
+/// `NotificationBind`: rdi = notification (Read), bound to the caller.
+fn notification_bind(k: &mut Kernel, cur: Tid, slot: u64) -> Result<(), u64> {
+    let s = own_slot(k, cur, slot).ok_or(Error::InvalidCapability.code())?;
+    let cap = *k.caps.get(s).ok_or(Error::InvalidCapability.code())?;
+    let Object::Notification { id } = cap.object else {
+        return Err(Error::InvalidCapability.code());
+    };
+    if !cap.rights.contains(Rights::READ) {
+        return Err(Error::InsufficientRights.code());
+    }
+    k.ipc
+        .bind_notification(cur, id as u16)
+        .map_err(|e| e.status())
 }
 
 /// The port `rsi`, `rdx` bytes wide, checked against the I/O-port

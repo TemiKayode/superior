@@ -50,7 +50,9 @@
 #![no_std]
 #![no_main]
 
+use core::sync::atomic::{AtomicU32, Ordering, fence};
 use superior_objects::abi::{CapTransfer, Error, ObjectType, Syscall, root};
+use superior_objects::interfaces::fs::ring;
 use superior_objects::interfaces::{Status, block, fs, mem, pci};
 use superior_sys::{Called, USER_BASE, call_retry, print_line, syscall, syscall_x};
 
@@ -875,6 +877,9 @@ fn fs_client() -> ! {
         format_args!("70 files in one directory (two blocks of entries) listed, then removed"),
     );
 
+    // The same kind of work through a ring, still under fault injection.
+    ring_phase(&mut t);
+
     // One more record, then a rename, both acknowledged; then the machine
     // stops at once: the rename never goes home before the power cut.
     let (ok, _) = append(h, RECORDS);
@@ -887,6 +892,315 @@ fn fs_client() -> ! {
     loop {
         syscall(Syscall::Yield, 0, [0; 4]);
     }
+}
+
+// ---- the ring client (`fs::ring`) ----
+
+/// The ring's pages (`shared 16 16` in the manifest), mapped at RING_VA.
+const RING_SHARED: u64 = 16;
+/// Where the completion notification and the doorbell arrive.
+const RING_COMPL: u64 = 40;
+const RING_BELL: u64 = 41;
+const RING_VA: u64 = USER_BASE + 0x6000_0000;
+/// Requests in flight, each with a 4 KiB buffer of the data pages.
+const DEPTH: usize = ring::DATA_PAGES as usize;
+
+fn rhdr(off: usize) -> &'static AtomicU32 {
+    // SAFETY: the ring page is mapped at RING_VA for good.
+    unsafe { &*((RING_VA + off as u64) as *const AtomicU32) }
+}
+
+/// Data buffer `t` (4 KiB) of the ring.
+fn rbuf(t: usize) -> &'static mut [u8] {
+    // SAFETY: the data pages follow the ring page, mapped for good.
+    unsafe { core::slice::from_raw_parts_mut((RING_VA + 4096 + 4096 * t as u64) as *mut u8, 4096) }
+}
+
+struct Ring {
+    sq_tail: u32,
+    cq_head: u32,
+    /// Each tag's request, while in flight: `[op, a, b, c]`.
+    inflight: [Option<[u64; 4]>; DEPTH],
+    /// System calls the ring itself cost: doorbells and sleeps.
+    doorbells: u64,
+    waits: u64,
+    /// Times the server was restarted under it and it set up again.
+    reconnects: u64,
+}
+
+impl Ring {
+    /// Maps the shared pages and sets the ring up with the server.
+    fn new() -> Option<Ring> {
+        for p in 0..ring::PAGES {
+            let va = RING_VA + 4096 * p;
+            if syscall(Syscall::FrameMap, RING_SHARED + p, [va, 1, 0, 0]).status != 0 {
+                return None;
+            }
+        }
+        let mut r = Ring {
+            sq_tail: 0,
+            cq_head: 0,
+            inflight: [None; DEPTH],
+            doorbells: 0,
+            waits: 0,
+            reconnects: 0,
+        };
+        r.register().then_some(r)
+    }
+
+    /// Attaches the pages, starts the ring and takes the doorbell; tried
+    /// again from the start if the server is restarted meanwhile.
+    fn register(&mut self) -> bool {
+        'again: for _ in 0..50 {
+            for s in [RING_COMPL, RING_BELL] {
+                syscall(Syscall::CapDelete, s, [0; 4]);
+            }
+            for p in 0..ring::PAGES {
+                let x = CapTransfer {
+                    grant: Some((RING_SHARED + p) as u16),
+                    accept: None,
+                };
+                let r = syscall_x(Syscall::Call, FS, [fs::RING_ATTACH, p, 0, 0], x);
+                if r.status != 0 || r.msg[0] != OK {
+                    continue 'again;
+                }
+            }
+            for (op, slot) in [(fs::RING_START, RING_COMPL), (fs::RING_DOORBELL, RING_BELL)] {
+                let x = CapTransfer {
+                    grant: None,
+                    accept: Some(slot as u16),
+                };
+                let r = syscall_x(Syscall::Call, FS, [op, 0, 0, 0], x);
+                if r.status != 0 || r.msg[0] != OK || r.cap != Some(slot as u16) {
+                    continue 'again;
+                }
+            }
+            // The server cleared the header.
+            self.sq_tail = 0;
+            self.cq_head = 0;
+            return true;
+        }
+        false
+    }
+
+    fn free_tag(&self) -> Option<usize> {
+        self.inflight.iter().position(|x| x.is_none())
+    }
+
+    /// Puts request `m` (data in buffer `tag`) in the submission queue.
+    fn push(&mut self, tag: usize, m: [u64; 4]) {
+        let sqe = RING_VA as usize + ring::SQ + (self.sq_tail % ring::ENTRIES) as usize * ring::SQE;
+        let words = [m[0], tag as u64, m[1], m[2], m[3], tag as u64 * 4096];
+        for (i, w) in words.iter().enumerate() {
+            // SAFETY: inside the ring page.
+            unsafe { ((sqe + 8 * i) as *mut u64).write_volatile(*w) };
+        }
+        self.sq_tail = self.sq_tail.wrapping_add(1);
+        rhdr(ring::SQ_TAIL).store(self.sq_tail, Ordering::Release);
+    }
+
+    fn submit(&mut self, tag: usize, m: [u64; 4]) {
+        self.inflight[tag] = Some(m);
+        self.push(tag, m);
+    }
+
+    /// Rings the doorbell if the server said it sleeps. False if the
+    /// server is gone (restarted).
+    fn kick(&mut self) -> bool {
+        fence(Ordering::SeqCst);
+        if rhdr(ring::FLAGS).load(Ordering::Relaxed) & ring::NEED_WAKEUP == 0 {
+            return true;
+        }
+        self.doorbells += 1;
+        syscall(Syscall::Signal, RING_BELL, [0; 4]).status == 0
+    }
+
+    /// The next completion: `(tag, [status, r1, r2, r3])`.
+    fn reap(&mut self) -> Option<(usize, [u64; 4])> {
+        if rhdr(ring::CQ_TAIL).load(Ordering::Acquire) == self.cq_head {
+            return None;
+        }
+        let cqe = RING_VA as usize + ring::CQ + (self.cq_head % ring::ENTRIES) as usize * ring::CQE;
+        // SAFETY: inside the ring page.
+        let w = |i: usize| unsafe { ((cqe + 8 * i) as *const u64).read_volatile() };
+        let (tag, r) = (w(0) as usize, [w(1), w(2), w(3), w(4)]);
+        self.cq_head = self.cq_head.wrapping_add(1);
+        rhdr(ring::CQ_HEAD).store(self.cq_head, Ordering::Release);
+        if tag >= DEPTH || self.inflight[tag].take().is_none() {
+            return self.reap(); // a duplicate after a resubmission
+        }
+        Some((tag, r))
+    }
+
+    /// Sleeps until a completion is posted. False if the server is gone.
+    fn wait(&mut self) -> bool {
+        // Wake when half of what is in flight is done: the queue refills
+        // while the server still has work, so it need not sleep.
+        let inflight = self.inflight.iter().filter(|x| x.is_some()).count() as u32;
+        let want = (inflight / 2).max(1);
+        rhdr(ring::CLIENT_WAITING).store(want, Ordering::Relaxed);
+        fence(Ordering::SeqCst);
+        let pending = rhdr(ring::CQ_TAIL)
+            .load(Ordering::Acquire)
+            .wrapping_sub(self.cq_head);
+        if pending >= want {
+            rhdr(ring::CLIENT_WAITING).store(0, Ordering::Relaxed);
+            return true;
+        }
+        self.waits += 1;
+        let ok = syscall(Syscall::Wait, RING_COMPL, [0; 4]).status == 0;
+        rhdr(ring::CLIENT_WAITING).store(0, Ordering::Relaxed);
+        ok
+    }
+
+    /// The server was restarted: set up again and submit what had no
+    /// completion (every operation is idempotent).
+    fn reconnect(&mut self) -> bool {
+        self.reconnects += 1;
+        if !self.register() {
+            return false;
+        }
+        for t in 0..DEPTH {
+            if let Some(m) = self.inflight[t] {
+                self.push(t, m);
+            }
+        }
+        true
+    }
+
+    /// Runs requests `0..n`, `DEPTH` in flight: `make(i, buffer)` fills
+    /// the buffer and gives the request, `done(i, reply, buffer)` checks
+    /// the reply. Returns how many replies were right.
+    fn run(
+        &mut self,
+        n: u64,
+        mut make: impl FnMut(u64, &mut [u8]) -> [u64; 4],
+        mut done: impl FnMut(u64, [u64; 4], &[u8]) -> bool,
+    ) -> u64 {
+        let mut which = [0u64; DEPTH];
+        let (mut next, mut finished, mut right) = (0, 0, 0);
+        while finished < n {
+            while next < n {
+                let Some(t) = self.free_tag() else { break };
+                which[t] = next;
+                let m = make(next, rbuf(t));
+                self.submit(t, m);
+                next += 1;
+            }
+            let mut alive = self.kick();
+            let mut got = false;
+            while let Some((t, r)) = self.reap() {
+                right += done(which[t], r, rbuf(t)) as u64;
+                finished += 1;
+                got = true;
+            }
+            if alive && !got {
+                alive = self.wait();
+            }
+            if !alive && !self.reconnect() {
+                return right;
+            }
+        }
+        right
+    }
+}
+
+/// Byte `j` of the ring log's record `k` (1 KiB records).
+fn ring_byte(k: u64, j: u64) -> u8 {
+    (k.wrapping_mul(131) ^ j.wrapping_mul(7) ^ (j >> 8)) as u8
+}
+
+const RING_RECORDS: u64 = 300;
+const RING_RECORD: u64 = 1024;
+
+/// The ring phase of the file test: opens a file, writes records and
+/// reads them back, all through the ring, under fault injection.
+fn ring_phase(t: &mut Checks) {
+    let Some(mut r) = Ring::new() else {
+        t.check(false, format_args!("ring: set up"));
+        return;
+    };
+    let mut handle = 0;
+    let opened = r.run(
+        1,
+        |_, b| {
+            let len = fs::put_path(b, "ring.log").unwrap();
+            [fs::OPEN, len, fs::CREATE | fs::TRUNC, 0]
+        },
+        |_, rep, _| {
+            handle = rep[1];
+            rep[0] == OK
+        },
+    );
+    let h = handle;
+    let wrote = r.run(
+        RING_RECORDS,
+        |k, b| {
+            for j in 0..RING_RECORD {
+                b[j as usize] = ring_byte(k, j);
+            }
+            [fs::WRITE, h, k * RING_RECORD, RING_RECORD]
+        },
+        |_, rep, _| rep[0] == OK,
+    );
+    let blocks = RING_RECORDS * RING_RECORD / fs::BLOCK;
+    let per = fs::BLOCK / RING_RECORD;
+    let read = r.run(
+        blocks,
+        |i, _| [fs::READ, h, i * fs::BLOCK, fs::BLOCK],
+        |i, rep, b| {
+            rep[0] == OK
+                && rep[1] == fs::BLOCK
+                && (0..fs::BLOCK).all(|p| {
+                    let (k, j) = (i * per + p / RING_RECORD, p % RING_RECORD);
+                    b[p as usize] == ring_byte(k, j)
+                })
+        },
+    );
+    let ios = 1 + RING_RECORDS + blocks;
+    let calls = r.doorbells + r.waits;
+    t.check(
+        opened == 1 && wrote == RING_RECORDS && read == blocks,
+        format_args!(
+            "ring: {ios} requests, {DEPTH} in flight, every write acknowledged and read back"
+        ),
+    );
+    say!(
+        "fs: ring: {calls} system calls for {ios} requests under fault injection ({} doorbells, {} sleeps; set up again {} times after a restart)",
+        r.doorbells,
+        r.waits,
+        r.reconnects
+    );
+}
+
+/// Reads the ring log back through a ring, with no faults injected: what
+/// the ring costs in system calls in the steady state.
+fn ring_steady(t: &mut Checks, h: u64) {
+    let Some(mut r) = Ring::new() else {
+        t.check(false, format_args!("ring: set up"));
+        return;
+    };
+    let per = fs::BLOCK / RING_RECORD;
+    let blocks = RING_RECORDS * RING_RECORD / fs::BLOCK;
+    let n = 4 * blocks;
+    let right = r.run(
+        n,
+        |i, _| [fs::READ, h, i % blocks * fs::BLOCK, fs::BLOCK],
+        |i, rep, b| {
+            let i = i % blocks;
+            rep[0] == OK
+                && (0..fs::BLOCK)
+                    .all(|p| b[p as usize] == ring_byte(i * per + p / RING_RECORD, p % RING_RECORD))
+        },
+    );
+    let calls = r.doorbells + r.waits;
+    t.check(
+        right == n && calls * 4 <= n,
+        format_args!(
+            "ring, no faults: {n} reads with {calls} system calls ({} doorbells, {} sleeps)",
+            r.doorbells, r.waits
+        ),
+    );
 }
 
 /// The file client after the power cut (`arg 8`).
@@ -913,13 +1227,29 @@ fn fs_verify() -> ! {
     let g2 = fs_open("g2", 0);
     let ag = fs_open("a/g", 0)[0];
     let root = fs_open("/", fs::DIRECTORY);
-    let (count, all) = list(root[1], &["logs", "data", "a", "many", "g2"]);
+    let (count, all) = list(root[1], &["logs", "data", "a", "many", "g2", "ring.log"]);
     t.check(
-        g2[0] == OK && g2[2] == 100 && ag == Status::NotFound as u64 && count == 5 && all,
+        g2[0] == OK && g2[2] == 100 && ag == Status::NotFound as u64 && count == 6 && all,
         format_args!(
             "the last rename survived: g2 is there, a/g is not; the root lists {count} entries"
         ),
     );
+    let log = fs_open("ring.log", 0);
+    let per = fs::BLOCK / RING_RECORD;
+    let mut right = 0;
+    for i in 0..RING_RECORDS / per {
+        let (r, _) = fs_call([fs::READ, log[1], i * fs::BLOCK, fs::BLOCK], true);
+        let b = fs_bytes();
+        right += (r[0] == OK
+            && (0..fs::BLOCK)
+                .all(|p| b[p as usize] == ring_byte(i * per + p / RING_RECORD, p % RING_RECORD)))
+            as u64;
+    }
+    t.check(
+        log[0] == OK && log[2] == RING_RECORDS * RING_RECORD && right == RING_RECORDS / per,
+        format_args!("ring.log survived: {} bytes", log[2]),
+    );
+    ring_steady(&mut t, log[1]);
     let big = fs_open("data/big", 0);
     let c = check_big(big[1], 0, 20_004, 10_000, 20_000);
     t.check(

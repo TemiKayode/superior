@@ -26,6 +26,7 @@ component fs
   uses block 0
   provides fs 1
   untyped 17 2
+  cspace 7
 
 component client
   image testclient
@@ -34,6 +35,7 @@ component client
   uses fs 0
   control 1
   untyped 12 2
+  shared 16 16
 
 component other
   image testclient

@@ -30,6 +30,13 @@
 //! Message delivery always fills `msg`, `badge` and `status` of the thread
 //! being woken; the kernel copies them into that thread's registers.
 //!
+//! Bound notifications (as in seL4): a thread may bind one notification
+//! to itself. Its `Recv` and `ReplyRecv` then also return when that
+//! notification is signalled, with status [`Error::Notified`] and the
+//! accumulated bits as the badge, so one server loop waits for calls on
+//! its endpoint and for doorbells of its shared-memory rings at once.
+//! Pending bits are taken before queued senders.
+//!
 //! Capability transfer: before each operation the kernel records the
 //! current thread's [`CapTransfer`] (slot to grant, slot to accept into).
 //! When a message moves from a sender that grants to a receiver that
@@ -133,6 +140,8 @@ pub struct Tcb {
     passive_pending: bool,
     /// The scheduling context a caller lent this (passive) thread.
     lent: Option<Tid>,
+    /// The notification bound to this thread.
+    bound: Option<u16>,
 }
 
 /// A capability to copy from `from`'s slot `grant` into `to`'s slot `accept`.
@@ -162,6 +171,7 @@ const IDLE_TCB: Tcb = Tcb {
     passive: false,
     passive_pending: false,
     lent: None,
+    bound: None,
 };
 
 #[derive(Clone, Copy, Default, Debug)]
@@ -248,6 +258,8 @@ struct Endpoint {
 struct Notification {
     word: u64,
     waiters: Queue,
+    /// The thread this notification is bound to.
+    bound: Option<Tid>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -260,6 +272,11 @@ pub enum IpcError {
     BadSchedParams,
     ThreadActive,
     WouldBlock,
+    /// The thread or notification is already bound.
+    AlreadyBound,
+    /// Not a failure: the receive was answered by the thread's bound
+    /// notification (the badge holds its bits).
+    Notified,
 }
 
 impl IpcError {
@@ -267,6 +284,7 @@ impl IpcError {
     pub const fn status(self) -> u64 {
         match self {
             IpcError::WouldBlock => Error::WouldBlock.code(),
+            IpcError::Notified => Error::Notified.code(),
             IpcError::BadObject => Error::InvalidCapability.code(),
             _ => Error::IllegalOperation.code(),
         }
@@ -306,6 +324,7 @@ impl<const T: usize, const E: usize, const N: usize> Ipc<T, E, N> {
             ntfns: [Notification {
                 word: 0,
                 waiters: Queue::EMPTY,
+                bound: None,
             }; N],
             ready: [Queue::EMPTY; PRIORITIES],
             ready_bits: 0,
@@ -431,6 +450,10 @@ impl<const T: usize, const E: usize, const N: usize> Ipc<T, E, N> {
         if tcb.state != State::Inactive {
             return Err(IpcError::ThreadActive);
         }
+        if let Some(n) = tcb.bound {
+            self.ntfns[n as usize].bound = None;
+        }
+        let tcb = &mut self.threads[t as usize];
         *tcb = IDLE_TCB;
         self.scs[t as usize] = UNLIMITED;
         // Its scheduling context goes with it: a passive thread running on
@@ -531,8 +554,41 @@ impl<const T: usize, const E: usize, const N: usize> Ipc<T, E, N> {
             self.wake(t);
         }
         self.ntfns[n].word = 0;
+        if let Some(t) = self.ntfns[n].bound.take() {
+            self.threads[t as usize].bound = None;
+        }
         self.schedule();
         Ok(())
+    }
+
+    /// Binds notification `ntfn` to thread `t`; see the module comment.
+    pub fn bind_notification(&mut self, t: Tid, ntfn: u16) -> Result<(), IpcError> {
+        let n = self.ntfn_index(ntfn)?;
+        if t as usize >= T {
+            return Err(IpcError::BadThread);
+        }
+        if self.threads[t as usize].bound.is_some() || self.ntfns[n].bound.is_some() {
+            return Err(IpcError::AlreadyBound);
+        }
+        self.threads[t as usize].bound = Some(ntfn);
+        self.ntfns[n].bound = Some(t);
+        Ok(())
+    }
+
+    /// Takes the current thread's bound notification's pending bits, if
+    /// there are any, as its badge.
+    fn take_bound(&mut self, cur: Tid) -> bool {
+        let Some(n) = self.threads[cur as usize].bound else {
+            return false;
+        };
+        let word = core::mem::take(&mut self.ntfns[n as usize].word);
+        if word == 0 {
+            return false;
+        }
+        let tcb = &mut self.threads[cur as usize];
+        tcb.badge = word;
+        tcb.cap_received = None;
+        true
     }
 
     /// Sets the status the current thread will see on return.
@@ -775,6 +831,9 @@ impl<const T: usize, const E: usize, const N: usize> Ipc<T, E, N> {
     pub fn recv(&mut self, ep: u16, blocking: bool) -> Result<(), IpcError> {
         let cur = self.cur()?;
         let e = self.ep_index(ep)?;
+        if self.take_bound(cur) {
+            return Err(IpcError::Notified);
+        }
         if self.eps[e].state == EpState::Sending {
             self.take_from_sender(cur, e);
             // A passive receiver runs on what the caller lent it, which
@@ -827,6 +886,15 @@ impl<const T: usize, const E: usize, const N: usize> Ipc<T, E, N> {
         if let Some(c) = caller {
             self.deliver(cur, c, msg, 0);
         }
+        if self.take_bound(cur) {
+            self.park_if_no_sc(cur);
+            if let Some(c) = caller {
+                self.wake(c);
+            }
+            self.schedule();
+            self.preempt_if_outranked();
+            return Err(IpcError::Notified);
+        }
         if self.eps[e].state == EpState::Sending {
             self.take_from_sender(cur, e);
             self.park_if_no_sc(cur);
@@ -875,7 +943,24 @@ impl<const T: usize, const E: usize, const N: usize> Ipc<T, E, N> {
                 tcb.status = 0;
                 self.wake(w);
             }
-            None => self.ntfns[n].word |= bits,
+            None => {
+                self.ntfns[n].word |= bits;
+                // A bound thread waiting for calls takes the bits now.
+                if let Some(t) = self.ntfns[n].bound
+                    && let State::BlockedRecv { ep } = self.threads[t as usize].state
+                {
+                    let e = ep as usize;
+                    self.eps[e].queue.remove(&mut self.threads, t);
+                    if self.eps[e].queue.is_empty() {
+                        self.eps[e].state = EpState::Idle;
+                    }
+                    let tcb = &mut self.threads[t as usize];
+                    tcb.badge = core::mem::take(&mut self.ntfns[n].word);
+                    tcb.status = Error::Notified.code();
+                    tcb.cap_received = None;
+                    self.wake(t);
+                }
+            }
         }
     }
 
@@ -1452,6 +1537,66 @@ mod tests {
         k.signal(0, 0b010).unwrap();
         assert_eq!(k.current(), Some(CLIENT)); // woken, preempts
         assert_eq!(k.thread(CLIENT).badge, 0b010);
+    }
+
+    #[test]
+    fn bound_notification_wakes_a_receiving_server() {
+        let mut k = server_waiting();
+        k.bind_notification(SERVER, 1).unwrap();
+        // Blocked in Recv: a signal takes it off the endpoint and wakes it.
+        k.signal(1, 0b10).unwrap();
+        assert_eq!(k.current(), Some(SERVER));
+        assert_eq!(k.thread(SERVER).badge, 0b10);
+        assert_eq!(k.thread(SERVER).status, Error::Notified.code());
+        // The endpoint no longer holds it: a call queues, and the next Recv
+        // takes it as an ordinary message.
+        k.recv(EP, true).unwrap();
+        k.call(EP, 7, [1, 2, 3, 4]).unwrap();
+        assert_eq!(k.current(), Some(SERVER));
+        assert_eq!(k.thread(SERVER).msg, [1, 2, 3, 4]);
+        assert_eq!(k.thread(SERVER).badge, 7);
+    }
+
+    #[test]
+    fn pending_bound_bits_come_before_queued_callers() {
+        let mut k = K::new();
+        k.spawn(SERVER, 10).unwrap();
+        k.spawn(CLIENT, 5).unwrap();
+        k.schedule();
+        k.bind_notification(SERVER, 1).unwrap();
+        k.signal(1, 0b1).unwrap();
+        k.signal(1, 0b100).unwrap();
+        // Bits pending: Recv returns at once, coalesced.
+        assert_eq!(k.recv(EP, true), Err(IpcError::Notified));
+        assert_eq!(k.thread(SERVER).badge, 0b101);
+        // Then it blocks; the client calls; ReplyRecv with bits pending
+        // replies and returns at once again.
+        k.recv(EP, true).unwrap();
+        k.call(EP, 3, [9, 0, 0, 0]).unwrap();
+        assert_eq!(k.current(), Some(SERVER));
+        k.signal(1, 0b1000).unwrap();
+        assert_eq!(k.reply_recv(EP, [5, 0, 0, 0]), Err(IpcError::Notified));
+        assert_eq!(k.thread(SERVER).badge, 0b1000);
+        assert_eq!(k.thread(CLIENT).msg[0], 5);
+        assert_eq!(k.thread(CLIENT).state, State::Ready);
+    }
+
+    #[test]
+    fn binding_is_one_to_one_and_ends_with_either_side() {
+        let mut k = K::new();
+        k.spawn(SERVER, 10).unwrap();
+        k.schedule();
+        k.bind_notification(SERVER, 1).unwrap();
+        assert_eq!(k.bind_notification(SERVER, 2), Err(IpcError::AlreadyBound));
+        assert_eq!(k.bind_notification(CLIENT, 1), Err(IpcError::AlreadyBound));
+        k.destroy_notification(1).unwrap();
+        k.bind_notification(CLIENT, 1).unwrap();
+        k.suspend(CLIENT).unwrap();
+        k.reset_thread(CLIENT).unwrap();
+        k.bind_notification(SERVER, 1).unwrap();
+        // Unbound now: a plain Wait on it still works for others.
+        k.signal(2, 1).unwrap();
+        assert_eq!(k.thread(SERVER).state, State::Running);
     }
 
     #[test]

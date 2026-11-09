@@ -72,6 +72,10 @@ holds the rest):
   runnable. The timer signals a notification each tick, so threads sleep by waiting on it.
 - IPC engine: `Send`, `Call`, `Recv`, `Reply`, `ReplyRecv`, `Signal`, `Wait`, `Yield`;
   direct switch on call/reply (fast path); 64 fixed priorities.
+- Bound notifications (as in seL4): `NotificationBind` ties a notification to the
+  calling thread, whose `Recv` and `ReplyRecv` then also return when it is signalled
+  (status `Notified`, the bits as the badge). Pending bits come before queued callers.
+  One server loop waits for calls and for its rings' doorbells at once.
 - Rights-checked capability lookup on every system call; badges delivered to servers.
 - Capability transfer in IPC: a sender grants a slot, the receiver names an accept slot,
   and the receiver gets a copy derived from the sender's. Every CSpace is a window onto
@@ -155,7 +159,9 @@ holds the rest):
   five restarts within sixty seconds (counted with the new `Ticks` call) and the
   manager gives up: a tombstone thread answers the component's services with
   `SERVICE_UNAVAILABLE`. A `state` capability is a page made once and handed to every
-  instance, so state outlives instances. `cargo xtask supervise-test` boots
+  instance, so state outlives instances. `shared <pages> <slot>` (up to 16) is the same
+  for memory a component shares with a server: the manager holds the originals, so a
+  restart of either side deletes only that side's copies and the other's mappings stay. `cargo xtask supervise-test` boots
   `boot/supervise.manifest`: a `counter` service keeps its value and a per-client
   request journal in its state page, is crashed under a call and finds its value
   again, and is crashed after applying a request but before replying, whose retry is
@@ -248,7 +254,18 @@ holds the rest):
   - Clients retry calls cut off by a restart (a retried `UNLINK` or `RENAME`
     answering `NotFound` had already happened); the server retries block calls
     cut off by a driver restart.
-  - Limits: 511 files and directories, 58-byte names, one request at a time.
+  - Rings (spec section 3, Tier 2): besides calls, a client may submit requests
+    through a ring of 16 entries and 15 data pages in its `shared` pages. Set-up
+    calls attach the pages and hand the client a completion notification (the
+    server's, so a server restart destroys it and wakes the client to set up again)
+    and a doorbell (the server's bound notification). Requests are the words of a call
+    plus a data offset; completions are posted once the change is durable. The server
+    polls while it has work and asks for the doorbell only before it sleeps; the client
+    sleeps until half of what it has in flight is done, and the server signals it once
+    then, so signals coalesce. A client resubmits what had no completion after a
+    restart.
+  - Limits: 511 files and directories, 58-byte names, one request at a time, four
+    rings.
   - Fault injection: a manifest `fault-injector` component may ask the Component
     Manager to kill another (it is restarted as if it had crashed; such kills do
     not count towards the restart limit, which is there to stop crash loops).
@@ -261,11 +278,15 @@ holds the rest):
     directories, renames, refused operations (exclusive create, a path through
     a file, `..`, a directory into itself, removing a non-empty directory);
     70 files in one directory, listed and removed;
+  - through a ring, 15 in flight: a file opened, 300 1 KiB records written and read
+    back, with the ring set up again after each server restart (about 15 a run);
   - one more record and a rename are acknowledged and the machine stops at once
     (a power cut);
-  - the second boot finds all 401 records, the rename, the big file and the
-    tree, and another component's tree does not have them. Every mount's check
-    must pass.
+  - the second boot finds all 401 records, the rename, the big file, the ring's
+    file and the tree, and another component's tree does not have them. Every
+    mount's check must pass. With no faults, 300 reads through a ring cost about
+    40 system calls (a handful of doorbells, the rest sleeps), where calls cost at
+    least one each.
 - Static-pie user programs loaded into their own address spaces and relocated.
 - Boot self-test: a server and a client in separate address spaces do 20,000
   call/reply round trips, and the kernel refuses four kinds of rights violations. A
