@@ -21,12 +21,21 @@
 //!   PCI bus server (slot 1) will not give it the driver's device, crashes
 //!   the driver and reads again once it is back. Memory in slot 2, control
 //!   in slot 3.
+//! - `arg 5`, the memory client (`boot/memory.manifest`): pages its heap in
+//!   by touching it, takes frames from the Memory Server (slot 0) up to
+//!   its quota and one more (refused), gives one back, then checks the
+//!   hog's pages came back to the pool. Control in slot 1.
+//! - `arg 6`, the hog: touches more heap than its quota allows, so the
+//!   manager restarts it; the next instance (it counts instances in its
+//!   state page, slot 1) checks it holds nothing and that every page it
+//!   is given now is zeroed, though the pool has reused the last
+//!   instance's pages. It then blocks on the notification in slot 2.
 
 #![no_std]
 #![no_main]
 
 use superior_objects::abi::{CapTransfer, Error, ObjectType, Syscall, root};
-use superior_objects::interfaces::{Status, block, pci};
+use superior_objects::interfaces::{Status, block, mem, pci};
 use superior_sys::{Called, USER_BASE, call_retry, print_line, syscall, syscall_x};
 
 const ECHO: u64 = 0;
@@ -305,6 +314,187 @@ fn block_client() -> ! {
     }
 }
 
+// The memory tests' slots and layout.
+const MEM: u64 = 0;
+const MEM_CONTROL: u64 = 1;
+const MEM_STATE: u64 = 1;
+const FRAMES: u64 = 2;
+const HEAP: u64 = USER_BASE + mem::HEAP_OFFSET;
+const FRAME_VA: u64 = USER_BASE + 0x4000_0000;
+const STATE_VA: u64 = USER_BASE + 0x5000_0000;
+/// The memory client's heap and quota (`boot/memory.manifest`).
+const CLIENT_HEAP: u64 = 32;
+const CLIENT_QUOTA: u64 = 40;
+/// The hog's quota, and how many heap pages it touches the first time.
+const HOG_QUOTA: u64 = 8;
+const HOG_TOUCH: u64 = 12;
+/// A notification nobody signals, for the hog to block on.
+const HOG_IDLE: u64 = 2;
+
+fn info() -> [u64; 4] {
+    let r = syscall(Syscall::Call, MEM, [mem::INFO, mem::VERSION, 0, 0]);
+    if r.status == 0 { r.msg } else { [u64::MAX; 4] }
+}
+
+/// Word `k` of heap page `p`, as written by the tests.
+fn heap_word(p: u64, k: u64) -> u64 {
+    0x4845_4150_0000_0000 | p << 16 | k
+}
+
+/// Touches heap page `p` (it pages in on the first access): checks it
+/// arrived zeroed, then fills it. Returns whether it was zero.
+fn touch(p: u64) -> bool {
+    // SAFETY: the heap is ours; a page appears on first touch.
+    let page = unsafe { core::slice::from_raw_parts_mut((HEAP + p * 4096) as *mut u64, 512) };
+    let zero = page.iter().all(|&w| w == 0);
+    for (k, w) in page.iter_mut().enumerate() {
+        *w = heap_word(p, k as u64);
+    }
+    zero
+}
+
+fn memory_client() -> ! {
+    let mut t = Checks(0, "memory");
+    // Let the hog (higher priority) run its course first.
+    let start = ticks();
+    while ticks() < start + 50 {
+        syscall(Syscall::Yield, 0, [0; 4]);
+    }
+    let r = info();
+    t.check(
+        r[0] == 0 && r[1] == CLIENT_QUOTA && r[2] == 0,
+        format_args!("quota {} pages, {} in use", r[1], r[2]),
+    );
+    let free_before = r[3];
+    let zeroed = (0..CLIENT_HEAP).all(touch);
+    t.check(
+        zeroed,
+        format_args!("{CLIENT_HEAP} heap pages appeared on first touch, each zeroed"),
+    );
+    let intact = (0..CLIENT_HEAP).all(|p| {
+        // SAFETY: as in `touch`; every page is mapped now.
+        let page = unsafe { core::slice::from_raw_parts((HEAP + p * 4096) as *const u64, 512) };
+        page.iter()
+            .enumerate()
+            .all(|(k, &w)| w == heap_word(p, k as u64))
+    });
+    t.check(intact, format_args!("and kept what was written"));
+    let r = info();
+    t.check(
+        r[2] == CLIENT_HEAP && r[3] == free_before - CLIENT_HEAP,
+        format_args!(
+            "{} pages charged to it; the pool has {} fewer",
+            r[2],
+            free_before - r[3]
+        ),
+    );
+    // Frames up to the quota, then one more.
+    let mut handles = [0u64; 8];
+    let room = CLIENT_QUOTA - CLIENT_HEAP;
+    let mut got = 0;
+    for n in 0..room {
+        let x = CapTransfer {
+            grant: None,
+            accept: Some((FRAMES + n) as u16),
+        };
+        let r = syscall_x(Syscall::Call, MEM, [mem::FRAME, 0, 0, 0], x);
+        if r.status == 0 && r.msg[0] == Status::Ok as u64 && r.cap == Some((FRAMES + n) as u16) {
+            handles[n as usize] = r.msg[1];
+            got += 1;
+        }
+    }
+    t.check(
+        got == room,
+        format_args!("{got} frames granted, filling the quota"),
+    );
+    let r = syscall(Syscall::Call, MEM, [mem::FRAME, 0, 0, 0]);
+    t.check(
+        r.status == 0 && r.msg[0] == Status::Denied as u64,
+        format_args!("one more is refused: the quota is spent"),
+    );
+    // A granted frame is a page like any other; giving it back takes the
+    // capability (and the mapping) away.
+    let mapped = syscall(Syscall::FrameMap, FRAMES, [FRAME_VA, 1, 0, 0]).status == 0;
+    // SAFETY: just mapped, writable.
+    let zero = mapped && unsafe { (FRAME_VA as *const u64).read_volatile() } == 0;
+    let r = syscall(Syscall::Call, MEM, [mem::FREE, handles[0], 0, 0]);
+    let gone = syscall(Syscall::FrameMap, FRAMES, [FRAME_VA + 4096, 1, 0, 0]).status != 0;
+    t.check(
+        zero && r.msg[0] == Status::Ok as u64 && gone,
+        format_args!("a granted frame arrives zeroed; freed, its capability is gone"),
+    );
+    let r = info();
+    t.check(
+        r[2] == CLIENT_QUOTA - 1,
+        format_args!("{} pages in use after freeing one", r[2]),
+    );
+    let x = CapTransfer {
+        grant: None,
+        accept: Some(FRAMES as u16),
+    };
+    let r = syscall_x(Syscall::Call, MEM, [mem::FRAME, 0, 0, 0], x);
+    t.check(
+        r.msg[0] == Status::Ok as u64,
+        format_args!("so another frame is granted"),
+    );
+    // Only the manager may page in or release.
+    let r = syscall(Syscall::Call, MEM, [mem::RELEASE, 3, 0, 0]);
+    t.check(
+        r.msg[0] == Status::Denied as u64,
+        format_args!("a component may not release another's pages"),
+    );
+    syscall(Syscall::Call, MEM_CONTROL, [OP_SHUTDOWN, t.0, 0, 0]);
+    loop {
+        syscall(Syscall::Yield, 0, [0; 4]);
+    }
+}
+
+fn hog() -> ! {
+    let mapped = syscall(Syscall::FrameMap, MEM_STATE, [STATE_VA, 1, 0, 0]).status == 0;
+    // SAFETY: the state page is mapped at STATE_VA.
+    let instance = if mapped {
+        let count = STATE_VA as *mut u64;
+        unsafe {
+            let n = count.read_volatile() + 1;
+            count.write_volatile(n);
+            n
+        }
+    } else {
+        0
+    };
+    if instance == 1 {
+        say!("hog: touching {HOG_TOUCH} heap pages with a quota of {HOG_QUOTA}");
+        for p in 0..HOG_TOUCH {
+            touch(p);
+        }
+        say!("[fail] hog: touched more heap than its quota");
+    } else {
+        let mut t = Checks(0, "hog");
+        let r = info();
+        t.check(
+            r[0] == 0 && r[2] == 0,
+            format_args!(
+                "restarted (instance {instance}) holding {} pages: all came back",
+                r[2]
+            ),
+        );
+        let zeroed = (0..HOG_QUOTA).all(touch);
+        t.check(
+            zeroed,
+            format_args!("{HOG_QUOTA} heap pages again, every one zeroed though reused"),
+        );
+        say!("hog: done ({} failed)", t.0);
+    }
+    // Out of the way of the (lower-priority) client: block for good.
+    loop {
+        syscall(Syscall::Wait, HOG_IDLE, [0; 4]);
+    }
+}
+
+fn ticks() -> u64 {
+    syscall(Syscall::Ticks, 0, [0; 4]).msg[0]
+}
+
 fn crasher() -> ! {
     say!("crasher: starting");
     // SAFETY: deliberately not: this must fault.
@@ -322,6 +512,8 @@ pub extern "C" fn _start(role: u64) -> ! {
         2 => supervise(),
         3 => crasher(),
         4 => block_client(),
+        5 => memory_client(),
+        6 => hog(),
         _ => probe(),
     }
 }

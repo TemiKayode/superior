@@ -94,3 +94,46 @@ pub mod block {
     /// Most sectors one `READ` moves.
     pub const MAX_SECTORS: u64 = 4096 / SECTOR;
 }
+
+/// The Memory Server: pages of RAM under a per-component quota.
+///
+/// A component's capability to it is badged by the Component Manager with
+/// the component's number (low 16 bits) and its quota in pages (the rest),
+/// so neither can be forged. The manager's own capability is unbadged
+/// (badge 0) and alone may use [`mem::FAULT`] and [`mem::RELEASE`].
+pub mod mem {
+    pub const VERSION: u64 = 1;
+
+    /// `[INFO, VERSION]`: reply `[status, quota, pages in use, pages free
+    /// in the whole pool]`.
+    pub const INFO: u64 = 1;
+    /// `[FRAME]` with an accept slot: a zeroed page, granted. Reply
+    /// `[status, handle]`; `Denied` over quota, `InUse` if the pool is
+    /// empty.
+    pub const FRAME: u64 = 2;
+    /// `[FREE, handle]`: gives a page from `FRAME` back. Every copy of its
+    /// capability is revoked (and unmapped) first.
+    pub const FREE: u64 = 3;
+    /// Manager only. `[FAULT, component, quota, address]` with the
+    /// component's address space lent: maps a zeroed page at `address`
+    /// (its heap took a page fault there), charged to the component.
+    /// `Denied` over quota.
+    pub const FAULT: u64 = 0x10;
+    /// Manager only. `[RELEASE, component]`: takes back every page the
+    /// component holds (it is being stopped). Reply `[status, pages]`.
+    pub const RELEASE: u64 = 0x11;
+
+    /// The badge on component `index`'s capability, with `quota` pages.
+    pub const fn badge(index: usize, quota: u64) -> u64 {
+        quota << 16 | (index as u64 + 1)
+    }
+
+    /// The (component number, quota) a badge carries.
+    pub const fn from_badge(badge: u64) -> (u64, u64) {
+        (badge & 0xffff, badge >> 16)
+    }
+
+    /// Where a component's heap starts (from `USER_BASE`): pages there
+    /// appear, zeroed, on first touch.
+    pub const HEAP_OFFSET: u64 = 0x2000_0000;
+}

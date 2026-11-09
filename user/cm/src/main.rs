@@ -36,6 +36,14 @@
 //! - **State is external.** A `state` capability is a page the manager
 //!   makes once and hands to every instance, so a new instance finds what
 //!   the last one wrote (a journal of the requests it applied, say).
+//! - **Memory.** The component providing `mem` is the Memory Server. A
+//!   component's capability to it carries the component's `quota` in its
+//!   badge. A page fault in a component's `heap` is not a crash: the
+//!   manager asks the Memory Server for a zeroed page there (lending it
+//!   the component's address space) and resumes the thread, unless the
+//!   quota is spent. Stopping a component gives every page it held back
+//!   to the Memory Server first. The Memory Server itself cannot be
+//!   restarted in place (spec section 4): if it fails, the system stops.
 //!
 //! Capabilities from the kernel are in `superior_objects::abi::root`.
 
@@ -43,15 +51,14 @@
 #![no_main]
 
 use superior_objects::abi::{
-    FaultKind, FaultReply, MAP_EXEC, MAP_WRITE, ObjectType, SERVICE_UNAVAILABLE, Syscall, TICK_HZ,
-    root,
+    CapTransfer, FaultKind, FaultReply, MAP_EXEC, MAP_WRITE, ObjectType, SERVICE_UNAVAILABLE,
+    Syscall, TICK_HZ, root,
 };
 use superior_objects::bundle::{Bundle, BundleError};
 use superior_objects::elf::{Elf, Machine};
-use superior_objects::manifest::{
-    CSPACE_BITS, CapKind, Component, MAX_COMPONENTS, Manifest, Restart, Start,
-};
-use superior_sys::{Ret, USER_BASE, syscall};
+use superior_objects::interfaces::{Status as Reply, mem};
+use superior_objects::manifest::{CapKind, Component, MAX_COMPONENTS, Manifest, Restart, Start};
+use superior_sys::{Ret, USER_BASE, syscall, syscall_x};
 
 // Rights masks.
 const READ: u64 = 1 << 0;
@@ -217,7 +224,7 @@ impl<'a> Manager<'a> {
             self.made[i] = true;
         }
         retype(ut, ObjectType::AddressSpace, 16, vspace).map_err(|e| ("address space", e))?;
-        retype(ut, ObjectType::CNode, CSPACE_BITS as u64, cnode).map_err(|e| ("CNode", e))?;
+        retype(ut, ObjectType::CNode, c.cspace_bits as u64, cnode).map_err(|e| ("CNode", e))?;
         retype(ut, ObjectType::Thread, 0, tcb).map_err(|e| ("thread", e))?;
         let image = self
             .bundle
@@ -238,9 +245,16 @@ impl<'a> Manager<'a> {
                 }
                 CapKind::Uses(s) => {
                     let ep = SERVICES + self.service_index(s).unwrap() as u64;
+                    // The Memory Server learns the client's quota from
+                    // the badge, which the client cannot change.
+                    let badge = if s == "mem" {
+                        mem::badge(i, c.quota_pages)
+                    } else {
+                        i as u64 + 1
+                    };
                     // Grant: a client may lend the server a capability
                     // (a buffer frame to DMA into, say).
-                    cnode_copy(cnode, slot, ep, WRITE | GRANT | GRANT_REPLY, i as u64 + 1)
+                    cnode_copy(cnode, slot, ep, WRITE | GRANT | GRANT_REPLY, badge)
                 }
                 CapKind::Device(d) => match device(d) {
                     Some((src, count)) => {
@@ -296,6 +310,20 @@ impl<'a> Manager<'a> {
     /// with `PeerRestarted`; calls still queued on its endpoints wait for
     /// the next instance.
     fn stop(&mut self, i: usize) {
+        // Its pages go back to the Memory Server while its address space
+        // still exists, so they are unmapped from it cleanly.
+        if self.status[i] != Status::NotStarted {
+            if let Some(ep) = self.memory_server().filter(|_| !self.is_memory_server(i)) {
+                let r = syscall(Syscall::Call, ep, [mem::RELEASE, i as u64 + 1, 0, 0]);
+                if r.status == 0 && r.msg[1] > 0 {
+                    say!(
+                        "{}: {} pages back to the Memory Server",
+                        self.component(i).name,
+                        r.msg[1]
+                    );
+                }
+            }
+        }
         if self.made[i] {
             let ut = BLOCKS + i as u64 * BLOCK + B_UNTYPED;
             let _ = sys(Syscall::CapRevoke, ut, [0; 4]);
@@ -359,6 +387,47 @@ impl<'a> Manager<'a> {
         }
         for j in (0..MAX_COMPONENTS).filter(|&j| group[j]) {
             self.start_logged(j, "restart");
+        }
+    }
+
+    /// The manager's capability to the Memory Server, if the manifest has
+    /// one and it is running.
+    fn memory_server(&self) -> Option<u64> {
+        let s = self.service_index("mem")?;
+        let (_, owner) = self.services[s]?;
+        (self.status[owner] == Status::Running).then_some(SERVICES + s as u64)
+    }
+
+    fn is_memory_server(&self, i: usize) -> bool {
+        self.component(i).provides().any(|s| s == "mem")
+    }
+
+    /// Component `i` took a page fault at `addr`: if that is in its heap,
+    /// has the Memory Server map a page there. True if it did.
+    fn page_in(&self, i: usize, addr: u64) -> Result<bool, Reply> {
+        let c = self.component(i);
+        let heap = USER_BASE + mem::HEAP_OFFSET;
+        if c.heap_pages == 0 || !(heap..heap + c.heap_pages * PAGE).contains(&addr) {
+            return Ok(false);
+        }
+        let Some(ep) = self.memory_server() else {
+            return Ok(false);
+        };
+        let vspace = BLOCKS + i as u64 * BLOCK + B_VSPACE;
+        let lend = CapTransfer {
+            grant: Some(vspace as u16),
+            accept: None,
+        };
+        let r = syscall_x(
+            Syscall::Call,
+            ep,
+            [mem::FAULT, i as u64 + 1, c.quota_pages, addr],
+            lend,
+        );
+        match Reply::from_u64(r.msg[0]) {
+            Reply::Ok if r.status == 0 => Ok(true),
+            _ if r.status != 0 => Err(Reply::DeviceError),
+            s => Err(s),
         }
     }
 
@@ -675,6 +744,11 @@ pub extern "C" fn _start(bundle_len: u64) -> ! {
     let mut msg = syscall(Syscall::Recv, CONTROL, [0; 4]);
     loop {
         let (badge, kind, i) = (msg.badge, msg.badge & !0xff, (msg.badge & 0xff) as usize);
+        // A page fault in a component's heap is paged in, not supervised.
+        let paged = (kind == BADGE_FAULT
+            && i < MAX_COMPONENTS
+            && msg.msg[0] == FaultKind::PageFault as u64)
+            .then(|| m.page_in(i, msg.msg[1]));
         let reply = match kind {
             BADGE_WATCHER => {
                 let (service, owner) = m.services.get(i).copied().flatten().unwrap_or(("?", 0));
@@ -684,8 +758,24 @@ pub extern "C" fn _start(bundle_len: u64) -> ! {
                 }
                 Some([(m.status[owner] != Status::Running) as u64, 0, 0, 0])
             }
+            BADGE_FAULT if paged == Some(Ok(true)) => {
+                // A heap page arrived: run the instruction again.
+                Some([FaultReply::Retry as u64, 0, 0, 0])
+            }
             BADGE_FAULT if i < MAX_COMPONENTS => {
                 let name = m.component(i).name;
+                if let Some(Err(why)) = paged {
+                    say!(
+                        "{name} is out of memory: heap page at {:#x} refused ({}), quota {} pages",
+                        msg.msg[1],
+                        match why {
+                            Reply::Denied => "quota spent",
+                            Reply::InUse => "pool empty",
+                            _ => "Memory Server error",
+                        },
+                        m.component(i).quota_pages
+                    );
+                }
                 let what = fault_name(msg.msg[0]);
                 say!(
                     "{name} faulted: {what} at pc {:#x}, address {:#x}",
@@ -696,6 +786,12 @@ pub extern "C" fn _start(bundle_len: u64) -> ! {
                 // owes no reply to an instance about to be destroyed.
                 syscall(Syscall::Reply, 0, [FaultReply::Stop as u64, 0, 0, 0]);
                 m.status[i] = Status::Stopped;
+                if m.is_memory_server(i) {
+                    // Every component's memory is in its hands: no
+                    // restart in place (spec section 4).
+                    say!("the Memory Server failed; the system must restart");
+                    shutdown(false);
+                }
                 m.supervise(i);
                 None
             }

@@ -1,0 +1,17 @@
+[package]
+name = "superior-memserver"
+description = "The Memory Server: pages of RAM under per-component quotas, demand-zero heaps, and every page back when a component stops."
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "superior-memserver"
+test = false
+bench = false
+
+[dependencies]
+superior-objects = { path = "../../crates/objects" }
+superior-sys = { path = "../../crates/sys" }

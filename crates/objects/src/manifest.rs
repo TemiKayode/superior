@@ -22,6 +22,9 @@
 //!   notification 3          # a fresh notification
 //!   untyped 16 4            # a fresh 2^16-byte untyped block
 //!   state 5                 # a page the manager keeps across restarts
+//!   cspace 9                # a CSpace of 2^9 slots (default 2^6)
+//!   quota 64                # pages the Memory Server may give it
+//!   heap 32                 # a demand-zero heap of 32 pages
 //! ```
 //!
 //! Slots are in the component's own CSpace, a CNode of [`CSPACE_SLOTS`].
@@ -35,6 +38,10 @@ pub const MAX_CAPS: usize = 12;
 /// Every component's CSpace size, in bits and slots.
 pub const CSPACE_BITS: u8 = 6;
 pub const CSPACE_SLOTS: usize = 1 << CSPACE_BITS;
+/// Bounds on a component's CSpace, in bits.
+pub const CSPACE_MAX_BITS: u8 = 10;
+/// Most pages a heap may span.
+pub const MAX_HEAP_PAGES: u64 = 4096;
 /// Bounds on the per-instance untyped block, in bits.
 pub const MEMORY_MIN_BITS: u8 = 16;
 pub const MEMORY_MAX_BITS: u8 = 24;
@@ -87,6 +94,12 @@ pub struct Component<'a> {
     pub priority: u8,
     pub arg: u64,
     pub memory_bits: u8,
+    /// Its CSpace size in bits.
+    pub cspace_bits: u8,
+    /// Pages the Memory Server may give it (heap and frames together).
+    pub quota_pages: u64,
+    /// Pages of demand-zero heap at `USER_BASE + mem::HEAP_OFFSET`.
+    pub heap_pages: u64,
     pub caps: [Option<CapSpec<'a>>; MAX_CAPS],
 }
 
@@ -100,6 +113,9 @@ impl<'a> Component<'a> {
             priority: 10,
             arg: 0,
             memory_bits: DEFAULT_MEMORY_BITS,
+            cspace_bits: CSPACE_BITS,
+            quota_pages: 0,
+            heap_pages: 0,
             caps: [None; MAX_CAPS],
         }
     }
@@ -241,6 +257,28 @@ impl<'a> Manifest<'a> {
                     }
                     None
                 }
+                "cspace" => {
+                    let w = arg("cspace needs a size in bits")?;
+                    match number(w)? {
+                        b if (CSPACE_BITS as u64..=CSPACE_MAX_BITS as u64).contains(&b) => {
+                            c.cspace_bits = b as u8
+                        }
+                        _ => return Err(err("cspace must be 6 to 10 bits", w)),
+                    }
+                    None
+                }
+                "quota" => {
+                    c.quota_pages = number(arg("quota needs a page count")?)?;
+                    None
+                }
+                "heap" => {
+                    let w = arg("heap needs a page count")?;
+                    match number(w)? {
+                        p @ 1..=MAX_HEAP_PAGES => c.heap_pages = p,
+                        _ => return Err(err("heap must be 1 to 4096 pages", w)),
+                    }
+                    None
+                }
                 "provides" => {
                     let s = arg("provides needs a service name")?;
                     Some((CapKind::Provides(s), arg("provides needs a slot")?))
@@ -305,6 +343,10 @@ impl<'a> Manifest<'a> {
             if c.start == Start::Lazy && c.provides().next().is_none() {
                 return Err(err("a lazy component must provide a service", c.name));
             }
+            // A heap is paged in by the Memory Server.
+            if c.heap_pages > 0 && self.provider("mem").is_none() {
+                return Err(err("a heap needs a component providing mem", c.name));
+            }
             for cap in c.caps() {
                 match cap.kind {
                     CapKind::Uses(s) if self.provider(s).is_none() => {
@@ -344,12 +386,18 @@ component client   # comment after a directive
   notification 3
   untyped 16 4
   state 5
+  cspace 8
+  quota 10
+  heap 4
+component memserver
+  image memserver
+  provides mem 0
 ";
 
     #[test]
     fn parses_components_and_caps() {
         let m = Manifest::parse(EXAMPLE).unwrap();
-        assert_eq!(m.len(), 2);
+        assert_eq!(m.len(), 3);
         let echo = m.components[0].unwrap();
         assert_eq!(
             (echo.name, echo.image, echo.start),
@@ -363,6 +411,11 @@ component client   # comment after a directive
             (9, 7, Start::Boot)
         );
         assert_eq!(client.restart, Restart::RestForOne);
+        assert_eq!(
+            (client.cspace_bits, client.quota_pages, client.heap_pages),
+            (8, 10, 4)
+        );
+        assert_eq!(echo.cspace_bits, CSPACE_BITS);
         let caps: std::vec::Vec<_> = client.caps().collect();
         assert_eq!(
             caps,
@@ -445,6 +498,18 @@ component client   # comment after a directive
  state 2"
             ),
             (4, "only one state page per component")
+        );
+        assert_eq!(
+            error("component a\n image a\n cspace 11"),
+            (3, "cspace must be 6 to 10 bits")
+        );
+        assert_eq!(
+            error("component a\n image a\n heap 0"),
+            (3, "heap must be 1 to 4096 pages")
+        );
+        assert_eq!(
+            error("component a\n image a\n heap 4"),
+            (0, "a heap needs a component providing mem")
         );
         assert_eq!(error("component a"), (0, "component has no image"));
         assert_eq!(

@@ -19,6 +19,10 @@
 //!                                  `boot/drivers.manifest` with a virtio
 //!                                  disk (PCI bus server, virtio-blk driver,
 //!                                  a client) and check the log
+//!   cargo xtask memory-test [arch]     the Memory Server: boot
+//!                                  `boot/memory.manifest` (quotas, demand-zero
+//!                                  heaps, pages back on restart) and check
+//!                                  the log
 //!   cargo xtask bench              time IPC under hardware virtualization
 //!                                  (WHPX or KVM, x86-64) and check it against
 //!                                  seL4's published figures
@@ -106,6 +110,8 @@ fn main() -> ExitCode {
                         .and_then(|img| supervise_test(&img))
                         .and_then(|_| image_with(false, a, "drivers"))
                         .and_then(|img| drivers_test(&img))
+                        .and_then(|_| image_with(false, a, "memory"))
+                        .and_then(|img| memory_test(&img))
                         .and_then(|_| image(false, a))
                         .and_then(|img| shell_session(&img))
                 })
@@ -122,9 +128,12 @@ fn main() -> ExitCode {
         Some("supervise-test") => {
             image_with(false, arch, "supervise").and_then(|img| supervise_test(&img))
         }
+        Some("memory-test") => {
+            image_with(false, arch, "memory").and_then(|img| memory_test(&img))
+        }
         Some("bench") => image(false, Arch::X86_64).and_then(|img| bench(&img)),
         _ => Err(
-            "usage: cargo xtask <image | run | test | boot-test | shell-test | cm-test | supervise-test | drivers-test | bench | sel4-test> [x86_64 | aarch64]"
+            "usage: cargo xtask <image | run | test | boot-test | shell-test | cm-test | supervise-test | drivers-test | memory-test | bench | sel4-test> [x86_64 | aarch64]"
                 .into(),
         ),
     });
@@ -224,6 +233,7 @@ fn bundle(arch: Arch, manifest: &str) -> Result<PathBuf, String> {
         ("counter", "superior-counter"),
         ("pcibus", "superior-pcibus"),
         ("virtio-blk", "superior-virtio-blk"),
+        ("memserver", "superior-memserver"),
         ("testclient", "superior-testclient"),
     ] {
         let path = user_program(package, arch)?;
@@ -701,6 +711,52 @@ fn drivers_test(img: &Image) -> Result<(), String> {
         }
     }
     println!("== driver framework test passed ({})", img.arch.name());
+    Ok(())
+}
+
+/// Boots `boot/memory.manifest` and checks the Memory Server: quotas
+/// enforced, heaps paged in on first touch, frames granted and freed, and
+/// a component that overran its quota restarted with every page back.
+fn memory_test(img: &Image) -> Result<(), String> {
+    println!("== Memory Server test on {}", img.path.display());
+    let out = run_to_exit(img, Duration::from_secs(60))?;
+    let steps = [
+        "[cm] manifest: 3 components",
+        "mem: pool of 512 pages",
+        "hog: touching 12 heap pages with a quota of 8",
+        "mem: client 2: heap page refused (8 pages is its quota)",
+        "[cm] hog is out of memory: heap page at",
+        "[cm] hog faulted: page fault",
+        "[cm] hog: 8 pages back to the Memory Server",
+        "[cm] restarting hog (one-for-one)",
+        "[pass] hog: restarted (instance 2) holding 0 pages: all came back",
+        "[pass] hog: 8 heap pages again, every one zeroed though reused",
+        "hog: done (0 failed)",
+        "[pass] memory: quota 40 pages, 0 in use",
+        "[pass] memory: 32 heap pages appeared on first touch, each zeroed",
+        "[pass] memory: and kept what was written",
+        "[pass] memory: 32 pages charged to it; the pool has 32 fewer",
+        "[pass] memory: 8 frames granted, filling the quota",
+        "[pass] memory: one more is refused: the quota is spent",
+        "[pass] memory: a granted frame arrives zeroed; freed, its capability is gone",
+        "[pass] memory: 39 pages in use after freeing one",
+        "[pass] memory: so another frame is granted",
+        "[pass] memory: a component may not release another's pages",
+        "[cm] client asked to shut down (pass)",
+    ];
+    let mut at = 0;
+    for step in steps {
+        match out[at..].find(step) {
+            Some(i) => at += i + step.len(),
+            None => return Err(format!("Memory Server test: missing (in order) {step:?}")),
+        }
+    }
+    for bad in ["[fail]", "could not", "panic"] {
+        if out.contains(bad) {
+            return Err(format!("Memory Server test: log contains {bad:?}"));
+        }
+    }
+    println!("== Memory Server test passed ({})", img.arch.name());
     Ok(())
 }
 

@@ -1,0 +1,37 @@
+# The Memory Server test (cargo xtask memory-test).
+#
+# The Memory Server holds a pool of pages and hands them out under the
+# quotas below. The client pages its heap in by touching it, takes frames
+# up to its quota and is refused one more, and frees one. The hog touches
+# more heap than its quota: the manager restarts it, every page it held
+# goes back to the pool, and its next instance finds them zeroed.
+
+component memserver
+  image memserver
+  priority 12
+  # Cannot be restarted in place (spec section 4).
+  restart never
+  memory 22
+  cspace 9
+  # CSpace of 2^9 slots, pool of 2^21 bytes: 9 | 21 << 8.
+  arg 5385
+  provides mem 0
+  untyped 21 1
+
+component hog
+  image testclient
+  arg 6
+  priority 11
+  uses mem 0
+  state 1
+  notification 2
+  quota 8
+  heap 16
+
+component client
+  image testclient
+  arg 5
+  uses mem 0
+  control 1
+  quota 40
+  heap 32

@@ -204,6 +204,27 @@ holds the rest):
     bypass left on, the same test fails);
   - the driver is crashed, restarted, its device reset and reopened, and reads work
     again.
+- The Memory Server, v1 (`user/memserver/`). It holds a pool of RAM and hands
+  out pages under per-component quotas, which the Component Manager puts in the
+  badge of each component's `mem` capability (manifest `quota`), so they cannot be
+  forged. It keeps the original of every page it gives, so it can always take one
+  back: revoking the original removes every copy and mapping. Pages that come back
+  are zeroed and reused.
+  - Demand-zero heaps (manifest `heap`): a page fault in a component's heap goes to
+    the manager, which asks the Memory Server to map a zeroed page there (lending it
+    the component's address space) and resumes the thread. Past the quota, the fault
+    is a crash and supervision takes over.
+  - `FRAME`, `FREE` and `INFO` for pages a component asks for directly.
+  - Stopping or restarting a component gives every page it held back first.
+  - The Memory Server cannot be restarted in place: if it fails, the system stops
+    (spec section 4; the fast reboot that should follow is not built yet).
+  - Components may have larger CSpaces (manifest `cspace`, up to 2^10 slots).
+  `cargo xtask memory-test` boots `boot/memory.manifest`:
+  - a client pages its heap in by touching it, and every page arrives zeroed;
+  - it takes frames up to its quota and is refused one more;
+  - it frees one, and the capability is gone;
+  - a hog touches more heap than its quota and is restarted, with all 8 pages back
+    in the pool; its next instance gets those same pages, zeroed.
 - Static-pie user programs loaded into their own address spaces and relocated.
 - Boot self-test: a server and a client in separate address spaces do 20,000
   call/reply round trips, and the kernel refuses four kinds of rights violations. A
@@ -239,7 +260,9 @@ these buses have none); buses behind bridges; the async executor, buffer pools a
 power callbacks of the SDK; an IDL compiler for the interfaces; escalating a component
 given up on to a supervisor above it (today the
 manager is the only one), restarting the Component Manager or Memory Server (spec: fast
-reboot instead), the Memory Server, page tables for boot processes paid for from user memory,
+reboot instead, not built yet), copy-on-write address-space cloning for `fork` in the
+Memory Server, memory budgets from a policy service, giving the Memory Server all spare
+RAM (today it gets a fixed pool from its manifest), page tables for boot processes paid for from user memory,
 multi-level CSpaces, the first call's capability forwarded by a lazy-start watcher, scheduling-context capabilities (budgets are set at boot), sporadic refills,
 timeout faults, SMP, an IPC benchmark on bare metal.
 
@@ -259,9 +282,10 @@ https://claude.ai/artifact/QKJS8qH5Dfbjzn58RStq1j
 | `user/shell/` | The boot shell and COM1 driver, started as a component |
 | `crates/driver/` | The Driver SDK: PCI access through the bus server, MMIO, DMA pages, virtqueues |
 | `user/pcibus/` | The PCI bus server |
+| `user/memserver/` | The Memory Server |
 | `user/virtio-blk/` | The virtio block driver |
 | `user/echo/`, `user/counter/`, `user/testclient/` | Test components for the Component Manager, supervision and drivers |
-| `boot/` | Component manifests: `shell.manifest` (normal boot), `test.manifest` (`cm-test`), `supervise.manifest` (`supervise-test`) and `drivers.manifest` (`drivers-test`) |
+| `boot/` | Component manifests: `shell.manifest` (normal boot), `test.manifest` (`cm-test`), `supervise.manifest` (`supervise-test`) , `drivers.manifest` (`drivers-test`) and `memory.manifest` (`memory-test`) |
 | `sel4/` | Docker build of seL4 and rust-sel4's kernel loader, for running the shell on seL4 |
 | `xtask/` | Build driver: user program, kernel, disk image, QEMU boot |
 
@@ -270,10 +294,11 @@ https://claude.ai/artifact/QKJS8qH5Dfbjzn58RStq1j
 Needs Rust (the pinned nightly in `rust-toolchain.toml` installs itself) and QEMU.
 
 ```bash
-cargo xtask test           # host tests, model check, simulation; on both ISAs the boot self-tests, the Component Manager, supervision and driver tests and a shell session; then the shell on seL4
+cargo xtask test           # host tests, model check, simulation; on both ISAs the boot self-tests, the Component Manager, supervision, driver and Memory Server tests and a shell session; then the shell on seL4
 cargo xtask cm-test        # just the Component Manager test (add aarch64 for that ISA)
 cargo xtask supervise-test # just the supervision test (add aarch64 for that ISA)
 cargo xtask drivers-test   # just the driver framework test (add aarch64 for that ISA)
+cargo xtask memory-test    # just the Memory Server test (add aarch64 for that ISA)
 cargo xtask run            # boot the shell in QEMU (x86-64), its console on this terminal
 cargo xtask run aarch64    # the same on QEMU's AArch64 virt machine
 cargo xtask image  # just build target/superior.img
