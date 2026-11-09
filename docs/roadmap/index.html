@@ -105,7 +105,7 @@ const PHASES = [
         { t: "Deterministic simulation test harness", s: "done", ev: "Seeded runs of the IPC and scheduling engine with invariant and message-integrity checks after every step; every seed replays identically. 10,000 seeds × 5,000 steps pass. It found and fixed six engine bugs. <code>e638296</code>" },
       ]},
       { name: "User space", tasks: [
-        { t: "User space brought up on seL4 in parallel", s: "open", ev: "Not started: the same user programs on seL4 as a fallback kernel." },
+        { t: "User space brought up on seL4 in parallel", s: "done", ev: "The same shell, unchanged, runs as seL4 17.0.0's root task on AArch64 (QEMU <code>virt</code>): a runtime in <code>superior-sys</code> builds its UART, IRQ, notification and untyped capabilities from seL4's and translates each Superior system call into seL4 calls and invocations. <code>cargo xtask test</code> ends by typing the same session into it (help, echo, sleep on a timer interrupt, IPC to a thread it creates, backspace) and requires <code>shutdown</code> to end QEMU with the pass code. seL4 is built in hypervisor mode for rust-sel4's loader. <code>cad5479</code>" },
       ]},
       { name: "Exit gate", tasks: [
         { t: "Boots to a shell on x86-64", s: "done", ev: "A user-space shell that is its own COM1 driver (I/O-port and IRQ capabilities). <code>cargo xtask test</code> types a session over serial — help, echo, sleep, ipc, backspace editing — checks every answer, and requires <code>shutdown</code> to power QEMU off. Also fixed a lost-signal race that hung 1 boot in 5; 16/16 clean since. <code>097c782</code>" },
