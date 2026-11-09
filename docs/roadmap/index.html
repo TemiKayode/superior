@@ -72,7 +72,7 @@ a { color: var(--accent); }
 </main>
 
 <script>
-const UPDATED = "2026-11-08";
+const UPDATED = "2026-11-09";
 // s: done | part | open. ev: the evidence (commit and test) for done items, or what is left.
 const PHASES = [
   { id: "P0", name: "Foundations", months: "Months 0–6",
@@ -116,12 +116,13 @@ const PHASES = [
   { id: "P1", name: "Core runtime and drivers", months: "Months 5–15",
     gate: "Fault injection kills any non-core service under load with no lost acknowledged writes; IPC gate passed at month 12.",
     groups: [{ name: "Deliverables", tasks: [
-      { t: "Component Manager", s: "open" }, { t: "Memory Server", s: "open" },
+      { t: "Component Manager", s: "done", ev: "The root task: the kernel starts only it, with every capability and a boot bundle. It reads the manifest and builds each component from its own untyped block (an address-space object that pays for its own page tables, a CNode, a thread, the relocated executable mapped writable or executable but never both, a stack), granting only the capabilities the manifest names. It owns every service endpoint and is every component's fault handler. Lazy components start on first call, and that call is forwarded under the client's badge. <code>cargo xtask cm-test</code> on both ISAs: a probe reading the manager's memory faults and the manager is told; <code>echo</code> starts only on the client's first call, and all 3 calls are answered; <code>spare</code>, which nothing calls, never starts. The shell now boots as a component. New self-test checks for address spaces: refusals, running out of page tables, and revoke under a running thread. <code>f2cbc43</code>" },
+      { t: "Memory Server", s: "open" },
       { t: "Filesystem server", s: "open" }, { t: "Network server", s: "open" },
-      { t: "Supervision and restart", s: "open" }, { t: "Driver framework v1", s: "open" },
+      { t: "Supervision and restart", s: "part", ev: "Done: every component's faults go to the Component Manager, labelled with which component it was, and the manager stops that component. Still to do: restart strategies and intensity limits, handing endpoints to the new instance, failing in-flight calls with PEER_RESTARTED." }, { t: "Driver framework v1", s: "open" },
       { t: "NVMe, xHCI, HID and AHCI class drivers", s: "open" },
       { t: "First Linux Driver Environment drivers", s: "open" },
-      { t: "Two reference laptops", s: "open" },
+      { t: "Two reference laptops", s: "open", ev: "Needs physical laptops: this can't be done or verified under QEMU." },
     ]}]},
   { id: "P2", name: "Graphics, UX and trust chain", months: "Months 12–24",
     gate: "Daily-drivable on reference hardware; latency budgets met; power and driver gate passed at month 24.",
