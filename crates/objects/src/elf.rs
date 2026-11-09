@@ -1,8 +1,10 @@
-//! Minimal ELF64 reader for loading statically linked x86-64 executables,
-//! fixed-address (`ET_EXEC`) or position-independent (`ET_DYN`, static-pie).
+//! Minimal ELF64 reader for loading statically linked x86-64 and AArch64
+//! executables, fixed-address (`ET_EXEC`) or position-independent
+//! (`ET_DYN`, static-pie).
 //!
-//! Only what a loader needs: the entry point, the `PT_LOAD` segments and,
-//! for position-independent images, the `R_X86_64_RELATIVE` relocations.
+//! Only what a loader needs: the machine, the entry point, the `PT_LOAD`
+//! segments and, for position-independent images, the RELATIVE relocations
+//! (`R_X86_64_RELATIVE`, `R_AARCH64_RELATIVE`).
 //! Every offset and size is bounds-checked against the image, because the
 //! image is untrusted input.
 
@@ -10,7 +12,7 @@
 pub enum ElfError {
     TooShort,
     BadMagic,
-    /// Not 64-bit, little-endian, x86-64.
+    /// Not 64-bit, little-endian, x86-64 or AArch64.
     WrongArch,
     /// Neither `ET_EXEC` nor `ET_DYN`.
     NotExecutable,
@@ -43,8 +45,25 @@ pub struct Segment {
     pub executable: bool,
 }
 
+/// The instruction set an image is for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Machine {
+    X86_64,
+    Aarch64,
+}
+
+impl Machine {
+    const fn relative(self) -> u32 {
+        match self {
+            Machine::X86_64 => R_X86_64_RELATIVE,
+            Machine::Aarch64 => R_AARCH64_RELATIVE,
+        }
+    }
+}
+
 pub struct Elf<'a> {
     data: &'a [u8],
+    pub machine: Machine,
     pub entry: u64,
     /// Position-independent: load at any base and apply [`Elf::relocations`].
     pub pie: bool,
@@ -63,6 +82,11 @@ const DT_REL: u64 = 17;
 const DT_JMPREL: u64 = 23;
 const R_X86_64_NONE: u32 = 0;
 const R_X86_64_RELATIVE: u32 = 8;
+#[cfg(test)]
+const R_AARCH64_NONE: u32 = 0;
+const R_AARCH64_RELATIVE: u32 = 1027;
+const EM_X86_64: u16 = 0x3e;
+const EM_AARCH64: u16 = 0xb7;
 const RELA_SIZE: u64 = 24;
 const PF_X: u32 = 1;
 const PF_W: u32 = 2;
@@ -87,10 +111,15 @@ impl<'a> Elf<'a> {
         if data[0..4] != *b"\x7fELF" {
             return Err(ElfError::BadMagic);
         }
-        // EI_CLASS = 64-bit, EI_DATA = little-endian, e_machine = x86-64.
-        if data[4] != 2 || data[5] != 1 || u16_at(data, 18) != Some(0x3e) {
+        // EI_CLASS = 64-bit, EI_DATA = little-endian.
+        if data[4] != 2 || data[5] != 1 {
             return Err(ElfError::WrongArch);
         }
+        let machine = match u16_at(data, 18) {
+            Some(EM_X86_64) => Machine::X86_64,
+            Some(EM_AARCH64) => Machine::Aarch64,
+            _ => return Err(ElfError::WrongArch),
+        };
         let pie = match u16_at(data, 16) {
             Some(2) => false,
             Some(3) => true,
@@ -108,6 +137,7 @@ impl<'a> Elf<'a> {
         }
         Ok(Elf {
             data,
+            machine,
             entry,
             pie,
             phoff,
@@ -161,9 +191,9 @@ impl<'a> Elf<'a> {
         })
     }
 
-    /// The relocations of a position-independent image, all of type
-    /// `R_X86_64_RELATIVE`. Anything else is refused, since there is no
-    /// symbol table to resolve against. Empty for fixed-address images.
+    /// The relocations of a position-independent image, all RELATIVE for
+    /// its machine. Anything else is refused, since there is no symbol
+    /// table to resolve against. Empty for fixed-address images.
     pub fn relocations(&self) -> Result<impl Iterator<Item = Relative> + '_, ElfError> {
         let (mut rela, mut relasz, mut relaent) = (0u64, 0u64, RELA_SIZE);
         let d = self.data;
@@ -200,9 +230,11 @@ impl<'a> Elf<'a> {
                 .ok_or(ElfError::BadDynamic)?
         };
         let table = &d[start..start + relasz as usize];
+        let relative = self.machine.relative();
         for r in table.as_chunks::<{ RELA_SIZE as usize }>().0 {
             let kind = u32_at(r, 8).unwrap();
-            if kind != R_X86_64_RELATIVE && kind != R_X86_64_NONE {
+            // R_X86_64_NONE and R_AARCH64_NONE are both 0.
+            if kind != relative && kind != R_X86_64_NONE {
                 return Err(ElfError::UnsupportedRelocation);
             }
         }
@@ -210,7 +242,7 @@ impl<'a> Elf<'a> {
             .as_chunks::<{ RELA_SIZE as usize }>()
             .0
             .iter()
-            .filter(|r| u32_at(&r[..], 8) == Some(R_X86_64_RELATIVE))
+            .filter(move |r| u32_at(&r[..], 8) == Some(relative))
             .map(|r| Relative {
                 offset: u64_at(r, 0).unwrap(),
                 addend: u64_at(r, 16).unwrap(),
@@ -271,7 +303,7 @@ mod tests {
         bad[1] = b'X';
         assert_eq!(Elf::parse(&bad).err(), Some(ElfError::BadMagic));
         let mut bad = good.clone();
-        bad[18] = 0xb7; // AArch64
+        bad[18] = 0xf3; // RISC-V
         assert_eq!(Elf::parse(&bad).err(), Some(ElfError::WrongArch));
         let mut bad = good.clone();
         bad[16] = 1; // ET_REL
@@ -296,6 +328,10 @@ mod tests {
     /// A static-pie image: one RW PT_LOAD holding a dynamic table and two
     /// RELA entries, plus a PT_DYNAMIC header covering the table.
     fn pie_image(second_reloc_type: u32) -> Vec<u8> {
+        pie_image_for(EM_X86_64, R_X86_64_RELATIVE, second_reloc_type)
+    }
+
+    fn pie_image_for(machine: u16, relative: u32, second_reloc_type: u32) -> Vec<u8> {
         let payload_off = 64 + 2 * PHDR_SIZE;
         let dyn_va = payload_off as u64; // vaddr == file offset, as lld lays out PIE
         let rela_va = dyn_va + 64;
@@ -310,7 +346,7 @@ mod tests {
             payload.extend_from_slice(&val.to_le_bytes());
         }
         let relocs = [
-            (0x2000u64, 0x1234u64, R_X86_64_RELATIVE),
+            (0x2000u64, 0x1234u64, relative),
             (0x2008, 0x10, second_reloc_type),
         ];
         for (off, add, ty) in relocs {
@@ -323,7 +359,7 @@ mod tests {
         d[4] = 2;
         d[5] = 1;
         d[16..18].copy_from_slice(&3u16.to_le_bytes()); // ET_DYN
-        d[18..20].copy_from_slice(&0x3eu16.to_le_bytes());
+        d[18..20].copy_from_slice(&machine.to_le_bytes());
         d[24..32].copy_from_slice(&0x100u64.to_le_bytes());
         d[32..40].copy_from_slice(&64u64.to_le_bytes());
         d[54..56].copy_from_slice(&(PHDR_SIZE as u16).to_le_bytes());
@@ -371,5 +407,26 @@ mod tests {
     fn fixed_address_image_has_no_relocations() {
         let img = image(0x1000, b"x", 1);
         assert_eq!(Elf::parse(&img).unwrap().relocations().unwrap().count(), 0);
+    }
+
+    #[test]
+    fn aarch64_relative_relocations() {
+        let img = pie_image_for(EM_AARCH64, R_AARCH64_RELATIVE, R_AARCH64_NONE);
+        let elf = Elf::parse(&img).unwrap();
+        assert_eq!(elf.machine, Machine::Aarch64);
+        let relocs: Vec<_> = elf.relocations().unwrap().collect();
+        assert_eq!(
+            relocs,
+            [Relative {
+                offset: 0x2000,
+                addend: 0x1234
+            }]
+        );
+        // An x86-64 relocation type in an AArch64 image is refused.
+        let img = pie_image_for(EM_AARCH64, R_AARCH64_RELATIVE, R_X86_64_RELATIVE);
+        assert_eq!(
+            Elf::parse(&img).unwrap().relocations().err(),
+            Some(ElfError::UnsupportedRelocation)
+        );
     }
 }

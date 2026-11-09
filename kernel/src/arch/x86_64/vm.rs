@@ -8,9 +8,9 @@
 //! (supervisor-only), so the kernel is mapped everywhere and user code
 //! cannot touch it.
 
-use crate::memory::{ROOT_CNODE, ROOT_CNODE_SLOTS};
 pub use crate::memory::MapError;
-use superior_objects::elf::Elf;
+use crate::memory::{ROOT_CNODE, ROOT_CNODE_SLOTS};
+use superior_objects::elf::{Elf, Machine};
 use x86_64::registers::control::Cr3;
 use x86_64::structures::paging::{
     mapper::MapToError, FrameAllocator, Mapper, OffsetPageTable, Page, PageTable,
@@ -111,7 +111,10 @@ impl AddressSpace {
     /// entry point. All segments must land inside the user window.
     /// Position-independent images are loaded at [`USER_BASE`] and relocated.
     pub fn load_elf(&self, image: &[u8]) -> Result<u64, &'static str> {
-        let elf = Elf::parse(image).map_err(|_| "user image is not a valid static x86-64 ELF")?;
+        let elf = Elf::parse(image).map_err(|_| "user image is not a valid static ELF")?;
+        if elf.machine != Machine::X86_64 {
+            return Err("user image is not for x86-64");
+        }
         let bias = if elf.pie { USER_BASE } else { 0 };
         let entry = elf.entry.wrapping_add(bias);
         if !(USER_BASE..USER_END).contains(&entry) {

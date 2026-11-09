@@ -1,17 +1,23 @@
-//! Superior build driver.
+//! Superior build driver. Each command takes an optional architecture,
+//! `x86_64` (the default) or `aarch64`:
 //!
-//!   cargo xtask image   build the kernel and a BIOS-bootable disk image
-//!   cargo xtask run     build and boot it in QEMU, into the shell (serial on
-//!                       this terminal)
-//!   cargo xtask test    host unit tests, the exhaustive model check and long
-//!                       simulation, the boot self-tests in QEMU, then a
-//!                       scripted session with the shell
-//!   cargo xtask boot-test   just the boot self-tests
-//!   cargo xtask shell-test  just the shell session
-//!   cargo xtask bench   time IPC under hardware virtualization (WHPX or KVM)
-//!                       and check it against seL4's published figures
+//!   cargo xtask image [arch]       build the kernel and a bootable image
+//!   cargo xtask run [arch]         boot it in QEMU, into the shell (serial on
+//!                                  this terminal)
+//!   cargo xtask test               host unit tests, the exhaustive model check
+//!                                  and long simulation, then on each
+//!                                  architecture the boot self-tests in QEMU and
+//!                                  a scripted session with the shell
+//!   cargo xtask boot-test [arch]   just the boot self-tests
+//!   cargo xtask shell-test [arch]  just the shell session
+//!   cargo xtask bench              time IPC under hardware virtualization
+//!                                  (WHPX or KVM, x86-64) and check it against
+//!                                  seL4's published figures
 //!
-//! QEMU is found through $QEMU, then the default Windows install path, then PATH.
+//! x86-64 boots from a BIOS disk image; AArch64 boots QEMU's `virt` machine
+//! straight from the kernel ELF, with semihosting for the exit status.
+//! QEMU is found through $QEMU (x86-64) or $QEMU_AARCH64, then the default
+//! Windows install path, then PATH.
 
 use std::env;
 use std::io::{Read, Write};
@@ -20,25 +26,70 @@ use std::process::{Command, ExitCode, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-const KERNEL_TARGET: &str = "x86_64-unknown-none";
-/// isa-debug-exit maps the kernel's 0x10 to QEMU status (0x10 << 1) | 1.
+/// Both architectures report the kernel's pass code 0x10 as QEMU status
+/// (0x10 << 1) | 1: isa-debug-exit on x86-64, semihosting on AArch64.
 const QEMU_PASS: i32 = 33;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Arch {
+    X86_64,
+    Aarch64,
+}
+
+impl Arch {
+    fn parse(s: Option<&str>) -> Result<Arch, String> {
+        match s {
+            None | Some("x86_64") | Some("x86-64") => Ok(Arch::X86_64),
+            Some("aarch64") | Some("arm64") => Ok(Arch::Aarch64),
+            Some(other) => Err(format!("unknown architecture {other:?}")),
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Arch::X86_64 => "x86_64",
+            Arch::Aarch64 => "aarch64",
+        }
+    }
+
+    /// The kernel and user programs share a target; floating point is off
+    /// on both, so threads never need FP state saved.
+    fn target(self) -> &'static str {
+        match self {
+            Arch::X86_64 => "x86_64-unknown-none",
+            Arch::Aarch64 => "aarch64-unknown-none-softfloat",
+        }
+    }
+}
+
+/// A bootable kernel for one architecture.
+struct Image {
+    path: PathBuf,
+    arch: Arch,
+}
+
 fn main() -> ExitCode {
-    let cmd = env::args().nth(1);
-    let result = match cmd.as_deref() {
-        Some("image") => image(false).map(|p| println!("image: {}", p.display())),
-        Some("run") => image(false).and_then(|img| boot(&img, false)),
-        Some("test") => host_tests()
-            .and_then(|_| image(true))
-            .and_then(|img| boot(&img, true))
-            .and_then(|_| image(false))
-            .and_then(|img| shell_session(&img)),
-        Some("boot-test") => image(true).and_then(|img| boot(&img, true)),
-        Some("shell-test") => image(false).and_then(|img| shell_session(&img)),
-        Some("bench") => image(false).and_then(|img| bench(&img)),
-        _ => Err("usage: cargo xtask <image | run | test | boot-test | shell-test | bench>".into()),
-    };
+    let args: Vec<String> = env::args().skip(1).collect();
+    let arch = Arch::parse(args.get(1).map(String::as_str));
+    let result = arch.and_then(|arch| match args.first().map(String::as_str) {
+        Some("image") => image(false, arch).map(|i| println!("image: {}", i.path.display())),
+        Some("run") => image(false, arch).and_then(|img| boot(&img, false)),
+        Some("test") => host_tests().and_then(|_| {
+            [Arch::X86_64, Arch::Aarch64].into_iter().try_for_each(|a| {
+                image(true, a)
+                    .and_then(|img| boot(&img, true))
+                    .and_then(|_| image(false, a))
+                    .and_then(|img| shell_session(&img))
+            })
+        }),
+        Some("boot-test") => image(true, arch).and_then(|img| boot(&img, true)),
+        Some("shell-test") => image(false, arch).and_then(|img| shell_session(&img)),
+        Some("bench") => image(false, Arch::X86_64).and_then(|img| bench(&img)),
+        _ => Err(
+            "usage: cargo xtask <image | run | test | boot-test | shell-test | bench> [x86_64 | aarch64]"
+                .into(),
+        ),
+    });
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -89,31 +140,44 @@ fn host_tests() -> Result<(), String> {
 }
 
 /// Builds a user program as a static position-independent executable; the
-/// kernel loads it into its user window and relocates it.
-fn user_program(package: &str) -> Result<PathBuf, String> {
-    println!("== building {package}");
-    run(cargo().args([
+/// kernel loads it into its user window and relocates it. User programs
+/// build in their own target directory, since on AArch64 they need flags
+/// the kernel must not get.
+fn user_program(package: &str, arch: Arch) -> Result<PathBuf, String> {
+    println!("== building {package} ({})", arch.name());
+    let mut build = cargo();
+    if arch == Arch::Aarch64 {
+        // x86_64-unknown-none is static-pie by default; this target is not.
+        build.env(
+            "CARGO_TARGET_AARCH64_UNKNOWN_NONE_SOFTFLOAT_RUSTFLAGS",
+            "-C relocation-model=pie -C link-arg=-pie -C link-arg=--no-dynamic-linker",
+        );
+    }
+    run(build.args([
         "build",
         "--quiet",
         "-p",
         package,
         "--release",
         "--target",
-        KERNEL_TARGET,
+        arch.target(),
+        "--target-dir",
+        "target/user",
     ]))?;
     Ok(root()
-        .join("target")
-        .join(KERNEL_TARGET)
+        .join("target/user")
+        .join(arch.target())
         .join("release")
         .join(package))
 }
 
-fn image(selftest: bool) -> Result<PathBuf, String> {
-    let user = user_program("superior-pingpong")?;
-    let shell = user_program("superior-shell")?;
+fn image(selftest: bool, arch: Arch) -> Result<Image, String> {
+    let user = user_program("superior-pingpong", arch)?;
+    let shell = user_program("superior-shell", arch)?;
     println!(
-        "== building kernel{}",
-        if selftest { " (selftest)" } else { "" }
+        "== building kernel ({}{})",
+        arch.name(),
+        if selftest { ", selftest" } else { "" }
     );
     let mut build = cargo();
     build.env("SUPERIOR_USER_ELF", &user);
@@ -125,7 +189,7 @@ fn image(selftest: bool) -> Result<PathBuf, String> {
         "superior-kernel",
         "--release",
         "--target",
-        KERNEL_TARGET,
+        arch.target(),
     ]);
     if selftest {
         build.args(["--features", "selftest"]);
@@ -134,55 +198,78 @@ fn image(selftest: bool) -> Result<PathBuf, String> {
 
     let target = root().join("target");
     let kernel = target
-        .join(KERNEL_TARGET)
+        .join(arch.target())
         .join("release")
         .join("superior-kernel");
-    let img = target.join(if selftest {
-        "superior-selftest.img"
-    } else {
-        "superior.img"
-    });
-    bootloader::BiosBoot::new(&kernel)
-        .create_disk_image(&img)
-        .map_err(|e| format!("creating disk image: {e}"))?;
-    Ok(img)
+    let suffix = if selftest { "-selftest" } else { "" };
+    let path = match arch {
+        Arch::X86_64 => {
+            let img = target.join(format!("superior{suffix}.img"));
+            bootloader::BiosBoot::new(&kernel)
+                .create_disk_image(&img)
+                .map_err(|e| format!("creating disk image: {e}"))?;
+            img
+        }
+        Arch::Aarch64 => {
+            let elf = target.join(format!("superior-aarch64{suffix}.elf"));
+            std::fs::copy(&kernel, &elf).map_err(|e| format!("copying kernel: {e}"))?;
+            elf
+        }
+    };
+    Ok(Image { path, arch })
 }
 
-fn qemu() -> PathBuf {
-    if let Ok(p) = env::var("QEMU") {
+fn qemu(arch: Arch) -> PathBuf {
+    let (var, exe) = match arch {
+        Arch::X86_64 => ("QEMU", "qemu-system-x86_64"),
+        Arch::Aarch64 => ("QEMU_AARCH64", "qemu-system-aarch64"),
+    };
+    if let Ok(p) = env::var(var) {
         return p.into();
     }
-    let windows_default = Path::new(r"C:\Program Files\qemu\qemu-system-x86_64.exe");
+    let windows_default = Path::new(r"C:\Program Files\qemu").join(format!("{exe}.exe"));
     if windows_default.exists() {
-        return windows_default.into();
+        return windows_default;
     }
-    "qemu-system-x86_64".into()
+    exe.into()
 }
 
-fn qemu_command(img: &Path) -> Command {
-    let mut q = Command::new(qemu());
-    q.arg("-drive")
-        .arg(format!("format=raw,file={}", img.display()))
-        .args(["-m", "512M", "-serial", "stdio", "-no-reboot"])
-        .args(["-device", "isa-debug-exit,iobase=0xf4,iosize=0x04"]);
+fn qemu_command(img: &Image) -> Command {
+    let mut q = Command::new(qemu(img.arch));
+    match img.arch {
+        Arch::X86_64 => {
+            q.arg("-drive")
+                .arg(format!("format=raw,file={}", img.path.display()))
+                .args(["-device", "isa-debug-exit,iobase=0xf4,iosize=0x04"]);
+        }
+        Arch::Aarch64 => {
+            q.args(["-machine", "virt", "-cpu", "cortex-a72", "-kernel"])
+                .arg(&img.path)
+                .args(["-semihosting-config", "enable=on,target=native"]);
+        }
+    }
+    q.args(["-m", "512M", "-serial", "stdio", "-no-reboot"]);
     q
 }
 
-fn boot(img: &Path, selftest: bool) -> Result<(), String> {
-    println!("== booting {}", img.display());
+fn boot(img: &Image, selftest: bool) -> Result<(), String> {
+    println!("== booting {}", img.path.display());
     let mut q = qemu_command(img);
-    if selftest {
+    if selftest || img.arch == Arch::Aarch64 {
         q.args(["-display", "none"]);
     }
     let status = q
         .status()
-        .map_err(|e| format!("could not start QEMU ({}): {e}", qemu().display()))?;
+        .map_err(|e| format!("could not start QEMU ({}): {e}", qemu(img.arch).display()))?;
     match (selftest, status.code()) {
         (true, Some(QEMU_PASS)) => {
-            println!("== boot self-tests passed");
+            println!("== boot self-tests passed ({})", img.arch.name());
             Ok(())
         }
-        (true, code) => Err(format!("boot self-tests failed (QEMU exit {code:?})")),
+        (true, code) => Err(format!(
+            "boot self-tests failed on {} (QEMU exit {code:?})",
+            img.arch.name()
+        )),
         (false, _) => Ok(()),
     }
 }
@@ -191,13 +278,13 @@ fn boot(img: &Path, selftest: bool) -> Result<(), String> {
 /// person would: wait for the prompt, type a command, check the answer.
 /// The shell's own `shutdown` command must then end QEMU with the pass
 /// code.
-fn shell_session(img: &Path) -> Result<(), String> {
-    println!("== shell session on {}", img.display());
+fn shell_session(img: &Image) -> Result<(), String> {
+    println!("== shell session on {}", img.path.display());
     // (typed text, text the answer must contain).
     let script: &[(&str, &str)] = &[
         ("help", "shutdown        power off"),
         ("echo hello from user space", "\nhello from user space"),
-        ("about", "its own COM1 driver"),
+        ("about", "its own serial driver"),
         ("sleep 20", "slept 20 ticks"),
         ("ipc 20000", "20000 round trips to another thread"),
         ("frobnicate", "unknown command: frobnicate"),
@@ -205,7 +292,7 @@ fn shell_session(img: &Path) -> Result<(), String> {
         ("echp\x7fo fixed", "\nfixed"),
     ];
     drive_shell(img, &[], script)?;
-    println!("== shell session passed");
+    println!("== shell session passed ({})", img.arch.name());
     Ok(())
 }
 
@@ -213,14 +300,14 @@ fn shell_session(img: &Path) -> Result<(), String> {
 /// serial port as a person would: wait for the prompt, type a command,
 /// check the answer, and finally `shutdown`, which must end QEMU with the
 /// pass code. Returns everything the shell printed.
-fn drive_shell(img: &Path, extra: &[&str], script: &[(&str, &str)]) -> Result<String, String> {
+fn drive_shell(img: &Image, extra: &[&str], script: &[(&str, &str)]) -> Result<String, String> {
     let mut child = qemu_command(img)
         .args(["-display", "none"])
         .args(extra)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
-        .map_err(|e| format!("could not start QEMU ({}): {e}", qemu().display()))?;
+        .map_err(|e| format!("could not start QEMU ({}): {e}", qemu(img.arch).display()))?;
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = child.stdout.take().unwrap();
     let seen = Arc::new(Mutex::new(Vec::<u8>::new()));
@@ -319,7 +406,7 @@ const BENCH_RUNS: usize = 5;
 /// reports one-way call and reply costs measured as sel4bench does. The
 /// gate is on the middle run's medians, since host interrupts stretch a
 /// few rounds under a hypervisor; the means are reported too.
-fn bench(img: &Path) -> Result<(), String> {
+fn bench(img: &Image) -> Result<(), String> {
     let accel: &[&str] = if cfg!(windows) {
         // WHPX: the in-kernel irqchip and nested VT-x are not available
         // on every Hyper-V host.
@@ -327,7 +414,7 @@ fn bench(img: &Path) -> Result<(), String> {
     } else {
         &["-accel", "kvm", "-cpu", "host"]
     };
-    println!("== IPC benchmark on {} ({})", img.display(), accel[1]);
+    println!("== IPC benchmark on {} ({})", img.path.display(), accel[1]);
     let script = [("ipc 100000", "(median)"); BENCH_RUNS];
     let out = drive_shell(img, accel, &script)?;
     let number_after = |line: &str, key: &str| -> Option<u64> {

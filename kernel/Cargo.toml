@@ -19,7 +19,9 @@ selftest = []
 
 [dependencies]
 superior-objects = { path = "../crates/objects" }
+spin = { version = "0.9", default-features = false, features = ["spin_mutex", "lazy"] }
+
+[target.'cfg(target_arch = "x86_64")'.dependencies]
 bootloader_api = "0.11"
 x86_64 = "0.15"
 uart_16550 = "0.3"
-spin = { version = "0.9", default-features = false, features = ["spin_mutex", "lazy"] }

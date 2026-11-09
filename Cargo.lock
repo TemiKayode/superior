@@ -411,10 +411,19 @@ name = "superior-pingpong"
 version = "0.1.0"
 dependencies = [
  "superior-objects",
+ "superior-sys",
 ]
 
 [[package]]
 name = "superior-shell"
+version = "0.1.0"
+dependencies = [
+ "superior-objects",
+ "superior-sys",
+]
+
+[[package]]
+name = "superior-sys"
 version = "0.1.0"
 dependencies = [
  "superior-objects",

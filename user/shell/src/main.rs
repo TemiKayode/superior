@@ -1,32 +1,32 @@
 //! The Superior boot shell.
 //!
 //! One user process that is also its own serial driver: the kernel gives it
-//! COM1's I/O ports and interrupt line as capabilities, and nothing about
-//! the console lives in the kernel. Each COM1 interrupt arrives as a signal
-//! on a notification; the shell drains the UART's receive buffer, then
+//! the UART and its interrupt line as capabilities, and nothing about the
+//! console lives in the kernel. Each UART interrupt arrives as a signal on
+//! a notification; the shell drains the UART's receive buffer, then
 //! acknowledges the interrupt so the kernel unmasks the line.
 //!
 //! Its capabilities (slots), from the kernel at boot:
 //!
 //! | Slot | Capability |
 //! | --- | --- |
-//! | 0 | I/O ports 0x3f8-0x3ff (COM1), read and write |
-//! | 1 | COM1's interrupt line |
+//! | 0 | the UART: I/O ports 0x3f8-0x3ff (COM1) on x86-64; on AArch64 the PL011's register page, a device frame the shell maps |
+//! | 1 | the UART's interrupt line |
 //! | 2 | a notification the interrupt signals |
 //! | 3 | the timer notification (one signal per 10 ms tick) |
 //! | 4 | 64 KiB of untyped memory |
-//! | 5 | I/O port 0xf4, QEMU's exit device |
+//! | 5 | I/O port 0xf4, QEMU's exit device (emulated on AArch64) |
 
 #![no_std]
 #![no_main]
 
-use core::arch::asm;
 use core::fmt::{self, Write};
-use superior_objects::abi::{CapTransfer, MSG_WORDS, ObjectType, Syscall};
+use superior_objects::abi::{ObjectType, Syscall};
+use superior_sys::{cycles, syscall};
 
-const COM1: u64 = 0;
-const COM1_IRQ: u64 = 1;
-const COM1_NTFN: u64 = 2;
+const UART: u64 = 0;
+const UART_IRQ: u64 = 1;
+const UART_NTFN: u64 = 2;
 const TIMER: u64 = 3;
 const UNTYPED: u64 = 4;
 const EXIT_PORT: u64 = 5;
@@ -42,60 +42,105 @@ const ECHO_STACK_VA: u64 = USER_BASE + 0x4000_0000;
 const RIGHT_READ: u64 = 1 << 0;
 const RIGHT_WRITE: u64 = 1 << 1;
 
-const PORT_DATA: u64 = 0x3f8;
-const PORT_LSR: u64 = 0x3fd;
-const LSR_DATA_READY: u64 = 1 << 0;
-const LSR_THR_EMPTY: u64 = 1 << 5;
-
 const PROMPT: &str = "superior> ";
 const LINE_MAX: usize = 120;
 
-struct Ret {
-    status: u64,
-    msg: [u64; MSG_WORDS],
-}
-
-#[inline(always)]
-fn syscall(nr: Syscall, a0: u64, m: [u64; MSG_WORDS]) -> Ret {
-    let (status, m0, m1, m2, m3): (u64, u64, u64, u64, u64);
-    // SAFETY: the kernel preserves every register except rax, rdi, rsi,
-    // rdx, r8, r9, r10 (outputs) and rcx, r11 (clobbered by `syscall`).
-    unsafe {
-        asm!(
-            "syscall",
-            inlateout("rax") nr as u64 => status,
-            inlateout("rdi") a0 => _,
-            inlateout("rsi") m[0] => m0,
-            inlateout("rdx") m[1] => m1,
-            inlateout("r8") m[2] => m2,
-            inlateout("r9") m[3] => m3,
-            inlateout("r10") CapTransfer::NONE.encode() => _,
-            lateout("rcx") _,
-            lateout("r11") _,
-            options(nostack),
-        );
-    }
-    Ret {
-        status,
-        msg: [m0, m1, m2, m3],
-    }
-}
-
 // ---- the serial driver -------------------------------------------------
 
-fn port_in(port: u64) -> u64 {
-    syscall(Syscall::IoPortIn, COM1, [port, 1, 0, 0]).msg[0]
+/// COM1, a 16550, through I/O-port system calls.
+#[cfg(target_arch = "x86_64")]
+mod uart {
+    use super::*;
+
+    const PORT_DATA: u64 = 0x3f8;
+    const PORT_LSR: u64 = 0x3fd;
+    const LSR_DATA_READY: u64 = 1 << 0;
+    const LSR_THR_EMPTY: u64 = 1 << 5;
+
+    fn port_in(port: u64) -> u64 {
+        syscall(Syscall::IoPortIn, UART, [port, 1, 0, 0]).msg[0]
+    }
+
+    fn port_out(port: u64, value: u64) {
+        syscall(Syscall::IoPortOut, UART, [port, 1, value, 0]);
+    }
+
+    /// The kernel already enabled the receive interrupt for its console.
+    pub fn init() -> u64 {
+        0
+    }
+
+    pub fn try_read() -> Option<u8> {
+        (port_in(PORT_LSR) & LSR_DATA_READY != 0).then(|| port_in(PORT_DATA) as u8)
+    }
+
+    pub fn write(b: u8) {
+        while port_in(PORT_LSR) & LSR_THR_EMPTY == 0 {
+            core::hint::spin_loop();
+        }
+        port_out(PORT_DATA, b as u64);
+    }
+
+    /// Reading the data register cleared the interrupt.
+    pub fn clear_interrupt() {}
 }
 
-fn port_out(port: u64, value: u64) {
-    syscall(Syscall::IoPortOut, COM1, [port, 1, value, 0]);
+/// A PL011, through its register page mapped into this address space.
+#[cfg(target_arch = "aarch64")]
+mod uart {
+    use super::*;
+
+    const UART_VA: u64 = USER_BASE + 0x3000_0000;
+    const DR: u64 = 0x00;
+    const FR: u64 = 0x18;
+    const IMSC: u64 = 0x38;
+    const ICR: u64 = 0x44;
+    const FR_RXFE: u32 = 1 << 4;
+    const FR_TXFF: u32 = 1 << 5;
+    /// Receive and receive-timeout interrupts.
+    const RX_INTERRUPTS: u32 = (1 << 4) | (1 << 6);
+
+    fn reg(off: u64) -> *mut u32 {
+        (UART_VA + off) as *mut u32
+    }
+
+    fn read_reg(off: u64) -> u32 {
+        // SAFETY: the register page is mapped at UART_VA by `init`.
+        unsafe { core::ptr::read_volatile(reg(off)) }
+    }
+
+    fn write_reg(off: u64, v: u32) {
+        // SAFETY: as in `read_reg`.
+        unsafe { core::ptr::write_volatile(reg(off), v) }
+    }
+
+    /// Maps the register page and enables the receive interrupts.
+    pub fn init() -> u64 {
+        let status = syscall(Syscall::FrameMap, UART, [UART_VA, 1, 0, 0]).status;
+        if status == 0 {
+            write_reg(IMSC, read_reg(IMSC) | RX_INTERRUPTS);
+        }
+        status
+    }
+
+    pub fn try_read() -> Option<u8> {
+        (read_reg(FR) & FR_RXFE == 0).then(|| read_reg(DR) as u8)
+    }
+
+    pub fn write(b: u8) {
+        while read_reg(FR) & FR_TXFF != 0 {
+            core::hint::spin_loop();
+        }
+        write_reg(DR, b as u32);
+    }
+
+    pub fn clear_interrupt() {
+        write_reg(ICR, RX_INTERRUPTS);
+    }
 }
 
 fn put_byte(b: u8) {
-    while port_in(PORT_LSR) & LSR_THR_EMPTY == 0 {
-        core::hint::spin_loop();
-    }
-    port_out(PORT_DATA, b as u64);
+    uart::write(b);
 }
 
 /// The console: output goes straight to the UART.
@@ -124,11 +169,12 @@ macro_rules! outln {
 /// interrupt.
 fn get_byte() -> u8 {
     loop {
-        if port_in(PORT_LSR) & LSR_DATA_READY != 0 {
-            return port_in(PORT_DATA) as u8;
+        if let Some(b) = uart::try_read() {
+            return b;
         }
-        syscall(Syscall::Wait, COM1_NTFN, [0; 4]);
-        syscall(Syscall::IrqAck, COM1_IRQ, [0; 4]);
+        syscall(Syscall::Wait, UART_NTFN, [0; 4]);
+        uart::clear_interrupt();
+        syscall(Syscall::IrqAck, UART_IRQ, [0; 4]);
     }
 }
 
@@ -170,9 +216,13 @@ fn help() {
 }
 
 fn about() {
-    outln!("Superior {} on x86-64", env!("CARGO_PKG_VERSION"));
-    outln!("This shell is a user process and its own COM1 driver: the kernel");
-    outln!("gave it the UART's ports and interrupt line as capabilities.");
+    outln!(
+        "Superior {} on {}",
+        env!("CARGO_PKG_VERSION"),
+        superior_sys::ARCH
+    );
+    outln!("This shell is a user process and its own serial driver: the kernel");
+    outln!("gave it the UART and its interrupt line as capabilities.");
 }
 
 fn sleep(arg: &str) {
@@ -194,9 +244,9 @@ fn sleep(arg: &str) {
 extern "C" fn echo_server(_: u64) -> ! {
     let mut r = syscall(Syscall::Recv, ECHO_SLOT, [0; 4]);
     loop {
-        let arrived = rdtsc();
+        let arrived = cycles();
         let n = r.msg[0] + 1;
-        let replying = rdtsc();
+        let replying = cycles();
         r = syscall(Syscall::ReplyRecv, ECHO_SLOT, [n, arrived, replying, 0]);
     }
 }
@@ -222,11 +272,6 @@ fn start_echo() -> Result<(), u64> {
         [entry, ECHO_STACK_VA + 0x1000, 0, 10],
     ))?;
     check(tcb(Syscall::ThreadResume, [0; 4]))
-}
-
-fn rdtsc() -> u64 {
-    // SAFETY: rdtsc has no preconditions.
-    unsafe { core::arch::x86_64::_rdtsc() }
 }
 
 /// Histograms of timings in 8-cycle buckets, for medians: under a
@@ -294,9 +339,9 @@ fn ipc(arg: &str, started: &mut bool) {
     let (mut min, mut total) = (u64::MAX, 0u64);
     let (mut call_total, mut reply_total) = (0u64, 0u64);
     for i in 0..rounds {
-        let t0 = rdtsc();
+        let t0 = cycles();
         let r = syscall(Syscall::Call, ECHO_EP, [i, 0, 0, 0]);
-        let t1 = rdtsc();
+        let t1 = cycles();
         if r.status != 0 || r.msg[0] != i + 1 {
             outln!("round {i} failed: status {} reply {}", r.status, r.msg[0]);
             return;
@@ -334,17 +379,21 @@ fn shutdown() -> ! {
     syscall(Syscall::IoPortOut, EXIT_PORT, [0xf4, 4, 0x10, 0]);
     // Not under QEMU: stop here.
     loop {
-        syscall(Syscall::Wait, COM1_NTFN, [0; 4]);
+        syscall(Syscall::Wait, UART_NTFN, [0; 4]);
     }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(_: u64) -> ! {
-    let bound = syscall(Syscall::IrqSetNotification, COM1_IRQ, [COM1_NTFN, 0, 0, 0]);
+    let mapped = uart::init();
+    let bound = syscall(Syscall::IrqSetNotification, UART_IRQ, [UART_NTFN, 0, 0, 0]);
     outln!();
     outln!("Superior shell. Type 'help' for commands.");
-    if bound.status != 0 {
-        outln!("(no serial interrupt: error {})", bound.status);
+    if mapped != 0 || bound.status != 0 {
+        outln!(
+            "(serial interrupt not set up: map {mapped}, bind {})",
+            bound.status
+        );
     }
     let mut echo_started = false;
     let mut buf = [0u8; LINE_MAX];
@@ -370,6 +419,6 @@ pub extern "C" fn _start(_: u64) -> ! {
 fn panic(_: &core::panic::PanicInfo) -> ! {
     outln!("shell panic");
     loop {
-        syscall(Syscall::Wait, COM1_NTFN, [0; 4]);
+        syscall(Syscall::Wait, UART_NTFN, [0; 4]);
     }
 }

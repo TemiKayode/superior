@@ -14,3 +14,4 @@ bench = false
 
 [dependencies]
 superior-objects = { path = "../../crates/objects" }
+superior-sys = { path = "../../crates/sys" }

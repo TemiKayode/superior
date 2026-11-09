@@ -1,0 +1,11 @@
+[package]
+name = "superior-sys"
+description = "User-side system call wrappers for Superior, x86-64 and AArch64."
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+edition = "2024"
+publish = false
+
+[dependencies]
+superior-objects = { path = "../objects" }

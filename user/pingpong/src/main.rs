@@ -26,6 +26,9 @@
 //! thread blocked, that only returns if the kernel idles and the timer
 //! wakes it.
 //!
+//! The same program runs on x86-64 and AArch64; only the instructions the
+//! fault tests use differ.
+//!
 //! Timings under QEMU's software emulation say nothing about real
 //! hardware; they are printed so the same binary can be measured on metal.
 
@@ -35,9 +38,8 @@
 use core::arch::asm;
 use core::fmt::{self, Write};
 use core::sync::atomic::{AtomicU64, Ordering};
-use superior_objects::abi::{
-    CapTransfer, Error, FaultKind, FaultReply, MSG_WORDS, ObjectType, Syscall,
-};
+use superior_objects::abi::{CapTransfer, Error, FaultKind, FaultReply, ObjectType, Syscall};
+use superior_sys::{Ret, syscall, syscall_x};
 
 const EP: u64 = 0;
 const EMPTY_SLOT: u64 = 5;
@@ -104,47 +106,6 @@ const CLIENT_BADGE: u64 = 0xC1;
 const WARMUP: u64 = 1_000;
 const ROUNDS: u64 = 20_000;
 
-struct Ret {
-    status: u64,
-    badge: u64,
-    msg: [u64; MSG_WORDS],
-    /// Slot a capability arrived in, if any.
-    cap: Option<u16>,
-}
-
-#[inline(always)]
-fn syscall(nr: Syscall, a0: u64, m: [u64; MSG_WORDS]) -> Ret {
-    syscall_x(nr, a0, m, CapTransfer::NONE)
-}
-
-#[inline(always)]
-fn syscall_x(nr: Syscall, a0: u64, m: [u64; MSG_WORDS], x: CapTransfer) -> Ret {
-    let (status, badge, m0, m1, m2, m3, cap): (u64, u64, u64, u64, u64, u64, u64);
-    // SAFETY: the kernel preserves every register except rax, rdi, rsi,
-    // rdx, r8, r9, r10 (outputs) and rcx, r11 (clobbered by `syscall`).
-    unsafe {
-        asm!(
-            "syscall",
-            inlateout("rax") nr as u64 => status,
-            inlateout("rdi") a0 => badge,
-            inlateout("rsi") m[0] => m0,
-            inlateout("rdx") m[1] => m1,
-            inlateout("r8") m[2] => m2,
-            inlateout("r9") m[3] => m3,
-            inlateout("r10") x.encode() => cap,
-            lateout("rcx") _,
-            lateout("r11") _,
-            options(nostack),
-        );
-    }
-    Ret {
-        status,
-        badge,
-        msg: [m0, m1, m2, m3],
-        cap: if cap == 0 { None } else { Some(cap as u16 - 1) },
-    }
-}
-
 fn put_str(s: &str) {
     syscall(
         Syscall::DebugPutStr,
@@ -196,8 +157,92 @@ macro_rules! say {
 }
 
 fn rdtsc() -> u64 {
-    // SAFETY: rdtsc has no preconditions.
-    unsafe { core::arch::x86_64::_rdtsc() }
+    superior_sys::cycles()
+}
+
+/// Lengths of the instructions the fault tests use, which the handler
+/// skips: a load, a store, a privileged instruction, an invalid opcode.
+#[cfg(target_arch = "x86_64")]
+const FAULTING_LEN: (u64, u64, u64, u64) = (3, 3, 1, 2);
+#[cfg(target_arch = "aarch64")]
+const FAULTING_LEN: (u64, u64, u64, u64) = (4, 4, 4, 4);
+
+/// Loads from `addr`, which faults; the handler skips the load and supplies
+/// the loaded register. A callee-saved register must come back intact.
+fn faulting_load(addr: u64) -> (u64, u64) {
+    let (value, kept): (u64, u64);
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: the load faults; the handler skips it and supplies rax.
+    // `mov rax, [rdi]` is exactly 3 bytes (48 8b 07).
+    unsafe {
+        asm!(
+            "mov rax, qword ptr [rdi]",
+            in("rdi") addr,
+            out("rax") value,
+            inout("r12") 0x1234_5678u64 => kept,
+            options(nostack),
+        );
+    }
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: the load faults; the handler skips it and supplies x0.
+    unsafe {
+        asm!(
+            "ldr x0, [x1]",
+            in("x1") addr,
+            out("x0") value,
+            inout("x20") 0x1234_5678u64 => kept,
+            options(nostack),
+        );
+    }
+    (value, kept)
+}
+
+/// Stores to `addr`, which faults; returns what the handler put in the
+/// first result register.
+fn faulting_store(addr: u64) -> u64 {
+    let code: u64;
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: the store faults; the handler skips it.
+    // `mov [rdi], rax` is exactly 3 bytes (48 89 07).
+    unsafe {
+        asm!(
+            "mov qword ptr [rdi], rax",
+            in("rdi") addr,
+            inout("rax") 0u64 => code,
+            options(nostack),
+        );
+    }
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: the store faults; the handler skips it.
+    unsafe {
+        asm!(
+            "str x0, [x1]",
+            in("x1") addr,
+            inout("x0") 0u64 => code,
+            options(nostack),
+        );
+    }
+    code
+}
+
+/// A privileged instruction (`hlt`; on AArch64 `wfi`, which the kernel
+/// traps from user mode) and an invalid opcode (`ud2`; `udf #0`). Returns
+/// what the handler reported for each.
+fn privileged_and_invalid() -> (u64, u64) {
+    let (gp, ud): (u64, u64);
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: both instructions fault in user mode; the handler skips them.
+    unsafe {
+        asm!("hlt", inout("rax") 0u64 => gp, options(nostack, nomem));
+        asm!("ud2", inout("rax") 0u64 => ud, options(nostack, nomem));
+    }
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: both instructions fault in user mode; the handler skips them.
+    unsafe {
+        asm!("wfi", inout("x0") 0u64 => gp, options(nostack, nomem));
+        asm!("udf #0", inout("x0") 0u64 => ud, options(nostack, nomem));
+    }
+    (gp, ud)
 }
 
 #[unsafe(no_mangle)]
@@ -455,32 +500,26 @@ fn frame_tests() -> bool {
 }
 
 /// The server as fault handler. It knows the client's test instructions
-/// (a 3-byte load or store, `hlt`, `ud2`) and skips them, handing back in
-/// `rax` what the kernel reported so the client can check it.
-fn fault_reply([kind, addr, rip, code]: [u64; 4]) -> [u64; 4] {
-    let resume = |len: u64, rax: u64| [FaultReply::ResumeAt as u64, rip + len, rax, 0];
+/// (a load or store, a privileged instruction, an invalid opcode) and skips
+/// them, handing back in the first result register (`rax`, `x0`) what the
+/// kernel reported so the client can check it.
+fn fault_reply([kind, addr, pc, code]: [u64; 4]) -> [u64; 4] {
+    let resume = |len: u64, value: u64| [FaultReply::ResumeAt as u64, pc + len, value, 0];
+    let (load, store, privileged, invalid) = FAULTING_LEN;
     match FaultKind::from_u64(kind) {
-        Some(FaultKind::PageFault) if code & 2 != 0 => resume(3, code),
-        Some(FaultKind::PageFault) => resume(3, addr),
-        Some(FaultKind::GeneralProtection) => resume(1, kind),
-        Some(FaultKind::InvalidOpcode) => resume(2, kind),
+        Some(FaultKind::PageFault) if code & 2 != 0 => resume(store, code),
+        Some(FaultKind::PageFault) => resume(load, addr),
+        Some(FaultKind::GeneralProtection) => resume(privileged, kind),
+        Some(FaultKind::InvalidOpcode) => resume(invalid, kind),
         _ => [FaultReply::Stop as u64, 0, 0, 0],
     }
 }
 
 /// A thread the client creates in its own address space.
 extern "C" fn worker(arg: u64) -> ! {
-    let seen: u64;
-    // SAFETY: faults; the inherited handler (the server) skips the 3-byte
-    // load and hands back the faulting address in rax.
-    unsafe {
-        asm!(
-            "mov rax, qword ptr [rdi]",
-            in("rdi") UNMAPPED,
-            out("rax") seen,
-            options(nostack),
-        );
-    }
+    // Faults; the inherited handler (the server) skips the load and hands
+    // back the faulting address.
+    let (seen, _) = faulting_load(UNMAPPED);
     WORKER_FAULT.store(seen, Ordering::SeqCst);
     WORKER_RESULT.store(arg * 3, Ordering::SeqCst);
     syscall(Syscall::Signal, W_DONE, [0; 4]);
@@ -589,18 +628,7 @@ fn fault_tests() -> bool {
         0,
     );
 
-    let (value, kept): (u64, u64);
-    // SAFETY: the load faults; the handler skips it and supplies rax.
-    // `mov rax, [rdi]` is exactly 3 bytes (48 8b 07).
-    unsafe {
-        asm!(
-            "mov rax, qword ptr [rdi]",
-            in("rdi") UNMAPPED,
-            out("rax") value,
-            inout("r12") 0x1234_5678u64 => kept,
-            options(nostack),
-        );
-    }
+    let (value, kept) = faulting_load(UNMAPPED);
     pass &= expect(
         "a page fault reaches the handler with its address, and the thread resumes",
         ok(value == UNMAPPED && kept == 0x1234_5678),
@@ -612,17 +640,7 @@ fn fault_tests() -> bool {
     let made = retype(UNTYPED, Frame, 0, FRAME_A);
     let ro = mint(FRAME_A, FRAME_RO, RIGHT_READ | RIGHT_MAP, 0);
     let mapped = map(FRAME_RO, VA_RO, false);
-    let code: u64;
-    // SAFETY: the store faults (read-only page); the handler skips it.
-    // `mov [rdi], rax` is exactly 3 bytes (48 89 07).
-    unsafe {
-        asm!(
-            "mov qword ptr [rdi], rax",
-            in("rdi") VA_RO,
-            inout("rax") 0u64 => code,
-            options(nostack),
-        );
-    }
+    let code = faulting_store(VA_RO);
     let untouched = page_is(VA_RO, |_| 0);
     let rv = syscall(Syscall::CapRevoke, UNTYPED, [0; 4]).status;
     pass &= expect(
@@ -631,12 +649,7 @@ fn fault_tests() -> bool {
         1,
     );
 
-    let (gp, ud): (u64, u64);
-    // SAFETY: both instructions fault in user mode; the handler skips them.
-    unsafe {
-        asm!("hlt", inout("rax") 0u64 => gp, options(nostack, nomem));
-        asm!("ud2", inout("rax") 0u64 => ud, options(nostack, nomem));
-    }
+    let (gp, ud) = privileged_and_invalid();
     pass &= expect(
         "a privileged instruction and an invalid opcode reach the handler",
         ok(gp == FaultKind::GeneralProtection as u64 && ud == FaultKind::InvalidOpcode as u64),

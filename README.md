@@ -11,7 +11,19 @@ Superior is a capability-secure microkernel desktop operating system.
 
 ## Status
 
-Phase 0 (foundations). Working today, under QEMU on x86-64:
+Phase 0 (foundations). Working today, under QEMU on x86-64 and AArch64 (one kernel:
+capabilities, threads, IPC, scheduling and the system calls are shared; `kernel/src/arch`
+holds the rest):
+
+- AArch64 on QEMU's `virt` machine: entered at EL1 from the kernel ELF, MMU and caches on
+  before any Rust runs, an identity map of devices and RAM for EL1 only, 4-level page
+  tables for user address spaces at the same user window as x86-64, the device tree read
+  for RAM, a GICv2, the generic timer at 100 Hz, EL0/EL1 exception vectors (`svc`, aborts,
+  undefined instructions, trapped `wfi`, interrupts, `brk`), and semihosting for the exit
+  status. The same user programs (built as static PIE for `aarch64-unknown-none-softfloat`)
+  pass the same boot self-tests and shell session; faults are reported in the same terms
+  on both, so fault handlers are portable. The shell drives the PL011 through a device
+  frame it maps, and `shutdown` uses the same exit-port capability, emulated.
 
 - Boot, serial console, GDT/TSS, exception handlers; the legacy PIC remapped to vector
   0x20 with every line masked until a driver claims one.
@@ -132,7 +144,9 @@ https://claude.ai/artifact/QKJS8qH5Dfbjzn58RStq1j
 
 | Path | What it is |
 | --- | --- |
-| `kernel/` | The microkernel (`no_std`, target `x86_64-unknown-none`) |
+| `kernel/` | The microkernel (`no_std`, targets `x86_64-unknown-none` and `aarch64-unknown-none-softfloat`) |
+| `kernel/src/arch/` | Per-ISA code: boot, exceptions and system call entry, page tables, interrupts, timer, console (`x86_64/`, `aarch64/`) |
+| `crates/sys/` | User-side system call wrappers for both ISAs (one ABI by register position) |
 | `crates/objects/` | Pure kernel logic, unit-tested on the host: capabilities and CNodes, untyped memory, the IPC and scheduling state machine, the syscall ABI, an ELF reader |
 | `user/pingpong/` | Boot self-test program (IPC server, client and spinner) |
 | `user/shell/` | The boot shell and COM1 driver |
@@ -143,13 +157,14 @@ https://claude.ai/artifact/QKJS8qH5Dfbjzn58RStq1j
 Needs Rust (the pinned nightly in `rust-toolchain.toml` installs itself) and QEMU.
 
 ```bash
-cargo xtask test   # host unit tests, model check, long simulation, boot self-tests, shell session
-cargo xtask run    # boot the shell in QEMU, its console on this terminal
+cargo xtask test           # host tests, model check, simulation; then on both ISAs the boot self-tests and a shell session
+cargo xtask run            # boot the shell in QEMU (x86-64), its console on this terminal
+cargo xtask run aarch64    # the same on QEMU's AArch64 virt machine
 cargo xtask image  # just build target/superior.img
 cargo xtask bench  # IPC timing under WHPX or KVM, checked against seL4's figures
 ```
 
-QEMU is found via `$QEMU`, then `C:\Program Files\qemu`, then `PATH`.
+QEMU is found via `$QEMU` (or `$QEMU_AARCH64`), then `C:\Program Files\qemu`, then `PATH`.
 
 ## Roadmap
 
