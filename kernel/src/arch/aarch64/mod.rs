@@ -11,6 +11,8 @@
 pub mod exceptions;
 mod fdt;
 mod gic;
+#[path = "smmu.rs"]
+pub mod iommu;
 pub mod qemu;
 pub mod serial;
 mod timer;
@@ -32,6 +34,13 @@ const UART_IRQ: u8 = 33;
 /// Where QEMU puts the device tree for a bare-metal image.
 const DTB_DEFAULT: u64 = 0x4000_0000;
 const BOOT_STACK_SIZE: usize = 128 * 1024;
+/// The device tree in use, for drivers that look themselves up later.
+static DTB: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Finds and turns on the IOMMU, if the machine has one.
+pub fn iommu_init() -> Option<&'static str> {
+    iommu::init(DTB.load(core::sync::atomic::Ordering::Relaxed))
+}
 
 #[repr(C, align(16))]
 struct Stack([u8; BOOT_STACK_SIZE]);
@@ -126,6 +135,7 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
     kprintln!("[ok] MMU on; exception vectors installed");
 
     let dtb = if fdt::valid(dtb) { dtb } else { DTB_DEFAULT };
+    DTB.store(dtb, core::sync::atomic::Ordering::Relaxed);
     let mut ram = [(0u64, 0u64); fdt::MAX_RANGES];
     let n = fdt::memory(dtb, &mut ram).expect("no usable device tree");
     let kernel_end = core::ptr::addr_of!(__kernel_end) as u64;

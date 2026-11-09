@@ -23,6 +23,7 @@ mod arch;
 #[path = "arch/x86_64/mod.rs"]
 mod arch;
 
+mod iommu;
 mod memory;
 mod task;
 
@@ -67,6 +68,10 @@ fn report_memory(mem: &memory::Summary) {
 
 /// Called by the architecture code once the machine is up.
 fn kernel_start(untyped_caps: usize) -> ! {
+    match arch::iommu_init() {
+        Some(name) => kprintln!("[ok] IOMMU: {name}, all DMA blocked until bound"),
+        None => kprintln!("[ok] no IOMMU"),
+    }
     #[cfg(feature = "selftest")]
     selftest(untyped_caps);
     #[cfg(not(feature = "selftest"))]
@@ -152,9 +157,15 @@ fn start_component_manager() -> Result<(), &'static str> {
                 )
             }),
     );
-    let mut all = [(0, caps[0].1); 16];
+    let iommu = arch::iommu::present().then(|| {
+        (
+            root::IOMMU as usize,
+            Capability::new(Object::IommuControl, Rights::ALL),
+        )
+    });
+    let mut all = [(0, caps[0].1); 24];
     let mut n = 0;
-    for c in caps.into_iter().chain(pci) {
+    for c in caps.into_iter().chain(pci).chain(iommu) {
         all[n] = c;
         n += 1;
     }

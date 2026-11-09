@@ -169,23 +169,39 @@ holds the rest):
   - Kernel: MSI vectors delivered as notification signals, with `IrqMsiMessage`
     saying what the device must write (local APIC vectors on x86-64, GICv2m on
     AArch64).
-  - Kernel: `FrameDmaAddress`, the address a device uses for a frame.
+  - Kernel: the IOMMU. Intel VT-d on x86-64 (QEMU q35 with `intel-iommu`) and Arm
+    SMMUv3 on AArch64 (`virt,iommu=smmuv3`) share one I/O page-table walker
+    (`kernel/src/iommu.rs`). Once the kernel turns the IOMMU on, no PCI function
+    can reach any memory. An I/O address space (`IoSpace`, an IOMMU domain) is
+    made from untyped memory like an address space, and bound to one function's
+    requester ID with the IOMMU-control capability (`IoSpaceBind`). `IoMap` puts a
+    page of RAM (never device memory) into it, and deleting or revoking that frame
+    capability takes it out again. Destroying the space unbinds the function first,
+    so its DMA stops before anything else happens.
   - The root task gets PCI configuration space (ports 0xcf8-0xcff, or ECAM), a BAR
     window and eight MSI vectors, and gives them to the PCI bus server
     (`user/pcibus/`), the only component that touches configuration space. It finds
     the functions on bus 0, assigns BARs, and serves the versioned `pci` interface
     (`crates/objects/src/interfaces.rs`). A driver opens one function and gets only
     its BAR pages and MSI vectors; configuration writes are limited to bus
-    mastering and MSI-X. Opening resets the function: decoding and bus mastering
-    off, the last owner's BAR pages and vectors revoked, MSI-X off, then a Function
-    Level Reset where the device has one.
+    mastering and MSI-X. Each opened function gets a new, empty IOMMU domain with
+    the `OPEN` reply; without an IOMMU, bus mastering is refused. Opening resets
+    the function: the last owner's domain revoked first (every copy, so its DMA is
+    blocked), then decoding and bus mastering off, the last owner's BAR pages and
+    vectors revoked, MSI-X off, then a Function Level Reset where the device has
+    one.
   - The Driver SDK (`crates/driver/`): the bus server client, MMIO registers, DMA
-    pages, split virtqueues.
+    pages mapped into the device's domain, split virtqueues.
   - A virtio-blk driver (`user/virtio-blk/`) serves the versioned `block`
     interface: reads land by DMA straight in a frame the client lends with the call.
+    The device reaches that frame only while the read is in flight: the driver maps
+    it into the domain, and deleting it before the reply unmaps it.
   `cargo xtask drivers-test` boots `boot/drivers.manifest` with a test disk:
   - the client reads it and checks every word;
   - the bus server refuses the client the driver's device and its BARs;
+  - the driver points its device at a page of its own outside the domain, and the
+    page must stay untouched (it does on both ISAs; with QEMU's virtio IOMMU
+    bypass left on, the same test fails);
   - the driver is crashed, restarted, its device reset and reopened, and reads work
     again.
 - Static-pie user programs loaded into their own address spaces and relocated.
@@ -215,9 +231,10 @@ holds the rest):
   notifications, a 256-slot CNode pool) so filling them stays quick; normal kernels have
   32 of each, 32 address spaces and a 4096-slot pool.
 
-Not yet: the IOMMU (VT-d, SMMUv3), so DMA can reach only buffers granted to a
-driver (today a driver could program its device to DMA anywhere) and MSI writes are
-remapped; Function Level Reset is coded but not yet exercised (QEMU's virtio devices on
+Not yet: interrupt remapping (a device can still write any MSI message, though only
+to the interrupt controller), IOMMU fault reporting (blocked DMA is dropped
+silently), buses behind bridges in the IOMMU (requester IDs on bus 0 only); Function
+Level Reset is coded but not yet exercised (QEMU's virtio devices on
 these buses have none); buses behind bridges; the async executor, buffer pools and
 power callbacks of the SDK; an IDL compiler for the interfaces; escalating a component
 given up on to a supervisor above it (today the

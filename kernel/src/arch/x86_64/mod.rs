@@ -6,6 +6,7 @@ pub mod apic;
 mod boot_memory;
 pub mod gdt;
 pub mod interrupts;
+pub mod iommu;
 pub mod qemu;
 pub mod serial;
 pub mod syscall;
@@ -21,6 +22,11 @@ use bootloader_api::{entry_point, BootInfo};
 use superior_objects::cap::{Capability, Object, Rights};
 
 pub const NAME: &str = "x86_64";
+
+/// Finds and turns on the IOMMU, if the machine has one.
+pub fn iommu_init() -> Option<&'static str> {
+    iommu::init()
+}
 
 pub static BOOTLOADER_CONFIG: BootloaderConfig = {
     let mut config = BootloaderConfig::new_default();

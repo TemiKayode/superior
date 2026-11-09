@@ -172,6 +172,23 @@ pub enum Syscall {
     /// page). Device frames may alias; who gets which is the holder's
     /// policy (the PCI bus server's).
     DeviceFrame = 36,
+    /// Binds the I/O address space in slot `rdi` to the PCI function with
+    /// requester ID `rdx` (bus << 8 | device << 3 | function), using the
+    /// IOMMU-control capability in slot `rsi`. From then on the function's
+    /// DMA is translated through that space and can reach only what is
+    /// mapped in it. A function is bound to at most one space, and a space
+    /// to one function; destroying the space unbinds it, which blocks the
+    /// function's DMA altogether.
+    IoSpaceBind = 37,
+    /// Maps the frame in slot `rdi` (Map right; RAM, not device memory)
+    /// into the I/O address space in slot `rsi`, writable by the device if
+    /// `rdx` = 1. Returns the address the device uses for it in message
+    /// word 0. Deleting or revoking that frame capability unmaps it, so a
+    /// buffer lent to a driver is reachable only while it is lent.
+    IoMap = 38,
+    /// Unmaps the frame in slot `rdi` from the I/O address space it was
+    /// mapped into, and waits until the IOMMU has forgotten it.
+    IoUnmap = 39,
     /// Maps the frame in slot `rdi` at page-aligned `rsi` in the address
     /// space in slot `r8` (Write right). `rdx` = [`MAP_WRITE`] and/or
     /// [`MAP_EXEC`], never both. Needs the frame's Map right, plus Write
@@ -234,6 +251,9 @@ impl Syscall {
             34 => Syscall::IrqMsiMessage,
             35 => Syscall::FrameDmaAddress,
             36 => Syscall::DeviceFrame,
+            37 => Syscall::IoSpaceBind,
+            38 => Syscall::IoMap,
+            39 => Syscall::IoUnmap,
             0x100 => Syscall::DebugPutStr,
             0x101 => Syscall::DebugSelftestDone,
             _ => return None,
@@ -355,6 +375,11 @@ pub enum ObjectType {
     /// mappings come from that memory, so it can map only as much as its
     /// pool has tables for, and gives every table back when destroyed.
     AddressSpace = 6,
+    /// An I/O address space (an IOMMU domain): what one PCI function's DMA
+    /// can reach. Sized like an address space, and its I/O page tables
+    /// come out of its memory the same way. Only made when the machine
+    /// has an IOMMU the kernel drives.
+    IoSpace = 7,
 }
 
 impl ObjectType {
@@ -367,6 +392,7 @@ impl ObjectType {
             4 => ObjectType::Thread,
             5 => ObjectType::CNode,
             6 => ObjectType::AddressSpace,
+            7 => ObjectType::IoSpace,
             _ => return None,
         })
     }
@@ -391,6 +417,10 @@ impl ObjectType {
                 Some(requested as u8)
             }
             ObjectType::AddressSpace => None,
+            ObjectType::IoSpace if requested >= VSPACE_MIN_BITS && requested <= VSPACE_MAX_BITS => {
+                Some(requested as u8)
+            }
+            ObjectType::IoSpace => None,
         }
     }
 }
@@ -458,8 +488,12 @@ pub mod root {
     /// [`MSI_COUNT`] MSI vectors (IRQ capabilities), in consecutive slots.
     pub const MSI: u64 = 8;
     pub const MSI_COUNT: u64 = 8;
+    /// The IOMMU-control capability, if the machine has an IOMMU the
+    /// kernel drives: the right to bind I/O address spaces to PCI
+    /// functions.
+    pub const IOMMU: u64 = MSI + MSI_COUNT;
     /// The first slot with nothing in it.
-    pub const FIRST_FREE: u64 = MSI + MSI_COUNT;
+    pub const FIRST_FREE: u64 = IOMMU + 1;
     /// Size of [`UNTYPED`], in bits.
     pub const UNTYPED_BITS: u8 = 25;
     /// Where the bundle is mapped, as an offset from the user window's base.

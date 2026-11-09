@@ -125,6 +125,12 @@ fn alloc_frame() -> Option<u64> {
 
 /// Zeroes the 4 KiB frame at `pa`, so memory handed to a new owner never
 /// carries a previous owner's data.
+/// The kernel's pointer to physical address `pa`: RAM and devices below
+/// 1 GiB are identity-mapped.
+pub fn phys_ptr(pa: u64) -> *mut u8 {
+    pa as *mut u8
+}
+
 pub fn zero_frame(pa: u64) {
     // SAFETY: the kernel identity-maps RAM, and the caller owns the frame.
     unsafe { core::ptr::write_bytes(pa as *mut u8, 0, PAGE as usize) };

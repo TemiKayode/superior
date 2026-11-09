@@ -127,3 +127,99 @@ pub fn memory(dtb: u64, out: &mut [(u64, u64); MAX_RANGES]) -> Option<usize> {
     }
     (n > 0).then_some(n)
 }
+
+/// The base address (first `reg` entry) of the first top-level node whose
+/// `compatible` list includes `want`, if any.
+pub fn find_compatible(dtb: u64, want: &[u8]) -> Option<u64> {
+    if !valid(dtb) {
+        return None;
+    }
+    let end = dtb + size(dtb);
+    let structs = dtb + be32(dtb + 8) as u64;
+    let strings = dtb + be32(dtb + 12) as u64;
+    let name_is = |off: u32, want: &[u8]| -> bool {
+        let at = strings + off as u64;
+        at + (want.len() as u64) < end
+            && want
+                .iter()
+                .enumerate()
+                .all(|(i, &c)| byte(at + i as u64) == c)
+            && byte(at + want.len() as u64) == 0
+    };
+    // Whether the NUL-separated string list at [value, value + len)
+    // contains `want`.
+    let list_has = |value: u64, len: u64| -> bool {
+        let mut s = value;
+        while s < value + len {
+            let mut e = s;
+            while e < value + len && byte(e) != 0 {
+                e += 1;
+            }
+            if e - s == want.len() as u64
+                && want
+                    .iter()
+                    .enumerate()
+                    .all(|(i, &c)| byte(s + i as u64) == c)
+            {
+                return true;
+            }
+            s = e + 1;
+        }
+        false
+    };
+    let mut addr_cells = 2u32;
+    let mut depth = 0u32;
+    let (mut matched, mut reg) = (false, None);
+    let mut p = structs;
+    while p + 4 <= end {
+        let token = be32(p);
+        p += 4;
+        match token {
+            BEGIN_NODE => {
+                depth += 1;
+                while p < end && byte(p) != 0 {
+                    p += 1;
+                }
+                p = (p + 1 + 3) & !3;
+                if depth == 2 {
+                    (matched, reg) = (false, None);
+                }
+            }
+            END_NODE => {
+                if depth == 2 && matched {
+                    if let Some(r) = reg {
+                        return Some(r);
+                    }
+                }
+                depth = depth.saturating_sub(1);
+            }
+            PROP => {
+                if p + 8 > end {
+                    return None;
+                }
+                let len = be32(p) as u64;
+                let name = be32(p + 4);
+                let value = p + 8;
+                if value + len > end {
+                    return None;
+                }
+                if depth == 1 && len == 4 && name_is(name, b"#address-cells") {
+                    addr_cells = be32(value);
+                } else if depth == 2 && name_is(name, b"compatible") {
+                    matched |= list_has(value, len);
+                } else if depth == 2
+                    && name_is(name, b"reg")
+                    && (1..=2).contains(&addr_cells)
+                    && len >= 4 * addr_cells as u64
+                {
+                    reg = Some(cells(value, addr_cells));
+                }
+                p = (value + len + 3) & !3;
+            }
+            NOP => {}
+            END => break,
+            _ => return None,
+        }
+    }
+    None
+}

@@ -263,6 +263,28 @@ fn block_client() -> ! {
         r.status == 0 && r.msg[0] == Status::Denied as u64,
         format_args!("nor any BAR page"),
     );
+    // The device can reach only what its driver maps into its IOMMU
+    // domain: aimed at another page of the driver's, the DMA must not land.
+    let r = syscall(Syscall::Call, BLOCK, [0x57a7, 0, 0, 0]);
+    t.check(
+        r.status == 0 && r.msg[0] == Status::Ok as u64 && r.msg[1] == 1,
+        format_args!(
+            "DMA aimed outside the device's IOMMU domain did not land (request {})",
+            match (r.msg[2], r.msg[3]) {
+                (0, _) => "never completed",
+                (_, 0) => "completed but wrote nothing there",
+                _ => "failed",
+            }
+        ),
+    );
+    let r = read_and_check(32, 8);
+    t.check(
+        r.is_ok(),
+        format_args!(
+            "read 8 sectors from 32 after the driver restarted on a fresh domain: {}",
+            r.err().unwrap_or("every word right")
+        ),
+    );
     // Crash the driver; reads work again once it is restarted.
     let r = syscall(Syscall::Call, BLOCK, [0xdead, 0, 0, 0]);
     t.check(

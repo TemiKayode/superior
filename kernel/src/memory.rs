@@ -32,10 +32,30 @@ pub struct Summary {
     pub dropped_bytes: u64,
 }
 
+/// The usable RAM ranges reported at boot, so the kernel can tell a frame
+/// of RAM from one of device memory.
+const MAX_RAM_RANGES: usize = 16;
+static RAM: Mutex<([(u64, u64); MAX_RAM_RANGES], usize)> =
+    Mutex::new(([(0, 0); MAX_RAM_RANGES], 0));
+
+/// Whether the page at `pa` is usable RAM.
+pub fn is_ram(pa: u64) -> bool {
+    let ram = RAM.lock();
+    ram.0[..ram.1].iter().any(|&(s, e)| (s..e).contains(&pa))
+}
+
 /// Places the usable physical range `[start, end)` in the root CNode.
 pub fn add_region(s: &mut Summary, start: u64, end: u64) {
     if start >= end {
         return;
+    }
+    {
+        let mut ram = RAM.lock();
+        let n = ram.1;
+        if n < MAX_RAM_RANGES {
+            ram.0[n] = (start, end);
+            ram.1 = n + 1;
+        }
     }
     let mut cnode = ROOT_CNODE.lock();
     s.regions += 1;

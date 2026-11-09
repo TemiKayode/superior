@@ -133,6 +133,13 @@ pub enum Object {
         base: u64,
         size_bits: u8,
     },
+    /// An I/O address space (an entry in the kernel's I/O-space table).
+    IoSpace {
+        id: u32,
+    },
+    /// The right to bind I/O address spaces to PCI functions. Handed out
+    /// at boot, when there is an IOMMU.
+    IommuControl,
 }
 
 impl Object {

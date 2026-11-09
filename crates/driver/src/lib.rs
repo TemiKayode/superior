@@ -9,8 +9,9 @@
 //! - [`Pci`]: open a function, map its BAR pages, enable bus mastering and
 //!   MSI-X, take an MSI vector bound to a notification.
 //! - [`Mmio`]: volatile register access through a mapping.
-//! - [`DmaPage`]: a page of RAM a device can reach, with the address to
-//!   program into it ([`Syscall::FrameDmaAddress`]).
+//! - [`DmaPage`], [`io_map`]: pages of RAM mapped into the device's IOMMU
+//!   domain, the only memory it can reach, with the address to program
+//!   into it.
 //! - [`virtq`]: split virtqueue rings (virtio 1.x).
 //!
 //! Still to come, per the spec: an async executor, DMA buffer pools and
@@ -59,10 +60,20 @@ impl Pci {
     }
 
     /// Claims the `instance`th function with these IDs (and resets it).
-    /// Returns its bus/device/function and the bitmask of memory BARs.
-    pub fn open(&self, vendor: u16, device: u16, instance: u64) -> Result<(u64, u64), Failure> {
+    /// Its IOMMU domain, empty, arrives in `domain`. Returns its
+    /// bus/device/function and the bitmask of memory BARs.
+    pub fn open(
+        &self,
+        vendor: u16,
+        device: u16,
+        instance: u64,
+        domain: u64,
+    ) -> Result<(u64, u64), Failure> {
         let ids = (vendor as u64) << 16 | device as u64;
-        let r = self.call([pci::OPEN, pci::VERSION, ids, instance], None)?;
+        let r = self.call([pci::OPEN, pci::VERSION, ids, instance], Some(domain))?;
+        if r.cap != Some(domain as u16) {
+            return Err(("no IOMMU domain arrived (no IOMMU?)", 0));
+        }
         Ok((r.msg[1], r.msg[2]))
     }
 
@@ -177,8 +188,8 @@ impl Mmio {
     }
 }
 
-/// A page of RAM for DMA: mapped at `va` for the driver, at `dma` for the
-/// device.
+/// A page of RAM for DMA: mapped at `va` for the driver, and into the
+/// device's domain at `dma`.
 #[derive(Clone, Copy)]
 pub struct DmaPage {
     pub va: u64,
@@ -186,9 +197,9 @@ pub struct DmaPage {
 }
 
 impl DmaPage {
-    /// Makes a frame from the untyped memory in `untyped` into `slot` and
-    /// maps it at `va`.
-    pub fn new(untyped: u64, slot: u64, va: u64) -> Result<DmaPage, Failure> {
+    /// Makes a frame from the untyped memory in `untyped` into `slot`, maps
+    /// it at `va` and into the IOMMU domain in `domain`.
+    pub fn new(untyped: u64, slot: u64, va: u64, domain: u64) -> Result<DmaPage, Failure> {
         sys(
             Syscall::Retype,
             untyped,
@@ -198,12 +209,30 @@ impl DmaPage {
         map(slot, va, true).map_err(|e| ("mapping a DMA page", e))?;
         Ok(DmaPage {
             va,
-            dma: dma_address(slot)?,
+            dma: io_map(slot, domain, true)?,
         })
     }
 }
 
-/// The address a device uses to reach the frame in `slot`.
+/// Maps the frame in `slot` into the IOMMU domain in `domain` (writable by
+/// the device if `writable`), returning the address the device uses for
+/// it. It stays reachable until unmapped ([`io_unmap`]) or until the
+/// capability is deleted.
+pub fn io_map(slot: u64, domain: u64, writable: bool) -> Result<u64, Failure> {
+    sys(Syscall::IoMap, slot, [domain, writable as u64, 0, 0])
+        .map(|r| r.msg[0])
+        .map_err(|e| ("mapping a page for DMA", e))
+}
+
+/// Takes the frame in `slot` back out of its IOMMU domain.
+pub fn io_unmap(slot: u64) -> Result<(), Failure> {
+    sys(Syscall::IoUnmap, slot, [0; 4])
+        .map(drop)
+        .map_err(|e| ("unmapping a page from DMA", e))
+}
+
+/// The physical address of the frame in `slot` (with an IOMMU, a device
+/// reaches it only once it is mapped into the device's domain).
 pub fn dma_address(slot: u64) -> Result<u64, Failure> {
     sys(Syscall::FrameDmaAddress, slot, [0; 4])
         .map(|r| r.msg[0])

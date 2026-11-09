@@ -1,10 +1,13 @@
 # The driver framework test (cargo xtask drivers-test).
 #
-# The PCI bus server owns configuration space, the BAR window and the MSI
-# vectors. The virtio-blk driver opens its one device through it and
+# The PCI bus server owns configuration space, the BAR window, the MSI
+# vectors and the IOMMU, and gives each driver's device its own IOMMU
+# domain. The virtio-blk driver opens its one device through it and
 # serves the block interface; the client reads the test disk through it,
-# checks the bus server will not give it the driver's device, crashes the
-# driver and reads again once the manager has restarted it.
+# checks the bus server will not give it the driver's device, has the
+# driver point its device at memory outside its domain (which must stay
+# untouched), crashes the driver and reads again once the manager has
+# restarted it.
 
 component pcibus
   image pcibus
@@ -14,6 +17,9 @@ component pcibus
   device pci-mmio 2
   # MSI vectors: slots 3 to 10.
   device msi 3
+  device iommu 11
+  # Memory for the IOMMU domains: 64 KiB each, four at once.
+  untyped 18 12
 
 component virtio-blk
   image virtio-blk

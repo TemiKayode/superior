@@ -41,7 +41,7 @@
 //! [`TIMER_NTFN`] on every tick, so a thread can sleep by waiting on it.
 
 use crate::arch::vm::{self, AddressSpace, USER_BASE, USER_END};
-use crate::arch::{self, Args, Exit, UserFrame};
+use crate::arch::{self, iommu, Args, Exit, UserFrame};
 use crate::memory::{MapError, TablePool};
 use crate::{kprint, kprintln};
 use spin::{Mutex, MutexGuard};
@@ -86,6 +86,8 @@ const MAX_NOTIFICATIONS: usize = 32;
 const MAX_NOTIFICATIONS: usize = 8;
 /// Address spaces: one per boot process, plus address-space objects.
 const MAX_SPACES: usize = 32;
+/// I/O address spaces (IOMMU domains): one per device a driver holds.
+const MAX_IO_SPACES: usize = 8;
 const DEBUG_STR_MAX: usize = 256;
 /// Interrupt lines a notification can be bound to.
 const MAX_IRQS: usize = 256;
@@ -118,6 +120,21 @@ struct VSpace {
     object: bool,
 }
 
+/// An I/O address space: its memory (header page, top-level table, then
+/// the pool its other tables come from) and the PCI function bound to it.
+#[derive(Clone, Copy)]
+struct IoDomain {
+    base: u64,
+    pool: TablePool,
+    sid: Option<u16>,
+}
+
+impl IoDomain {
+    fn root(&self) -> u64 {
+        self.base + 4096
+    }
+}
+
 struct Kernel {
     ipc: Ipc<MAX_THREADS, MAX_ENDPOINTS, MAX_NOTIFICATIONS>,
     frames: [UserFrame; MAX_THREADS],
@@ -143,6 +160,11 @@ struct Kernel {
     /// Where the frame capability in each capability-table slot is mapped:
     /// (address space, user address).
     mapped: [Option<(u16, u64)>; CAP_TABLE_SLOTS],
+    /// I/O address spaces by id.
+    io_spaces: [Option<IoDomain>; MAX_IO_SPACES],
+    /// Where the frame capability in each capability-table slot is mapped
+    /// for DMA: (I/O address space, I/O address).
+    io_mapped: [Option<(u8, u64)>; CAP_TABLE_SLOTS],
     /// Each thread's fault handler: endpoint and badge.
     fault_ep: [Option<(u16, u64)>; MAX_THREADS],
     /// Blocked in a fault call: the reply says how to resume.
@@ -182,6 +204,8 @@ static KERNEL: Mutex<Kernel> = Mutex::new(Kernel {
     reply_grant: [false; MAX_THREADS],
     ep_used: [false; MAX_ENDPOINTS],
     mapped: [None; CAP_TABLE_SLOTS],
+    io_spaces: [None; MAX_IO_SPACES],
+    io_mapped: [None; CAP_TABLE_SLOTS],
     fault_ep: [None; MAX_THREADS],
     in_fault: [false; MAX_THREADS],
     thread_used: [false; MAX_THREADS],
@@ -382,6 +406,9 @@ pub fn handle_syscall(frame: &mut UserFrame) -> Exit {
         Some(Syscall::IrqMsiMessage) => irq_msi_message(k, cur, a.a0),
         Some(Syscall::FrameDmaAddress) => frame_dma_address(k, cur, a.a0),
         Some(Syscall::DeviceFrame) => device_frame(k, cur, &a),
+        Some(Syscall::IoSpaceBind) => io_space_bind(k, cur, &a),
+        Some(Syscall::IoMap) => io_map(k, cur, &a),
+        Some(Syscall::IoUnmap) => io_unmap(k, cur, a.a0),
         Some(Syscall::ThreadSetVSpace) => thread_set_vspace(k, cur, &a),
         Some(Syscall::ThreadSetFaultHandler) => thread_set_fault_handler(k, cur, &a),
         Some(Syscall::SetFaultHandler) => set_fault_handler(k, cur, a.a0),
@@ -804,13 +831,133 @@ fn delete_index(k: &mut Kernel, s: usize) -> Result<(), u64> {
     Ok(())
 }
 
-/// Unmaps the frame whose capability is in table slot `s`, if mapped.
+/// Unmaps the frame whose capability is in table slot `s`, if mapped,
+/// from its address space and from its I/O address space.
 fn unmap_slot(k: &mut Kernel, s: usize) {
     if let Some((id, va)) = k.mapped[s].take() {
         if let Some(v) = k.vspaces[id as usize] {
             v.root.unmap(va);
         }
     }
+    if let Some((id, iova)) = k.io_mapped[s].take() {
+        if let Some(d) = k.io_spaces[id as usize] {
+            crate::iommu::unmap(d.root(), iova);
+            iommu::flush();
+        }
+    }
+}
+
+/// The I/O address space a capability in the caller's slot names, with
+/// Write.
+fn io_space_cap(k: &Kernel, cur: Tid, slot: u64) -> Result<usize, u64> {
+    let s = own_slot(k, cur, slot).ok_or(Error::InvalidCapability.code())?;
+    let cap = k.caps.get(s).ok_or(Error::InvalidCapability.code())?;
+    let Object::IoSpace { id } = cap.object else {
+        return Err(Error::InvalidCapability.code());
+    };
+    if !cap.rights.contains(Rights::WRITE) {
+        return Err(Error::InsufficientRights.code());
+    }
+    Ok(id as usize)
+}
+
+/// `IoSpaceBind`: rdi = I/O address space, rsi = IOMMU control, rdx =
+/// PCI requester ID.
+fn io_space_bind(k: &mut Kernel, cur: Tid, f: &Args) -> Result<(), u64> {
+    let id = io_space_cap(k, cur, f.a0)?;
+    let ctl = own_slot(k, cur, f.a1).ok_or(Error::InvalidCapability.code())?;
+    if !matches!(
+        k.caps.get(ctl).map(|c| c.object),
+        Some(Object::IommuControl)
+    ) {
+        return Err(Error::InvalidCapability.code());
+    }
+    let sid = u16::try_from(f.a2)
+        .ok()
+        .filter(|&s| iommu::valid_sid(s))
+        .ok_or(Error::InvalidArgument.code())?;
+    let d = k.io_spaces[id].ok_or(Error::InvalidCapability.code())?;
+    // One function per space, one space per function.
+    if d.sid.is_some() || k.io_spaces.iter().flatten().any(|o| o.sid == Some(sid)) {
+        return Err(Error::IllegalOperation.code());
+    }
+    iommu::attach(sid, id as u16 + 1, d.base, d.root());
+    k.io_spaces[id] = Some(IoDomain {
+        sid: Some(sid),
+        ..d
+    });
+    Ok(())
+}
+
+/// `IoMap`: rdi = frame (Map right), rsi = I/O address space, rdx = 1 if
+/// the device may write it. The I/O address is the frame's physical
+/// address.
+fn io_map(k: &mut Kernel, cur: Tid, f: &Args) -> Result<(), u64> {
+    if f.a2 > 1 {
+        return Err(Error::InvalidArgument.code());
+    }
+    let s = own_slot(k, cur, f.a0).ok_or(Error::InvalidCapability.code())?;
+    let cap = *k.caps.get(s).ok_or(Error::InvalidCapability.code())?;
+    let Object::Frame { paddr, size_bits } = cap.object else {
+        return Err(Error::InvalidCapability.code());
+    };
+    let write = f.a2 == 1;
+    let needed = if write {
+        Rights::MAP | Rights::WRITE
+    } else {
+        Rights::MAP | Rights::READ
+    };
+    if !cap.rights.contains(needed) {
+        return Err(Error::InsufficientRights.code());
+    }
+    // Only a page of RAM: a device must not reach another's registers.
+    if size_bits != 12 || !crate::memory::is_ram(paddr) {
+        return Err(Error::InvalidArgument.code());
+    }
+    let id = io_space_cap(k, cur, f.a1)?;
+    if k.io_mapped[s].is_some() {
+        return Err(Error::AlreadyMapped.code());
+    }
+    let d = k.io_spaces[id]
+        .as_mut()
+        .ok_or(Error::InvalidCapability.code())?;
+    let root = d.root();
+    crate::iommu::map(root, paddr, paddr, write, &mut d.pool).map_err(|e| match e {
+        crate::iommu::IoMapError::InUse => Error::AlreadyMapped.code(),
+        crate::iommu::IoMapError::OutOfMemory => Error::NotEnoughMemory.code(),
+        crate::iommu::IoMapError::TooHigh => Error::InvalidArgument.code(),
+    })?;
+    iommu::flush();
+    k.io_mapped[s] = Some((id as u8, paddr));
+    k.ipc.set_msg_of(cur, [paddr, 0, 0, 0]);
+    Ok(())
+}
+
+/// `IoUnmap`: rdi = frame slot.
+fn io_unmap(k: &mut Kernel, cur: Tid, slot: u64) -> Result<(), u64> {
+    let s = own_slot(k, cur, slot).ok_or(Error::InvalidCapability.code())?;
+    k.caps.get(s).ok_or(Error::InvalidCapability.code())?;
+    let (id, iova) = k.io_mapped[s].take().ok_or(Error::InvalidArgument.code())?;
+    if let Some(d) = k.io_spaces[id as usize] {
+        crate::iommu::unmap(d.root(), iova);
+        iommu::flush();
+    }
+    Ok(())
+}
+
+/// Destroys I/O address space `id`: its function's DMA is blocked first,
+/// then every frame mapped in it is forgotten (its tables are about to go
+/// back to untyped memory with it).
+fn destroy_io_space(k: &mut Kernel, id: usize) {
+    if let Some(sid) = k.io_spaces[id].and_then(|d| d.sid) {
+        iommu::detach(sid);
+    }
+    for m in k.io_mapped.iter_mut() {
+        if matches!(m, Some((s, _)) if *s as usize == id) {
+            *m = None;
+        }
+    }
+    k.io_spaces[id] = None;
 }
 
 /// `FrameMap`: rdi = frame slot, rsi = user address, rdx = 1 for writable.
@@ -969,6 +1116,12 @@ fn reap(k: &mut Kernel) {
             destroy_vspace(k, id as u16);
             continue;
         }
+        if let Some(id) =
+            (0..MAX_IO_SPACES).find(|&id| k.io_spaces[id].is_some() && !live.io_spaces[id])
+        {
+            destroy_io_space(k, id);
+            continue;
+        }
         for id in 0..MAX_ENDPOINTS {
             if k.ep_used[id] && !live.endpoints[id] {
                 k.ep_used[id] = false;
@@ -1006,6 +1159,7 @@ struct Live {
     threads: [bool; MAX_THREADS],
     cnodes: [bool; CNODE_CHUNKS],
     spaces: [bool; MAX_SPACES],
+    io_spaces: [bool; MAX_IO_SPACES],
     endpoints: [bool; MAX_ENDPOINTS],
     ntfns: [bool; MAX_NOTIFICATIONS],
 }
@@ -1016,6 +1170,7 @@ impl Live {
             threads: [false; MAX_THREADS],
             cnodes: [false; CNODE_CHUNKS],
             spaces: [false; MAX_SPACES],
+            io_spaces: [false; MAX_IO_SPACES],
             endpoints: [false; MAX_ENDPOINTS],
             ntfns: [false; MAX_NOTIFICATIONS],
         };
@@ -1026,6 +1181,7 @@ impl Live {
                     .checked_sub(CNODE_POOL)
                     .and_then(|o| l.cnodes.get_mut(o / CNODE_CHUNK)),
                 Object::AddressSpace { id } => l.spaces.get_mut(id as usize),
+                Object::IoSpace { id } => l.io_spaces.get_mut(id as usize),
                 Object::Endpoint { id } => l.endpoints.get_mut(id as usize),
                 Object::Notification { id } => l.ntfns.get_mut(id as usize),
                 _ => None,
@@ -1309,6 +1465,14 @@ fn retype(k: &mut Kernel, cur: Tid, f: &Args) -> Result<(), u64> {
                 .position(Option::is_none)
                 .ok_or(Error::ObjectTableFull.code())?,
         ),
+        // Only with an IOMMU the kernel drives.
+        ObjectType::IoSpace if !iommu::present() => return Err(Error::IllegalOperation.code()),
+        ObjectType::IoSpace => Some(
+            k.io_spaces
+                .iter()
+                .position(Option::is_none)
+                .ok_or(Error::ObjectTableFull.code())?,
+        ),
     };
     let base = k.caps.carve(src, bits).map_err(cap_error)?;
     let ipc_rights = Rights::READ | Rights::WRITE | Rights::GRANT | Rights::GRANT_REPLY;
@@ -1356,6 +1520,28 @@ fn retype(k: &mut Kernel, cur: Tid, f: &Args) -> Result<(), u64> {
             });
             Capability::new(
                 Object::AddressSpace { id: id as u32 },
+                Rights::READ | Rights::WRITE | Rights::GRANT,
+            )
+        }
+        (ObjectType::IoSpace, Some(id)) => {
+            vm::zero_frame(base);
+            vm::zero_frame(base + 4096);
+            let mut d = IoDomain {
+                base,
+                pool: TablePool::Own {
+                    next: base + 2 * 4096,
+                    end: base + (1 << bits),
+                },
+                sid: None,
+            };
+            iommu::init_space(base, d.root(), id as u16 + 1);
+            for &pa in iommu::fixed_pages() {
+                crate::iommu::map(d.root(), pa, pa, true, &mut d.pool)
+                    .expect("a new I/O space has room for its fixed pages");
+            }
+            k.io_spaces[id] = Some(d);
+            Capability::new(
+                Object::IoSpace { id: id as u32 },
                 Rights::READ | Rights::WRITE | Rights::GRANT,
             )
         }

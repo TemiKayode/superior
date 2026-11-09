@@ -8,22 +8,32 @@
 //! MSI vectors. Configuration writes go through here, and only the few a
 //! driver needs are offered: bus mastering, MSI-X enable.
 //!
-//! Opening resets the function first: decoding and bus mastering off (so
-//! in-flight DMA stops), every BAR page and MSI vector the last owner held
-//! revoked, MSI-X off, then a Function Level Reset if the function has
-//! one. A restarted driver (same badge) reopens its device this way, so it
-//! always starts from a quiet device. A device without FLR is left to the
+//! DMA: each opened function gets its own I/O address space (IOMMU domain),
+//! bound to its requester ID and granted to the driver with the `OPEN`
+//! reply. The device can reach only frames the driver maps into it, and
+//! nothing until it does. Without an IOMMU there is no domain, and bus
+//! mastering is refused: a device that could DMA anywhere is not handed
+//! out.
+//!
+//! Opening resets the function first. The last owner's domain is revoked
+//! (every copy of it, so its DMA is blocked before anything else happens),
+//! then decoding and bus mastering go off, every BAR page and MSI vector
+//! the last owner held is revoked, MSI-X goes off, and a Function Level
+//! Reset follows if the function has one. A restarted driver (same badge)
+//! reopens its device this way, so it always starts from a quiet device
+//! and a fresh, empty domain. A device without FLR is left to the
 //! driver's own reset routine (virtio: writing 0 to the device status).
 //!
 //! Slots: 0 the `pci` endpoint (receive), 1 configuration space (I/O ports
 //! on x86-64, ECAM device memory on AArch64), 2 the BAR window (device
-//! memory), 3.. the MSI vectors.
+//! memory), 3.. the MSI vectors, then the IOMMU-control capability (empty
+//! without an IOMMU) and untyped memory for the domains.
 
 #![no_std]
 #![no_main]
 
 use superior_driver::dma_address;
-use superior_objects::abi::{CapTransfer, Syscall, root};
+use superior_objects::abi::{CapTransfer, ObjectType, Syscall, root};
 use superior_objects::interfaces::{Status, pci};
 use superior_sys::{print_line, syscall, syscall_x};
 
@@ -32,14 +42,23 @@ const CONFIG: u64 = 1;
 const WINDOW: u64 = 2;
 const MSI: u64 = 3;
 const MSI_COUNT: usize = root::MSI_COUNT as usize;
-const SCRATCH: u64 = MSI + MSI_COUNT as u64;
+const IOMMU: u64 = MSI + MSI_COUNT as u64;
+const UNTYPED: u64 = IOMMU + 1;
+const SCRATCH: u64 = UNTYPED + 1;
 /// One ECAM page per function found (AArch64).
 const FUNC_SLOTS: u64 = SCRATCH + 1;
 const MAX_FUNCS: usize = 16;
 /// The original of every BAR page handed out.
 const BAR_SLOTS: u64 = FUNC_SLOTS + MAX_FUNCS as u64;
-const MAX_BAR_PAGES: usize = 36;
-const _: () = assert!(BAR_SLOTS + MAX_BAR_PAGES as u64 <= 64);
+const MAX_BAR_PAGES: usize = 24;
+/// Functions open at once, each with a block of untyped memory its domain
+/// is made from (revoking the block destroys the domain and every copy),
+/// and the domain itself.
+const MAX_OPEN: usize = 4;
+const DOMAIN_MEMORY: u64 = BAR_SLOTS + MAX_BAR_PAGES as u64;
+const DOMAINS: u64 = DOMAIN_MEMORY + MAX_OPEN as u64;
+const DOMAIN_BITS: u64 = 16;
+const _: () = assert!(DOMAINS + MAX_OPEN as u64 <= 64);
 
 // Configuration space.
 const COMMAND: u64 = 0x04;
@@ -73,6 +92,10 @@ struct Func {
     sized: bool,
     /// MSI vectors given to it: indexes into the pool.
     msi: [Option<u8>; MSI_COUNT],
+    /// Its domain: an index into the domain slots.
+    domain: Option<u8>,
+    /// It has a live domain, so it may master the bus.
+    dma: bool,
 }
 
 struct Bus {
@@ -80,6 +103,8 @@ struct Bus {
     /// (function, BAR, page) of each BAR page original.
     bar_pages: [Option<(u8, u8, u16)>; MAX_BAR_PAGES],
     msi_owner: [Option<u8>; MSI_COUNT],
+    /// The function each domain slot belongs to.
+    domain_owner: [Option<u8>; MAX_OPEN],
     window_base: u64,
     window_next: u64,
 }
@@ -209,6 +234,8 @@ impl Bus {
                     bars: [None; 6],
                     sized: false,
                     msi: [None; MSI_COUNT],
+                    domain: None,
+                    dma: false,
                 };
                 if !config::attach(n, &f) {
                     return;
@@ -329,12 +356,62 @@ impl Bus {
         "Function Level Reset"
     }
 
-    fn open(&mut self, badge: u64, ids: u64, instance: u64) -> [u64; 4] {
+    /// Destroys function `i`'s domain (blocking its DMA) and makes it a
+    /// new, empty one, bound to its requester ID. Returns the domain's
+    /// slot, or `None` without an IOMMU.
+    fn new_domain(&mut self, i: usize) -> Result<Option<u64>, Status> {
+        let d = match self.funcs[i].unwrap().domain {
+            Some(d) => d as usize,
+            None => {
+                let d = self
+                    .domain_owner
+                    .iter()
+                    .position(Option::is_none)
+                    .ok_or(Status::InUse)?;
+                let made = syscall(
+                    Syscall::Retype,
+                    UNTYPED,
+                    [
+                        ObjectType::Untyped as u64,
+                        DOMAIN_BITS,
+                        DOMAIN_MEMORY + d as u64,
+                        0,
+                    ],
+                );
+                if made.status != 0 {
+                    return Err(Status::DeviceError);
+                }
+                self.domain_owner[d] = Some(i as u8);
+                self.funcs[i].as_mut().unwrap().domain = Some(d as u8);
+                d
+            }
+        };
+        // Every copy of the old domain goes, the driver's too: the kernel
+        // unbinds the function first, so its DMA stops here.
+        syscall(Syscall::CapRevoke, DOMAIN_MEMORY + d as u64, [0; 4]);
+        let slot = DOMAINS + d as u64;
+        let made = syscall(
+            Syscall::Retype,
+            DOMAIN_MEMORY + d as u64,
+            [ObjectType::IoSpace as u64, DOMAIN_BITS, slot, 0],
+        );
+        if made.status != 0 {
+            return Ok(None); // no IOMMU
+        }
+        let f = self.funcs[i].unwrap();
+        let rid = (f.bus as u64) << 8 | (f.dev as u64) << 3 | f.func as u64;
+        if syscall(Syscall::IoSpaceBind, slot, [IOMMU, rid, 0, 0]).status != 0 {
+            return Err(Status::DeviceError);
+        }
+        Ok(Some(slot))
+    }
+
+    fn open(&mut self, badge: u64, ids: u64, instance: u64) -> ([u64; 4], Option<u64>) {
         let found = (0..MAX_FUNCS)
             .filter(|&i| matches!(self.funcs[i], Some(f) if f.ids as u64 == ids))
             .nth(instance as usize);
         let Some(i) = found else {
-            return [Status::NotFound as u64, 0, 0, 0];
+            return ([Status::NotFound as u64, 0, 0, 0], None);
         };
         let f = self.funcs[i].unwrap();
         if f.owner != 0 && f.owner != badge {
@@ -345,8 +422,12 @@ impl Bus {
                 f.func,
                 f.owner
             );
-            return [Status::InUse as u64, 0, 0, 0];
+            return ([Status::InUse as u64, 0, 0, 0], None);
         }
+        let domain = match self.new_domain(i) {
+            Ok(d) => d,
+            Err(s) => return ([s as u64, 0, 0, 0], None),
+        };
         let how = self.reset(i);
         if !self.funcs[i].unwrap().sized {
             self.size_bars(i);
@@ -356,13 +437,19 @@ impl Bus {
         let f = self.funcs[i].as_mut().unwrap();
         let again = f.owner == badge;
         f.owner = badge;
+        f.dma = domain.is_some();
         let f = *f;
         say!(
-            "{:02x}:{:02x}.{} {} client {badge} (reset: {how})",
+            "{:02x}:{:02x}.{} {} client {badge} (reset: {how}; {})",
             f.bus,
             f.dev,
             f.func,
-            if again { "reopened by" } else { "given to" }
+            if again { "reopened by" } else { "given to" },
+            if domain.is_some() {
+                "new, empty IOMMU domain"
+            } else {
+                "no IOMMU, so no bus mastering"
+            }
         );
         let mask = f
             .bars
@@ -371,7 +458,7 @@ impl Bus {
             .filter(|(_, b)| b.is_some())
             .fold(0, |m, (b, _)| m | 1 << b);
         let bdf = (f.bus as u64) << 8 | (f.dev as u64) << 3 | f.func as u64;
-        [Status::Ok as u64, bdf, mask, 0]
+        ([Status::Ok as u64, bdf, mask, 0], domain)
     }
 
     /// The function `badge` owns.
@@ -434,7 +521,7 @@ impl Bus {
             if m[1] != pci::VERSION {
                 return status(Status::Invalid);
             }
-            return (self.open(badge, m[2], m[3]), None);
+            return self.open(badge, m[2], m[3]);
         }
         let Some(i) = self.owned(badge) else {
             return status(Status::Denied);
@@ -447,6 +534,8 @@ impl Bus {
             pci::CONFIG_READ if m[1] < 256 && m[1] % 4 == 0 => {
                 ([Status::Ok as u64, self.read(i, m[1]) as u64, 0, 0], None)
             }
+            // Without a domain the device could reach all of memory.
+            pci::BUS_MASTER if m[1] != 0 && !self.funcs[i].unwrap().dma => status(Status::Denied),
             pci::BUS_MASTER => {
                 if m[1] != 0 {
                     self.set_command(i, CMD_BUS_MASTER, 0);
@@ -491,6 +580,7 @@ pub extern "C" fn _start(_: u64) -> ! {
         funcs: [None; MAX_FUNCS],
         bar_pages: [None; MAX_BAR_PAGES],
         msi_owner: [None; MSI_COUNT],
+        domain_owner: [None; MAX_OPEN],
         window_base: base,
         window_next: base,
     };

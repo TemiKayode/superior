@@ -436,6 +436,12 @@ fn qemu_command(img: &Image) -> Command {
     let mut q = Command::new(qemu(img.arch));
     match img.arch {
         Arch::X86_64 => {
+            // Images with a disk are driver tests: they need an IOMMU,
+            // which QEMU emulates (VT-d) only on its q35 machine. Interrupt
+            // remapping stays off: MSIs reach the local APIC directly.
+            if img.disk.is_some() {
+                q.args(["-machine", "q35", "-device", "intel-iommu,intremap=off"]);
+            }
             q.arg("-drive")
                 .arg(format!("format=raw,file={}", img.path.display()))
                 .args(["-device", "isa-debug-exit,iobase=0xf4,iosize=0x04"]);
@@ -443,8 +449,11 @@ fn qemu_command(img: &Image) -> Command {
         Arch::Aarch64 => {
             // highmem=off keeps PCI's ECAM window below 4 GiB, where the
             // kernel hands it to the PCI bus server.
+            // Driver tests get an SMMUv3 in front of PCI.
             let machine = if img.sel4 {
                 SEL4_MACHINE
+            } else if img.disk.is_some() {
+                "virt,highmem=off,iommu=smmuv3"
             } else {
                 "virt,highmem=off"
             };
@@ -467,13 +476,18 @@ fn qemu_command(img: &Image) -> Command {
         q.args(["-m", "512M"]);
     }
     if let Some(disk) = &img.disk {
-        // Modern only (virtio 1.x): no legacy I/O BAR.
+        // Modern only (virtio 1.x): no legacy I/O BAR. iommu_platform:
+        // the device's DMA goes through the IOMMU (QEMU's virtio devices
+        // bypass it otherwise).
         q.arg("-drive")
             .arg(format!(
                 "if=none,id=blk0,format=raw,readonly=on,file={}",
                 disk.display()
             ))
-            .args(["-device", "virtio-blk-pci,drive=blk0,disable-legacy=on"]);
+            .args([
+                "-device",
+                "virtio-blk-pci,drive=blk0,disable-legacy=on,iommu_platform=on",
+            ]);
     }
     q.args(["-serial", "stdio", "-no-reboot"]);
     q
@@ -640,10 +654,12 @@ fn drivers_test(img: &Image) -> Result<(), String> {
     println!("== driver framework test on {}", img.path.display());
     let out = run_to_exit(img, Duration::from_secs(60))?;
     let steps = [
+        "IOMMU: ",
         "[cm] manifest: 3 components",
         "pci: BAR window at",
         "1af4:1042 class 010000",
         "given to client 2 (reset:",
+        "new, empty IOMMU domain",
         "virtio-blk: ready:",
         "[pass] block: 128 sectors of 512 bytes",
         "[pass] block: read 8 sectors from 0 by DMA into its page: every word right",
@@ -652,6 +668,14 @@ fn drivers_test(img: &Image) -> Result<(), String> {
         "may not have",
         "[pass] block: the bus server will not give it the driver's device",
         "[pass] block: nor any BAR page",
+        "virtio-blk: stray DMA: page untouched",
+        "virtio-blk: crashing (fault injection)",
+        "[cm] restarting virtio-blk (one-for-one)",
+        "reopened by client 2 (reset:",
+        "new, empty IOMMU domain",
+        "virtio-blk: ready:",
+        "[pass] block: DMA aimed outside the device's IOMMU domain did not land",
+        "[pass] block: read 8 sectors from 32 after the driver restarted on a fresh domain: every word right",
         "virtio-blk: crashing (fault injection)",
         "[cm] restarting virtio-blk (one-for-one)",
         "reopened by client 2 (reset:",

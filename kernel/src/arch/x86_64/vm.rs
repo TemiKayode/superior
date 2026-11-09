@@ -48,6 +48,12 @@ fn phys_offset() -> u64 {
     unsafe { (&raw const PHYS_OFFSET).read() }
 }
 
+/// The kernel's pointer to physical address `pa` (RAM or a mapped
+/// device page).
+pub fn phys_ptr(pa: u64) -> *mut u8 {
+    phys_to_virt(PhysAddr::new(pa))
+}
+
 fn phys_to_virt(pa: PhysAddr) -> *mut u8 {
     (phys_offset() + pa.as_u64()) as *mut u8
 }

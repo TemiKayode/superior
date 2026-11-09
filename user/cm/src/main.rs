@@ -244,7 +244,11 @@ impl<'a> Manager<'a> {
                 }
                 CapKind::Device(d) => match device(d) {
                     Some((src, count)) => {
-                        (0..count).try_for_each(|k| cnode_copy(cnode, slot + k, src + k, ALL, 0))
+                        let r = (0..count)
+                            .try_for_each(|k| cnode_copy(cnode, slot + k, src + k, ALL, 0));
+                        // A machine without an IOMMU has none to give: the
+                        // slot stays empty, and the component copes.
+                        if d == "iommu" { Ok(()) } else { r }
                     }
                     None => return Err(("unknown device", 0)),
                 },
@@ -377,7 +381,8 @@ fn ticks() -> u64 {
 
 /// The manager's slot holding the device capability called `name`.
 /// `msi` is all the MSI vectors, in consecutive slots from the one named;
-/// the rest are one capability each. Returns (first slot, count).
+/// the rest are one capability each (`iommu` may be absent). Returns
+/// (first slot, count).
 fn device(name: &str) -> Option<(u64, u64)> {
     Some(match name {
         "uart" => (root::UART, 1),
@@ -387,6 +392,7 @@ fn device(name: &str) -> Option<(u64, u64)> {
         "pci-config" => (root::PCI_CONFIG, 1),
         "pci-mmio" => (root::PCI_MMIO, 1),
         "msi" => (root::MSI, root::MSI_COUNT),
+        "iommu" => (root::IOMMU, 1),
         _ => return None,
     })
 }
