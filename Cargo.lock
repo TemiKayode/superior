@@ -451,6 +451,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "superior-nvme"
+version = "0.1.0"
+dependencies = [
+ "superior-driver",
+ "superior-objects",
+ "superior-sys",
+]
+
+[[package]]
 name = "superior-objects"
 version = "0.1.0"
 

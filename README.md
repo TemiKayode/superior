@@ -202,6 +202,12 @@ holds the rest):
     interface: reads land by DMA straight in a frame the client lends with the call.
     The device reaches that frame only while the read is in flight: the driver maps
     it into the domain, and deleting it before the reply unmaps it.
+  - An NVMe driver (`user/nvme/`), the first class driver: it opens the first
+    function of class 01:08:02 (`pci::OPEN_CLASS`), whoever made it, and serves the
+    same `block` interface. It disables the controller, sets up the admin queues,
+    identifies the controller (its write cache) and namespace 1 (its size and block
+    size), and creates one I/O queue pair whose completions raise MSI-X vector 0.
+    One command at a time, one PRP entry each (a request is at most a page).
   `cargo xtask drivers-test` boots `boot/drivers.manifest` with a test disk:
   - the client reads it and checks every word;
   - the bus server refuses the client the driver's device and its BARs;
@@ -210,6 +216,13 @@ holds the rest):
     bypass left on, the same test fails);
   - the driver is crashed, restarted, its device reset and reopened, and reads work
     again.
+  `cargo xtask nvme-test` runs that test and the filesystem test with the disk on
+  QEMU's NVMe controller and the manifests' `virtio-blk` swapped for `nvme`, on
+  either ISA; `cargo xtask test` runs both drivers. Through the IOMMU the stray
+  read leaves the page untouched (QEMU's controller then reports the command a
+  success); the bus server resets the controller with a Function Level Reset on
+  every restart; under the filesystem test's fault injection a controller still
+  writing a completion for a killed driver is blocked by the IOMMU.
 - The Memory Server, v1 (`user/memserver/`). It holds a pool of RAM and hands
   out pages under per-component quotas, which the Component Manager puts in the
   badge of each component's `mem` capability (manifest `quota`), so they cannot be
@@ -317,8 +330,9 @@ holds the rest):
 Not yet: interrupt remapping (a device can still write any MSI message, though only
 to the interrupt controller), IOMMU fault reporting (blocked DMA is dropped
 silently), buses behind bridges in the IOMMU (requester IDs on bus 0 only); Function
-Level Reset is coded but not yet exercised (QEMU's virtio devices on
-these buses have none); buses behind bridges; the async executor, buffer pools and
+Level Reset is exercised only by the NVMe controller (QEMU's virtio devices on
+these buses have none); several queues and commands in flight in the NVMe driver,
+namespaces other than 1, and the xHCI, HID and AHCI class drivers; buses behind bridges; the async executor, buffer pools and
 power callbacks of the SDK; an IDL compiler for the interfaces; escalating a component
 given up on to a supervisor above it (today the
 manager is the only one), restarting the Component Manager or Memory Server (spec: fast
@@ -347,6 +361,7 @@ https://claude.ai/artifact/QKJS8qH5Dfbjzn58RStq1j
 | `user/memserver/` | The Memory Server |
 | `user/fs/` | The filesystem server |
 | `user/virtio-blk/` | The virtio block driver |
+| `user/nvme/` | The NVMe class driver |
 | `user/echo/`, `user/counter/`, `user/testclient/` | Test components for the Component Manager, supervision and drivers |
 | `boot/` | Component manifests: `shell.manifest` (normal boot), `test.manifest` (`cm-test`), `supervise.manifest` (`supervise-test`) , `drivers.manifest` (`drivers-test`) , `memory.manifest` (`memory-test`), `fs.manifest` and `fs-verify.manifest` (`fs-test`) |
 | `sel4/` | Docker build of seL4 and rust-sel4's kernel loader, for running the shell on seL4 |
@@ -363,6 +378,7 @@ cargo xtask supervise-test # just the supervision test (add aarch64 for that ISA
 cargo xtask drivers-test   # just the driver framework test (add aarch64 for that ISA)
 cargo xtask memory-test    # just the Memory Server test (add aarch64 for that ISA)
 cargo xtask fs-test        # just the filesystem test, two boots (add aarch64 for that ISA)
+cargo xtask nvme-test      # the driver and filesystem tests on an NVMe disk (add aarch64 for that ISA)
 cargo xtask run            # boot the shell in QEMU (x86-64), its console on this terminal
 cargo xtask run aarch64    # the same on QEMU's AArch64 virt machine
 cargo xtask image  # just build target/superior.img

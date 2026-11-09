@@ -1,0 +1,18 @@
+[package]
+name = "superior-nvme"
+description = "An NVMe driver (a PCI class driver), serving the block interface."
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "superior-nvme"
+test = false
+bench = false
+
+[dependencies]
+superior-objects = { path = "../../crates/objects" }
+superior-sys = { path = "../../crates/sys" }
+superior-driver = { path = "../../crates/driver" }

@@ -89,6 +89,10 @@ pub mod pci {
     /// capability) in the call's accept slot. The driver asks the kernel
     /// for its message (`IrqMsiMessage`) and programs it into the device.
     pub const MSI_VECTOR: u64 = 6;
+    /// `[OPEN_CLASS, VERSION, class << 16 | subclass << 8 | interface,
+    /// instance]`: as `OPEN`, but claims the `instance`th function of
+    /// this class, whoever made it (a class driver: NVMe, xHCI, AHCI).
+    pub const OPEN_CLASS: u64 = 7;
 }
 
 /// Block devices: what a storage driver serves.

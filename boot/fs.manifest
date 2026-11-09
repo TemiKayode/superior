@@ -23,7 +23,9 @@ component virtio-blk
   uses pci 0
   provides block 1
   notification 2
-  untyped 14 3
+  # 32 KiB: enough for either disk driver (cargo xtask nvme-test boots
+  # this manifest with nvme in its place).
+  untyped 15 3
 
 component fs
   image fs

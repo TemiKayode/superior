@@ -406,9 +406,20 @@ impl Bus {
         Ok(Some(slot))
     }
 
-    fn open(&mut self, badge: u64, ids: u64, instance: u64) -> ([u64; 4], Option<u64>) {
+    /// Opens the `instance`th function with these IDs (or, if `class`, of
+    /// this class).
+    fn open(
+        &mut self,
+        badge: u64,
+        class: bool,
+        ids: u64,
+        instance: u64,
+    ) -> ([u64; 4], Option<u64>) {
         let found = (0..MAX_FUNCS)
-            .filter(|&i| matches!(self.funcs[i], Some(f) if f.ids as u64 == ids))
+            .filter(|&i| {
+                matches!(self.funcs[i], Some(f)
+                    if (if class { f.class } else { f.ids }) as u64 == ids)
+            })
             .nth(instance as usize);
         let Some(i) = found else {
             return ([Status::NotFound as u64, 0, 0, 0], None);
@@ -517,11 +528,11 @@ impl Bus {
     /// Serves one call. Returns the reply and a capability to grant.
     fn serve(&mut self, badge: u64, m: [u64; 4]) -> ([u64; 4], Option<u64>) {
         let status = |s: Status| ([s as u64, 0, 0, 0], None);
-        if m[0] == pci::OPEN {
+        if m[0] == pci::OPEN || m[0] == pci::OPEN_CLASS {
             if m[1] != pci::VERSION {
                 return status(Status::Invalid);
             }
-            return self.open(badge, m[2], m[3]);
+            return self.open(badge, m[0] == pci::OPEN_CLASS, m[2], m[3]);
         }
         let Some(i) = self.owned(badge) else {
             return status(Status::Denied);

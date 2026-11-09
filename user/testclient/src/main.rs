@@ -278,11 +278,24 @@ fn block_client() -> ! {
             ),
         );
     }
-    // Exactly one driver per device.
+    // Exactly one driver per device: whichever disk the driver has (a
+    // virtio one by its IDs, or any NVMe controller by its class), the bus
+    // server refuses it; the other is not there.
     let ids = 0x1af4u64 << 16 | 0x1042;
-    let r = syscall(Syscall::Call, BLOCK_PCI, [pci::OPEN, pci::VERSION, ids, 0]);
+    let by_ids = syscall(Syscall::Call, BLOCK_PCI, [pci::OPEN, pci::VERSION, ids, 0]);
+    let by_class = syscall(
+        Syscall::Call,
+        BLOCK_PCI,
+        [pci::OPEN_CLASS, pci::VERSION, 0x01_08_02, 0],
+    );
+    let (in_use, missing) = (Status::InUse as u64, Status::NotFound as u64);
     t.check(
-        r.status == 0 && r.msg[0] == Status::InUse as u64,
+        by_ids.status == 0
+            && by_class.status == 0
+            && matches!(
+                (by_ids.msg[0], by_class.msg[0]),
+                (a, b) if (a == in_use && b == missing) || (a == missing && b == in_use)
+            ),
         format_args!("the bus server will not give it the driver's device"),
     );
     let r = syscall(Syscall::Call, BLOCK_PCI, [pci::BAR_PAGE, 4, 0, 0]);

@@ -70,7 +70,28 @@ impl Pci {
         domain: u64,
     ) -> Result<(u64, u64), Failure> {
         let ids = (vendor as u64) << 16 | device as u64;
-        let r = self.call([pci::OPEN, pci::VERSION, ids, instance], Some(domain))?;
+        self.open_with(pci::OPEN, ids, instance, domain)
+    }
+
+    /// As [`Pci::open`], for the `instance`th function of a class
+    /// (`class << 16 | subclass << 8 | interface`), whoever made it.
+    pub fn open_class(
+        &self,
+        class: u32,
+        instance: u64,
+        domain: u64,
+    ) -> Result<(u64, u64), Failure> {
+        self.open_with(pci::OPEN_CLASS, class as u64, instance, domain)
+    }
+
+    fn open_with(
+        &self,
+        op: u64,
+        what: u64,
+        instance: u64,
+        domain: u64,
+    ) -> Result<(u64, u64), Failure> {
+        let r = self.call([op, pci::VERSION, what, instance], Some(domain))?;
         if r.cap != Some(domain as u16) {
             return Err(("no IOMMU domain arrived (no IOMMU?)", 0));
         }
