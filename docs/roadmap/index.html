@@ -81,7 +81,7 @@ const PHASES = [
       { name: "Toolchain and boot", tasks: [
         { t: "Rust toolchain and x86-64 target", s: "done", ev: "Pinned nightly in <code>rust-toolchain.toml</code>, target <code>x86_64-unknown-none</code>; kernel, user program and disk image built by <code>cargo xtask test</code>. <code>0654537</code>" },
         { t: "Rust bootloader on x86-64", s: "done", ev: "Boots via the Rust <code>bootloader</code> 0.11 crate under QEMU; serial console, GDT/TSS, exception handlers. <code>0654537</code>" },
-        { t: "AArch64 target and boot", s: "open", ev: "Not started: <code>aarch64-unknown-none</code> kernel booting on QEMU <code>virt</code>." },
+        { t: "AArch64 target and boot", s: "done", ev: "<code>aarch64-unknown-none-softfloat</code> kernel linked at 0x40200000, booted by QEMU <code>virt</code> from its ELF; MMU and caches on in the boot assembly, RAM from the device tree. <code>c2d181c</code>" },
       ]},
       { name: "Kernel core on x86-64", tasks: [
         { t: "Untyped memory, retype from user space", s: "done", ev: "All RAM handed out as untyped; no kernel heap. Boot self-test makes, revokes and re-makes objects. <code>131eec1</code>" },
@@ -97,8 +97,8 @@ const PHASES = [
         { t: "Threads as objects", s: "done", ev: "Retype, configure, copy caps, suspend/resume (Interrupted), destroy on last cap; table refilled. <code>ab4b716</code>" },
       ]},
       { name: "Kernel core on AArch64", tasks: [
-        { t: "Exceptions, MMU, GIC timer, context switch", s: "open", ev: "Not started." },
-        { t: "Same self-tests passing on AArch64", s: "open", ev: "Not started." },
+        { t: "Exceptions, MMU, GIC timer, context switch", s: "done", ev: "EL0/EL1 vectors (svc, aborts, undefined, trapped wfi, IRQ, brk), 4-level user page tables, GICv2, generic timer at 100 Hz, full-frame context switch with eret. The kernel core (capabilities, IPC, threads, CNodes, scheduling) is shared code with x86-64. <code>c2d181c</code>" },
+        { t: "Same self-tests passing on AArch64", s: "done", ev: "The same self-test program, built for AArch64, passes every check on QEMU <code>virt</code>: rights, transfer, retype/revoke, frames, faults as IPC, threads, CNodes, preemption, budgets, passive server, idle. Run by <code>cargo xtask test</code>. <code>c2d181c</code>" },
       ]},
       { name: "Assurance", tasks: [
         { t: "Formal model of capability derivation", s: "done", ev: "Independent spec with ghost provenance; every reachable state of a 4-slot table checked: 2,756,509 states, 286,676,936 transitions, no violation. A planted allocator bug is caught in 2 steps. Bounded model checking, not a proof. <code>1105293</code>" },
@@ -109,7 +109,7 @@ const PHASES = [
       ]},
       { name: "Exit gate", tasks: [
         { t: "Boots to a shell on x86-64", s: "done", ev: "A user-space shell that is its own COM1 driver (I/O-port and IRQ capabilities). <code>cargo xtask test</code> types a session over serial — help, echo, sleep, ipc, backspace editing — checks every answer, and requires <code>shutdown</code> to power QEMU off. Also fixed a lost-signal race that hung 1 boot in 5; 16/16 clean since. <code>097c782</code>" },
-        { t: "Boots to a shell on AArch64", s: "open", ev: "Not started." },
+        { t: "Boots to a shell on AArch64", s: "done", ev: "The same shell, its own PL011 driver through a device frame and the UART's IRQ capability; <code>cargo xtask test</code> types the same session on both ISAs and requires <code>shutdown</code> to end QEMU with the pass code. <code>c2d181c</code>" },
         { t: "Tier 1 IPC within 1.5× of seL4", s: "done", ev: "<code>cargo xtask bench</code>: one-way call and reply timed as sel4bench does, 5 × 100,000 round trips under WHPX on an i7-1165G7. Median call 504, reply 496 TSC cycles vs seL4 MCS (Skylake) 771 / 667: 0.65× and 0.74×. Allowing for TSC vs turbo clock, at most 1.10× / 1.25×. x86-64 under a hypervisor, not bare metal. <code>1dd67c0</code>" },
       ]},
     ]},
