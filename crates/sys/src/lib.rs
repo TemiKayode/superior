@@ -11,8 +11,14 @@
 //! | trap instruction | `syscall` (clobbers `rcx`, `r11`) | `svc #0` |
 //!
 //! The kernel preserves every other register.
+//!
+//! With the `sel4` feature (AArch64 only) a program instead runs as seL4's
+//! root task, its system calls translated by `src/sel4.rs`.
 
 #![no_std]
+
+#[cfg(all(feature = "sel4", target_arch = "aarch64"))]
+mod sel4;
 
 use superior_objects::abi::{CapTransfer, MSG_WORDS, Syscall};
 
@@ -35,6 +41,9 @@ pub fn syscall(nr: Syscall, a0: u64, m: [u64; MSG_WORDS]) -> Ret {
 /// A system call that may grant and accept a capability.
 #[inline(always)]
 pub fn syscall_x(nr: Syscall, a0: u64, m: [u64; MSG_WORDS], x: CapTransfer) -> Ret {
+    #[cfg(all(feature = "sel4", target_arch = "aarch64"))]
+    return sel4::syscall(nr, a0, m, x);
+    #[allow(unreachable_code)]
     let (status, badge, m0, m1, m2, m3, cap): (u64, u64, u64, u64, u64, u64, u64);
     #[cfg(target_arch = "x86_64")]
     // SAFETY: the kernel preserves every register except rax, rdi, rsi,
@@ -99,8 +108,19 @@ pub fn cycles() -> u64 {
     }
 }
 
+/// Where a program may map memory: Superior's user window, or on seL4 an
+/// address inside its smaller user address space (hypervisor-mode seL4
+/// gives user mode 40 or 44 bits).
+pub const USER_BASE: u64 = if cfg!(all(feature = "sel4", target_arch = "aarch64")) {
+    0x10_0000_0000
+} else {
+    0x7000_0000_0000
+};
+
 /// The instruction set, for messages.
-pub const ARCH: &str = if cfg!(target_arch = "aarch64") {
+pub const ARCH: &str = if cfg!(all(feature = "sel4", target_arch = "aarch64")) {
+    "AArch64, on seL4"
+} else if cfg!(target_arch = "aarch64") {
     "AArch64"
 } else {
     "x86-64"

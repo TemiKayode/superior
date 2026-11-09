@@ -15,3 +15,7 @@ bench = false
 [dependencies]
 superior-objects = { path = "../../crates/objects" }
 superior-sys = { path = "../../crates/sys" }
+
+[features]
+# Build as seL4's root task instead of a Superior program.
+sel4 = ["superior-sys/sel4"]

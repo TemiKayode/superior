@@ -9,3 +9,7 @@ publish = false
 
 [dependencies]
 superior-objects = { path = "../objects" }
+
+[features]
+# Run on seL4 instead (AArch64): see src/sel4.rs.
+sel4 = []

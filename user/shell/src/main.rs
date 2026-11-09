@@ -22,7 +22,7 @@
 
 use core::fmt::{self, Write};
 use superior_objects::abi::{ObjectType, Syscall};
-use superior_sys::{cycles, syscall};
+use superior_sys::{USER_BASE, cycles, syscall};
 
 const UART: u64 = 0;
 const UART_IRQ: u64 = 1;
@@ -37,7 +37,6 @@ const ECHO_STACK: u64 = 9;
 /// The echo thread's endpoint, in its own CSpace.
 const ECHO_SLOT: u64 = 0;
 
-const USER_BASE: u64 = 0x7000_0000_0000;
 const ECHO_STACK_VA: u64 = USER_BASE + 0x4000_0000;
 const RIGHT_READ: u64 = 1 << 0;
 const RIGHT_WRITE: u64 = 1 << 1;
@@ -383,7 +382,9 @@ fn shutdown() -> ! {
     }
 }
 
-#[unsafe(no_mangle)]
+// On seL4 the runtime in superior-sys owns `_start` and calls this.
+#[cfg_attr(not(feature = "sel4"), unsafe(no_mangle))]
+#[cfg_attr(feature = "sel4", unsafe(export_name = "superior_main"))]
 pub extern "C" fn _start(_: u64) -> ! {
     let mapped = uart::init();
     let bound = syscall(Syscall::IrqSetNotification, UART_IRQ, [UART_NTFN, 0, 0, 0]);

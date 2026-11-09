@@ -13,6 +13,10 @@
 //!   cargo xtask bench              time IPC under hardware virtualization
 //!                                  (WHPX or KVM, x86-64) and check it against
 //!                                  seL4's published figures
+//!   cargo xtask sel4-test          the same shell session with the shell
+//!                                  running on seL4 (AArch64) instead; `test`
+//!                                  ends with it. seL4 and its loader are built
+//!                                  once, in Docker (sel4/Dockerfile)
 //!
 //! x86-64 boots from a BIOS disk image; AArch64 boots QEMU's `virt` machine
 //! straight from the kernel ELF, with semihosting for the exit status.
@@ -66,6 +70,8 @@ impl Arch {
 struct Image {
     path: PathBuf,
     arch: Arch,
+    /// seL4 with the shell as its root task, rather than Superior.
+    sel4: bool,
 }
 
 fn main() -> ExitCode {
@@ -74,19 +80,23 @@ fn main() -> ExitCode {
     let result = arch.and_then(|arch| match args.first().map(String::as_str) {
         Some("image") => image(false, arch).map(|i| println!("image: {}", i.path.display())),
         Some("run") => image(false, arch).and_then(|img| boot(&img, false)),
-        Some("test") => host_tests().and_then(|_| {
-            [Arch::X86_64, Arch::Aarch64].into_iter().try_for_each(|a| {
-                image(true, a)
-                    .and_then(|img| boot(&img, true))
-                    .and_then(|_| image(false, a))
-                    .and_then(|img| shell_session(&img))
+        Some("test") => host_tests()
+            .and_then(|_| {
+                [Arch::X86_64, Arch::Aarch64].into_iter().try_for_each(|a| {
+                    image(true, a)
+                        .and_then(|img| boot(&img, true))
+                        .and_then(|_| image(false, a))
+                        .and_then(|img| shell_session(&img))
+                })
             })
-        }),
+            .and_then(|_| sel4_image())
+            .and_then(|img| shell_session(&img)),
+        Some("sel4-test") => sel4_image().and_then(|img| shell_session(&img)),
         Some("boot-test") => image(true, arch).and_then(|img| boot(&img, true)),
         Some("shell-test") => image(false, arch).and_then(|img| shell_session(&img)),
         Some("bench") => image(false, Arch::X86_64).and_then(|img| bench(&img)),
         _ => Err(
-            "usage: cargo xtask <image | run | test | boot-test | shell-test | bench> [x86_64 | aarch64]"
+            "usage: cargo xtask <image | run | test | boot-test | shell-test | bench | sel4-test> [x86_64 | aarch64]"
                 .into(),
         ),
     });
@@ -216,7 +226,99 @@ fn image(selftest: bool, arch: Arch) -> Result<Image, String> {
             elf
         }
     };
-    Ok(Image { path, arch })
+    Ok(Image {
+        path,
+        arch,
+        sel4: false,
+    })
+}
+
+/// Runs `args` in the seL4 build container with the repository at /work,
+/// building the container first if needed.
+fn docker(args: &[&str]) -> Result<(), String> {
+    let have = Command::new("docker")
+        .args(["image", "inspect", "superior-sel4"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|e| format!("could not run docker: {e}"))?;
+    if !have.success() {
+        println!("== building the seL4 build container");
+        run(Command::new("docker")
+            .args(["build", "-t", "superior-sel4"])
+            .arg(root().join("sel4")))?;
+    }
+    run(Command::new("docker")
+        .args(["run", "--rm", "-v"])
+        .arg(format!("{}:/work", root().display()))
+        // Toolchains and crates survive between runs.
+        .args(["-v", "superior-sel4-rustup:/root/.rustup"])
+        .args(["-v", "superior-sel4-cargo:/root/.cargo/registry"])
+        .args(["-v", "superior-sel4-git:/root/.cargo/git"])
+        .arg("superior-sel4")
+        .args(args))
+}
+
+/// The QEMU machine and memory seL4 is built for and booted on.
+const SEL4_MACHINE: &str = "virt,secure=off,gic-version=2,virtualization=on";
+const SEL4_MEMORY: &str = "1024M";
+
+/// seL4 booting the shell as its root task: seL4 and rust-sel4's kernel
+/// loader are built once (sel4/build.sh); the shell is built with its
+/// `sel4` feature, as an ordinary static executable, and appended to the
+/// loader as its payload.
+fn sel4_image() -> Result<Image, String> {
+    let out = root().join("target/sel4");
+    if !out
+        .join("loader/bin/sel4-kernel-loader-add-payload")
+        .exists()
+    {
+        // seL4 is configured from the device tree of the machine it will
+        // boot on, dumped from this QEMU.
+        std::fs::create_dir_all(&out).map_err(|e| e.to_string())?;
+        run(Command::new(qemu(Arch::Aarch64))
+            .arg("-machine")
+            .arg(format!(
+                "{SEL4_MACHINE},dumpdtb={}",
+                out.join("virt.dtb").display()
+            ))
+            .args(["-cpu", "cortex-a72", "-smp", "1", "-m", SEL4_MEMORY])
+            .args(["-display", "none"]))?;
+        println!("== building seL4 and its loader (once)");
+        docker(&["sh", "/work/sel4/build.sh"])?;
+    }
+    println!("== building superior-shell for seL4");
+    let target = Arch::Aarch64.target();
+    run(cargo().args([
+        "build",
+        "--quiet",
+        "-p",
+        "superior-shell",
+        "--release",
+        "--features",
+        "sel4",
+        "--target",
+        target,
+        "--target-dir",
+        "target/sel4-user",
+    ]))?;
+    let app = format!("/work/target/sel4-user/{target}/release/superior-shell");
+    docker(&[
+        "/work/target/sel4/loader/bin/sel4-kernel-loader-add-payload",
+        "--sel4-prefix",
+        "/work/target/sel4/prefix",
+        "--loader",
+        "/work/target/sel4/loader/bin/sel4-kernel-loader",
+        "--app",
+        &app,
+        "-o",
+        "/work/target/sel4/superior-shell-sel4.elf",
+    ])?;
+    Ok(Image {
+        path: out.join("superior-shell-sel4.elf"),
+        arch: Arch::Aarch64,
+        sel4: true,
+    })
 }
 
 fn qemu(arch: Arch) -> PathBuf {
@@ -243,12 +345,26 @@ fn qemu_command(img: &Image) -> Command {
                 .args(["-device", "isa-debug-exit,iobase=0xf4,iosize=0x04"]);
         }
         Arch::Aarch64 => {
-            q.args(["-machine", "virt", "-cpu", "cortex-a72", "-kernel"])
-                .arg(&img.path)
-                .args(["-semihosting-config", "enable=on,target=native"]);
+            let machine = if img.sel4 { SEL4_MACHINE } else { "virt" };
+            q.args(["-machine", machine, "-cpu", "cortex-a72", "-kernel"])
+                .arg(&img.path);
+            if img.sel4 {
+                // The shell's exit is a semihosting call from user mode.
+                q.args([
+                    "-semihosting-config",
+                    "enable=on,target=native,userspace=on",
+                ])
+                .args(["-m", SEL4_MEMORY]);
+            } else {
+                q.args(["-semihosting-config", "enable=on,target=native"])
+                    .args(["-m", "512M"]);
+            }
         }
     }
-    q.args(["-m", "512M", "-serial", "stdio", "-no-reboot"]);
+    if img.arch == Arch::X86_64 {
+        q.args(["-m", "512M"]);
+    }
+    q.args(["-serial", "stdio", "-no-reboot"]);
     q
 }
 
@@ -292,7 +408,11 @@ fn shell_session(img: &Image) -> Result<(), String> {
         ("echp\x7fo fixed", "\nfixed"),
     ];
     drive_shell(img, &[], script)?;
-    println!("== shell session passed ({})", img.arch.name());
+    println!(
+        "== shell session passed ({}{})",
+        img.arch.name(),
+        if img.sel4 { ", on seL4" } else { "" }
+    );
     Ok(())
 }
 

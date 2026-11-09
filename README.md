@@ -111,6 +111,15 @@ holds the rest):
   of 771 and 667 on Skylake (0.65x and 0.74x; the gate is 1.5x). The TSC runs at the
   nominal 2.8 GHz while the core may turbo to 4.7 GHz, so in core cycles the ratio could
   be up to 1.68x worse (1.10x and 1.25x), still inside the gate. Not measured on bare metal.
+- The same shell on seL4 (`cargo xtask sel4-test`, also the last step of `cargo xtask
+  test`): built with the `sel4` feature of `superior-sys`, it becomes seL4's root task
+  (seL4 17.0.0, AArch64, QEMU virt), and a small runtime translates each Superior system
+  call into seL4 system calls and invocations. Its UART frame, interrupt, notifications
+  and untyped memory are made from seL4's boot capabilities; `sleep` waits on the EL1
+  physical timer's interrupt; `ipc` calls an echo thread made through `TCB_Configure`
+  and friends. The scripted session passes unchanged. seL4 is built in hypervisor mode,
+  because rust-sel4's kernel loader enters the kernel at EL2; it and the loader are built
+  once in Docker (`sel4/`), against a device tree dumped from the QEMU that boots it.
 - Static-pie user programs loaded into their own address spaces and relocated.
 - Boot self-test: a server and a client in separate address spaces do 20,000
   call/reply round trips, and the kernel refuses four kinds of rights violations. A
@@ -146,10 +155,11 @@ https://claude.ai/artifact/QKJS8qH5Dfbjzn58RStq1j
 | --- | --- |
 | `kernel/` | The microkernel (`no_std`, targets `x86_64-unknown-none` and `aarch64-unknown-none-softfloat`) |
 | `kernel/src/arch/` | Per-ISA code: boot, exceptions and system call entry, page tables, interrupts, timer, console (`x86_64/`, `aarch64/`) |
-| `crates/sys/` | User-side system call wrappers for both ISAs (one ABI by register position) |
+| `crates/sys/` | User-side system call wrappers for both ISAs (one ABI by register position), and the seL4 runtime (`src/sel4.rs`) |
 | `crates/objects/` | Pure kernel logic, unit-tested on the host: capabilities and CNodes, untyped memory, the IPC and scheduling state machine, the syscall ABI, an ELF reader |
 | `user/pingpong/` | Boot self-test program (IPC server, client and spinner) |
 | `user/shell/` | The boot shell and COM1 driver |
+| `sel4/` | Docker build of seL4 and rust-sel4's kernel loader, for running the shell on seL4 |
 | `xtask/` | Build driver: user program, kernel, disk image, QEMU boot |
 
 ## Building
@@ -157,11 +167,12 @@ https://claude.ai/artifact/QKJS8qH5Dfbjzn58RStq1j
 Needs Rust (the pinned nightly in `rust-toolchain.toml` installs itself) and QEMU.
 
 ```bash
-cargo xtask test           # host tests, model check, simulation; then on both ISAs the boot self-tests and a shell session
+cargo xtask test           # host tests, model check, simulation; on both ISAs the boot self-tests and a shell session; then the shell on seL4
 cargo xtask run            # boot the shell in QEMU (x86-64), its console on this terminal
 cargo xtask run aarch64    # the same on QEMU's AArch64 virt machine
 cargo xtask image  # just build target/superior.img
 cargo xtask bench  # IPC timing under WHPX or KVM, checked against seL4's figures
+cargo xtask sel4-test      # the shell session on seL4 (needs Docker the first time)
 ```
 
 QEMU is found via `$QEMU` (or `$QEMU_AARCH64`), then `C:\Program Files\qemu`, then `PATH`.
