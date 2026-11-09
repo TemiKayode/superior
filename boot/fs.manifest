@@ -1,0 +1,49 @@
+# The filesystem test, first boot (cargo xtask fs-test).
+#
+# A client appends records to a file while the injector kills the
+# filesystem server and the disk driver at pseudo-random moments; every
+# acknowledged record must read back. The client then appends one more and
+# shuts the machine down at once. boot/fs-verify.manifest boots the same
+# disk again. Component numbers matter: the client is component 3 in both,
+# so it gets the same container; the injector kills components 1 and 2.
+
+component pcibus
+  image pcibus
+  priority 12
+  provides pci 0
+  device pci-config 1
+  device pci-mmio 2
+  device msi 3
+  device iommu 11
+  untyped 18 12
+
+component virtio-blk
+  image virtio-blk
+  priority 11
+  uses pci 0
+  provides block 1
+  notification 2
+  untyped 14 3
+
+component fs
+  image fs
+  priority 10
+  uses block 0
+  provides fs 1
+  untyped 16 2
+
+component client
+  image testclient
+  arg 7
+  priority 8
+  uses fs 0
+  control 1
+  untyped 12 2
+
+component injector
+  image testclient
+  arg 10
+  priority 8
+  control 0
+  fault-injector
+  notification 1

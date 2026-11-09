@@ -30,12 +30,26 @@
 //!   state page, slot 1) checks it holds nothing and that every page it
 //!   is given now is zeroed, though the pool has reused the last
 //!   instance's pages. It then blocks on the notification in slot 2.
+//! - `arg 7`, the file client under load (`boot/fs.manifest`): appends
+//!   records to a file through the filesystem server (slot 0) while the
+//!   injector kills the server and the disk driver, retrying calls cut
+//!   off by a restart; checks every acknowledged record reads back, then
+//!   appends one more and shuts the machine down at once (a power cut).
+//!   Control in slot 1, memory in slot 2.
+//! - `arg 8`, the file client after the power cut (`boot/fs-verify.manifest`):
+//!   checks every acknowledged record is on the disk. Same slots.
+//! - `arg 9`, a second file client: its container must not hold the
+//!   first client's file. Memory in slot 1, a notification to block on in
+//!   slot 2.
+//! - `arg 10`, the fault injector: asks the manager (control, slot 0) to
+//!   kill the filesystem server and the disk driver at pseudo-random
+//!   moments, then blocks on the notification in slot 1.
 
 #![no_std]
 #![no_main]
 
 use superior_objects::abi::{CapTransfer, Error, ObjectType, Syscall, root};
-use superior_objects::interfaces::{Status, block, mem, pci};
+use superior_objects::interfaces::{Status, block, fs, mem, pci};
 use superior_sys::{Called, USER_BASE, call_retry, print_line, syscall, syscall_x};
 
 const ECHO: u64 = 0;
@@ -491,6 +505,227 @@ fn hog() -> ! {
     }
 }
 
+// The file tests' slots and layout.
+const FS: u64 = 0;
+const FS_CONTROL: u64 = 1;
+const FS_MEMORY: u64 = 2;
+const FS_BUFFER: u64 = 4;
+const FS_BUFFER_VA: u64 = USER_BASE + 0x4000_0000;
+/// Records appended under load; one more goes in just before the power
+/// cut.
+const RECORDS: u64 = 400;
+const RECORD: u64 = 64;
+/// Component numbers in `boot/fs.manifest` (manifest order).
+const DRIVER_INDEX: u64 = 1;
+const FS_INDEX: u64 = 2;
+const OP_KILL: u64 = 3;
+
+/// Word `j` of record `k`.
+fn record_word(k: u64, j: u64) -> u64 {
+    0x5245_434f_0000_0000 | k << 8 | j
+}
+
+/// A call to the filesystem server lending the buffer, retried while the
+/// server (or the driver under it) is restarted. Returns the reply and
+/// how many times it was retried.
+fn fs_call(m: [u64; 4], lend: bool) -> ([u64; 4], u64) {
+    let x = CapTransfer {
+        grant: lend.then_some(FS_BUFFER as u16),
+        accept: None,
+    };
+    for tries in 0..50 {
+        let r = syscall_x(Syscall::Call, FS, m, x);
+        if r.status == 0 {
+            return (r.msg, tries);
+        }
+        if r.status != Error::PeerRestarted.code() {
+            break;
+        }
+    }
+    ([u64::MAX; 4], 50)
+}
+
+fn fs_buffer() -> &'static mut [u64] {
+    // SAFETY: the buffer frame is mapped at FS_BUFFER_VA.
+    unsafe { core::slice::from_raw_parts_mut(FS_BUFFER_VA as *mut u64, 512) }
+}
+
+fn fs_setup(memory: u64) -> bool {
+    syscall(
+        Syscall::Retype,
+        memory,
+        [ObjectType::Frame as u64, 0, FS_BUFFER, 0],
+    )
+    .status
+        == 0
+        && syscall(Syscall::FrameMap, FS_BUFFER, [FS_BUFFER_VA, 1, 0, 0]).status == 0
+}
+
+fn fs_open(name: &str, create: bool) -> [u64; 4] {
+    let n = fs::name(name).unwrap();
+    let op = if create { fs::CREATE } else { fs::OPEN };
+    fs_call([op, n[0], n[1], n[2]], false).0
+}
+
+/// Appends record `k`. Returns whether it was acknowledged, and retries.
+fn append(h: u64, k: u64) -> (bool, u64) {
+    let b = fs_buffer();
+    for j in 0..RECORD / 8 {
+        b[j as usize] = record_word(k, j);
+    }
+    let (r, tries) = fs_call([fs::WRITE, h, k * RECORD, RECORD], true);
+    (r[0] == Status::Ok as u64, tries)
+}
+
+/// Checks records `0..n` of the file read back right. Returns the first
+/// wrong one.
+fn check_records(h: u64, n: u64) -> Result<(), u64> {
+    let per_block = fs::BLOCK / RECORD;
+    let mut k = 0;
+    while k < n {
+        let (r, _) = fs_call([fs::READ, h, k * RECORD, fs::BLOCK], true);
+        if r[0] != Status::Ok as u64 {
+            return Err(k);
+        }
+        let b = fs_buffer();
+        for i in 0..per_block.min(n - k) {
+            let rec = k + i;
+            for j in 0..RECORD / 8 {
+                if b[(i * RECORD / 8 + j) as usize] != record_word(rec, j) {
+                    return Err(rec);
+                }
+            }
+        }
+        k += per_block;
+    }
+    Ok(())
+}
+
+fn fs_client() -> ! {
+    let mut t = Checks(0, "fs");
+    t.check(
+        fs_setup(FS_MEMORY),
+        format_args!("a buffer page of its own"),
+    );
+    let r = fs_open("log", true);
+    t.check(
+        r[0] == Status::Ok as u64 && r[2] == 0,
+        format_args!("created an empty file"),
+    );
+    let h = r[1];
+    let (mut acked, mut retried) = (0, 0);
+    for k in 0..RECORDS {
+        let (ok, tries) = append(h, k);
+        retried += tries;
+        if !ok {
+            break;
+        }
+        acked += 1;
+    }
+    t.check(
+        acked == RECORDS,
+        format_args!(
+            "{acked} records written under fault injection ({retried} calls cut off by a restart and retried)"
+        ),
+    );
+    let c = check_records(h, acked);
+    t.check(
+        c.is_ok(),
+        format_args!(
+            "every acknowledged record reads back (first wrong: {})",
+            c.err().map_or(-1, |k| k as i64)
+        ),
+    );
+    let (r, _) = fs_call([fs::STAT, h, 0, 0], false);
+    t.check(
+        r[1] == acked * RECORD,
+        format_args!("the file is {} bytes", r[1]),
+    );
+    // One more, acknowledged, then the machine stops at once: the server
+    // gets no chance to write it home.
+    let (ok, _) = append(h, RECORDS);
+    t.check(
+        ok,
+        format_args!("record {RECORDS} acknowledged; cutting the power"),
+    );
+    syscall(Syscall::Call, FS_CONTROL, [OP_SHUTDOWN, t.0, 0, 0]);
+    loop {
+        syscall(Syscall::Yield, 0, [0; 4]);
+    }
+}
+
+fn fs_verify() -> ! {
+    let mut t = Checks(0, "fs");
+    t.check(
+        fs_setup(FS_MEMORY),
+        format_args!("a buffer page of its own"),
+    );
+    let r = fs_open("log", false);
+    let n = RECORDS + 1;
+    t.check(
+        r[0] == Status::Ok as u64 && r[2] == n * RECORD,
+        format_args!("after the power cut the file is {} bytes", r[2]),
+    );
+    let c = check_records(r[1], n);
+    t.check(
+        c.is_ok(),
+        format_args!(
+            "all {n} acknowledged records survived (first wrong: {})",
+            c.err().map_or(-1, |k| k as i64)
+        ),
+    );
+    syscall(Syscall::Call, FS_CONTROL, [OP_SHUTDOWN, t.0, 0, 0]);
+    loop {
+        syscall(Syscall::Yield, 0, [0; 4]);
+    }
+}
+
+fn fs_other() -> ! {
+    let mut t = Checks(0, "fs other");
+    t.check(fs_setup(1), format_args!("a buffer page of its own"));
+    let r = fs_open("log", false);
+    t.check(
+        r[0] == Status::NotFound as u64,
+        format_args!("another component's \"log\" is not in its container"),
+    );
+    let r = fs_open("log", true);
+    let (ok, _) = append(r[1], 7);
+    let (st, _) = fs_call([fs::STAT, r[1], 0, 0], false);
+    t.check(
+        r[0] == Status::Ok as u64 && ok && st[1] == 8 * RECORD,
+        format_args!("its own \"log\" is a separate file"),
+    );
+    loop {
+        syscall(Syscall::Wait, 2, [0; 4]);
+    }
+}
+
+fn injector() -> ! {
+    // A fixed seed: the moments vary with timing, not between runs.
+    let mut seed = 0x2545_f491_4f6c_dd1du64;
+    // Let the client get going first.
+    let start = ticks();
+    while ticks() < start + 10 {
+        syscall(Syscall::Yield, 0, [0; 4]);
+    }
+    for n in 0..8 {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        let wait = 3 + seed % 12;
+        let start = ticks();
+        while ticks() < start + wait {
+            syscall(Syscall::Yield, 0, [0; 4]);
+        }
+        let target = if n % 2 == 0 { FS_INDEX } else { DRIVER_INDEX };
+        syscall(Syscall::Call, 0, [OP_KILL, target, 0, 0]);
+    }
+    say!("injector: done");
+    loop {
+        syscall(Syscall::Wait, 1, [0; 4]);
+    }
+}
+
 fn ticks() -> u64 {
     syscall(Syscall::Ticks, 0, [0; 4]).msg[0]
 }
@@ -514,6 +749,10 @@ pub extern "C" fn _start(role: u64) -> ! {
         4 => block_client(),
         5 => memory_client(),
         6 => hog(),
+        7 => fs_client(),
+        8 => fs_verify(),
+        9 => fs_other(),
+        10 => injector(),
         _ => probe(),
     }
 }

@@ -112,6 +112,9 @@ const BADGE_FAULT: u64 = 0x200;
 const BADGE_WATCHER: u64 = 0x300;
 /// Reports a component may send (msg[0]).
 const OP_SHUTDOWN: u64 = 2;
+/// `[OP_KILL, component index]`, from a `fault-injector` only: kill the
+/// component as if it had crashed (supervision restarts it).
+const OP_KILL: u64 = 3;
 
 // ---- the manager's own address space -----------------------------------
 
@@ -794,6 +797,22 @@ pub extern "C" fn _start(bundle_len: u64) -> ! {
                 }
                 m.supervise(i);
                 None
+            }
+            BADGE_REPORT
+                if i < MAX_COMPONENTS && msg.msg[0] == OP_KILL && m.component(i).injector =>
+            {
+                let t = msg.msg[1] as usize;
+                let killable = t < MAX_COMPONENTS
+                    && t != i
+                    && m.manifest.components[t].is_some()
+                    && m.status[t] == Status::Running
+                    && !m.is_memory_server(t);
+                if killable {
+                    say!("fault injection: killing {}", m.component(t).name);
+                    m.status[t] = Status::Stopped;
+                    m.supervise(t);
+                }
+                Some([!killable as u64, 0, 0, 0])
             }
             BADGE_REPORT if i < MAX_COMPONENTS && msg.msg[0] == OP_SHUTDOWN => {
                 let name = m.component(i).name;

@@ -424,6 +424,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "superior-fs"
+version = "0.1.0"
+dependencies = [
+ "superior-objects",
+ "superior-sys",
+]
+
+[[package]]
 name = "superior-kernel"
 version = "0.1.0"
 dependencies = [

@@ -89,12 +89,18 @@ const ACCESS_PLATFORM: u32 = 1 << 1;
 
 /// virtio-blk request types.
 const IN: u32 = 0;
+const OUT: u32 = 1;
+const FLUSH: u32 = 4;
+/// Feature 9: the device has a write cache that `FLUSH` empties.
+const F_FLUSH: u32 = 1 << 9;
 
 macro_rules! say {
     ($($t:tt)*) => { print_line(format_args!("virtio-blk: {}", format_args!($($t)*))) };
 }
 
 struct Device {
+    /// The device has a write cache, emptied by a flush.
+    flush: bool,
     notify: u64,
     queue: Queue,
     request: DmaPage,
@@ -178,11 +184,13 @@ fn start() -> Result<Device, Failure> {
     if common.read32(DEVICE_FEATURE) & 1 == 0 {
         return Err(("the device does not offer VERSION_1", 0));
     }
-    // VERSION_1 (feature 32), and ACCESS_PLATFORM (33) if offered: the
-    // device's DMA goes through the IOMMU. Nothing else.
+    // VERSION_1 (feature 32), ACCESS_PLATFORM (33) if offered (the
+    // device's DMA goes through the IOMMU) and FLUSH (9) if offered.
     let high = common.read32(DEVICE_FEATURE) & ACCESS_PLATFORM;
+    common.write32(DEVICE_FEATURE_SELECT, 0);
+    let low = common.read32(DEVICE_FEATURE) & F_FLUSH;
     common.write32(DRIVER_FEATURE_SELECT, 0);
-    common.write32(DRIVER_FEATURE, 0);
+    common.write32(DRIVER_FEATURE, low);
     common.write32(DRIVER_FEATURE_SELECT, 1);
     common.write32(DRIVER_FEATURE, 1 | high);
     common.write8(DEVICE_STATUS, ACKNOWLEDGE | DRIVER | FEATURES_OK);
@@ -237,6 +245,7 @@ fn start() -> Result<Device, Failure> {
         bdf & 7
     );
     Ok(Device {
+        flush: low != 0,
         notify,
         queue,
         request,
@@ -248,24 +257,37 @@ impl Device {
     /// Starts reading `count` sectors from `sector` into the frame at
     /// `buffer` (a device address).
     fn submit(&mut self, sector: u64, count: u64, buffer: u64) {
+        self.submit_op(IN, sector, count, buffer);
+    }
+
+    /// Starts request `kind` (`IN`, `OUT` or `FLUSH`); `count` sectors at
+    /// `buffer`, none for a flush.
+    fn submit_op(&mut self, kind: u32, sector: u64, count: u64, buffer: u64) {
         let r = self.request;
         // SAFETY: the request page is mapped at `r.va`; the header takes
         // 16 bytes and the status byte follows.
         unsafe {
-            (r.va as *mut u32).write_volatile(IN);
+            (r.va as *mut u32).write_volatile(kind);
             ((r.va + 4) as *mut u32).write_volatile(0);
             ((r.va + 8) as *mut u64).write_volatile(sector);
             ((r.va + 16) as *mut u8).write_volatile(0xff);
         }
         let q = &mut self.queue;
         q.set(0, r.dma, 16, virtq::NEXT);
-        q.set(
-            1,
-            buffer,
-            (count * block::SECTOR) as u32,
-            virtq::NEXT | virtq::WRITE,
-        );
-        q.set(2, r.dma + 16, 1, virtq::WRITE);
+        let status = if kind == FLUSH {
+            1
+        } else {
+            // The device writes the buffer on a read, reads it on a write.
+            let flags = if kind == IN { virtq::WRITE } else { 0 };
+            q.set(
+                1,
+                buffer,
+                (count * block::SECTOR) as u32,
+                virtq::NEXT | flags,
+            );
+            2
+        };
+        q.set(status, r.dma + 16, 1, virtq::WRITE);
         q.submit(0);
         Mmio { base: self.notify }.write16(0, 0);
     }
@@ -280,7 +302,12 @@ impl Device {
     /// Reads `count` sectors from `sector` into the frame at `buffer` (a
     /// device address), waiting for the interrupt.
     fn read(&mut self, sector: u64, count: u64, buffer: u64) -> Status {
-        self.submit(sector, count, buffer);
+        self.run(IN, sector, count, buffer)
+    }
+
+    /// Runs request `kind` to completion, waiting for the interrupt.
+    fn run(&mut self, kind: u32, sector: u64, count: u64, buffer: u64) -> Status {
+        self.submit_op(kind, sector, count, buffer);
         loop {
             if self.queue.take_used().is_some() {
                 break;
@@ -340,7 +367,10 @@ impl Device {
             block::INFO if m[1] == block::VERSION => {
                 [Status::Ok as u64, self.capacity, block::SECTOR, 0]
             }
-            block::READ => {
+            block::FLUSH if self.flush => status(self.run(FLUSH, 0, 0, 0)),
+            // No write cache: every completed write is already durable.
+            block::FLUSH => status(Status::Ok),
+            block::READ | block::WRITE => {
                 let (sector, count) = (m[1], m[2]);
                 if !lent
                     || count == 0
@@ -352,8 +382,10 @@ impl Device {
                     return status(Status::Invalid);
                 }
                 // Reachable by the device only until it is deleted, before
-                // the reply.
-                match io_map(BUFFER, DOMAIN, true) {
+                // the reply; for a write, only for reading.
+                let write = m[0] == block::WRITE;
+                match io_map(BUFFER, DOMAIN, !write) {
+                    Ok(buffer) if write => status(self.run(OUT, sector, count, buffer)),
                     Ok(buffer) => status(self.read(sector, count, buffer)),
                     Err(_) => status(Status::Invalid),
                 }

@@ -25,6 +25,7 @@
 //!   cspace 9                # a CSpace of 2^9 slots (default 2^6)
 //!   quota 64                # pages the Memory Server may give it
 //!   heap 32                 # a demand-zero heap of 32 pages
+//!   fault-injector          # may ask the manager to kill components
 //! ```
 //!
 //! Slots are in the component's own CSpace, a CNode of [`CSPACE_SLOTS`].
@@ -100,6 +101,9 @@ pub struct Component<'a> {
     pub quota_pages: u64,
     /// Pages of demand-zero heap at `USER_BASE + mem::HEAP_OFFSET`.
     pub heap_pages: u64,
+    /// May ask the manager (through its `control` capability) to kill
+    /// other components: for fault-injection tests.
+    pub injector: bool,
     pub caps: [Option<CapSpec<'a>>; MAX_CAPS],
 }
 
@@ -116,6 +120,7 @@ impl<'a> Component<'a> {
             cspace_bits: CSPACE_BITS,
             quota_pages: 0,
             heap_pages: 0,
+            injector: false,
             caps: [None; MAX_CAPS],
         }
     }
@@ -267,6 +272,10 @@ impl<'a> Manifest<'a> {
                     }
                     None
                 }
+                "fault-injector" => {
+                    c.injector = true;
+                    None
+                }
                 "quota" => {
                     c.quota_pages = number(arg("quota needs a page count")?)?;
                     None
@@ -389,6 +398,7 @@ component client   # comment after a directive
   cspace 8
   quota 10
   heap 4
+  fault-injector
 component memserver
   image memserver
   provides mem 0
@@ -415,6 +425,7 @@ component memserver
             (client.cspace_bits, client.quota_pages, client.heap_pages),
             (8, 10, 4)
         );
+        assert!(client.injector && !echo.injector);
         assert_eq!(echo.cspace_bits, CSPACE_BITS);
         let caps: std::vec::Vec<_> = client.caps().collect();
         assert_eq!(

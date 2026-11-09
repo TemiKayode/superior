@@ -225,6 +225,28 @@ holds the rest):
   - it frees one, and the capability is gone;
   - a hog touches more heap than its quota and is restarted, with all 8 pages back
     in the pool; its next instance gets those same pages, zeroed.
+- The filesystem server, v1 (`user/fs/`), over the block interface (which now has
+  `WRITE` and `FLUSH`; the virtio-blk driver negotiates the device's write cache).
+  - No global namespace: each component sees only its own container of files,
+    picked by the badge on its capability, so the same component finds the same
+    files after a restart.
+  - Crash-only, with a write-ahead journal. Changed blocks go to the journal, then a
+    flush, then a header with their home addresses and a checksum, then a flush:
+    only then is the write acknowledged. The blocks go home after the reply. Mount
+    replays a committed transaction an instance (or the machine) left unfinished;
+    a torn one fails its checksum and was never acknowledged.
+  - Every operation is idempotent, so clients retry calls cut off by a restart,
+    and the server retries block calls cut off by a driver restart.
+  - v1 limits: 128 files, 32 KiB each, one block per read or write.
+  - Fault injection: a manifest `fault-injector` component may ask the Component
+    Manager to kill another (it is restarted as if it had crashed).
+  `cargo xtask fs-test` boots a fresh disk twice:
+  - while a client appends 400 records, the injector kills the filesystem server and
+    the disk driver 8 times at pseudo-random moments; every acknowledged record
+    reads back;
+  - one more record is acknowledged and the machine stops at once (a power cut);
+  - the second boot finds all 401 records, often by replaying the journal, and
+    another component's container does not have the file.
 - Static-pie user programs loaded into their own address spaces and relocated.
 - Boot self-test: a server and a client in separate address spaces do 20,000
   call/reply round trips, and the kernel refuses four kinds of rights violations. A
@@ -283,9 +305,10 @@ https://claude.ai/artifact/QKJS8qH5Dfbjzn58RStq1j
 | `crates/driver/` | The Driver SDK: PCI access through the bus server, MMIO, DMA pages, virtqueues |
 | `user/pcibus/` | The PCI bus server |
 | `user/memserver/` | The Memory Server |
+| `user/fs/` | The filesystem server |
 | `user/virtio-blk/` | The virtio block driver |
 | `user/echo/`, `user/counter/`, `user/testclient/` | Test components for the Component Manager, supervision and drivers |
-| `boot/` | Component manifests: `shell.manifest` (normal boot), `test.manifest` (`cm-test`), `supervise.manifest` (`supervise-test`) , `drivers.manifest` (`drivers-test`) and `memory.manifest` (`memory-test`) |
+| `boot/` | Component manifests: `shell.manifest` (normal boot), `test.manifest` (`cm-test`), `supervise.manifest` (`supervise-test`) , `drivers.manifest` (`drivers-test`) , `memory.manifest` (`memory-test`), `fs.manifest` and `fs-verify.manifest` (`fs-test`) |
 | `sel4/` | Docker build of seL4 and rust-sel4's kernel loader, for running the shell on seL4 |
 | `xtask/` | Build driver: user program, kernel, disk image, QEMU boot |
 
@@ -294,11 +317,12 @@ https://claude.ai/artifact/QKJS8qH5Dfbjzn58RStq1j
 Needs Rust (the pinned nightly in `rust-toolchain.toml` installs itself) and QEMU.
 
 ```bash
-cargo xtask test           # host tests, model check, simulation; on both ISAs the boot self-tests, the Component Manager, supervision, driver and Memory Server tests and a shell session; then the shell on seL4
+cargo xtask test           # host tests, model check, simulation; on both ISAs the boot self-tests, the Component Manager, supervision, driver, Memory Server and filesystem tests and a shell session; then the shell on seL4
 cargo xtask cm-test        # just the Component Manager test (add aarch64 for that ISA)
 cargo xtask supervise-test # just the supervision test (add aarch64 for that ISA)
 cargo xtask drivers-test   # just the driver framework test (add aarch64 for that ISA)
 cargo xtask memory-test    # just the Memory Server test (add aarch64 for that ISA)
+cargo xtask fs-test        # just the filesystem test, two boots (add aarch64 for that ISA)
 cargo xtask run            # boot the shell in QEMU (x86-64), its console on this terminal
 cargo xtask run aarch64    # the same on QEMU's AArch64 virt machine
 cargo xtask image  # just build target/superior.img

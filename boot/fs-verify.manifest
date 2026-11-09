@@ -1,0 +1,44 @@
+# The filesystem test, second boot, after the power cut (cargo xtask fs-test).
+# Every acknowledged record must be on the disk, and another component's
+# container must not hold the client's file.
+
+component pcibus
+  image pcibus
+  priority 12
+  provides pci 0
+  device pci-config 1
+  device pci-mmio 2
+  device msi 3
+  device iommu 11
+  untyped 18 12
+
+component virtio-blk
+  image virtio-blk
+  priority 11
+  uses pci 0
+  provides block 1
+  notification 2
+  untyped 14 3
+
+component fs
+  image fs
+  priority 10
+  uses block 0
+  provides fs 1
+  untyped 16 2
+
+component client
+  image testclient
+  arg 8
+  priority 8
+  uses fs 0
+  control 1
+  untyped 12 2
+
+component other
+  image testclient
+  arg 9
+  priority 9
+  uses fs 0
+  untyped 12 1
+  notification 2

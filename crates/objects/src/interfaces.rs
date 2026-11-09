@@ -91,8 +91,73 @@ pub mod block {
     /// replying. Reply: `[status]`. Reads are idempotent, so a client may
     /// retry one that failed with `PeerRestarted`.
     pub const READ: u64 = 2;
-    /// Most sectors one `READ` moves.
+    /// `[WRITE, first sector, count]` with a frame granted: writes `count`
+    /// sectors (at most 8) from the frame. The driver hands the frame back
+    /// before replying. A write is not durable until a `FLUSH` after it
+    /// succeeds. Idempotent, so it may be retried.
+    pub const WRITE: u64 = 3;
+    /// `[FLUSH]`: every write that succeeded before it is on stable
+    /// storage when it succeeds. Idempotent.
+    pub const FLUSH: u64 = 4;
+    /// Most sectors one `READ` or `WRITE` moves.
     pub const MAX_SECTORS: u64 = 4096 / SECTOR;
+}
+
+/// Files: what the filesystem server serves.
+///
+/// There is no global namespace: each component sees only its own
+/// container of files, chosen by the badge on its capability. A write is
+/// acknowledged only once it is committed to the journal on stable
+/// storage, so an acknowledged write survives the server, the driver or
+/// the whole machine stopping at any instant. Every operation is
+/// idempotent, so a client retries one that failed with `PeerRestarted`.
+pub mod fs {
+    pub const VERSION: u64 = 1;
+    /// Bytes in a file name, NUL-padded, packed little-endian into three
+    /// message words ([`name`]).
+    pub const MAX_NAME: usize = 24;
+    /// Bytes in a block; one `READ` or `WRITE` stays inside one.
+    pub const BLOCK: u64 = 4096;
+    /// Largest file, in bytes.
+    pub const MAX_FILE: u64 = 8 * BLOCK;
+
+    /// `[CREATE, name...]`: opens the named file in the caller's container,
+    /// making it empty if there is none. Reply `[status, handle, size]`.
+    pub const CREATE: u64 = 1;
+    /// `[OPEN, name...]`: as `CREATE`, but `NotFound` if there is none.
+    pub const OPEN: u64 = 2;
+    /// `[READ, handle, offset, length]` with a frame granted: copies the
+    /// bytes into the start of the frame. Reply `[status, bytes read]`.
+    pub const READ: u64 = 3;
+    /// `[WRITE, handle, offset, length]` with a frame granted: writes the
+    /// first `length` bytes of the frame. Reply `[status]`, sent only once
+    /// the write is durable.
+    pub const WRITE: u64 = 4;
+    /// `[STAT, handle]`: reply `[status, size]`.
+    pub const STAT: u64 = 5;
+
+    /// A file name packed into message words; `None` if it is empty, too
+    /// long, or contains a NUL.
+    pub fn name(s: &str) -> Option<[u64; 3]> {
+        let b = s.as_bytes();
+        if b.is_empty() || b.len() > MAX_NAME || b.contains(&0) {
+            return None;
+        }
+        let mut w = [0u64; 3];
+        for (i, &c) in b.iter().enumerate() {
+            w[i / 8] |= (c as u64) << (8 * (i % 8));
+        }
+        Some(w)
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn names_pack_into_three_words() {
+        assert_eq!(name("ab"), Some([0x6261, 0, 0]));
+        assert_eq!(name("abcdefghi").unwrap()[1], 0x69);
+        assert!(name("").is_none());
+        assert!(name("0123456789abcdefghijklmnX").is_none());
+    }
 }
 
 /// The Memory Server: pages of RAM under a per-component quota.

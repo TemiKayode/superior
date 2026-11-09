@@ -23,6 +23,11 @@
 //!                                  `boot/memory.manifest` (quotas, demand-zero
 //!                                  heaps, pages back on restart) and check
 //!                                  the log
+//!   cargo xtask fs-test [arch]     the filesystem server: boot
+//!                                  `boot/fs.manifest` on a fresh disk (writes
+//!                                  under fault injection, then a power cut),
+//!                                  then `boot/fs-verify.manifest` on the same
+//!                                  disk, and check the logs
 //!   cargo xtask bench              time IPC under hardware virtualization
 //!                                  (WHPX or KVM, x86-64) and check it against
 //!                                  seL4's published figures
@@ -91,6 +96,8 @@ struct Image {
     sel4: bool,
     /// A disk image to attach as a virtio block device (PCI).
     disk: Option<PathBuf>,
+    /// The disk may be written (the filesystem tests).
+    writable: bool,
 }
 
 fn main() -> ExitCode {
@@ -112,6 +119,7 @@ fn main() -> ExitCode {
                         .and_then(|img| drivers_test(&img))
                         .and_then(|_| image_with(false, a, "memory"))
                         .and_then(|img| memory_test(&img))
+                        .and_then(|_| fs_test(a))
                         .and_then(|_| image(false, a))
                         .and_then(|img| shell_session(&img))
                 })
@@ -128,12 +136,13 @@ fn main() -> ExitCode {
         Some("supervise-test") => {
             image_with(false, arch, "supervise").and_then(|img| supervise_test(&img))
         }
+        Some("fs-test") => fs_test(arch),
         Some("memory-test") => {
             image_with(false, arch, "memory").and_then(|img| memory_test(&img))
         }
         Some("bench") => image(false, Arch::X86_64).and_then(|img| bench(&img)),
         _ => Err(
-            "usage: cargo xtask <image | run | test | boot-test | shell-test | cm-test | supervise-test | drivers-test | memory-test | bench | sel4-test> [x86_64 | aarch64]"
+            "usage: cargo xtask <image | run | test | boot-test | shell-test | cm-test | supervise-test | drivers-test | memory-test | fs-test | bench | sel4-test> [x86_64 | aarch64]"
                 .into(),
         ),
     });
@@ -234,6 +243,7 @@ fn bundle(arch: Arch, manifest: &str) -> Result<PathBuf, String> {
         ("pcibus", "superior-pcibus"),
         ("virtio-blk", "superior-virtio-blk"),
         ("memserver", "superior-memserver"),
+        ("fs", "superior-fs"),
         ("testclient", "superior-testclient"),
     ] {
         let path = user_program(package, arch)?;
@@ -325,8 +335,11 @@ fn image_with(selftest: bool, arch: Arch, manifest: &str) -> Result<Image, Strin
             elf
         }
     };
+    let fs = manifest.starts_with("fs");
     let disk = if manifest == "drivers" {
         Some(test_disk()?)
+    } else if fs {
+        Some(fs_disk())
     } else {
         None
     };
@@ -335,6 +348,7 @@ fn image_with(selftest: bool, arch: Arch, manifest: &str) -> Result<Image, Strin
         arch,
         sel4: false,
         disk,
+        writable: fs,
     })
 }
 
@@ -424,6 +438,7 @@ fn sel4_image() -> Result<Image, String> {
         arch: Arch::Aarch64,
         sel4: true,
         disk: None,
+        writable: false,
     })
 }
 
@@ -491,7 +506,8 @@ fn qemu_command(img: &Image) -> Command {
         // bypass it otherwise).
         q.arg("-drive")
             .arg(format!(
-                "if=none,id=blk0,format=raw,readonly=on,file={}",
+                "if=none,id=blk0,format=raw,readonly={},file={}",
+                if img.writable { "off" } else { "on" },
                 disk.display()
             ))
             .args([
@@ -711,6 +727,80 @@ fn drivers_test(img: &Image) -> Result<(), String> {
         }
     }
     println!("== driver framework test passed ({})", img.arch.name());
+    Ok(())
+}
+
+/// The filesystem tests' disk (4 MiB), shared by both boots.
+fn fs_disk() -> PathBuf {
+    root().join("target").join("fs-test-disk.img")
+}
+
+/// The filesystem server, in two boots of one fresh disk:
+/// - `boot/fs.manifest`: a client appends records while the injector kills
+///   the server and the driver; every acknowledged record reads back; one
+///   more is acknowledged and the machine stops at once (a power cut);
+/// - `boot/fs-verify.manifest`: every acknowledged record is on the disk,
+///   and another component's container does not hold the file.
+fn fs_test(arch: Arch) -> Result<(), String> {
+    let first = image_with(false, arch, "fs")?;
+    let second = image_with(false, arch, "fs-verify")?;
+    let disk = fs_disk();
+    std::fs::write(&disk, vec![0u8; 4 << 20])
+        .map_err(|e| format!("writing {}: {e}", disk.display()))?;
+    println!("== filesystem test, first boot: {}", first.path.display());
+    let out = run_to_exit(&first, Duration::from_secs(120))?;
+    let steps = [
+        "fs: formatted",
+        "fs: mounted in",
+        "[pass] fs: created an empty file",
+        "[cm] fault injection: killing fs",
+        "[cm] fault injection: killing virtio-blk",
+        "injector: done",
+        "[pass] fs: 400 records written under fault injection",
+        "[pass] fs: every acknowledged record reads back",
+        "[pass] fs: the file is 25600 bytes",
+        "[pass] fs: record 400 acknowledged; cutting the power",
+        "[cm] client asked to shut down (pass)",
+    ];
+    check_log("filesystem test (first boot)", &out, &steps)?;
+    let kills = out.matches("[cm] fault injection: killing").count();
+    let replays = out.matches("replayed a committed transaction").count();
+    println!("== {kills} services killed under load; {replays} mounts replayed the journal");
+    println!("== filesystem test, second boot: {}", second.path.display());
+    let out = run_to_exit(&second, Duration::from_secs(60))?;
+    let steps = [
+        "fs: mounted in",
+        "[pass] fs other: another component's \"log\" is not in its container",
+        "[pass] fs other: its own \"log\" is a separate file",
+        "[pass] fs: after the power cut the file is 25664 bytes",
+        "[pass] fs: all 401 acknowledged records survived",
+        "[cm] client asked to shut down (pass)",
+    ];
+    // The two clients run side by side: their lines interleave.
+    for step in steps {
+        check_log("filesystem test (second boot)", &out, &[step])?;
+    }
+    if out.contains("fs: formatted") {
+        return Err("filesystem test: the second boot formatted the disk".into());
+    }
+    println!("== filesystem test passed ({})", arch.name());
+    Ok(())
+}
+
+/// Checks `steps` appear in `out` in order, and no failure markers.
+fn check_log(what: &str, out: &str, steps: &[&str]) -> Result<(), String> {
+    let mut at = 0;
+    for step in steps {
+        match out[at..].find(step) {
+            Some(i) => at += i + step.len(),
+            None => return Err(format!("{what}: missing (in order) {step:?}")),
+        }
+    }
+    for bad in ["[fail]", "could not", "panic"] {
+        if out.contains(bad) {
+            return Err(format!("{what}: log contains {bad:?}"));
+        }
+    }
     Ok(())
 }
 

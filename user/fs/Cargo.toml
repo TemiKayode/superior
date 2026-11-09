@@ -1,0 +1,17 @@
+[package]
+name = "superior-fs"
+description = "The filesystem server: per-component file containers over the block interface, with a write-ahead journal so no acknowledged write is lost."
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "superior-fs"
+test = false
+bench = false
+
+[dependencies]
+superior-objects = { path = "../../crates/objects" }
+superior-sys = { path = "../../crates/sys" }
