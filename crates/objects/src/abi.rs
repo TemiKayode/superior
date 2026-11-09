@@ -88,9 +88,13 @@ pub enum Syscall {
     /// blocks; afterwards it runs only on contexts lent by its callers.
     SchedPassive = 12,
     /// Makes a new kernel object from the untyped capability in slot `rdi`:
-    /// `rsi` = [`ObjectType`], `rdx` = size in bits (untyped only), `r8` =
-    /// the empty slot for the new capability, which becomes a child of the
-    /// untyped one (revoking it destroys the object).
+    /// `rsi` = [`ObjectType`], `rdx` = size in bits (untyped, CNode and
+    /// address space), `r8` = the empty slot for the new capability, which
+    /// becomes a child of the untyped one (revoking it destroys the
+    /// object). `r9` = 0 puts it in the caller's own CSpace; otherwise `r9`
+    /// - 1 is the slot of a CNode (Write right) and `r8` an index in it, so
+    /// a parent can give a child an original capability, such as untyped
+    /// memory it can retype in turn.
     Retype = 13,
     /// Copies the capability in slot `rdi` into the empty slot `rsi` with
     /// rights `rdx` (a mask: rights only shrink) and badge `r8` (0 = keep).
@@ -146,6 +150,22 @@ pub enum Syscall {
     /// Writes `r8` to I/O port `rsi` (in the range of the I/O-port
     /// capability in `rdi`, Write right), `rdx` bytes wide (1, 2 or 4).
     IoPortOut = 29,
+    /// Maps the frame in slot `rdi` at page-aligned `rsi` in the address
+    /// space in slot `r8` (Write right). `rdx` = [`MAP_WRITE`] and/or
+    /// [`MAP_EXEC`], never both. Needs the frame's Map right, plus Write
+    /// for a writable mapping and Read otherwise. This is how a component
+    /// loader puts code into another component's address space.
+    FrameMapInto = 30,
+    /// Puts the inactive thread in slot `rdi` (Write right) in the address
+    /// space in slot `rsi` (Write right). The thread holds its own copy of
+    /// that capability, so the address space lives as long as the thread
+    /// does (or until revoked). Without this, a thread runs in its
+    /// creator's address space.
+    ThreadSetVSpace = 31,
+    /// Makes the endpoint in slot `rsi` (Write right) the fault handler of
+    /// the thread in slot `rdi` (Write right), with that capability's
+    /// badge: how a supervisor learns which of its children faulted.
+    ThreadSetFaultHandler = 32,
     /// Debug build only: print a UTF-8 string. rdi = pointer, rsi = length.
     DebugPutStr = 0x100,
     /// Debug build only: report a self-test result. rdi = 0 for pass.
@@ -185,6 +205,9 @@ impl Syscall {
             27 => Syscall::IrqAck,
             28 => Syscall::IoPortIn,
             29 => Syscall::IoPortOut,
+            30 => Syscall::FrameMapInto,
+            31 => Syscall::ThreadSetVSpace,
+            32 => Syscall::ThreadSetFaultHandler,
             0x100 => Syscall::DebugPutStr,
             0x101 => Syscall::DebugSelftestDone,
             _ => return None,
@@ -262,10 +285,17 @@ pub enum FaultReply {
 
 /// Frames are 4 KiB.
 pub const FRAME_BITS: u8 = 12;
-/// A CNode holds from 2^4 to 2^8 slots, each taking 2^5 bytes.
+/// A CNode holds from 2^4 to 2^11 slots, each taking 2^5 bytes.
 pub const CNODE_MIN_BITS: u64 = 4;
-pub const CNODE_MAX_BITS: u64 = 8;
+pub const CNODE_MAX_BITS: u64 = 11;
 pub const CNODE_SLOT_BITS: u8 = 5;
+/// An address space takes from 2^14 to 2^20 bytes: one page for its
+/// top-level table, the rest a pool for the page tables under it.
+pub const VSPACE_MIN_BITS: u64 = 14;
+pub const VSPACE_MAX_BITS: u64 = 20;
+/// [`Syscall::FrameMapInto`] flags.
+pub const MAP_WRITE: u64 = 1;
+pub const MAP_EXEC: u64 = 2;
 
 /// Kernel object types for [`Syscall::Retype`].
 #[repr(u64)]
@@ -281,6 +311,11 @@ pub enum ObjectType {
     /// A table of capability slots, usable as a thread's CSpace. The size
     /// argument is the slot count in bits; each slot takes 32 bytes.
     CNode = 5,
+    /// An address space. The size argument is its total size in bits
+    /// ([`VSPACE_MIN_BITS`] to [`VSPACE_MAX_BITS`]): page tables for its
+    /// mappings come from that memory, so it can map only as much as its
+    /// pool has tables for, and gives every table back when destroyed.
+    AddressSpace = 6,
 }
 
 impl ObjectType {
@@ -292,6 +327,7 @@ impl ObjectType {
             3 => ObjectType::Frame,
             4 => ObjectType::Thread,
             5 => ObjectType::CNode,
+            6 => ObjectType::AddressSpace,
             _ => return None,
         })
     }
@@ -310,6 +346,12 @@ impl ObjectType {
                 Some(requested as u8 + CNODE_SLOT_BITS)
             }
             ObjectType::CNode => None,
+            ObjectType::AddressSpace
+                if requested >= VSPACE_MIN_BITS && requested <= VSPACE_MAX_BITS =>
+            {
+                Some(requested as u8)
+            }
+            ObjectType::AddressSpace => None,
         }
     }
 }
@@ -346,4 +388,33 @@ mod tests {
         assert_eq!(CapTransfer::decode(0), Some(CapTransfer::NONE));
         assert_eq!(CapTransfer::decode(1 << 32), None, "reserved bits");
     }
+}
+
+/// What the kernel gives the root task, the Component Manager, at boot.
+/// Its CSpace is a CNode of `1 << CNODE_BITS` slots; the boot bundle (see
+/// [`crate::bundle`]) is mapped read-only at [`BUNDLE_VA`](root::BUNDLE_VA)
+/// and its length is the root task's first argument.
+pub mod root {
+    pub const CNODE_BITS: u8 = 11;
+    /// A capability to the root task's own CSpace CNode.
+    pub const SELF_CNODE: u64 = 0;
+    /// All the memory it hands out to components.
+    pub const UNTYPED: u64 = 1;
+    /// The timer notification (Read): one signal per tick.
+    pub const TIMER: u64 = 2;
+    /// QEMU's exit device: I/O port 0xf4 (emulated on AArch64).
+    pub const EXIT_PORT: u64 = 3;
+    /// The console UART: I/O ports 0x3f8-0x3ff on x86-64, the PL011's
+    /// register page (a device frame) on AArch64.
+    pub const UART: u64 = 4;
+    /// The UART's interrupt line.
+    pub const UART_IRQ: u64 = 5;
+    /// The first slot with nothing in it.
+    pub const FIRST_FREE: u64 = 8;
+    /// Size of [`UNTYPED`], in bits.
+    pub const UNTYPED_BITS: u8 = 25;
+    /// Where the bundle is mapped, as an offset from the user window's base.
+    pub const BUNDLE_OFFSET: u64 = 0x1_0000_0000;
+    /// The root task's priority; a component can be given at most this.
+    pub const PRIORITY: u8 = 60;
 }

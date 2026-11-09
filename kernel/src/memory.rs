@@ -57,6 +57,36 @@ pub fn add_region(s: &mut Summary, start: u64, end: u64) {
     });
 }
 
+/// Where an address space's page tables come from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TablePool {
+    /// The root CNode's untyped memory: address spaces the kernel builds
+    /// at boot.
+    Kernel,
+    /// Pages `next..end` of the address-space object's own memory, handed
+    /// out in order. Nothing is freed until the whole object is.
+    Own { next: u64, end: u64 },
+}
+
+impl TablePool {
+    /// A zeroed 4 KiB frame for a page table, by physical address.
+    pub fn alloc(&mut self, zero: impl Fn(u64)) -> Option<u64> {
+        let pa = match self {
+            TablePool::Kernel => carve(12)?,
+            TablePool::Own { next, end } => {
+                if *next >= *end {
+                    return None;
+                }
+                let pa = *next;
+                *next += 4096;
+                pa
+            }
+        };
+        zero(pa);
+        Some(pa)
+    }
+}
+
 /// Why mapping a frame failed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MapError {

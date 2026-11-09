@@ -125,3 +125,35 @@ pub const ARCH: &str = if cfg!(all(feature = "sel4", target_arch = "aarch64")) {
 } else {
     "x86-64"
 };
+
+/// Formats one line (at most 200 bytes) and prints it on the kernel's
+/// debug console with one `DebugPutStr`, which the kernel prefixes with
+/// the calling thread.
+pub fn print_line(args: core::fmt::Arguments) {
+    struct Line {
+        buf: [u8; 200],
+        len: usize,
+    }
+    impl core::fmt::Write for Line {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            for &b in s.as_bytes() {
+                if self.len < self.buf.len() {
+                    self.buf[self.len] = b;
+                    self.len += 1;
+                }
+            }
+            Ok(())
+        }
+    }
+    let mut l = Line {
+        buf: [0; 200],
+        len: 0,
+    };
+    let _ = core::fmt::Write::write_fmt(&mut l, args);
+    let _ = core::fmt::Write::write_str(&mut l, "\n");
+    syscall(
+        Syscall::DebugPutStr,
+        l.buf.as_ptr() as u64,
+        [l.len as u64, 0, 0, 0],
+    );
+}

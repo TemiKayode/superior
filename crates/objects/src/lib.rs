@@ -11,9 +11,11 @@
 extern crate std;
 
 pub mod abi;
+pub mod bundle;
 pub mod cap;
 pub mod elf;
 pub mod ipc;
+pub mod manifest;
 #[cfg(test)]
 pub mod model;
 #[cfg(test)]

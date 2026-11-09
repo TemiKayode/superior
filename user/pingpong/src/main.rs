@@ -786,7 +786,12 @@ fn cnode_tests() -> bool {
     use ObjectType::{CNode, Endpoint, Frame, Notification, Thread};
     let mut pass = true;
     let made = retype(UNTYPED, CNode, 4, CN);
-    let too_big = retype(UNTYPED, CNode, 9, CN_BIG);
+    let too_big = retype(
+        UNTYPED,
+        CNode,
+        superior_objects::abi::CNODE_MAX_BITS + 1,
+        CN_BIG,
+    );
     let no_room = retype(UNTYPED, CNode, 8, CN_BIG);
     pass &= expect(
         "a 16-slot CNode is made; oversized or unplaceable ones are refused",
@@ -867,6 +872,96 @@ fn cnode_tests() -> bool {
     pass
 }
 
+/// Address-space objects: made from untyped memory, paying for their own
+/// page tables, mapped into by a capability holder (writable or
+/// executable, never both), and destroyed with the memory they came from.
+fn vspace_tests() -> bool {
+    use ObjectType::{AddressSpace, Frame, Thread, Untyped};
+    use superior_objects::abi::{MAP_EXEC, MAP_WRITE};
+    const SUB: u64 = 13;
+    const AS: u64 = 6;
+    const F: u64 = 7;
+    const RO: u64 = 8;
+    const F2: u64 = 9;
+    const T: u64 = 10;
+    const VA1: u64 = USER_BASE + 0x1000_0000;
+    let map_into = |frame: u64, va: u64, flags: u64, space: u64| {
+        syscall(Syscall::FrameMapInto, frame, [va, flags, space, 0]).status
+    };
+    let mut pass = true;
+    let sub = retype(UNTYPED, Untyped, 15, SUB);
+    let small = retype(SUB, AddressSpace, 13, AS);
+    let big = retype(SUB, AddressSpace, 21, AS);
+    let made = retype(SUB, AddressSpace, 14, AS);
+    pass &= expect(
+        "an address space of 16 KiB is made; below 16 KiB or above 1 MiB is refused",
+        ok(sub == 0
+            && small == Error::InvalidArgument.code()
+            && big == Error::InvalidArgument.code()
+            && made == 0),
+        1,
+    );
+
+    let f = retype(SUB, Frame, 0, F);
+    let ro = mint(F, RO, RIGHT_READ | RIGHT_MAP, 0);
+    let wx = map_into(F, VA1, MAP_WRITE | MAP_EXEC, AS);
+    let junk = map_into(F, VA1, 4, AS);
+    let not_space = map_into(F, VA1, 0, F);
+    let ro_write = map_into(RO, VA1, MAP_WRITE, AS);
+    let ro_exec = map_into(RO, VA1, MAP_EXEC, AS);
+    pass &= expect(
+        "map into a space: W+X, bad flags, a non-space, read-only as writable refused; exec needs Read",
+        ok(f == 0
+            && ro == 0
+            && wx == Error::InvalidArgument.code()
+            && junk == Error::InvalidArgument.code()
+            && not_space == Error::InvalidCapability.code()
+            && ro_write == Error::InsufficientRights.code()
+            && ro_exec == 0),
+        1,
+    );
+
+    // 16 KiB is the top-level table and three more. The first mapping
+    // took all three (one per level below the top); a page in another
+    // GiB needs two more and must fail, while one beside the first
+    // needs none.
+    let f2 = retype(SUB, Frame, 0, F2);
+    let far = map_into(F2, VA1 + 0x4000_0000, MAP_WRITE, AS);
+    let near = map_into(F2, VA1 + 0x1000, MAP_WRITE, AS);
+    let twice = syscall(Syscall::FrameMap, F2, [VA_A, 1, 0, 0]).status;
+    pass &= expect(
+        "an address space's page tables come from its own memory: when they run out, mapping fails",
+        ok(f2 == 0
+            && far == Error::NotEnoughMemory.code()
+            && near == 0
+            && twice == Error::AlreadyMapped.code()),
+        1,
+    );
+
+    // A thread put in the space holds it; revoking the memory the space
+    // came from destroys it anyway, and the thread cannot run.
+    let entry = VA1;
+    let t = retype(UNTYPED, Thread, 0, T);
+    let set = syscall(Syscall::ThreadSetVSpace, T, [AS, 0, 0, 0]).status;
+    let conf = syscall(Syscall::ThreadConfigure, T, [entry, VA1 + 0x2000, 0, 1]).status;
+    let rv = syscall(Syscall::CapRevoke, SUB, [0; 4]).status;
+    let run = syscall(Syscall::ThreadResume, T, [0; 4]).status;
+    let gone = map_into(F2, VA1, 0, AS);
+    let cleanup = syscall(Syscall::CapRevoke, UNTYPED, [0; 4]).status;
+    pass &= expect(
+        "revoking its memory destroys an address space a thread is using, and the thread cannot run",
+        ok(t == 0
+            && set == 0
+            && conf == 0
+            && rv == 0
+            && run == Error::IllegalOperation.code()
+            && gone == Error::InvalidCapability.code()
+            && cleanup == 0),
+        1,
+    );
+    pass
+}
+
 fn expect(what: &str, got: u64, want: u64) -> bool {
     if got == want {
         say!("ok   {what}");
@@ -912,6 +1007,7 @@ fn client() -> ! {
     pass &= fault_tests();
     pass &= thread_tests();
     pass &= cnode_tests();
+    pass &= vspace_tests();
 
     // Round trips through the server.
     let (mut min, mut total) = (u64::MAX, 0u64);

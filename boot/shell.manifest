@@ -1,0 +1,12 @@
+# The normal boot: the Component Manager starts the shell, which is its
+# own serial driver. Its slots are the ones it has always had.
+
+component shell
+  image shell
+  memory 21
+  device uart 0
+  device uart-irq 1
+  notification 2
+  device timer 3
+  untyped 16 4
+  device exit 5

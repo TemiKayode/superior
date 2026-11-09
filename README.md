@@ -11,7 +11,8 @@ Superior is a capability-secure microkernel desktop operating system.
 
 ## Status
 
-Phase 0 (foundations). Working today, under QEMU on x86-64 and AArch64 (one kernel:
+Phase 0 (foundations) is complete; Phase 1 (core runtime and drivers) has begun with the
+Component Manager. Working today, under QEMU on x86-64 and AArch64 (one kernel:
 capabilities, threads, IPC, scheduling and the system calls are shared; `kernel/src/arch`
 holds the rest):
 
@@ -39,24 +40,24 @@ holds the rest):
   one, so revoking the untyped destroys every object made from it (waking threads blocked
   on them with an error) and makes its memory reusable. `CapMint` copies a capability
   with fewer rights or a badge. Endpoint and notification state still lives in fixed
-  kernel tables (8 of each) claimed at retype, not in the carved memory.
+  kernel tables (32 of each) claimed at retype, not in the carved memory.
 - Frames: retype makes 4 KiB frames, zeroed when made. `FrameMap` maps one into the
   caller's own address space (never executable; writable only with the Write right;
   needs the Map right), and `FrameUnmap` undoes it. Each frame capability maps once;
   mapping copies shares memory. Deleting or revoking a frame capability unmaps it first,
-  so memory is never reused while still mapped. Intermediate page tables still come from
-  kernel memory, not from the caller's untyped.
+  so memory is never reused while still mapped. Page tables for a boot process's address
+  space come from kernel memory; an address-space object pays for its own (below).
 - Threads as objects: retype makes a thread; `ThreadConfigure` sets entry, stack,
   argument and priority (no higher than the creator's) to run in the creator's address
   space, inheriting its fault handler and budget; `ThreadCopyCap` fills its CSpace;
   `ThreadResume` and `ThreadSuspend` start and stop it (a blocked call is cancelled with
   `Interrupted`). Deleting the last capability destroys the thread and empties its CSpace.
-  Threads live in the kernel's fixed thread table (8, 4 used at boot).
-- CNodes as objects: retype makes a CNode of 16 to 256 slots. `CNodeCopy`, `CNodeDelete`
+  Threads live in the kernel's fixed thread table (32).
+- CNodes as objects: retype makes a CNode of 16 to 2048 slots. `CNodeCopy`, `CNodeDelete`
   and `CNodeRevoke` work on its slots, and `ThreadSetSpace` makes it a thread's CSpace.
   The thread holds its own copy of the CNode capability, so the CNode lives while any
   capability or thread refers to it; revoking the untyped it came from destroys it.
-  CNode slots come from a fixed pool of 256 in the kernel's capability table.
+  CNode slots come from a fixed pool of 4096 in the kernel's capability table.
 - User faults as messages: a thread names a fault endpoint (`SetFaultHandler`); a page
   fault, general-protection fault, invalid opcode or divide error in user mode becomes a
   `Call` to it (kind, address, rip, error code). The handler's reply retries the
@@ -120,6 +121,30 @@ holds the rest):
   and friends. The scripted session passes unchanged. seL4 is built in hypervisor mode,
   because rust-sel4's kernel loader enters the kernel at EL2; it and the loader are built
   once in Docker (`sel4/`), against a device tree dumped from the QEMU that boots it.
+- Address spaces as objects: retype makes an address space of 16 KiB to 1 MiB; its
+  top-level page table and every table under it come from that memory, so it can map
+  only as much as it paid for and gives everything back when destroyed. `FrameMapInto`
+  maps a frame into an address space the caller holds, writable or executable, never
+  both; `ThreadSetVSpace` puts a thread in one (the thread holds its own reference).
+  `ThreadSetFaultHandler` names another thread's fault handler, with a badge. `Retype`
+  can place the new capability straight into a CNode the caller holds, so a parent can
+  give a child original capabilities (untyped memory it can retype in turn).
+- The Component Manager (`user/cm/`), the root task: the kernel starts only it, with
+  every capability (memory, timer, console UART and interrupt, exit port) and the boot
+  bundle mapped read-only. It reads the manifest in the bundle (`boot/*.manifest`,
+  parsed by `crates/objects/src/manifest.rs`) and builds each component from its own
+  untyped block: an address space, a 32-slot CNode, a thread, the frames it loads the
+  executable into (relocated, mapped with each segment's permissions), a stack. Each
+  component gets only the capabilities its manifest names: services it provides (the
+  receive side) or uses (badged per client), devices, notifications, untyped memory, a
+  control endpoint. The manager makes and keeps every service endpoint, and is every
+  component's fault handler. A `start lazy` component starts on the first call to its
+  service: a watcher thread takes the call, has it started, forwards the call under the
+  client's badge and relays the reply. The shell now boots as a component.
+  `cargo xtask cm-test` boots `boot/test.manifest` and checks the log: a probe reading
+  the manager's memory faults and the manager is told; the lazy `echo` starts only on
+  the client's first call, which is answered (forwarded under the client's badge 2);
+  `spare`, which nothing calls, never starts.
 - Static-pie user programs loaded into their own address spaces and relocated.
 - Boot self-test: a server and a client in separate address spaces do 20,000
   call/reply round trips, and the kernel refuses four kinds of rights violations. A
@@ -140,10 +165,16 @@ holds the rest):
   its own address space, checks it ran with its copied capabilities and inherited fault
   handler, suspends and resumes it, then destroys it and refills the thread table. It makes a
   CNode, fills it with badged copies, runs a thread with it as its CSpace, and checks the
-  CNode outlives the client's capability but not its last thread.
+  CNode outlives the client's capability but not its last thread. It makes an address
+  space, checks the refusals (writable and executable, a read-only copy mapped writable),
+  runs its page-table pool dry, and revokes its memory under a thread using it, which
+  then cannot run. Self-test kernels keep small tables (8 threads, endpoints and
+  notifications, a 256-slot CNode pool) so filling them stays quick; normal kernels have
+  32 of each, 32 address spaces and a 4096-slot pool.
 
-Not yet: page tables paid for from user untyped memory, mapping into other address
-spaces, new address spaces as retypable objects, multi-level CSpaces, scheduling-context capabilities (budgets are set at boot), sporadic refills,
+Not yet: supervision and restart (faults reach the Component Manager, which stops the
+component), the Memory Server, page tables for boot processes paid for from user memory,
+multi-level CSpaces, the first call's capability forwarded by a lazy-start watcher, scheduling-context capabilities (budgets are set at boot), sporadic refills,
 timeout faults, SMP, an IPC benchmark on bare metal.
 
 The architectural specification lives in the Superior OS Architectural Specification doc:
@@ -156,9 +187,12 @@ https://claude.ai/artifact/QKJS8qH5Dfbjzn58RStq1j
 | `kernel/` | The microkernel (`no_std`, targets `x86_64-unknown-none` and `aarch64-unknown-none-softfloat`) |
 | `kernel/src/arch/` | Per-ISA code: boot, exceptions and system call entry, page tables, interrupts, timer, console (`x86_64/`, `aarch64/`) |
 | `crates/sys/` | User-side system call wrappers for both ISAs (one ABI by register position), and the seL4 runtime (`src/sel4.rs`) |
-| `crates/objects/` | Pure kernel logic, unit-tested on the host: capabilities and CNodes, untyped memory, the IPC and scheduling state machine, the syscall ABI, an ELF reader |
+| `crates/objects/` | Pure kernel logic, unit-tested on the host: capabilities and CNodes, untyped memory, the IPC and scheduling state machine, the syscall ABI, an ELF reader, the boot bundle and manifest formats |
 | `user/pingpong/` | Boot self-test program (IPC server, client and spinner) |
-| `user/shell/` | The boot shell and COM1 driver |
+| `user/cm/` | The Component Manager: the root task, which starts every component from the boot manifest |
+| `user/shell/` | The boot shell and COM1 driver, started as a component |
+| `user/echo/`, `user/testclient/` | Test components for the Component Manager |
+| `boot/` | Component manifests: `shell.manifest` (normal boot) and `test.manifest` (`cm-test`) |
 | `sel4/` | Docker build of seL4 and rust-sel4's kernel loader, for running the shell on seL4 |
 | `xtask/` | Build driver: user program, kernel, disk image, QEMU boot |
 
@@ -167,7 +201,8 @@ https://claude.ai/artifact/QKJS8qH5Dfbjzn58RStq1j
 Needs Rust (the pinned nightly in `rust-toolchain.toml` installs itself) and QEMU.
 
 ```bash
-cargo xtask test           # host tests, model check, simulation; on both ISAs the boot self-tests and a shell session; then the shell on seL4
+cargo xtask test           # host tests, model check, simulation; on both ISAs the boot self-tests, the Component Manager test and a shell session; then the shell on seL4
+cargo xtask cm-test        # just the Component Manager test (add aarch64 for that ISA)
 cargo xtask run            # boot the shell in QEMU (x86-64), its console on this terminal
 cargo xtask run aarch64    # the same on QEMU's AArch64 virt machine
 cargo xtask image  # just build target/superior.img

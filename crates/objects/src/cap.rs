@@ -119,6 +119,12 @@ pub enum Object {
     Irq {
         line: u8,
     },
+    /// An address space (an entry in the kernel's address-space table).
+    /// Its top-level page table and every table under it come out of the
+    /// untyped memory it was retyped from.
+    AddressSpace {
+        id: u32,
+    },
 }
 
 impl Object {

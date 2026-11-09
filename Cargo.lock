@@ -392,6 +392,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3763264f6b73151db08c50ff20d7d8a0b8796e021cdea7ceedad07b80155fa0e"
 
 [[package]]
+name = "superior-cm"
+version = "0.1.0"
+dependencies = [
+ "superior-objects",
+ "superior-sys",
+]
+
+[[package]]
+name = "superior-echo"
+version = "0.1.0"
+dependencies = [
+ "superior-objects",
+ "superior-sys",
+]
+
+[[package]]
 name = "superior-kernel"
 version = "0.1.0"
 dependencies = [
@@ -427,6 +443,14 @@ name = "superior-sys"
 version = "0.1.0"
 dependencies = [
  "superior-objects",
+]
+
+[[package]]
+name = "superior-testclient"
+version = "0.1.0"
+dependencies = [
+ "superior-objects",
+ "superior-sys",
 ]
 
 [[package]]

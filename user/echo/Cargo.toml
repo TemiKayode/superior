@@ -1,0 +1,17 @@
+[package]
+name = "superior-echo"
+description = "A test service: replies to each call with the value plus one and the caller's badge."
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "superior-echo"
+test = false
+bench = false
+
+[dependencies]
+superior-objects = { path = "../../crates/objects" }
+superior-sys = { path = "../../crates/sys" }

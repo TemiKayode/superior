@@ -10,6 +10,8 @@
 //!                                  a scripted session with the shell
 //!   cargo xtask boot-test [arch]   just the boot self-tests
 //!   cargo xtask shell-test [arch]  just the shell session
+//!   cargo xtask cm-test [arch]     the Component Manager's boot test: boot
+//!                                  `boot/test.manifest` and check the log
 //!   cargo xtask bench              time IPC under hardware virtualization
 //!                                  (WHPX or KVM, x86-64) and check it against
 //!                                  seL4's published figures
@@ -17,6 +19,10 @@
 //!                                  running on seL4 (AArch64) instead; `test`
 //!                                  ends with it. seL4 and its loader are built
 //!                                  once, in Docker (sel4/Dockerfile)
+//!
+//! A normal image boots the Component Manager with a bundle built from
+//! `boot/shell.manifest`, so the shell runs as a component. Self-test
+//! images run the kernel's own self-test programs instead.
 //!
 //! x86-64 boots from a BIOS disk image; AArch64 boots QEMU's `virt` machine
 //! straight from the kernel ELF, with semihosting for the exit status.
@@ -85,6 +91,8 @@ fn main() -> ExitCode {
                 [Arch::X86_64, Arch::Aarch64].into_iter().try_for_each(|a| {
                     image(true, a)
                         .and_then(|img| boot(&img, true))
+                        .and_then(|_| image_with(false, a, "test"))
+                        .and_then(|img| cm_test(&img))
                         .and_then(|_| image(false, a))
                         .and_then(|img| shell_session(&img))
                 })
@@ -94,9 +102,10 @@ fn main() -> ExitCode {
         Some("sel4-test") => sel4_image().and_then(|img| shell_session(&img)),
         Some("boot-test") => image(true, arch).and_then(|img| boot(&img, true)),
         Some("shell-test") => image(false, arch).and_then(|img| shell_session(&img)),
+        Some("cm-test") => image_with(false, arch, "test").and_then(|img| cm_test(&img)),
         Some("bench") => image(false, Arch::X86_64).and_then(|img| bench(&img)),
         _ => Err(
-            "usage: cargo xtask <image | run | test | boot-test | shell-test | bench | sel4-test> [x86_64 | aarch64]"
+            "usage: cargo xtask <image | run | test | boot-test | shell-test | cm-test | bench | sel4-test> [x86_64 | aarch64]"
                 .into(),
         ),
     });
@@ -156,6 +165,9 @@ fn host_tests() -> Result<(), String> {
 fn user_program(package: &str, arch: Arch) -> Result<PathBuf, String> {
     println!("== building {package} ({})", arch.name());
     let mut build = cargo();
+    // Loaders read only program headers: leave debug information out, so
+    // the boot bundle stays small.
+    build.env("CARGO_PROFILE_RELEASE_STRIP", "debuginfo");
     if arch == Arch::Aarch64 {
         // x86_64-unknown-none is static-pie by default; this target is not.
         build.env(
@@ -181,9 +193,56 @@ fn user_program(package: &str, arch: Arch) -> Result<PathBuf, String> {
         .join(package))
 }
 
+/// Packs `boot/<manifest>.manifest` and every component executable into a
+/// boot bundle (format in `superior_objects::bundle`) and returns its path.
+fn bundle(arch: Arch, manifest: &str) -> Result<PathBuf, String> {
+    let text = std::fs::read(root().join("boot").join(format!("{manifest}.manifest")))
+        .map_err(|e| format!("reading boot/{manifest}.manifest: {e}"))?;
+    let mut files = vec![("manifest".to_string(), text)];
+    for (name, package) in [
+        ("shell", "superior-shell"),
+        ("echo", "superior-echo"),
+        ("testclient", "superior-testclient"),
+    ] {
+        let path = user_program(package, arch)?;
+        let bytes = std::fs::read(&path).map_err(|e| format!("reading {}: {e}", path.display()))?;
+        files.push((name.to_string(), bytes));
+    }
+    let mut out = Vec::new();
+    out.extend_from_slice(b"SUPBNDL1");
+    out.extend_from_slice(&(files.len() as u32).to_le_bytes());
+    out.extend_from_slice(&[0; 4]);
+    let mut offset = 16 + 40 * files.len();
+    for (name, data) in &files {
+        let mut n = [0u8; 32];
+        n[..name.len()].copy_from_slice(name.as_bytes());
+        out.extend_from_slice(&n);
+        out.extend_from_slice(&(offset as u32).to_le_bytes());
+        out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        offset += data.len();
+    }
+    for (_, data) in &files {
+        out.extend_from_slice(data);
+    }
+    let path = root()
+        .join("target")
+        .join(format!("bundle-{}-{manifest}.bin", arch.name()));
+    std::fs::write(&path, out).map_err(|e| format!("writing {}: {e}", path.display()))?;
+    Ok(path)
+}
+
 fn image(selftest: bool, arch: Arch) -> Result<Image, String> {
+    image_with(selftest, arch, "shell")
+}
+
+/// Builds a bootable image. A self-test image runs the kernel's self-test
+/// programs; any other boots the Component Manager with the bundle for
+/// `boot/<manifest>.manifest`.
+fn image_with(selftest: bool, arch: Arch, manifest: &str) -> Result<Image, String> {
     let user = user_program("superior-pingpong", arch)?;
     let shell = user_program("superior-shell", arch)?;
+    let cm = user_program("superior-cm", arch)?;
+    let bundle = bundle(arch, manifest)?;
     println!(
         "== building kernel ({}{})",
         arch.name(),
@@ -192,6 +251,8 @@ fn image(selftest: bool, arch: Arch) -> Result<Image, String> {
     let mut build = cargo();
     build.env("SUPERIOR_USER_ELF", &user);
     build.env("SUPERIOR_SHELL_ELF", &shell);
+    build.env("SUPERIOR_CM_ELF", &cm);
+    build.env("SUPERIOR_BUNDLE", &bundle);
     build.args([
         "build",
         "--quiet",
@@ -211,7 +272,13 @@ fn image(selftest: bool, arch: Arch) -> Result<Image, String> {
         .join(arch.target())
         .join("release")
         .join("superior-kernel");
-    let suffix = if selftest { "-selftest" } else { "" };
+    let suffix = if selftest {
+        "-selftest".to_string()
+    } else if manifest == "shell" {
+        String::new()
+    } else {
+        format!("-{manifest}")
+    };
     let path = match arch {
         Arch::X86_64 => {
             let img = target.join(format!("superior{suffix}.img"));
@@ -387,6 +454,100 @@ fn boot(img: &Image, selftest: bool) -> Result<(), String> {
             img.arch.name()
         )),
         (false, _) => Ok(()),
+    }
+}
+
+/// Boots the image built from `boot/test.manifest` and checks, from the
+/// boot log, that the Component Manager:
+/// - starts each boot component in an address space of its own (the
+///   probe's read of the manager's bundle address faults, and the fault
+///   reaches the manager as its fault handler);
+/// - starts the lazy `echo` only when the client first calls it, and the
+///   first call still gets its answer (forwarded under the client's
+///   badge), as do later calls straight to the service;
+/// - never starts `spare`, which nothing calls;
+/// - powers off with the pass code when the client reports success.
+fn cm_test(img: &Image) -> Result<(), String> {
+    println!("== Component Manager test on {}", img.path.display());
+    let out = run_to_exit(img, Duration::from_secs(60))?;
+    let bundle_va = 0x7001_0000_0000u64;
+    // In order.
+    let steps = [
+        "[cm] manifest: 4 components".to_string(),
+        "[cm] started probe (boot)".to_string(),
+        "[cm] started client (boot)".to_string(),
+        format!("probe: reading {bundle_va:#x}"),
+        "[cm] probe faulted: page fault at pc".to_string(),
+        format!("address {bundle_va:#x}; stopped"),
+        "[cm] started echo (lazy: first call to its service)".to_string(),
+        "echo: running in its own address space".to_string(),
+        "[pass] client: call 1: sent 100, got 101".to_string(),
+        "[pass] client: call 2: sent 200, got 201".to_string(),
+        "[pass] client: call 3: sent 300, got 301".to_string(),
+        "[cm] client asked to shut down (pass)".to_string(),
+        "[cm] never started: spare (nothing used it)".to_string(),
+    ];
+    let mut at = 0;
+    for step in &steps {
+        match out[at..].find(step.as_str()) {
+            Some(i) => at += i + step.len(),
+            None => {
+                return Err(format!(
+                    "Component Manager test: missing (in order) {step:?}"
+                ));
+            }
+        }
+    }
+    for bad in ["[fail]", "started spare", "could not start", "panic"] {
+        if out.contains(bad) {
+            return Err(format!("Component Manager test: log contains {bad:?}"));
+        }
+    }
+    println!("== Component Manager test passed ({})", img.arch.name());
+    Ok(())
+}
+
+/// Boots `img` with no input until QEMU exits, echoing its output, and
+/// returns the output if it exited with the pass code.
+fn run_to_exit(img: &Image, limit: Duration) -> Result<String, String> {
+    let mut child = qemu_command(img)
+        .args(["-display", "none"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("could not start QEMU ({}): {e}", qemu(img.arch).display()))?;
+    let mut stdout = child.stdout.take().unwrap();
+    let reader = std::thread::spawn(move || {
+        let mut all = Vec::new();
+        let mut buf = [0u8; 256];
+        while let Ok(n) = stdout.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            let _ = std::io::stdout().write_all(&buf[..n]);
+            let _ = std::io::stdout().flush();
+            all.extend_from_slice(&buf[..n]);
+        }
+        all
+    });
+    let deadline = Instant::now() + limit;
+    let status = loop {
+        if let Some(s) = child.try_wait().map_err(|e| e.to_string())? {
+            break Some(s);
+        }
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let out = String::from_utf8_lossy(&reader.join().unwrap_or_default()).into_owned();
+    println!();
+    match status.and_then(|s| s.code()) {
+        Some(QEMU_PASS) => Ok(out),
+        code => Err(format!(
+            "QEMU did not exit with the pass code (exit {code:?})"
+        )),
     }
 }
 

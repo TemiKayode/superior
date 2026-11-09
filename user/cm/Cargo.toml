@@ -1,0 +1,17 @@
+[package]
+name = "superior-cm"
+description = "The Component Manager: Superior's root task, which starts every component from the boot manifest."
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "superior-cm"
+test = false
+bench = false
+
+[dependencies]
+superior-objects = { path = "../../crates/objects" }
+superior-sys = { path = "../../crates/sys" }

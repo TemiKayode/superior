@@ -9,7 +9,7 @@
 //! cannot touch it.
 
 pub use crate::memory::MapError;
-use crate::memory::{ROOT_CNODE, ROOT_CNODE_SLOTS};
+use crate::memory::{TablePool, ROOT_CNODE, ROOT_CNODE_SLOTS};
 use superior_objects::elf::{Elf, Machine};
 use x86_64::registers::control::Cr3;
 use x86_64::structures::paging::{
@@ -26,10 +26,21 @@ const USER_STACK_PAGES: u64 = 16;
 const PAGE: u64 = 4096;
 
 static mut PHYS_OFFSET: u64 = 0;
+/// The kernel's own PML4 (the boot page tables), which every address
+/// space copies its kernel half from.
+static mut KERNEL_PML4: u64 = 0;
 
 pub fn init(physical_memory_offset: u64) {
     // SAFETY: written once at boot before any other use.
-    unsafe { (&raw mut PHYS_OFFSET).write(physical_memory_offset) };
+    unsafe {
+        (&raw mut PHYS_OFFSET).write(physical_memory_offset);
+        (&raw mut KERNEL_PML4).write(Cr3::read().0.start_address().as_u64());
+    }
+}
+
+fn kernel_pml4() -> PhysFrame {
+    // SAFETY: only written once, in init.
+    PhysFrame::containing_address(PhysAddr::new(unsafe { (&raw const KERNEL_PML4).read() }))
 }
 
 fn phys_offset() -> u64 {
@@ -57,6 +68,17 @@ unsafe impl FrameAllocator<Size4KiB> for UntypedFrames {
     }
 }
 
+/// Hands out page-table frames from an address space's [`TablePool`].
+struct PoolFrames<'a>(&'a mut TablePool);
+
+// SAFETY: the pool hands out each frame once, zeroed.
+unsafe impl FrameAllocator<Size4KiB> for PoolFrames<'_> {
+    fn allocate_frame(&mut self) -> Option<PhysFrame> {
+        let pa = self.0.alloc(zero_frame)?;
+        Some(PhysFrame::containing_address(PhysAddr::new(pa)))
+    }
+}
+
 /// An address space: the physical frame of its PML4.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AddressSpace(pub PhysFrame);
@@ -66,7 +88,15 @@ impl AddressSpace {
         let frame = UntypedFrames
             .allocate_frame()
             .ok_or("out of memory for PML4")?;
-        let (kernel_pml4, _) = Cr3::read();
+        Self::new_in(frame.start_address().as_u64())
+    }
+
+    /// Builds an address space whose top-level table is the frame at `pa`
+    /// (owned by the caller, zeroed here).
+    pub fn new_in(pa: u64) -> Result<Self, &'static str> {
+        zero_frame(pa);
+        let frame = PhysFrame::containing_address(PhysAddr::new(pa));
+        let kernel_pml4 = kernel_pml4();
         // SAFETY: both frames are page tables mapped through PHYS_OFFSET.
         let (new, kernel) = unsafe { (table(frame), table(kernel_pml4)) };
         if !kernel[USER_PML4_INDEX].is_unused() {
@@ -170,6 +200,24 @@ impl AddressSpace {
         Ok(entry)
     }
 
+    /// Maps a read-only, non-executable copy of `data` at page-aligned `va`.
+    pub fn map_data(&self, va: u64, data: &[u8]) -> Result<(), &'static str> {
+        let flags = F::PRESENT | F::USER_ACCESSIBLE | F::NO_EXECUTE;
+        for (i, chunk) in data.chunks(PAGE as usize).enumerate() {
+            let page = Page::containing_address(VirtAddr::new(va + i as u64 * PAGE));
+            let frame = self.ensure_page(page, flags)?;
+            // SAFETY: the frame was just mapped and is PAGE bytes long.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    chunk.as_ptr(),
+                    phys_to_virt(frame.start_address()),
+                    chunk.len(),
+                )
+            };
+        }
+        Ok(())
+    }
+
     /// Maps a zeroed, non-executable stack ending at [`USER_STACK_TOP`],
     /// with an unmapped guard page below it. Returns the stack top.
     pub fn map_stack(&self) -> Result<u64, &'static str> {
@@ -248,9 +296,17 @@ pub fn zero_frame(pa: u64) {
 
 impl AddressSpace {
     /// Maps the frame at `pa` at user address `va` (page-aligned, in the
-    /// user window), never executable. Intermediate page tables come from
-    /// kernel memory.
-    pub fn map_frame(&self, va: u64, pa: u64, writable: bool) -> Result<(), MapError> {
+    /// user window), writable or executable but never both. Intermediate
+    /// page tables come from `pool`.
+    pub fn map_frame(
+        &self,
+        va: u64,
+        pa: u64,
+        writable: bool,
+        executable: bool,
+        pool: &mut TablePool,
+    ) -> Result<(), MapError> {
+        debug_assert!(!(writable && executable));
         debug_assert!(va.is_multiple_of(PAGE) && (USER_BASE..USER_END).contains(&va));
         let mut mapper = self.mapper();
         let page = Page::<Size4KiB>::containing_address(VirtAddr::new(va));
@@ -258,16 +314,19 @@ impl AddressSpace {
             return Err(MapError::InUse);
         }
         let frame = PhysFrame::containing_address(PhysAddr::new(pa));
-        let mut flags = F::PRESENT | F::USER_ACCESSIBLE | F::NO_EXECUTE;
+        let mut flags = F::PRESENT | F::USER_ACCESSIBLE;
         if writable {
             flags |= F::WRITABLE;
+        }
+        if !executable {
+            flags |= F::NO_EXECUTE;
         }
         let parent = F::PRESENT | F::WRITABLE | F::USER_ACCESSIBLE;
         // SAFETY: the page is in the user window and unmapped; the frame
         // is a user frame object, never kernel memory.
         let flush = unsafe {
             mapper
-                .map_to_with_table_flags(page, frame, flags, parent, &mut UntypedFrames)
+                .map_to_with_table_flags(page, frame, flags, parent, &mut PoolFrames(pool))
                 .map_err(|e| match e {
                     MapToError::FrameAllocationFailed => MapError::OutOfMemory,
                     _ => MapError::InUse,

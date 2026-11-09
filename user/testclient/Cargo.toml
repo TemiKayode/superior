@@ -1,0 +1,17 @@
+[package]
+name = "superior-testclient"
+description = "Test components for the Component Manager: an echo client and an isolation probe."
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "superior-testclient"
+test = false
+bench = false
+
+[dependencies]
+superior-objects = { path = "../../crates/objects" }
+superior-sys = { path = "../../crates/sys" }

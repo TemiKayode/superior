@@ -35,6 +35,10 @@ use superior_objects::cap::{Capability, Object, Rights};
 static USER_IMAGE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/user.elf"));
 /// The shell, built by `cargo xtask` (empty if none).
 static SHELL_IMAGE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shell.elf"));
+/// The Component Manager, the root task (empty if none).
+static CM_IMAGE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/cm.elf"));
+/// The boot bundle: the component manifest and every component's image.
+static BUNDLE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/bundle.bin"));
 
 fn banner() {
     kprintln!();
@@ -68,8 +72,12 @@ fn kernel_start(untyped_caps: usize) -> ! {
     #[cfg(not(feature = "selftest"))]
     let _ = untyped_caps;
 
-    // Self-test builds run the self-test programs; others boot the shell.
-    let started = if cfg!(feature = "selftest") || SHELL_IMAGE.is_empty() {
+    // Self-test builds run the self-test programs; others start the
+    // Component Manager, which starts everything else (or, built without
+    // one, the shell directly).
+    let started = if !cfg!(feature = "selftest") && !CM_IMAGE.is_empty() {
+        start_component_manager()
+    } else if cfg!(feature = "selftest") || SHELL_IMAGE.is_empty() {
         if USER_IMAGE.is_empty() {
             kprintln!("no boot user program embedded; idle");
             arch::halt_forever();
@@ -82,6 +90,65 @@ fn kernel_start(untyped_caps: usize) -> ! {
         panic!("starting user programs: {e}");
     }
     task::start()
+}
+
+/// The Component Manager: the root task, and the only process the kernel
+/// starts. It gets every capability the system has to give (memory, the
+/// timer, the console UART and its interrupt, QEMU's exit device) and the
+/// boot bundle mapped read-only, and builds every other process from them
+/// according to the manifest in the bundle.
+fn start_component_manager() -> Result<(), &'static str> {
+    use superior_objects::abi::root;
+    let base = memory::carve(root::UNTYPED_BITS).ok_or("no memory for the Component Manager")?;
+    let (uart, irq) = arch::console_caps();
+    let caps = [
+        (
+            root::UNTYPED as usize,
+            Capability::new(
+                Object::Untyped {
+                    base,
+                    size_bits: root::UNTYPED_BITS,
+                },
+                Rights::ALL,
+            ),
+        ),
+        (
+            root::TIMER as usize,
+            Capability::new(
+                Object::Notification {
+                    id: task::TIMER_NTFN as u32,
+                },
+                Rights::READ,
+            ),
+        ),
+        (
+            root::EXIT_PORT as usize,
+            Capability::new(
+                Object::IoPort {
+                    base: 0xf4,
+                    count: 4,
+                },
+                Rights::WRITE,
+            ),
+        ),
+        (root::UART as usize, uart),
+        (root::UART_IRQ as usize, irq),
+    ];
+    task::give_cnode(0, root::CNODE_BITS, root::SELF_CNODE as usize)?;
+    let bundle_va = arch::vm::USER_BASE + root::BUNDLE_OFFSET;
+    task::spawn_process_with(
+        0,
+        CM_IMAGE,
+        root::PRIORITY,
+        BUNDLE.len() as u64,
+        &caps,
+        &[(bundle_va, BUNDLE)],
+    )?;
+    kprintln!(
+        "[ok] Component Manager loaded; boot bundle of {} KiB",
+        BUNDLE.len() >> 10
+    );
+    Ok(())
 }
 
 /// The shell: one process that is also the serial driver. It gets the

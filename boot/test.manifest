@@ -1,0 +1,28 @@
+# The Component Manager's boot test (cargo xtask cm-test).
+#
+# The probe starts first, at a higher priority, so its fault is handled
+# before the client finishes. echo and spare are lazy: echo starts on the
+# client's first call; nothing ever calls spare, so it never starts.
+
+component probe
+  image testclient
+  arg 1
+  priority 11
+  restart never
+  control 1
+
+component client
+  image testclient
+  arg 0
+  uses echo 0
+  control 1
+
+component echo
+  image echo
+  start lazy
+  provides echo 0
+
+component spare
+  image echo
+  start lazy
+  provides spare 0

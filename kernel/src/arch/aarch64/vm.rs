@@ -11,7 +11,7 @@
 //! CNode, never from a kernel heap. The kernel reaches any physical page
 //! through its identity map.
 
-use crate::memory::{MapError, ROOT_CNODE, ROOT_CNODE_SLOTS};
+use crate::memory::{MapError, TablePool, ROOT_CNODE, ROOT_CNODE_SLOTS};
 use superior_objects::elf::{Elf, Machine};
 
 pub const USER_L0_INDEX: usize = 224;
@@ -143,6 +143,13 @@ pub struct AddressSpace(pub u64);
 impl AddressSpace {
     pub fn new() -> Result<Self, &'static str> {
         let pa = alloc_frame().ok_or("out of memory for a top-level table")?;
+        Self::new_in(pa)
+    }
+
+    /// Builds an address space whose top-level table is the frame at `pa`
+    /// (owned by the caller, zeroed here).
+    pub fn new_in(pa: u64) -> Result<Self, &'static str> {
+        zero_frame(pa);
         // SAFETY: a fresh table frame; KERNEL_L0 is set up at boot.
         unsafe {
             let kernel = &*core::ptr::addr_of!(KERNEL_L0);
@@ -152,18 +159,23 @@ impl AddressSpace {
         Ok(AddressSpace(pa))
     }
 
-    /// The level-3 entry for `va`, creating tables on the way if `create`.
-    fn entry(&self, va: u64, create: bool) -> Result<Option<*mut u64>, MapError> {
+    /// The level-3 entry for `va`, creating tables from `pool` on the way
+    /// if one is given.
+    fn entry(
+        &self,
+        va: u64,
+        mut pool: Option<&mut TablePool>,
+    ) -> Result<Option<*mut u64>, MapError> {
         let mut t = self.0;
         for shift in [39u32, 30, 21] {
             let i = ((va >> shift) & 511) as usize;
             // SAFETY: `t` is one of this address space's table frames.
             let e = unsafe { &mut table(t)[i] };
             if *e & VALID == 0 {
-                if !create {
+                let Some(pool) = pool.as_deref_mut() else {
                     return Ok(None);
-                }
-                let new = alloc_frame().ok_or(MapError::OutOfMemory)?;
+                };
+                let new = pool.alloc(zero_frame).ok_or(MapError::OutOfMemory)?;
                 *e = new | VALID | TABLE;
             } else if *e & TABLE == 0 {
                 return Err(MapError::InUse); // a block mapping
@@ -177,14 +189,14 @@ impl AddressSpace {
     }
 
     fn translate(&self, va: u64) -> Option<u64> {
-        let e = self.entry(va, false).ok()??;
+        let e = self.entry(va, None).ok()??;
         // SAFETY: a valid entry pointer from `entry`.
         let d = unsafe { *e };
         (d & VALID != 0).then_some(d & ADDR_MASK)
     }
 
-    fn map(&self, va: u64, pa: u64, desc_bits: u64) -> Result<(), MapError> {
-        let e = self.entry(va, true)?.ok_or(MapError::OutOfMemory)?;
+    fn map(&self, va: u64, pa: u64, desc_bits: u64, pool: &mut TablePool) -> Result<(), MapError> {
+        let e = self.entry(va, Some(pool))?.ok_or(MapError::OutOfMemory)?;
         // SAFETY: a valid entry pointer from `entry`.
         unsafe {
             if *e & VALID != 0 {
@@ -220,8 +232,13 @@ impl AddressSpace {
             return Ok(pa);
         }
         let pa = alloc_frame().ok_or("out of memory for user page")?;
-        self.map(va, pa, Self::user_bits(pa, writable, executable))
-            .map_err(|_| "mapping user page failed")?;
+        self.map(
+            va,
+            pa,
+            Self::user_bits(pa, writable, executable),
+            &mut TablePool::Kernel,
+        )
+        .map_err(|_| "mapping user page failed")?;
         Ok(pa)
     }
 
@@ -341,16 +358,39 @@ impl AddressSpace {
         }
     }
 
-    /// Maps the frame at `pa` at user address `va`, never executable;
-    /// device memory if `pa` is not RAM.
-    pub fn map_frame(&self, va: u64, pa: u64, writable: bool) -> Result<(), MapError> {
+    /// Maps the frame at `pa` at user address `va`, writable or executable
+    /// but never both; device memory (never executable) if `pa` is not
+    /// RAM. Intermediate tables come from `pool`.
+    pub fn map_frame(
+        &self,
+        va: u64,
+        pa: u64,
+        writable: bool,
+        executable: bool,
+        pool: &mut TablePool,
+    ) -> Result<(), MapError> {
         debug_assert!(va.is_multiple_of(PAGE) && (USER_BASE..USER_END).contains(&va));
-        self.map(va, pa, Self::user_bits(pa, writable, false))
+        debug_assert!(!(writable && executable));
+        if executable && is_ram(pa) {
+            // The loader wrote the code through its own mapping.
+            sync_icache(pa);
+        }
+        self.map(va, pa, Self::user_bits(pa, writable, executable), pool)
+    }
+
+    /// Maps a read-only, non-executable copy of `data` at page-aligned `va`.
+    pub fn map_data(&self, va: u64, data: &[u8]) -> Result<(), &'static str> {
+        for (i, chunk) in data.chunks(PAGE as usize).enumerate() {
+            let pa = self.ensure_page(va + i as u64 * PAGE, false, false)?;
+            // SAFETY: the frame was just mapped and is PAGE bytes long.
+            unsafe { core::ptr::copy_nonoverlapping(chunk.as_ptr(), pa as *mut u8, chunk.len()) };
+        }
+        Ok(())
     }
 
     /// Removes the mapping at user address `va`.
     pub fn unmap(&self, va: u64) {
-        if let Ok(Some(e)) = self.entry(va, false) {
+        if let Ok(Some(e)) = self.entry(va, None) {
             // SAFETY: a valid entry pointer from `entry`.
             unsafe { *e = 0 };
             flush_tlb();

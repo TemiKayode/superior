@@ -42,29 +42,49 @@
 
 use crate::arch::vm::{self, AddressSpace, USER_BASE, USER_END};
 use crate::arch::{self, Args, Exit, UserFrame};
-use crate::memory::MapError;
+use crate::memory::{MapError, TablePool};
 use crate::{kprint, kprintln};
 use spin::{Mutex, MutexGuard};
 use superior_objects::abi::{
-    CapTransfer, Error, FaultKind, FaultReply, ObjectType, Syscall, CNODE_SLOT_BITS,
+    CapTransfer, Error, FaultKind, FaultReply, ObjectType, Syscall, CNODE_SLOT_BITS, MAP_EXEC,
+    MAP_WRITE,
 };
 use superior_objects::cap::{CNode, CapError, Capability, Object, Rights};
 use superior_objects::ipc::{Ipc, Tid};
 
+/// Table sizes. Self-test builds keep them small: the self-test fills
+/// each table to prove that freeing objects frees their entries.
+#[cfg(not(feature = "selftest"))]
+pub const MAX_THREADS: usize = 32;
+#[cfg(feature = "selftest")]
 pub const MAX_THREADS: usize = 8;
 pub const CSPACE_SLOTS: usize = 16;
 /// Layout of the one capability table: each thread's own window, then one
 /// hidden slot per thread holding its CNode CSpace's capability (which keeps
-/// the CNode alive), then the slots CNode objects are carved from.
+/// the CNode alive), then one hidden slot per thread holding its address
+/// space's capability (likewise), then the slots CNode objects are carved
+/// from.
 const WINDOW_SLOTS: usize = MAX_THREADS * CSPACE_SLOTS;
 const ROOT_SLOTS: usize = WINDOW_SLOTS;
-const CNODE_POOL: usize = ROOT_SLOTS + MAX_THREADS;
+const VSPACE_SLOTS: usize = ROOT_SLOTS + MAX_THREADS;
+const CNODE_POOL: usize = VSPACE_SLOTS + MAX_THREADS;
 /// CNodes are made of 16-slot chunks, aligned to their own size.
 const CNODE_CHUNK: usize = 16;
+#[cfg(not(feature = "selftest"))]
+const CNODE_CHUNKS: usize = 256;
+#[cfg(feature = "selftest")]
 const CNODE_CHUNKS: usize = 16;
 const CAP_TABLE_SLOTS: usize = CNODE_POOL + CNODE_CHUNK * CNODE_CHUNKS;
+#[cfg(not(feature = "selftest"))]
+const MAX_ENDPOINTS: usize = 32;
+#[cfg(feature = "selftest")]
 const MAX_ENDPOINTS: usize = 8;
+#[cfg(not(feature = "selftest"))]
+const MAX_NOTIFICATIONS: usize = 32;
+#[cfg(feature = "selftest")]
 const MAX_NOTIFICATIONS: usize = 8;
+/// Address spaces: one per boot process, plus address-space objects.
+const MAX_SPACES: usize = 32;
 const DEBUG_STR_MAX: usize = 256;
 /// Interrupt lines a notification can be bound to.
 const MAX_IRQS: usize = 64;
@@ -87,10 +107,23 @@ struct Stats {
     faults_unhandled: u64,
 }
 
+/// An address space and where its page tables come from.
+#[derive(Clone, Copy)]
+struct VSpace {
+    root: AddressSpace,
+    pool: TablePool,
+    /// Made by retype (so destroyed with its last capability), not by the
+    /// kernel at boot.
+    object: bool,
+}
+
 struct Kernel {
     ipc: Ipc<MAX_THREADS, MAX_ENDPOINTS, MAX_NOTIFICATIONS>,
     frames: [UserFrame; MAX_THREADS],
-    spaces: [Option<AddressSpace>; MAX_THREADS],
+    /// Address spaces by id.
+    vspaces: [Option<VSpace>; MAX_SPACES],
+    /// The address space each thread runs in.
+    spaces: [Option<u16>; MAX_THREADS],
     /// Every capability: thread windows, CSpace roots and CNode objects.
     caps: CNode<CAP_TABLE_SLOTS>,
     /// Each thread's CSpace as (first table index, slot count). Empty if
@@ -107,8 +140,8 @@ struct Kernel {
     ep_used: [bool; MAX_ENDPOINTS],
     ntfn_used: [bool; MAX_NOTIFICATIONS],
     /// Where the frame capability in each capability-table slot is mapped:
-    /// (thread whose address space, user address).
-    mapped: [Option<(Tid, u64)>; CAP_TABLE_SLOTS],
+    /// (address space, user address).
+    mapped: [Option<(u16, u64)>; CAP_TABLE_SLOTS],
     /// Each thread's fault handler: endpoint and badge.
     fault_ep: [Option<(u16, u64)>; MAX_THREADS],
     /// Blocked in a fault call: the reply says how to resume.
@@ -131,6 +164,7 @@ struct Kernel {
 static KERNEL: Mutex<Kernel> = Mutex::new(Kernel {
     ipc: Ipc::new(),
     frames: [UserFrame::ZERO; MAX_THREADS],
+    vspaces: [None; MAX_SPACES],
     spaces: [None; MAX_THREADS],
     caps: CNode::new(),
     cspace: {
@@ -178,9 +212,25 @@ pub fn spawn_process(
     arg: u64,
     caps: &[(usize, Capability)],
 ) -> Result<(), &'static str> {
+    spawn_process_with(tid, image, prio, arg, caps, &[])
+}
+
+/// [`spawn_process`], also mapping each `(address, bytes)` of `extra`
+/// read-only into the new address space.
+pub fn spawn_process_with(
+    tid: Tid,
+    image: &[u8],
+    prio: u8,
+    arg: u64,
+    caps: &[(usize, Capability)],
+    extra: &[(u64, &[u8])],
+) -> Result<(), &'static str> {
     let space = AddressSpace::new()?;
     let entry = space.load_elf(image)?;
     let stack_top = space.map_stack()?;
+    for &(va, data) in extra {
+        space.map_data(va, data)?;
+    }
 
     let mut k = KERNEL.lock();
     let t = tid as usize;
@@ -198,8 +248,18 @@ pub fn spawn_process(
             _ => {}
         }
     }
+    let id = k
+        .vspaces
+        .iter()
+        .position(Option::is_none)
+        .ok_or("address-space table full")?;
+    k.vspaces[id] = Some(VSpace {
+        root: space,
+        pool: TablePool::Kernel,
+        object: false,
+    });
     k.frames[t] = UserFrame::new_thread(entry, stack_top, arg);
-    k.spaces[t] = Some(space);
+    k.spaces[t] = Some(id as u16);
     k.thread_used[t] = true;
     k.fresh[t] = true;
     k.ipc
@@ -245,6 +305,33 @@ pub fn grant_root(t: Tid, slot: usize, cap: Capability) -> Result<(), &'static s
         .map_err(|_| "cspace slot unavailable")
 }
 
+/// Gives boot thread `t` a CSpace of `1 << bits` slots (a CNode from the
+/// pool) in place of its window, before any capability is placed in it.
+/// Its own slot `self_slot` gets a capability to that CNode.
+pub fn give_cnode(t: Tid, bits: u8, self_slot: usize) -> Result<(), &'static str> {
+    let mut k = KERNEL.lock();
+    let k = &mut *k;
+    let c = alloc_cnode(k, bits).ok_or("CNode pool full")?;
+    k.cnodes[c] = Some(bits);
+    let base = CNODE_POOL + c * CNODE_CHUNK;
+    let cap = Capability::new(
+        Object::CNode {
+            base: base as u32,
+            size_bits: bits,
+        },
+        Rights::READ | Rights::WRITE | Rights::GRANT,
+    );
+    let root = ROOT_SLOTS + t as usize;
+    k.caps
+        .insert_root(root, cap)
+        .map_err(|_| "CSpace root slot in use")?;
+    k.cspace[t as usize] = (base as u16, 1 << bits);
+    k.caps
+        .derive(root, base + self_slot, Rights::ALL, None)
+        .map_err(|_| "CNode self slot")?;
+    Ok(())
+}
+
 /// Index in the capability table of thread `t`'s slot `slot`.
 fn cap_slot(k: &Kernel, t: Tid, slot: usize) -> Option<usize> {
     let (base, size) = *k.cspace.get(t as usize)?;
@@ -264,7 +351,7 @@ pub fn start() -> ! {
         k.ipc.schedule();
         let t = k.ipc.current().expect("no runnable thread at start") as usize;
         k.fresh[t] = false;
-        k.spaces[t].unwrap().activate();
+        space_of(&k, t as Tid).unwrap().activate();
         k.frames[t]
     };
     arch::enter_user(frame)
@@ -285,6 +372,9 @@ pub fn handle_syscall(frame: &mut UserFrame) -> Exit {
         Some(Syscall::CapDelete) => cap_delete(k, cur, a.a0),
         Some(Syscall::FrameMap) => frame_map(k, cur, &a),
         Some(Syscall::FrameUnmap) => frame_unmap(k, cur, a.a0),
+        Some(Syscall::FrameMapInto) => frame_map_into(k, cur, &a),
+        Some(Syscall::ThreadSetVSpace) => thread_set_vspace(k, cur, &a),
+        Some(Syscall::ThreadSetFaultHandler) => thread_set_fault_handler(k, cur, &a),
         Some(Syscall::SetFaultHandler) => set_fault_handler(k, cur, a.a0),
         Some(Syscall::ThreadConfigure) => thread_configure(k, cur, &a),
         Some(Syscall::ThreadResume) => thread_resume(k, cur, a.a0),
@@ -524,6 +614,20 @@ fn apply_fault_reply(k: &mut Kernel, t: Tid) -> bool {
 
 /// `SetFaultHandler`: rdi = slot of an endpoint capability with Write.
 fn set_fault_handler(k: &mut Kernel, cur: Tid, slot: u64) -> Result<(), u64> {
+    k.fault_ep[cur as usize] = Some(fault_endpoint(k, cur, slot)?);
+    Ok(())
+}
+
+/// `ThreadSetFaultHandler`: rdi = thread, rsi = endpoint with Write.
+fn thread_set_fault_handler(k: &mut Kernel, cur: Tid, f: &Args) -> Result<(), u64> {
+    let t = thread_cap(k, cur, f.a0)?;
+    k.fault_ep[t as usize] = Some(fault_endpoint(k, cur, f.a1)?);
+    Ok(())
+}
+
+/// The endpoint and badge of the caller's slot `slot`, which must hold an
+/// endpoint capability with Write.
+fn fault_endpoint(k: &Kernel, cur: Tid, slot: u64) -> Result<(u16, u64), u64> {
     let s = own_slot(k, cur, slot).ok_or(Error::InvalidCapability.code())?;
     let cap = *k.caps.get(s).ok_or(Error::InvalidCapability.code())?;
     let Object::Endpoint { id } = cap.object else {
@@ -532,8 +636,13 @@ fn set_fault_handler(k: &mut Kernel, cur: Tid, slot: u64) -> Result<(), u64> {
     if !cap.rights.contains(Rights::WRITE) {
         return Err(Error::InsufficientRights.code());
     }
-    k.fault_ep[cur as usize] = Some((id as u16, cap.badge));
-    Ok(())
+    Ok((id as u16, cap.badge))
+}
+
+/// The address space thread `t` runs in.
+fn space_of(k: &Kernel, t: Tid) -> Option<AddressSpace> {
+    let id = k.spaces[t as usize]?;
+    k.vspaces[id as usize].map(|v| v.root)
 }
 
 /// Loads the registers of the thread the IPC engine chose into `frame`,
@@ -579,7 +688,9 @@ fn resume(mut guard: MutexGuard<'_, Kernel>, cur: Tid, frame: &mut UserFrame) ->
         Exit::Sysret
     };
     if next != cur {
-        k.spaces[n].unwrap().activate();
+        space_of(k, next)
+            .expect("running thread has no address space")
+            .activate();
     }
     *frame = out;
     exit
@@ -637,25 +748,42 @@ fn delete_index(k: &mut Kernel, s: usize) -> Result<(), u64> {
 
 /// Unmaps the frame whose capability is in table slot `s`, if mapped.
 fn unmap_slot(k: &mut Kernel, s: usize) {
-    if let Some((t, va)) = k.mapped[s].take() {
-        if let Some(space) = k.spaces[t as usize] {
-            space.unmap(va);
+    if let Some((id, va)) = k.mapped[s].take() {
+        if let Some(v) = k.vspaces[id as usize] {
+            v.root.unmap(va);
         }
     }
 }
 
 /// `FrameMap`: rdi = frame slot, rsi = user address, rdx = 1 for writable.
 fn frame_map(k: &mut Kernel, cur: Tid, f: &Args) -> Result<(), u64> {
-    let s = own_slot(k, cur, f.a0).ok_or(Error::InvalidCapability.code())?;
+    if f.a2 > 1 {
+        return Err(Error::InvalidArgument.code());
+    }
+    let id = k.spaces[cur as usize].ok_or(Error::IllegalOperation.code())?;
+    map_into(k, cur, f.a0, f.a1, f.a2, id)
+}
+
+/// `FrameMapInto`: rdi = frame slot, rsi = user address, rdx = flags, r8
+/// = address-space slot (Write right).
+fn frame_map_into(k: &mut Kernel, cur: Tid, f: &Args) -> Result<(), u64> {
+    let id = vspace_cap(k, cur, f.a3)?;
+    map_into(k, cur, f.a0, f.a1, f.a2, id)
+}
+
+/// Maps the frame in the caller's slot `slot` at `va` in address space
+/// `id`, with [`MAP_WRITE`] / [`MAP_EXEC`] `flags`.
+fn map_into(k: &mut Kernel, cur: Tid, slot: u64, va: u64, flags: u64, id: u16) -> Result<(), u64> {
+    let s = own_slot(k, cur, slot).ok_or(Error::InvalidCapability.code())?;
     let cap = *k.caps.get(s).ok_or(Error::InvalidCapability.code())?;
     let Object::Frame { paddr, .. } = cap.object else {
         return Err(Error::InvalidCapability.code());
     };
-    let writable = match f.a2 {
-        0 => false,
-        1 => true,
-        _ => return Err(Error::InvalidArgument.code()),
-    };
+    let (writable, executable) = (flags & MAP_WRITE != 0, flags & MAP_EXEC != 0);
+    // Writable or executable, never both.
+    if flags & !(MAP_WRITE | MAP_EXEC) != 0 || (writable && executable) {
+        return Err(Error::InvalidArgument.code());
+    }
     let needed = if writable {
         Rights::MAP | Rights::WRITE
     } else {
@@ -664,20 +792,75 @@ fn frame_map(k: &mut Kernel, cur: Tid, f: &Args) -> Result<(), u64> {
     if !cap.rights.contains(needed) {
         return Err(Error::InsufficientRights.code());
     }
-    let va = f.a1;
     if !va.is_multiple_of(4096) || !(USER_BASE..USER_END).contains(&va) {
         return Err(Error::InvalidArgument.code());
     }
     if k.mapped[s].is_some() {
         return Err(Error::AlreadyMapped.code());
     }
-    let space = k.spaces[cur as usize].ok_or(Error::IllegalOperation.code())?;
-    space.map_frame(va, paddr, writable).map_err(|e| match e {
-        MapError::InUse => Error::AlreadyMapped.code(),
-        MapError::OutOfMemory => Error::NotEnoughMemory.code(),
-    })?;
-    k.mapped[s] = Some((cur, va));
+    let v = k.vspaces[id as usize]
+        .as_mut()
+        .ok_or(Error::IllegalOperation.code())?;
+    v.root
+        .map_frame(va, paddr, writable, executable, &mut v.pool)
+        .map_err(|e| match e {
+            MapError::InUse => Error::AlreadyMapped.code(),
+            MapError::OutOfMemory => Error::NotEnoughMemory.code(),
+        })?;
+    k.mapped[s] = Some((id, va));
     Ok(())
+}
+
+/// The address space a capability in the caller's slot names, with Write.
+fn vspace_cap(k: &Kernel, cur: Tid, slot: u64) -> Result<u16, u64> {
+    let s = own_slot(k, cur, slot).ok_or(Error::InvalidCapability.code())?;
+    let cap = k.caps.get(s).ok_or(Error::InvalidCapability.code())?;
+    let Object::AddressSpace { id } = cap.object else {
+        return Err(Error::InvalidCapability.code());
+    };
+    if !cap.rights.contains(Rights::WRITE) {
+        return Err(Error::InsufficientRights.code());
+    }
+    Ok(id as u16)
+}
+
+/// `ThreadSetVSpace`: rdi = thread, rsi = address space. The thread's
+/// hidden slot gets a copy of the capability, keeping the space alive.
+fn thread_set_vspace(k: &mut Kernel, cur: Tid, f: &Args) -> Result<(), u64> {
+    let t = thread_cap(k, cur, f.a0)?;
+    if !thread_inactive(k, t) {
+        return Err(Error::IllegalOperation.code());
+    }
+    let id = vspace_cap(k, cur, f.a1)?;
+    let src = own_slot(k, cur, f.a1).ok_or(Error::InvalidCapability.code())?;
+    let hidden = VSPACE_SLOTS + t as usize;
+    if k.caps.get(hidden).is_some() {
+        let _ = k.caps.delete(hidden);
+    }
+    k.caps
+        .derive(src, hidden, Rights::ALL, None)
+        .map_err(cap_error)?;
+    k.spaces[t as usize] = Some(id);
+    reap(k);
+    Ok(())
+}
+
+/// Destroys address space `id`: forgets every frame mapped in it (its page
+/// tables are about to go back to untyped memory with it) and stops every
+/// thread still running in it.
+fn destroy_vspace(k: &mut Kernel, id: u16) {
+    for m in k.mapped.iter_mut() {
+        if matches!(m, Some((s, _)) if *s == id) {
+            *m = None;
+        }
+    }
+    for t in 0..MAX_THREADS {
+        if k.spaces[t] == Some(id) {
+            let _ = k.ipc.suspend(t as Tid);
+            k.spaces[t] = None;
+        }
+    }
+    k.vspaces[id as usize] = None;
 }
 
 /// `FrameUnmap`: rdi = frame slot.
@@ -709,62 +892,82 @@ fn cap_error(e: CapError) -> u64 {
 /// more, waking threads blocked on them with `ObjectDestroyed`.
 fn reap(k: &mut Kernel) {
     // Destroying a thread empties its CSpace, which can orphan more
-    // objects (or threads): repeat until nothing changes.
-    // Destroying a CNode empties it, with the same effect.
+    // objects (or threads): repeat until nothing changes. Destroying a
+    // CNode empties it, with the same effect. Each round is one pass over
+    // the capability table marking what is still referred to.
     loop {
-        let dead = (0..MAX_THREADS).find(|&t| {
-            k.thread_object[t]
-                && !k
-                    .caps
-                    .iter()
-                    .any(|c| c.object == Object::Thread { id: t as u32 })
-        });
-        if let Some(t) = dead {
+        let live = Live::of(k);
+        if let Some(t) = (0..MAX_THREADS).find(|&t| k.thread_object[t] && !live.threads[t]) {
             destroy_thread(k, t as Tid);
             continue;
         }
-        let dead = (0..CNODE_CHUNKS).find(|&c| {
-            let base = (CNODE_POOL + c * CNODE_CHUNK) as u32;
-            k.cnodes[c].is_some()
-                && !k
-                    .caps
-                    .iter()
-                    .any(|cap| matches!(cap.object, Object::CNode { base: b, .. } if b == base))
-        });
-        match dead {
-            Some(c) => destroy_cnode(k, c),
-            None => break,
-        }
-    }
-    for id in 0..MAX_ENDPOINTS {
-        let live = k
-            .caps
-            .iter()
-            .any(|c| c.object == Object::Endpoint { id: id as u32 });
-        if k.ep_used[id] && !live {
-            k.ep_used[id] = false;
-            // A fault handler naming this endpoint must not follow its id
-            // to whatever object reuses the table entry.
-            for h in k.fault_ep.iter_mut() {
-                if matches!(h, Some((e, _)) if *e as usize == id) {
-                    *h = None;
-                }
-            }
-            let _ = k.ipc.destroy_endpoint(id as u16);
-        }
-    }
-    for id in 0..MAX_NOTIFICATIONS {
-        if id == TIMER_NTFN as usize {
+        if let Some(c) = (0..CNODE_CHUNKS).find(|&c| k.cnodes[c].is_some() && !live.cnodes[c]) {
+            destroy_cnode(k, c);
             continue;
         }
-        let live = k
-            .caps
-            .iter()
-            .any(|c| c.object == Object::Notification { id: id as u32 });
-        if k.ntfn_used[id] && !live {
-            k.ntfn_used[id] = false;
-            let _ = k.ipc.destroy_notification(id as u16);
+        let dead = (0..MAX_SPACES)
+            .find(|&id| matches!(k.vspaces[id], Some(v) if v.object) && !live.spaces[id]);
+        if let Some(id) = dead {
+            destroy_vspace(k, id as u16);
+            continue;
         }
+        for id in 0..MAX_ENDPOINTS {
+            if k.ep_used[id] && !live.endpoints[id] {
+                k.ep_used[id] = false;
+                // A fault handler naming this endpoint must not follow its
+                // id to whatever object reuses the table entry.
+                for h in k.fault_ep.iter_mut() {
+                    if matches!(h, Some((e, _)) if *e as usize == id) {
+                        *h = None;
+                    }
+                }
+                let _ = k.ipc.destroy_endpoint(id as u16);
+            }
+        }
+        for id in 0..MAX_NOTIFICATIONS {
+            if id != TIMER_NTFN as usize && k.ntfn_used[id] && !live.ntfns[id] {
+                k.ntfn_used[id] = false;
+                let _ = k.ipc.destroy_notification(id as u16);
+            }
+        }
+        break;
+    }
+}
+
+/// Which table entries some capability still refers to.
+struct Live {
+    threads: [bool; MAX_THREADS],
+    cnodes: [bool; CNODE_CHUNKS],
+    spaces: [bool; MAX_SPACES],
+    endpoints: [bool; MAX_ENDPOINTS],
+    ntfns: [bool; MAX_NOTIFICATIONS],
+}
+
+impl Live {
+    fn of(k: &Kernel) -> Live {
+        let mut l = Live {
+            threads: [false; MAX_THREADS],
+            cnodes: [false; CNODE_CHUNKS],
+            spaces: [false; MAX_SPACES],
+            endpoints: [false; MAX_ENDPOINTS],
+            ntfns: [false; MAX_NOTIFICATIONS],
+        };
+        for c in k.caps.iter() {
+            let i = match c.object {
+                Object::Thread { id } => l.threads.get_mut(id as usize),
+                Object::CNode { base, .. } => (base as usize)
+                    .checked_sub(CNODE_POOL)
+                    .and_then(|o| l.cnodes.get_mut(o / CNODE_CHUNK)),
+                Object::AddressSpace { id } => l.spaces.get_mut(id as usize),
+                Object::Endpoint { id } => l.endpoints.get_mut(id as usize),
+                Object::Notification { id } => l.ntfns.get_mut(id as usize),
+                _ => None,
+            };
+            if let Some(i) = i {
+                *i = true;
+            }
+        }
+        l
     }
 }
 
@@ -774,7 +977,7 @@ fn destroy_thread(k: &mut Kernel, t: Tid) {
     let _ = k.ipc.suspend(t);
     let (base, size) = window(t as usize);
     let own = base as usize..(base + size) as usize;
-    for s in own.chain([ROOT_SLOTS + t as usize]) {
+    for s in own.chain([ROOT_SLOTS + t as usize, VSPACE_SLOTS + t as usize]) {
         if k.caps.get(s).is_some() {
             unmap_slot(k, s);
             let _ = k.caps.delete(s);
@@ -829,7 +1032,10 @@ fn thread_configure(k: &mut Kernel, cur: Tid, f: &Args) -> Result<(), u64> {
         return Err(Error::InsufficientRights.code());
     }
     let i = t as usize;
-    k.spaces[i] = k.spaces[cur as usize];
+    // Its own address space if it was given one, else its creator's.
+    if k.caps.get(VSPACE_SLOTS + i).is_none() {
+        k.spaces[i] = k.spaces[cur as usize];
+    }
     k.frames[i] = UserFrame::new_thread(entry, stack_top, f.a3);
     k.fresh[i] = true;
     k.preempted[i] = false;
@@ -847,6 +1053,9 @@ fn thread_configure(k: &mut Kernel, cur: Tid, f: &Args) -> Result<(), u64> {
 fn thread_resume(k: &mut Kernel, cur: Tid, slot: u64) -> Result<(), u64> {
     let t = thread_cap(k, cur, slot)?;
     let prio = k.configured[t as usize].ok_or(Error::IllegalOperation.code())?;
+    if k.spaces[t as usize].is_none() {
+        return Err(Error::IllegalOperation.code());
+    }
     if !thread_inactive(k, t) {
         return Err(Error::IllegalOperation.code());
     }
@@ -983,15 +1192,27 @@ fn cap_mint(k: &mut Kernel, cur: Tid, f: &Args) -> Result<(), u64> {
     k.caps.derive(src, dst, mask, badge).map_err(cap_error)
 }
 
-/// `Retype`: rdi = untyped slot, rsi = object type, rdx = size in bits
-/// (untyped only), r8 = empty destination slot.
+/// `Retype`: rdi = untyped slot, rsi = object type, rdx = size in bits,
+/// r8 = empty destination slot, r9 = 0 for the caller's CSpace or a CNode
+/// slot + 1.
 fn retype(k: &mut Kernel, cur: Tid, f: &Args) -> Result<(), u64> {
     let src = own_slot(k, cur, f.a0).ok_or(Error::InvalidCapability.code())?;
     let ut = *k.caps.get(src).ok_or(Error::InvalidCapability.code())?;
     if !matches!(ut.object, Object::Untyped { .. }) {
         return Err(Error::InvalidCapability.code());
     }
-    let dst = own_slot(k, cur, f.a3).ok_or(Error::InvalidArgument.code())?;
+    // The new capability goes in the caller's own CSpace, or (r9 = a CNode
+    // slot + 1) at index r8 of that CNode.
+    let dst = if f.a4 == 0 {
+        own_slot(k, cur, f.a3).ok_or(Error::InvalidArgument.code())?
+    } else {
+        let (base, size) = cnode_cap(k, cur, f.a4 - 1)?;
+        usize::try_from(f.a3)
+            .ok()
+            .filter(|&i| i < size)
+            .map(|i| base + i)
+            .ok_or(Error::InvalidArgument.code())?
+    };
     if k.caps.get(dst).is_some() {
         return Err(Error::SlotOccupied.code());
     }
@@ -1008,6 +1229,12 @@ fn retype(k: &mut Kernel, cur: Tid, f: &Args) -> Result<(), u64> {
         ObjectType::CNode => {
             Some(alloc_cnode(k, bits - CNODE_SLOT_BITS).ok_or(Error::ObjectTableFull.code())?)
         }
+        ObjectType::AddressSpace => Some(
+            k.vspaces
+                .iter()
+                .position(Option::is_none)
+                .ok_or(Error::ObjectTableFull.code())?,
+        ),
     };
     let base = k.caps.carve(src, bits).map_err(cap_error)?;
     let ipc_rights = Rights::READ | Rights::WRITE | Rights::GRANT | Rights::GRANT_REPLY;
@@ -1040,6 +1267,21 @@ fn retype(k: &mut Kernel, cur: Tid, f: &Args) -> Result<(), u64> {
                     base: (CNODE_POOL + c * CNODE_CHUNK) as u32,
                     size_bits: slot_bits,
                 },
+                Rights::READ | Rights::WRITE | Rights::GRANT,
+            )
+        }
+        (ObjectType::AddressSpace, Some(id)) => {
+            let root = AddressSpace::new_in(base).map_err(|_| Error::IllegalOperation.code())?;
+            k.vspaces[id] = Some(VSpace {
+                root,
+                pool: TablePool::Own {
+                    next: base + 4096,
+                    end: base + (1 << bits),
+                },
+                object: true,
+            });
+            Capability::new(
+                Object::AddressSpace { id: id as u32 },
                 Rights::READ | Rights::WRITE | Rights::GRANT,
             )
         }
@@ -1164,7 +1406,7 @@ fn ipc_op(
 fn debug_put_str(k: &Kernel, cur: Tid, ptr: u64, len: u64) -> Result<(), u64> {
     let mut buf = [0u8; DEBUG_STR_MAX];
     let len = (len as usize).min(DEBUG_STR_MAX);
-    let space = k.spaces[cur as usize].ok_or(Error::IllegalOperation.code())?;
+    let space = space_of(k, cur).ok_or(Error::IllegalOperation.code())?;
     space
         .copy_from_user(ptr, &mut buf[..len])
         .map_err(|_| Error::InvalidArgument.code())?;
