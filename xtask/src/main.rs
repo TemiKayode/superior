@@ -101,6 +101,9 @@ struct Image {
     /// The disk's driver, and so how the disk is attached: `virtio-blk`,
     /// `nvme` or `ahci`.
     driver: &'static str,
+    /// A virtio network device on QEMU's user-mode network (the network
+    /// test).
+    net: bool,
 }
 
 /// The disk drivers, each with the PCI function its test disk appears as
@@ -140,6 +143,7 @@ fn main() -> ExitCode {
                         .and_then(|_| fs_test(a, "virtio-blk"))
                         .and_then(|_| disk_test(a, "nvme"))
                         .and_then(|_| disk_test(a, "ahci"))
+                        .and_then(|_| net_test(a))
                         .and_then(|_| image(false, a))
                         .and_then(|img| shell_session(&img))
                 })
@@ -159,12 +163,13 @@ fn main() -> ExitCode {
         Some("fs-test") => fs_test(arch, "virtio-blk"),
         Some("nvme-test") => disk_test(arch, "nvme"),
         Some("ahci-test") => disk_test(arch, "ahci"),
+        Some("net-test") => net_test(arch),
         Some("memory-test") => {
             image_with(false, arch, "memory").and_then(|img| memory_test(&img))
         }
         Some("bench") => image(false, Arch::X86_64).and_then(|img| bench(&img)),
         _ => Err(
-            "usage: cargo xtask <image | run | test | boot-test | shell-test | cm-test | supervise-test | drivers-test | memory-test | fs-test | nvme-test | ahci-test | bench | sel4-test> [x86_64 | aarch64]"
+            "usage: cargo xtask <image | run | test | boot-test | shell-test | cm-test | supervise-test | drivers-test | memory-test | fs-test | nvme-test | ahci-test | net-test | bench | sel4-test> [x86_64 | aarch64]"
                 .into(),
         ),
     });
@@ -279,6 +284,8 @@ fn bundle(arch: Arch, manifest: &str, driver: &str) -> Result<PathBuf, String> {
         ("virtio-blk", "superior-virtio-blk"),
         ("nvme", "superior-nvme"),
         ("ahci", "superior-ahci"),
+        ("virtio-net", "superior-virtio-net"),
+        ("net", "superior-net"),
         ("memserver", "superior-memserver"),
         ("fs", "superior-fs"),
         ("testclient", "superior-testclient"),
@@ -401,6 +408,7 @@ fn image_for(
         disk,
         writable: fs,
         driver,
+        net: manifest == "net",
     })
 }
 
@@ -492,6 +500,7 @@ fn sel4_image() -> Result<Image, String> {
         disk: None,
         writable: false,
         driver: "virtio-blk",
+        net: false,
     })
 }
 
@@ -517,7 +526,7 @@ fn qemu_command(img: &Image) -> Command {
             // Images with a disk are driver tests: they need an IOMMU,
             // which QEMU emulates (VT-d) only on its q35 machine. Interrupt
             // remapping stays off: MSIs reach the local APIC directly.
-            if img.disk.is_some() {
+            if img.disk.is_some() || img.net {
                 q.args(["-machine", "q35", "-device", "intel-iommu,intremap=off"]);
             }
             if img.disk.is_some() && img.driver == "ahci" {
@@ -541,7 +550,7 @@ fn qemu_command(img: &Image) -> Command {
             // Driver tests get an SMMUv3 in front of PCI.
             let machine = if img.sel4 {
                 SEL4_MACHINE
-            } else if img.disk.is_some() {
+            } else if img.disk.is_some() || img.net {
                 "virt,highmem=off,iommu=smmuv3"
             } else {
                 "virt,highmem=off"
@@ -607,6 +616,16 @@ fn qemu_command(img: &Image) -> Command {
                 "-device",
                 "virtio-blk-pci,drive=blk0,disable-legacy=on,iommu_platform=on",
             ]);
+    }
+    if img.net {
+        // User-mode networking: the guest is 10.0.2.15, the gateway (the
+        // host) 10.0.2.2. Modern virtio only, its DMA through the IOMMU.
+        q.args([
+            "-netdev",
+            "user,id=n0",
+            "-device",
+            "virtio-net-pci,netdev=n0,disable-legacy=on,iommu_platform=on",
+        ]);
     }
     q.args(["-serial", "stdio", "-no-reboot"]);
     q
@@ -935,6 +954,86 @@ fn check_log(what: &str, out: &str, steps: &[&str]) -> Result<(), String> {
             return Err(format!("{what}: log contains {bad:?}"));
         }
     }
+    Ok(())
+}
+
+/// The port the network test's client sends UDP to (on the gateway, which
+/// QEMU's user-mode network passes to the host's loopback).
+const ECHO_PORT: u16 = 47001;
+
+/// Boots `boot/net.manifest` on QEMU's user-mode network while a thread
+/// here echoes UDP datagrams back, and checks that every ping and every
+/// datagram came back right while the injector killed the network server
+/// and the virtio-net driver.
+fn net_test(arch: Arch) -> Result<(), String> {
+    use std::net::UdpSocket;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    let img = image_with(false, arch, "net")?;
+    let socket = UdpSocket::bind(("127.0.0.1", ECHO_PORT))
+        .map_err(|e| format!("binding the echo port {ECHO_PORT}: {e}"))?;
+    socket
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .map_err(|e| e.to_string())?;
+    let stop = Arc::new(AtomicBool::new(false));
+    let echoed = Arc::new(AtomicU64::new(0));
+    let echo = {
+        let (stop, echoed) = (stop.clone(), echoed.clone());
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 2048];
+            while !stop.load(Ordering::Relaxed) {
+                if let Ok((n, from)) = socket.recv_from(&mut buf) {
+                    if socket.send_to(&buf[..n], from).is_ok() {
+                        echoed.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+        })
+    };
+    println!("== network test on {}", img.path.display());
+    let out = run_to_exit(&img, Duration::from_secs(120));
+    stop.store(true, Ordering::Relaxed);
+    let _ = echo.join();
+    let out = out?;
+    let steps = [
+        "virtio-net: ready:",
+        "net: ready: 10.0.2.15/24 via 10.0.2.2",
+        "[pass] net: a page of its own",
+        "[pass] net: this host is 10.0.2.15, the gateway 10.0.2.2",
+        "[cm] fault injection: killing",
+        "pings to 10.0.2.2 answered, every byte right",
+        "UDP datagrams of 1 to 1400 bytes echoed by the host, every byte right",
+        "[cm] client asked to shut down (pass)",
+    ];
+    check_log("network test", &out, &steps)?;
+    if !out.contains("net: 10.0.2.2 is at") {
+        return Err("network test: the gateway's MAC address was never learned".into());
+    }
+    let kills = |what: &str| {
+        out.matches(&format!("[cm] fault injection: killing {what}\n"))
+            .count()
+            + out
+                .matches(&format!("[cm] fault injection: killing {what}\r\n"))
+                .count()
+    };
+    let (server, driver) = (kills("net"), kills("virtio-net"));
+    // Kills land among the pings and the echoes, not only after them.
+    let during = |what: &str| {
+        out.find(what).map_or(0, |i| {
+            out[..i].matches("[cm] fault injection: killing").count()
+        })
+    };
+    let (by_pings, by_echoes) = (during("pings to 10.0.2.2"), during("echoed by the host"));
+    if server < 10 || driver < 10 || by_pings < 5 || by_echoes < by_pings + 20 {
+        return Err(format!(
+            "network test: the server was killed {server} times and the driver {driver}, {by_pings} kills by the end of the pings and {by_echoes} by the end of the echoes; want 10, 10, 5 and 20 more"
+        ));
+    }
+    println!(
+        "== the server was killed {server} times and the driver {driver}; the host echoed {} datagrams",
+        echoed.load(Ordering::Relaxed)
+    );
+    println!("== network test passed ({})", arch.name());
     Ok(())
 }
 

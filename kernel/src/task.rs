@@ -41,13 +41,13 @@
 //! [`TIMER_NTFN`] on every tick, so a thread can sleep by waiting on it.
 
 use crate::arch::vm::{self, AddressSpace, USER_BASE, USER_END};
-use crate::arch::{self, iommu, Args, Exit, UserFrame};
+use crate::arch::{self, Args, Exit, UserFrame, iommu};
 use crate::memory::{MapError, TablePool};
 use crate::{kprint, kprintln};
 use spin::{Mutex, MutexGuard};
 use superior_objects::abi::{
-    CapTransfer, Error, FaultKind, FaultReply, ObjectType, Syscall, CNODE_SLOT_BITS, MAP_EXEC,
-    MAP_WRITE,
+    CNODE_SLOT_BITS, CapTransfer, Error, FaultKind, FaultReply, MAP_EXEC, MAP_WRITE, ObjectType,
+    Syscall,
 };
 use superior_objects::cap::{CNode, CapError, Capability, Object, Rights};
 use superior_objects::ipc::{Ipc, Tid};
@@ -93,6 +93,9 @@ const DEBUG_STR_MAX: usize = 256;
 const MAX_IRQS: usize = 256;
 /// The notification the timer signals (bit 0) on every tick.
 pub const TIMER_NTFN: u16 = 0;
+/// Pending `TimerSignal`s at once, across the system (one per
+/// notification).
+const MAX_TIMERS: usize = 64;
 /// Self-test builds give up after this many seconds, so a deadlock fails
 /// the test instead of idling forever.
 #[cfg(feature = "selftest")]
@@ -157,6 +160,8 @@ struct Kernel {
     /// Endpoint and notification table entries in use by some object.
     ep_used: [bool; MAX_ENDPOINTS],
     ntfn_used: [bool; MAX_NOTIFICATIONS],
+    /// Pending `TimerSignal`s: (deadline in ticks, notification, bits).
+    timers: [Option<(u64, u16, u64)>; MAX_TIMERS],
     /// Where the frame capability in each capability-table slot is mapped:
     /// (address space, user address).
     mapped: [Option<(u16, u64)>; CAP_TABLE_SLOTS],
@@ -201,6 +206,7 @@ static KERNEL: Mutex<Kernel> = Mutex::new(Kernel {
     },
     cnodes: [None; CNODE_CHUNKS],
     irq_ntfn: [None; MAX_IRQS],
+    timers: [None; MAX_TIMERS],
     reply_grant: [false; MAX_THREADS],
     ep_used: [false; MAX_ENDPOINTS],
     mapped: [None; CAP_TABLE_SLOTS],
@@ -410,6 +416,7 @@ pub fn handle_syscall(frame: &mut UserFrame) -> Exit {
         Some(Syscall::IoMap) => io_map(k, cur, &a),
         Some(Syscall::IoUnmap) => io_unmap(k, cur, a.a0),
         Some(Syscall::NotificationBind) => notification_bind(k, cur, a.a0),
+        Some(Syscall::TimerSignal) => timer_signal(k, cur, a.a0, a.a1),
         Some(Syscall::ThreadSetVSpace) => thread_set_vspace(k, cur, &a),
         Some(Syscall::ThreadSetFaultHandler) => thread_set_fault_handler(k, cur, &a),
         Some(Syscall::SetFaultHandler) => set_fault_handler(k, cur, a.a0),
@@ -483,6 +490,7 @@ pub fn handle_timer(frame: &mut UserFrame) -> Exit {
         // sleeper, and return to it; the idle loop decides who runs.
         k.ipc.tick();
         let _ = k.ipc.signal_irq(TIMER_NTFN, 1);
+        fire_timers(k);
         return Exit::Iret;
     }
     let cur = k
@@ -495,6 +503,7 @@ pub fn handle_timer(frame: &mut UserFrame) -> Exit {
         k.stats.preemptions += 1;
     }
     let _ = k.ipc.signal_irq(TIMER_NTFN, 1);
+    fire_timers(k);
     resume(guard, cur, frame)
 }
 
@@ -629,6 +638,50 @@ fn irq_set_notification(k: &mut Kernel, cur: Tid, f: &Args) -> Result<(), u64> {
     k.irq_ntfn[line as usize] = Some((id as u16, badge));
     arch::irq_unmask(line);
     Ok(())
+}
+
+/// `TimerSignal`: rdi = notification (Write), rsi = ticks from now (0
+/// cancels).
+fn timer_signal(k: &mut Kernel, cur: Tid, slot: u64, ticks: u64) -> Result<(), u64> {
+    let s = own_slot(k, cur, slot).ok_or(Error::InvalidCapability.code())?;
+    let cap = *k.caps.get(s).ok_or(Error::InvalidCapability.code())?;
+    let Object::Notification { id } = cap.object else {
+        return Err(Error::InvalidCapability.code());
+    };
+    if !cap.rights.contains(Rights::WRITE) {
+        return Err(Error::InsufficientRights.code());
+    }
+    let id = id as u16;
+    // One deadline per notification: a new one replaces the old.
+    for t in k.timers.iter_mut() {
+        if matches!(t, Some((_, n, _)) if *n == id) {
+            *t = None;
+        }
+    }
+    if ticks == 0 {
+        return Ok(());
+    }
+    let free = k
+        .timers
+        .iter()
+        .position(Option::is_none)
+        .ok_or(Error::ObjectTableFull.code())?;
+    let bits = if cap.badge == 0 { 1 } else { cap.badge };
+    k.timers[free] = Some((k.stats.ticks.saturating_add(ticks), id, bits));
+    Ok(())
+}
+
+/// Signals every notification whose `TimerSignal` deadline has come.
+fn fire_timers(k: &mut Kernel) {
+    let now = k.stats.ticks;
+    for i in 0..MAX_TIMERS {
+        if let Some((deadline, n, bits)) = k.timers[i] {
+            if deadline <= now {
+                k.timers[i] = None;
+                let _ = k.ipc.signal_irq(n, bits);
+            }
+        }
+    }
 }
 
 /// `NotificationBind`: rdi = notification (Read), bound to the caller.
@@ -1161,6 +1214,12 @@ fn reap(k: &mut Kernel) {
                 for line in 0..MAX_IRQS {
                     if matches!(k.irq_ntfn[line], Some((n, _)) if n as usize == id) {
                         k.irq_ntfn[line] = None;
+                    }
+                }
+                // Nor may a pending timer.
+                for t in k.timers.iter_mut() {
+                    if matches!(t, Some((_, n, _)) if *n as usize == id) {
+                        *t = None;
                     }
                 }
                 let _ = k.ipc.destroy_notification(id as u16);

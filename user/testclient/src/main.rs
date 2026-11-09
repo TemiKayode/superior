@@ -53,7 +53,7 @@
 use core::sync::atomic::{AtomicU32, Ordering, fence};
 use superior_objects::abi::{CapTransfer, Error, ObjectType, Syscall, root};
 use superior_objects::interfaces::fs::ring;
-use superior_objects::interfaces::{Status, block, fs, mem, pci};
+use superior_objects::interfaces::{Status, block, fs, mem, net, pci};
 use superior_sys::{Called, USER_BASE, call_retry, print_line, syscall, syscall_x};
 
 const ECHO: u64 = 0;
@@ -1314,6 +1314,285 @@ fn injector() -> ! {
     unreachable!()
 }
 
+// ---- the network client (`arg 13`, boot/net.manifest) ----
+
+const NET: u64 = 0;
+const NET_CONTROL: u64 = 1;
+const NET_MEMORY: u64 = 2;
+/// The socket's notification arrives here.
+const NET_NTFN: u64 = 3;
+const NET_PAGE: u64 = 4;
+const NET_PAGE_VA: u64 = USER_BASE + 0x4000_0000;
+/// QEMU's user-mode network: the gateway is the host, and UDP to it
+/// reaches the host's loopback, where `cargo xtask net-test` echoes on
+/// this port.
+const GATEWAY: [u8; 4] = [10, 0, 2, 2];
+const ECHO_PORT: u16 = 47001;
+/// At least this many pings and echoes, and for at least this many ticks
+/// each, so the injector's kills land throughout.
+const PINGS: u64 = 20;
+const ECHOES: u64 = 200;
+const PING_TICKS: u64 = 200;
+const ECHO_TICKS: u64 = 500;
+/// Ticks to wait for an answer before sending again.
+const NET_TIMEOUT: u64 = 30;
+const NET_TRIES: u32 = 50;
+
+fn net_page() -> &'static mut [u8] {
+    // SAFETY: the page is mapped at NET_PAGE_VA for good.
+    unsafe { core::slice::from_raw_parts_mut(NET_PAGE_VA as *mut u8, 4096) }
+}
+
+/// A call lending the page; `None` if the server was restarted under it.
+fn net_call(m: [u64; 4]) -> Option<[u64; 4]> {
+    let x = CapTransfer {
+        grant: Some(NET_PAGE as u16),
+        accept: None,
+    };
+    let r = syscall_x(Syscall::Call, NET, m, x);
+    (r.status == 0).then_some(r.msg)
+}
+
+struct Sock {
+    udp: bool,
+    handle: u64,
+    /// Bound again after the server lost the socket (it was restarted).
+    rebinds: u64,
+    /// Requests sent again after no answer came in time.
+    resent: u64,
+}
+
+impl Sock {
+    fn new(udp: bool) -> Option<Sock> {
+        let mut s = Sock {
+            udp,
+            handle: 0,
+            rebinds: 0,
+            resent: 0,
+        };
+        s.bind().then_some(s)
+    }
+
+    fn bind(&mut self) -> bool {
+        for _ in 0..200 {
+            syscall(Syscall::CapDelete, NET_NTFN, [0; 4]);
+            let op = if self.udp {
+                net::UDP_BIND
+            } else {
+                net::ICMP_BIND
+            };
+            let x = CapTransfer {
+                grant: None,
+                accept: Some(NET_NTFN as u16),
+            };
+            let r = syscall_x(Syscall::Call, NET, [op, 0, 0, 0], x);
+            if r.status == 0 && r.msg[0] == OK && r.cap == Some(NET_NTFN as u16) {
+                self.handle = r.msg[1];
+                return true;
+            }
+            syscall(Syscall::Yield, 0, [0; 4]);
+        }
+        false
+    }
+
+    /// Sends `len` bytes of what `fill` writes to `to` and waits for an
+    /// answer `matches` accepts, sending again on a timeout and binding
+    /// again if the server restarted. False if none came at all.
+    fn exchange(
+        &mut self,
+        to: u64,
+        len: u64,
+        fill: impl Fn(&mut [u8]),
+        matches: impl Fn(u64, &[u8], u64) -> bool,
+    ) -> bool {
+        let mut tries = 0;
+        'send: while tries < NET_TRIES {
+            tries += 1;
+            if tries > 1 {
+                self.resent += 1;
+            }
+            fill(net_page());
+            match net_call([net::SEND, self.handle, to, len]) {
+                Some(r) if r[0] == OK => {}
+                Some(r) if r[0] == Status::NotFound as u64 => {
+                    self.rebind();
+                    continue;
+                }
+                // Restarted under the call, or the driver was.
+                _ => {
+                    self.rebind_if_lost();
+                    continue;
+                }
+            }
+            let deadline = ticks() + NET_TIMEOUT;
+            loop {
+                // Everything that has arrived.
+                loop {
+                    match net_call([net::RECV, self.handle, 0, 0]) {
+                        Some(r) if r[0] == OK => {
+                            if matches(r[1], &net_page()[..r[1] as usize], r[2]) {
+                                return true;
+                            }
+                        }
+                        Some(r) if r[0] == Status::Empty as u64 => break,
+                        _ => {
+                            self.rebind_if_lost();
+                            continue 'send;
+                        }
+                    }
+                }
+                let now = ticks();
+                if now >= deadline {
+                    continue 'send;
+                }
+                syscall(Syscall::TimerSignal, NET_NTFN, [deadline - now, 0, 0, 0]);
+                let w = syscall(Syscall::Wait, NET_NTFN, [0; 4]);
+                if w.status != 0 {
+                    // Its notification is gone: the server restarted.
+                    self.rebind();
+                    continue 'send;
+                }
+            }
+        }
+        false
+    }
+
+    fn rebind(&mut self) {
+        self.rebinds += 1;
+        self.bind();
+    }
+
+    /// Binds again if the server no longer knows the socket.
+    fn rebind_if_lost(&mut self) {
+        match net_call([net::RECV, self.handle, 0, 0]) {
+            Some(r) if r[0] != Status::NotFound as u64 => {}
+            _ => self.rebind(),
+        }
+    }
+}
+
+/// Echo `k`'s length and byte `j`.
+fn echo_len(k: u64) -> u64 {
+    1 + k * 97 % 1400
+}
+
+fn echo_byte(k: u64, j: u64) -> u8 {
+    (k.wrapping_mul(31) ^ j.wrapping_mul(7) ^ j >> 8) as u8
+}
+
+/// Byte `j` of UDP echo `k`: its number first (so a late echo of an
+/// earlier one is told apart), then the pattern.
+fn echo_at(k: u64, j: u64) -> u8 {
+    match k.to_le_bytes().get(j as usize) {
+        Some(&b) => b,
+        None => echo_byte(k, j),
+    }
+}
+
+fn net_client() -> ! {
+    let mut t = Checks(0, "net");
+    let made = syscall(
+        Syscall::Retype,
+        NET_MEMORY,
+        [ObjectType::Frame as u64, 0, NET_PAGE, 0],
+    );
+    let mapped = syscall(Syscall::FrameMap, NET_PAGE, [NET_PAGE_VA, 1, 0, 0]);
+    t.check(
+        made.status == 0 && mapped.status == 0,
+        format_args!("a page of its own"),
+    );
+    let info = (0..200)
+        .find_map(|_| {
+            let r = syscall(Syscall::Call, NET, [net::INFO, net::VERSION, 0, 0]);
+            syscall(Syscall::Yield, 0, [0; 4]);
+            (r.status == 0 && r.msg[0] == OK).then_some(r.msg)
+        })
+        .unwrap_or([u64::MAX; 4]);
+    t.check(
+        info[1] == net::addr([10, 0, 2, 15], 0) && info[3] == net::addr(GATEWAY, 0),
+        format_args!("this host is 10.0.2.15, the gateway 10.0.2.2"),
+    );
+
+    // Pings to the gateway, under fault injection.
+    let (mut answered, mut pings) = (0, 0);
+    let mut stats = (0, 0);
+    if let Some(mut s) = Sock::new(false) {
+        let start = ticks();
+        while pings < PINGS || ticks() < start + PING_TICKS {
+            let seq = pings;
+            pings += 1;
+            let to = net::addr(GATEWAY, seq as u16);
+            let ok = s.exchange(
+                to,
+                56,
+                |b| {
+                    for (j, x) in b[..56].iter_mut().enumerate() {
+                        *x = echo_byte(seq, j as u64);
+                    }
+                },
+                |len, b, from| {
+                    from == to
+                        && len == 56
+                        && b.iter()
+                            .enumerate()
+                            .all(|(j, &x)| x == echo_byte(seq, j as u64))
+                },
+            );
+            answered += ok as u64;
+        }
+        stats = (s.resent, s.rebinds);
+    }
+    t.check(
+        answered == pings && pings >= PINGS,
+        format_args!(
+            "{answered} of {pings} pings to 10.0.2.2 answered, every byte right ({} sent again, {} sockets bound again after a restart)",
+            stats.0, stats.1
+        ),
+    );
+
+    // UDP datagrams of 1 to 1400 bytes, echoed by the host.
+    let (mut echoed, mut echoes) = (0, 0);
+    let mut stats = (0, 0);
+    if let Some(mut s) = Sock::new(true) {
+        let to = net::addr(GATEWAY, ECHO_PORT);
+        let start = ticks();
+        while echoes < ECHOES || ticks() < start + ECHO_TICKS {
+            let k = echoes;
+            echoes += 1;
+            let len = echo_len(k);
+            let ok = s.exchange(
+                to,
+                len,
+                |b| {
+                    for j in 0..len {
+                        b[j as usize] = echo_at(k, j);
+                    }
+                },
+                |n, b, from| {
+                    from == to
+                        && n == len
+                        && b.iter()
+                            .enumerate()
+                            .all(|(j, &x)| x == echo_at(k, j as u64))
+                },
+            );
+            echoed += ok as u64;
+        }
+        stats = (s.resent, s.rebinds);
+    }
+    t.check(
+        echoed == echoes && echoes >= ECHOES,
+        format_args!(
+            "{echoed} of {echoes} UDP datagrams of 1 to 1400 bytes echoed by the host, every byte right ({} sent again, {} sockets bound again after a restart)",
+            stats.0, stats.1
+        ),
+    );
+    syscall(Syscall::Call, NET_CONTROL, [OP_SHUTDOWN, t.0, 0, 0]);
+    loop {
+        syscall(Syscall::Yield, 0, [0; 4]);
+    }
+}
+
 fn ticks() -> u64 {
     syscall(Syscall::Ticks, 0, [0; 4]).msg[0]
 }
@@ -1337,6 +1616,7 @@ pub extern "C" fn _start(role: u64) -> ! {
         4 => block_client([pci::OPEN, pci::VERSION, 0x1af4 << 16 | 0x1042, 0]),
         11 => block_client([pci::OPEN_CLASS, pci::VERSION, 0x01_08_02, 0]),
         12 => block_client([pci::OPEN_CLASS, pci::VERSION, 0x01_06_01, 0]),
+        13 => net_client(),
         5 => memory_client(),
         6 => hog(),
         7 => fs_client(),

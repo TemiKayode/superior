@@ -70,6 +70,13 @@ impl Queue {
         dma_barrier();
     }
 
+    /// Whether the device has finished a chain not yet taken.
+    pub fn has_used(&self) -> bool {
+        dma_barrier();
+        // SAFETY: as in `submit`.
+        unsafe { self.at::<u16>(USED + 2).read_volatile() != self.last_used }
+    }
+
     /// The next chain the device finished, if any: (head, bytes written).
     pub fn take_used(&mut self) -> Option<(u16, u32)> {
         // SAFETY: as in `submit`.

@@ -196,6 +196,14 @@ pub enum Syscall {
     /// notification is bound to at most one thread, for as long as both
     /// exist.
     NotificationBind = 40,
+    /// Signals the notification in slot `rdi` (Write right) once, `rsi`
+    /// ticks ([`TICK_HZ`] a second) from now, with the capability's badge
+    /// (1 if it has none), as the timer interrupt would. Setting it again
+    /// replaces the earlier deadline; `rsi` = 0 cancels it. A component
+    /// sleeps with a timeout by waiting (or receiving, if it is bound) on
+    /// the notification. Fails with `ObjectTableFull` when every kernel
+    /// timer is in use.
+    TimerSignal = 41,
     /// Maps the frame in slot `rdi` at page-aligned `rsi` in the address
     /// space in slot `r8` (Write right). `rdx` = [`MAP_WRITE`] and/or
     /// [`MAP_EXEC`], never both. Needs the frame's Map right, plus Write
@@ -262,6 +270,7 @@ impl Syscall {
             38 => Syscall::IoMap,
             39 => Syscall::IoUnmap,
             40 => Syscall::NotificationBind,
+            41 => Syscall::TimerSignal,
             0x100 => Syscall::DebugPutStr,
             0x101 => Syscall::DebugSelftestDone,
             _ => return None,

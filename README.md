@@ -76,6 +76,10 @@ holds the rest):
   calling thread, whose `Recv` and `ReplyRecv` then also return when it is signalled
   (status `Notified`, the bits as the badge). Pending bits come before queued callers.
   One server loop waits for calls and for its rings' doorbells at once.
+- Timers: `TimerSignal` signals a notification once, a number of ticks from now, with
+  the capability's badge (a new deadline replaces the old; 0 cancels; 64 pending
+  across the system, cleared when the notification is destroyed). A thread waits
+  with a timeout by waiting on a notification it also set a timer on.
 - Rights-checked capability lookup on every system call; badges delivered to servers.
 - Capability transfer in IPC: a sender grants a slot, the receiver names an accept slot,
   and the receiver gets a copy derived from the sender's. Every CSpace is a window onto
@@ -310,6 +314,33 @@ holds the rest):
     mount's check must pass. With no faults, 300 reads through a ring cost about
     40 system calls (a handful of doorbells, the rest sleeps), where calls cost at
     least one each.
+- The network server, v1 (`user/net/`), and a virtio-net driver (`user/virtio-net/`).
+  - The driver serves the versioned `nic` interface: whole Ethernet frames copied
+    between its own receive and transmit buffers (the only memory the device reaches,
+    through the IOMMU) and a page the caller lends with each call. Its interrupt is
+    bound to its thread, so one `Recv` waits for calls and frames; when frames arrive
+    it signals the notification its caller attached. A restarted driver has lost it,
+    and says so in every `RECV` reply.
+  - The server speaks IPv4 over Ethernet: ARP (answering for itself, resolving next
+    hops, holding frames that wait for an answer and asking again), ICMP echo (it
+    answers pings) and UDP, with checksums; it serves the `net` interface: UDP and
+    ICMP-echo sockets, each owned by the client that bound it, send and receive with
+    a lent page. Each socket comes with a notification of the server's, signalled when
+    something arrives: a client waits on it, with a `TimerSignal` on it for a timeout,
+    and a server restart deletes it, which wakes the client to bind again. The server's
+    own notification, bound to its thread, carries the driver's signal and a 100 ms
+    timer; on the timer it drains the driver and attaches again if the driver
+    restarted, and resends ARP requests. Fixed address for now: 10.0.2.15/24 via
+    10.0.2.2.
+  `cargo xtask net-test` boots `boot/net.manifest` on QEMU's user-mode network while
+  xtask echoes UDP on the host. For at least 2 s the client pings the gateway, then for
+  at least 5 s it sends UDP datagrams of 1 to 1,400 bytes that the host echoes back;
+  meanwhile the injector kills the server and the driver every 30 to 150 ms. Every
+  ping and every datagram must come back with every byte right (the client sends
+  again after 300 ms, or binds again when its socket is gone), and both components
+  must have been killed at least 10 times, among the pings and among the echoes. A
+  run does about 1,000 to 3,000 pings and 2,000 to 3,600 echoes through some 35
+  kills of each.
 - Static-pie user programs loaded into their own address spaces and relocated.
 - Boot self-test: a server and a client in separate address spaces do 20,000
   call/reply round trips, and the kernel refuses four kinds of rights violations. A
@@ -343,7 +374,9 @@ silently), buses behind bridges in the IOMMU (requester IDs on bus 0 only); Func
 Level Reset is exercised only by the NVMe controller (QEMU's virtio devices on
 these buses have none); several queues and commands in flight in the NVMe driver,
 namespaces other than 1, several commands (NCQ) and ports in the AHCI driver, ATAPI
-and port multipliers, and the xHCI and HID class drivers; buses behind bridges; the async executor, buffer pools and
+and port multipliers, and the xHCI and HID class drivers; in the network server
+DHCP, TCP, IPv6, fragments, DNS, routes beyond one gateway, and rings in place of a
+call per frame; buses behind bridges; the async executor, buffer pools and
 power callbacks of the SDK; an IDL compiler for the interfaces; escalating a component
 given up on to a supervisor above it (today the
 manager is the only one), restarting the Component Manager or Memory Server (spec: fast
@@ -374,8 +407,10 @@ https://claude.ai/artifact/QKJS8qH5Dfbjzn58RStq1j
 | `user/virtio-blk/` | The virtio block driver |
 | `user/nvme/` | The NVMe class driver |
 | `user/ahci/` | The AHCI (SATA) class driver |
+| `user/virtio-net/` | The virtio network driver |
+| `user/net/` | The network server |
 | `user/echo/`, `user/counter/`, `user/testclient/` | Test components for the Component Manager, supervision and drivers |
-| `boot/` | Component manifests: `shell.manifest` (normal boot), `test.manifest` (`cm-test`), `supervise.manifest` (`supervise-test`) , `drivers.manifest` (`drivers-test`) , `memory.manifest` (`memory-test`), `fs.manifest` and `fs-verify.manifest` (`fs-test`) |
+| `boot/` | Component manifests: `shell.manifest` (normal boot), `test.manifest` (`cm-test`), `supervise.manifest` (`supervise-test`) , `drivers.manifest` (`drivers-test`) , `memory.manifest` (`memory-test`), `fs.manifest` and `fs-verify.manifest` (`fs-test`), `net.manifest` (`net-test`) |
 | `sel4/` | Docker build of seL4 and rust-sel4's kernel loader, for running the shell on seL4 |
 | `xtask/` | Build driver: user program, kernel, disk image, QEMU boot |
 
@@ -384,7 +419,7 @@ https://claude.ai/artifact/QKJS8qH5Dfbjzn58RStq1j
 Needs Rust (the pinned nightly in `rust-toolchain.toml` installs itself) and QEMU.
 
 ```bash
-cargo xtask test           # host tests, model check, simulation; on both ISAs the boot self-tests, the Component Manager, supervision, driver, Memory Server and filesystem tests and a shell session; then the shell on seL4
+cargo xtask test           # host tests, model check, simulation; on both ISAs the boot self-tests, the Component Manager, supervision, driver, Memory Server and filesystem tests (the disk tests on all three disk drivers), the network test and a shell session; then the shell on seL4
 cargo xtask cm-test        # just the Component Manager test (add aarch64 for that ISA)
 cargo xtask supervise-test # just the supervision test (add aarch64 for that ISA)
 cargo xtask drivers-test   # just the driver framework test (add aarch64 for that ISA)
@@ -392,6 +427,7 @@ cargo xtask memory-test    # just the Memory Server test (add aarch64 for that I
 cargo xtask fs-test        # just the filesystem test, two boots (add aarch64 for that ISA)
 cargo xtask nvme-test      # the driver and filesystem tests on an NVMe disk (add aarch64 for that ISA)
 cargo xtask ahci-test      # the same on a SATA disk behind AHCI (add aarch64 for that ISA)
+cargo xtask net-test       # just the network test (add aarch64 for that ISA)
 cargo xtask run            # boot the shell in QEMU (x86-64), its console on this terminal
 cargo xtask run aarch64    # the same on QEMU's AArch64 virt machine
 cargo xtask image  # just build target/superior.img

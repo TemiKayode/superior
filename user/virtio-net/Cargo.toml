@@ -1,0 +1,18 @@
+[package]
+name = "superior-virtio-net"
+description = "A virtio network driver (virtio 1.x over PCI), serving the nic interface."
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "superior-virtio-net"
+test = false
+bench = false
+
+[dependencies]
+superior-objects = { path = "../../crates/objects" }
+superior-sys = { path = "../../crates/sys" }
+superior-driver = { path = "../../crates/driver" }

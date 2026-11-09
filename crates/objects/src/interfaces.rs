@@ -37,8 +37,14 @@ pub enum Status {
     NotDir = 8,
     /// The target is a directory.
     IsDir = 9,
-    /// No free blocks or inodes, or the file would pass its largest size.
+    /// No free blocks or inodes, or the file would pass its largest size;
+    /// or no room to queue a frame.
     NoSpace = 10,
+    /// Nothing waiting to be received.
+    Empty = 11,
+    /// The address could not be resolved (no answer to ARP) or no driver
+    /// is there to send through; the caller may try again.
+    Unreachable = 12,
 }
 
 impl Status {
@@ -54,6 +60,8 @@ impl Status {
             8 => Status::NotDir,
             9 => Status::IsDir,
             10 => Status::NoSpace,
+            11 => Status::Empty,
+            12 => Status::Unreachable,
             _ => Status::Invalid,
         }
     }
@@ -125,6 +133,86 @@ pub mod block {
     pub const FLUSH: u64 = 4;
     /// Most sectors one `READ` or `WRITE` moves.
     pub const MAX_SECTORS: u64 = 4096 / SECTOR;
+}
+
+/// Network interfaces: what a NIC driver serves (to the network server).
+///
+/// Frames are whole Ethernet frames (destination, source, type, payload;
+/// no FCS), at most [`nic::MAX_FRAME`] bytes, at the start of a frame
+/// (memory page) lent with the call; the driver copies them, so the page
+/// comes back with the reply.
+pub mod nic {
+    pub const VERSION: u64 = 1;
+    /// The largest frame: 1500 bytes of payload and a 14-byte header.
+    pub const MAX_FRAME: u64 = 1514;
+
+    /// `[INFO, VERSION]`: reply `[status, MAC address (its six bytes, the
+    /// first the most significant, in the low 48 bits), MAX_FRAME, 0]`.
+    pub const INFO: u64 = 1;
+    /// `[ATTACH]` with a notification granted: the driver signals it
+    /// whenever received frames are waiting. A restarted driver has lost
+    /// it: `RECV` says so, and the caller attaches again.
+    pub const ATTACH: u64 = 2;
+    /// `[RECV]` with a frame lent: the oldest received frame, copied into
+    /// it. Reply `[status, length, attached, 0]`: `Empty` if none is
+    /// waiting; `attached` is 0 if no notification is attached.
+    pub const RECV: u64 = 3;
+    /// `[SEND, length]` with a frame lent: queues the frame at its start
+    /// for transmission. Reply `[status]`: `NoSpace` if the transmit
+    /// queue is full.
+    pub const SEND: u64 = 4;
+}
+
+/// The network: what the network server serves. IPv4 with ICMP echo and
+/// UDP; each socket belongs to the client that bound it.
+///
+/// An address and port travel in one word, [`net::addr`]: the IPv4
+/// address (its first byte the most significant) shifted up 16 bits, and
+/// the port (or, for ICMP echo, the sequence number) in the low 16.
+/// Payloads are at the start of a frame lent with the call.
+///
+/// A socket comes with a notification, granted with the reply to
+/// `UDP_BIND` or `ICMP_BIND`: the server signals it when something
+/// arrives, and its deletion (the server restarted, or the socket closed)
+/// wakes a client waiting on it with `ObjectDestroyed`. The client may
+/// also set a `TimerSignal` on it to wait with a timeout. A restarted
+/// server has no sockets: calls on old handles answer `NotFound` (or fail
+/// with `PeerRestarted`), and the client binds again. Datagrams are not
+/// reliable: one may be lost at any time, and the client resends.
+pub mod net {
+    pub const VERSION: u64 = 1;
+    /// The largest payload: an unfragmented 1500-byte IPv4 packet.
+    pub const MAX_PAYLOAD: u64 = 1472;
+
+    /// `[INFO, VERSION]`: reply `[status, this host's address (IPv4, as
+    /// in addr), its MAC address, the gateway's address]`.
+    pub const INFO: u64 = 1;
+    /// `[UDP_BIND, port]`: a UDP socket on `port` (0: any free one). Reply
+    /// `[status, handle, port]` and the socket's notification; `InUse` if
+    /// the port is taken, `NoSpace` if every socket is.
+    pub const UDP_BIND: u64 = 2;
+    /// `[ICMP_BIND]`: a socket for ICMP echo: requests sent through it
+    /// carry its identifier, and the replies arrive on it. Reply `[status,
+    /// handle]` and the socket's notification.
+    pub const ICMP_BIND: u64 = 3;
+    /// `[SEND, handle, address, length]` with a frame lent: sends a UDP
+    /// datagram from the socket to `address`, or an ICMP echo request
+    /// with the sequence number in its low 16 bits; the payload is the
+    /// first `length` bytes of the frame. Reply `[status]`: `Unreachable`
+    /// if the next hop did not answer ARP (the datagram is dropped).
+    pub const SEND: u64 = 4;
+    /// `[RECV, handle]` with a frame lent: the oldest datagram (or echo
+    /// reply payload) that arrived on the socket, copied into the frame.
+    /// Reply `[status, length, source address]`; `Empty` if none is
+    /// waiting. A socket keeps the last few; more are dropped.
+    pub const RECV: u64 = 5;
+    /// `[CLOSE, handle]`: closes the socket; its notification is deleted.
+    pub const CLOSE: u64 = 6;
+
+    /// The word for IPv4 address `ip` and `port`.
+    pub const fn addr(ip: [u8; 4], port: u16) -> u64 {
+        (u32::from_be_bytes(ip) as u64) << 16 | port as u64
+    }
 }
 
 /// Files: what the filesystem server serves.

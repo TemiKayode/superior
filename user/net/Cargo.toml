@@ -1,0 +1,17 @@
+[package]
+name = "superior-net"
+description = "The network server: IPv4, ARP, ICMP echo and UDP over a NIC driver."
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "superior-net"
+test = false
+bench = false
+
+[dependencies]
+superior-objects = { path = "../../crates/objects" }
+superior-sys = { path = "../../crates/sys" }
