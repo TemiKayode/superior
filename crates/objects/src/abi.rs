@@ -153,6 +153,25 @@ pub enum Syscall {
     /// Timer ticks since boot ([`TICK_HZ`] a second), in message word 0.
     /// Supervisors use it to count restarts per unit of time.
     Ticks = 33,
+    /// The message a device writes to raise the MSI vector in IRQ
+    /// capability `rdi`: the address in message word 0, the data in word 1.
+    /// A driver programs these into its device's MSI-X table, then binds
+    /// the vector to a notification with [`Syscall::IrqSetNotification`].
+    /// Fails with `InvalidArgument` for a line that is not an MSI vector.
+    IrqMsiMessage = 34,
+    /// The address a device uses to reach the frame in slot `rdi` (Map
+    /// right), in message word 0, for programming DMA. Today that is the
+    /// physical address; with an IOMMU it becomes the frame's address in
+    /// the driver's I/O address space, so drivers need no change.
+    FrameDmaAddress = 35,
+    /// Makes a frame over page `rsi` (a byte offset, page-aligned) of the
+    /// device memory in slot `rdi`, in empty slot `rdx`: a child of the
+    /// device-memory capability, so revoking that removes it. Unlike
+    /// `Retype` this picks the page, so the holder can reach exactly the
+    /// registers it needs (one PCI function's configuration space, one BAR
+    /// page). Device frames may alias; who gets which is the holder's
+    /// policy (the PCI bus server's).
+    DeviceFrame = 36,
     /// Maps the frame in slot `rdi` at page-aligned `rsi` in the address
     /// space in slot `r8` (Write right). `rdx` = [`MAP_WRITE`] and/or
     /// [`MAP_EXEC`], never both. Needs the frame's Map right, plus Write
@@ -212,6 +231,9 @@ impl Syscall {
             31 => Syscall::ThreadSetVSpace,
             32 => Syscall::ThreadSetFaultHandler,
             33 => Syscall::Ticks,
+            34 => Syscall::IrqMsiMessage,
+            35 => Syscall::FrameDmaAddress,
+            36 => Syscall::DeviceFrame,
             0x100 => Syscall::DebugPutStr,
             0x101 => Syscall::DebugSelftestDone,
             _ => return None,
@@ -426,8 +448,18 @@ pub mod root {
     pub const UART: u64 = 4;
     /// The UART's interrupt line.
     pub const UART_IRQ: u64 = 5;
+    /// PCI configuration space: I/O ports 0xcf8-0xcff on x86-64 (the
+    /// legacy address/data pair), the ECAM window (device memory, buses 0
+    /// to 15) on AArch64.
+    pub const PCI_CONFIG: u64 = 6;
+    /// Device memory for PCI BARs: a window no RAM or firmware device uses,
+    /// which the PCI bus server assigns BARs from.
+    pub const PCI_MMIO: u64 = 7;
+    /// [`MSI_COUNT`] MSI vectors (IRQ capabilities), in consecutive slots.
+    pub const MSI: u64 = 8;
+    pub const MSI_COUNT: u64 = 8;
     /// The first slot with nothing in it.
-    pub const FIRST_FREE: u64 = 8;
+    pub const FIRST_FREE: u64 = MSI + MSI_COUNT;
     /// Size of [`UNTYPED`], in bits.
     pub const UNTYPED_BITS: u8 = 25;
     /// Where the bundle is mapped, as an offset from the user window's base.

@@ -88,7 +88,7 @@ const MAX_NOTIFICATIONS: usize = 8;
 const MAX_SPACES: usize = 32;
 const DEBUG_STR_MAX: usize = 256;
 /// Interrupt lines a notification can be bound to.
-const MAX_IRQS: usize = 64;
+const MAX_IRQS: usize = 256;
 /// The notification the timer signals (bit 0) on every tick.
 pub const TIMER_NTFN: u16 = 0;
 /// Self-test builds give up after this many seconds, so a deadlock fails
@@ -379,6 +379,9 @@ pub fn handle_syscall(frame: &mut UserFrame) -> Exit {
             k.ipc.set_msg_of(cur, [ticks, 0, 0, 0]);
             Ok(())
         }
+        Some(Syscall::IrqMsiMessage) => irq_msi_message(k, cur, a.a0),
+        Some(Syscall::FrameDmaAddress) => frame_dma_address(k, cur, a.a0),
+        Some(Syscall::DeviceFrame) => device_frame(k, cur, &a),
         Some(Syscall::ThreadSetVSpace) => thread_set_vspace(k, cur, &a),
         Some(Syscall::ThreadSetFaultHandler) => thread_set_fault_handler(k, cur, &a),
         Some(Syscall::SetFaultHandler) => set_fault_handler(k, cur, a.a0),
@@ -528,6 +531,55 @@ fn irq_cap(k: &Kernel, cur: Tid, slot: u64) -> Result<u8, u64> {
         Some(Object::Irq { line }) => Ok(line),
         _ => Err(Error::InvalidCapability.code()),
     }
+}
+
+/// `IrqMsiMessage`: rdi = IRQ capability for an MSI vector.
+fn irq_msi_message(k: &mut Kernel, cur: Tid, slot: u64) -> Result<(), u64> {
+    let line = irq_cap(k, cur, slot)?;
+    let (address, data) = arch::msi_message(line).ok_or(Error::InvalidArgument.code())?;
+    k.ipc.set_msg_of(cur, [address, data, 0, 0]);
+    Ok(())
+}
+
+/// `FrameDmaAddress`: rdi = frame capability (Map right). With no IOMMU
+/// yet, a device reaches a frame at its physical address.
+fn frame_dma_address(k: &mut Kernel, cur: Tid, slot: u64) -> Result<(), u64> {
+    let s = own_slot(k, cur, slot).ok_or(Error::InvalidCapability.code())?;
+    let cap = *k.caps.get(s).ok_or(Error::InvalidCapability.code())?;
+    let Object::Frame { paddr, .. } = cap.object else {
+        return Err(Error::InvalidCapability.code());
+    };
+    if !cap.rights.contains(Rights::MAP) {
+        return Err(Error::InsufficientRights.code());
+    }
+    k.ipc.set_msg_of(cur, [paddr, 0, 0, 0]);
+    Ok(())
+}
+
+/// `DeviceFrame`: rdi = device memory, rsi = page offset, rdx = empty
+/// slot.
+fn device_frame(k: &mut Kernel, cur: Tid, f: &Args) -> Result<(), u64> {
+    let src = own_slot(k, cur, f.a0).ok_or(Error::InvalidCapability.code())?;
+    let cap = *k.caps.get(src).ok_or(Error::InvalidCapability.code())?;
+    let Object::DeviceUntyped { base, size_bits } = cap.object else {
+        return Err(Error::InvalidCapability.code());
+    };
+    let offset = f.a1;
+    if !offset.is_multiple_of(4096) || offset >= 1 << size_bits {
+        return Err(Error::InvalidArgument.code());
+    }
+    let dst = own_slot(k, cur, f.a2).ok_or(Error::InvalidArgument.code())?;
+    if k.caps.get(dst).is_some() {
+        return Err(Error::SlotOccupied.code());
+    }
+    let frame = Capability::new(
+        Object::Frame {
+            paddr: base + offset,
+            size_bits: 12,
+        },
+        Rights::READ | Rights::WRITE | Rights::GRANT | Rights::MAP,
+    );
+    k.caps.insert_child(src, dst, frame).map_err(cap_error)
 }
 
 /// `IrqSetNotification`: rdi = IRQ capability, rsi = notification (Write).
@@ -1214,9 +1266,12 @@ fn cap_mint(k: &mut Kernel, cur: Tid, f: &Args) -> Result<(), u64> {
 fn retype(k: &mut Kernel, cur: Tid, f: &Args) -> Result<(), u64> {
     let src = own_slot(k, cur, f.a0).ok_or(Error::InvalidCapability.code())?;
     let ut = *k.caps.get(src).ok_or(Error::InvalidCapability.code())?;
-    if !matches!(ut.object, Object::Untyped { .. }) {
+    if ut.object.untyped().is_none() {
         return Err(Error::InvalidCapability.code());
     }
+    // Device memory is registers, not RAM: it makes only frames over
+    // them, and smaller device-memory blocks.
+    let device = matches!(ut.object, Object::DeviceUntyped { .. });
     // The new capability goes in the caller's own CSpace, or (r9 = a CNode
     // slot + 1) at index r8 of that CNode.
     let dst = if f.a4 == 0 {
@@ -1234,6 +1289,9 @@ fn retype(k: &mut Kernel, cur: Tid, f: &Args) -> Result<(), u64> {
     }
     let ty = ObjectType::from_u64(f.a1).ok_or(Error::InvalidArgument.code())?;
     let bits = ty.size_bits(f.a2).ok_or(Error::InvalidArgument.code())?;
+    if device && !matches!(ty, ObjectType::Untyped | ObjectType::Frame) {
+        return Err(Error::InvalidArgument.code());
+    }
     // Claim a table entry only once everything else is known to succeed.
     let free = |used: &[bool]| used.iter().position(|u| !u);
     let entry = match ty {
@@ -1302,7 +1360,9 @@ fn retype(k: &mut Kernel, cur: Tid, f: &Args) -> Result<(), u64> {
             )
         }
         (ObjectType::Frame, _) => {
-            vm::zero_frame(base);
+            if !device {
+                vm::zero_frame(base);
+            }
             Capability::new(
                 Object::Frame {
                     paddr: base,
@@ -1311,6 +1371,13 @@ fn retype(k: &mut Kernel, cur: Tid, f: &Args) -> Result<(), u64> {
                 Rights::READ | Rights::WRITE | Rights::GRANT | Rights::MAP,
             )
         }
+        _ if device => Capability::new(
+            Object::DeviceUntyped {
+                base,
+                size_bits: bits,
+            },
+            Rights::ALL,
+        ),
         _ => Capability::new(
             Object::Untyped {
                 base,

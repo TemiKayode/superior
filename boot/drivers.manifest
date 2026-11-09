@@ -1,0 +1,34 @@
+# The driver framework test (cargo xtask drivers-test).
+#
+# The PCI bus server owns configuration space, the BAR window and the MSI
+# vectors. The virtio-blk driver opens its one device through it and
+# serves the block interface; the client reads the test disk through it,
+# checks the bus server will not give it the driver's device, crashes the
+# driver and reads again once the manager has restarted it.
+
+component pcibus
+  image pcibus
+  priority 12
+  provides pci 0
+  device pci-config 1
+  device pci-mmio 2
+  # MSI vectors: slots 3 to 10.
+  device msi 3
+
+component virtio-blk
+  image virtio-blk
+  # Fault injection on, for the test.
+  arg 1
+  priority 11
+  uses pci 0
+  provides block 1
+  notification 2
+  untyped 14 3
+
+component client
+  image testclient
+  arg 4
+  uses block 0
+  uses pci 1
+  untyped 12 2
+  control 3

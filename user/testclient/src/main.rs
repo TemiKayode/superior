@@ -15,12 +15,19 @@
 //!   component after it, `after` (slot 3, an echo), is restarted too.
 //!   Control is slot 4.
 //! - `arg 3`, the crasher: faults as soon as it starts.
+//! - `arg 4`, the block client (`boot/drivers.manifest`): reads the test
+//!   disk through the `block` service (slot 0) into a frame of its own,
+//!   checks every word against the pattern `cargo xtask` wrote, checks the
+//!   PCI bus server (slot 1) will not give it the driver's device, crashes
+//!   the driver and reads again once it is back. Memory in slot 2, control
+//!   in slot 3.
 
 #![no_std]
 #![no_main]
 
-use superior_objects::abi::{Error, Syscall, root};
-use superior_sys::{Called, USER_BASE, call_retry, print_line, syscall};
+use superior_objects::abi::{CapTransfer, Error, ObjectType, Syscall, root};
+use superior_objects::interfaces::{Status, block, pci};
+use superior_sys::{Called, USER_BASE, call_retry, print_line, syscall, syscall_x};
 
 const ECHO: u64 = 0;
 const CONTROL: u64 = 1;
@@ -77,11 +84,12 @@ const CRASH: u64 = 3;
 const ADD_CRASH: u64 = 4;
 const TRIES: u32 = 4;
 
-struct Checks(u64);
+/// Failures so far, and the name checks are logged under.
+struct Checks(u64, &'static str);
 
 impl Checks {
     fn check(&mut self, ok: bool, what: core::fmt::Arguments) {
-        say!("[{}] supervise: {what}", if ok { "pass" } else { "fail" });
+        say!("[{}] {}: {what}", if ok { "pass" } else { "fail" }, self.1);
         self.0 += !ok as u64;
     }
 }
@@ -95,7 +103,7 @@ fn answered(c: Called) -> [u64; 4] {
 }
 
 fn supervise() -> ! {
-    let mut t = Checks(0);
+    let mut t = Checks(0, "supervise");
     let peer_restarted = Error::PeerRestarted.code();
 
     // State and journal survive restarts.
@@ -172,6 +180,109 @@ fn supervise() -> ! {
     }
 }
 
+// The block client's slots.
+const BLOCK: u64 = 0;
+const BLOCK_PCI: u64 = 1;
+const BLOCK_MEMORY: u64 = 2;
+const BLOCK_CONTROL: u64 = 3;
+const BUFFER: u64 = 4;
+const BUFFER_VA: u64 = USER_BASE + 0x4000_0000;
+
+/// Word `k` of sector `s` of the test disk (see `xtask`).
+fn disk_word(s: u64, k: u64) -> u64 {
+    0x5355_0000_0000_0000 | s << 16 | k
+}
+
+/// Reads `count` sectors from `sector` into the buffer (lent with the
+/// call; retried if the driver restarts under it) and checks them.
+fn read_and_check(sector: u64, count: u64) -> Result<(), &'static str> {
+    let words = (count * block::SECTOR / 8) as usize;
+    // SAFETY: the buffer frame is mapped at BUFFER_VA.
+    let buf = unsafe { core::slice::from_raw_parts_mut(BUFFER_VA as *mut u64, 512) };
+    buf.fill(0);
+    let lend = CapTransfer {
+        grant: Some(BUFFER as u16),
+        accept: None,
+    };
+    let peer_restarted = Error::PeerRestarted.code();
+    let mut r = syscall_x(Syscall::Call, BLOCK, [block::READ, sector, count, 0], lend);
+    for _ in 0..3 {
+        if r.status != peer_restarted {
+            break;
+        }
+        r = syscall_x(Syscall::Call, BLOCK, [block::READ, sector, count, 0], lend);
+    }
+    if r.status != 0 || r.msg[0] != Status::Ok as u64 {
+        return Err("the read failed");
+    }
+    for (k, w) in buf[..words].iter().enumerate() {
+        let k = k as u64;
+        if *w != disk_word(sector + k / 64, k % 64) {
+            return Err("wrong data");
+        }
+    }
+    Ok(())
+}
+
+fn block_client() -> ! {
+    let mut t = Checks(0, "block");
+    let r = syscall(Syscall::Call, BLOCK, [block::INFO, block::VERSION, 0, 0]);
+    t.check(
+        r.status == 0 && r.msg[0] == 0 && r.msg[1] == 128 && r.msg[2] == 512,
+        format_args!("{} sectors of {} bytes", r.msg[1], r.msg[2]),
+    );
+    let made = syscall(
+        Syscall::Retype,
+        BLOCK_MEMORY,
+        [ObjectType::Frame as u64, 0, BUFFER, 0],
+    );
+    let mapped = syscall(Syscall::FrameMap, BUFFER, [BUFFER_VA, 1, 0, 0]);
+    t.check(
+        made.status == 0 && mapped.status == 0,
+        format_args!("a buffer page of its own"),
+    );
+    for (sector, count) in [(0, 8), (100, 8), (127, 1)] {
+        let r = read_and_check(sector, count);
+        t.check(
+            r.is_ok(),
+            format_args!(
+                "read {count} sectors from {sector} by DMA into its page: {}",
+                r.err().unwrap_or("every word right")
+            ),
+        );
+    }
+    // Exactly one driver per device.
+    let ids = 0x1af4u64 << 16 | 0x1042;
+    let r = syscall(Syscall::Call, BLOCK_PCI, [pci::OPEN, pci::VERSION, ids, 0]);
+    t.check(
+        r.status == 0 && r.msg[0] == Status::InUse as u64,
+        format_args!("the bus server will not give it the driver's device"),
+    );
+    let r = syscall(Syscall::Call, BLOCK_PCI, [pci::BAR_PAGE, 4, 0, 0]);
+    t.check(
+        r.status == 0 && r.msg[0] == Status::Denied as u64,
+        format_args!("nor any BAR page"),
+    );
+    // Crash the driver; reads work again once it is restarted.
+    let r = syscall(Syscall::Call, BLOCK, [0xdead, 0, 0, 0]);
+    t.check(
+        r.status == Error::PeerRestarted.code(),
+        format_args!("the driver crashed under a call (PeerRestarted)"),
+    );
+    let r = read_and_check(64, 8);
+    t.check(
+        r.is_ok(),
+        format_args!(
+            "read 8 sectors from 64 after the restart: {}",
+            r.err().unwrap_or("every word right")
+        ),
+    );
+    syscall(Syscall::Call, BLOCK_CONTROL, [OP_SHUTDOWN, t.0, 0, 0]);
+    loop {
+        syscall(Syscall::Yield, 0, [0; 4]);
+    }
+}
+
 fn crasher() -> ! {
     say!("crasher: starting");
     // SAFETY: deliberately not: this must fault.
@@ -188,6 +299,7 @@ pub extern "C" fn _start(role: u64) -> ! {
         0 => client(),
         2 => supervise(),
         3 => crasher(),
+        4 => block_client(),
         _ => probe(),
     }
 }

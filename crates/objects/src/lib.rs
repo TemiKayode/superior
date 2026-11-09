@@ -14,6 +14,7 @@ pub mod abi;
 pub mod bundle;
 pub mod cap;
 pub mod elf;
+pub mod interfaces;
 pub mod ipc;
 pub mod manifest;
 #[cfg(test)]

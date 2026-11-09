@@ -33,7 +33,7 @@
 pub const MAX_COMPONENTS: usize = 16;
 pub const MAX_CAPS: usize = 12;
 /// Every component's CSpace size, in bits and slots.
-pub const CSPACE_BITS: u8 = 5;
+pub const CSPACE_BITS: u8 = 6;
 pub const CSPACE_SLOTS: usize = 1 << CSPACE_BITS;
 /// Bounds on the per-instance untyped block, in bits.
 pub const MEMORY_MIN_BITS: u8 = 16;
@@ -414,7 +414,7 @@ component client   # comment after a directive
             (3, "unknown directive")
         );
         assert_eq!(
-            error("component a\n image a\n control 32"),
+            error("component a\n image a\n control 64"),
             (3, "slot out of range")
         );
         assert_eq!(

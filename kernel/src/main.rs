@@ -94,7 +94,8 @@ fn kernel_start(untyped_caps: usize) -> ! {
 
 /// The Component Manager: the root task, and the only process the kernel
 /// starts. It gets every capability the system has to give (memory, the
-/// timer, the console UART and its interrupt, QEMU's exit device) and the
+/// timer, the console UART and its interrupt, QEMU's exit device, PCI
+/// configuration space, device memory for BARs and the MSI vectors) and the
 /// boot bundle mapped read-only, and builds every other process from them
 /// according to the manifest in the bundle.
 fn start_component_manager() -> Result<(), &'static str> {
@@ -134,6 +135,30 @@ fn start_component_manager() -> Result<(), &'static str> {
         (root::UART as usize, uart),
         (root::UART_IRQ as usize, irq),
     ];
+    let (pci_config, pci_mmio, msi) = arch::pci_caps();
+    let rw = Rights::READ | Rights::WRITE;
+    let pci = [
+        (root::PCI_CONFIG as usize, pci_config),
+        (root::PCI_MMIO as usize, pci_mmio),
+    ]
+    .into_iter()
+    .chain(
+        msi.take(root::MSI_COUNT as usize)
+            .enumerate()
+            .map(|(n, line)| {
+                (
+                    root::MSI as usize + n,
+                    Capability::new(Object::Irq { line }, rw),
+                )
+            }),
+    );
+    let mut all = [(0, caps[0].1); 16];
+    let mut n = 0;
+    for c in caps.into_iter().chain(pci) {
+        all[n] = c;
+        n += 1;
+    }
+    let caps = &all[..n];
     task::give_cnode(0, root::CNODE_BITS, root::SELF_CNODE as usize)?;
     let bundle_va = arch::vm::USER_BASE + root::BUNDLE_OFFSET;
     task::spawn_process_with(
@@ -141,7 +166,7 @@ fn start_component_manager() -> Result<(), &'static str> {
         CM_IMAGE,
         root::PRIORITY,
         BUNDLE.len() as u64,
-        &caps,
+        caps,
         &[(bundle_va, BUNDLE)],
     )?;
     kprintln!(

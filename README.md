@@ -133,7 +133,7 @@ holds the rest):
   every capability (memory, timer, console UART and interrupt, exit port) and the boot
   bundle mapped read-only. It reads the manifest in the bundle (`boot/*.manifest`,
   parsed by `crates/objects/src/manifest.rs`) and builds each component from its own
-  untyped block: an address space, a 32-slot CNode, a thread, the frames it loads the
+  untyped block: an address space, a 64-slot CNode, a thread, the frames it loads the
   executable into (relocated, mapped with each segment's permissions), a stack. Each
   component gets only the capabilities its manifest names: services it provides (the
   receive side) or uses (badged per client), devices, notifications, untyped memory, a
@@ -162,6 +162,32 @@ holds the rest):
   answered from the journal instead of applied twice; a component that faults at every
   start is restarted five times, then given up on, and its client is told so; crashing
   a rest-for-one component restarts the one after it.
+- Driver framework v1 (spec section 5). Drivers are ordinary components that reach
+  exactly one device:
+  - Kernel: device-memory capabilities (`DeviceUntyped`), which make only frames,
+    never zeroed and never kernel objects; `DeviceFrame` picks the page.
+  - Kernel: MSI vectors delivered as notification signals, with `IrqMsiMessage`
+    saying what the device must write (local APIC vectors on x86-64, GICv2m on
+    AArch64).
+  - Kernel: `FrameDmaAddress`, the address a device uses for a frame.
+  - The root task gets PCI configuration space (ports 0xcf8-0xcff, or ECAM), a BAR
+    window and eight MSI vectors, and gives them to the PCI bus server
+    (`user/pcibus/`), the only component that touches configuration space. It finds
+    the functions on bus 0, assigns BARs, and serves the versioned `pci` interface
+    (`crates/objects/src/interfaces.rs`). A driver opens one function and gets only
+    its BAR pages and MSI vectors; configuration writes are limited to bus
+    mastering and MSI-X. Opening resets the function: decoding and bus mastering
+    off, the last owner's BAR pages and vectors revoked, MSI-X off, then a Function
+    Level Reset where the device has one.
+  - The Driver SDK (`crates/driver/`): the bus server client, MMIO registers, DMA
+    pages, split virtqueues.
+  - A virtio-blk driver (`user/virtio-blk/`) serves the versioned `block`
+    interface: reads land by DMA straight in a frame the client lends with the call.
+  `cargo xtask drivers-test` boots `boot/drivers.manifest` with a test disk:
+  - the client reads it and checks every word;
+  - the bus server refuses the client the driver's device and its BARs;
+  - the driver is crashed, restarted, its device reset and reopened, and reads work
+    again.
 - Static-pie user programs loaded into their own address spaces and relocated.
 - Boot self-test: a server and a client in separate address spaces do 20,000
   call/reply round trips, and the kernel refuses four kinds of rights violations. A
@@ -189,7 +215,12 @@ holds the rest):
   notifications, a 256-slot CNode pool) so filling them stays quick; normal kernels have
   32 of each, 32 address spaces and a 4096-slot pool.
 
-Not yet: escalating a component given up on to a supervisor above it (today the
+Not yet: the IOMMU (VT-d, SMMUv3), so DMA can reach only buffers granted to a
+driver (today a driver could program its device to DMA anywhere) and MSI writes are
+remapped; Function Level Reset is coded but not yet exercised (QEMU's virtio devices on
+these buses have none); buses behind bridges; the async executor, buffer pools and
+power callbacks of the SDK; an IDL compiler for the interfaces; escalating a component
+given up on to a supervisor above it (today the
 manager is the only one), restarting the Component Manager or Memory Server (spec: fast
 reboot instead), the Memory Server, page tables for boot processes paid for from user memory,
 multi-level CSpaces, the first call's capability forwarded by a lazy-start watcher, scheduling-context capabilities (budgets are set at boot), sporadic refills,
@@ -209,8 +240,11 @@ https://claude.ai/artifact/QKJS8qH5Dfbjzn58RStq1j
 | `user/pingpong/` | Boot self-test program (IPC server, client and spinner) |
 | `user/cm/` | The Component Manager: the root task, which starts every component from the boot manifest |
 | `user/shell/` | The boot shell and COM1 driver, started as a component |
-| `user/echo/`, `user/counter/`, `user/testclient/` | Test components for the Component Manager and supervision |
-| `boot/` | Component manifests: `shell.manifest` (normal boot), `test.manifest` (`cm-test`) and `supervise.manifest` (`supervise-test`) |
+| `crates/driver/` | The Driver SDK: PCI access through the bus server, MMIO, DMA pages, virtqueues |
+| `user/pcibus/` | The PCI bus server |
+| `user/virtio-blk/` | The virtio block driver |
+| `user/echo/`, `user/counter/`, `user/testclient/` | Test components for the Component Manager, supervision and drivers |
+| `boot/` | Component manifests: `shell.manifest` (normal boot), `test.manifest` (`cm-test`), `supervise.manifest` (`supervise-test`) and `drivers.manifest` (`drivers-test`) |
 | `sel4/` | Docker build of seL4 and rust-sel4's kernel loader, for running the shell on seL4 |
 | `xtask/` | Build driver: user program, kernel, disk image, QEMU boot |
 
@@ -219,9 +253,10 @@ https://claude.ai/artifact/QKJS8qH5Dfbjzn58RStq1j
 Needs Rust (the pinned nightly in `rust-toolchain.toml` installs itself) and QEMU.
 
 ```bash
-cargo xtask test           # host tests, model check, simulation; on both ISAs the boot self-tests, the Component Manager and supervision tests and a shell session; then the shell on seL4
+cargo xtask test           # host tests, model check, simulation; on both ISAs the boot self-tests, the Component Manager, supervision and driver tests and a shell session; then the shell on seL4
 cargo xtask cm-test        # just the Component Manager test (add aarch64 for that ISA)
 cargo xtask supervise-test # just the supervision test (add aarch64 for that ISA)
+cargo xtask drivers-test   # just the driver framework test (add aarch64 for that ISA)
 cargo xtask run            # boot the shell in QEMU (x86-64), its console on this terminal
 cargo xtask run aarch64    # the same on QEMU's AArch64 virt machine
 cargo xtask image  # just build target/superior.img

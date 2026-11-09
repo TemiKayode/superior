@@ -125,9 +125,27 @@ pub enum Object {
     AddressSpace {
         id: u32,
     },
+    /// Device memory (memory-mapped registers): carved like `Untyped`, but
+    /// only into frames, which are not zeroed (they are a device's
+    /// registers, not RAM), and into smaller device-memory blocks. Never
+    /// into kernel objects. Handed out by the kernel at boot.
+    DeviceUntyped {
+        base: u64,
+        size_bits: u8,
+    },
 }
 
 impl Object {
+    /// Untyped memory of either kind, as (base, size in bits).
+    pub const fn untyped(&self) -> Option<(u64, u8)> {
+        match *self {
+            Object::Untyped { base, size_bits } | Object::DeviceUntyped { base, size_bits } => {
+                Some((base, size_bits))
+            }
+            _ => None,
+        }
+    }
+
     /// Only communication objects carry badges; the badge tells a server
     /// which client or which object a message is about.
     pub const fn badgeable(&self) -> bool {
@@ -323,11 +341,7 @@ impl<const N: usize> CNode<N> {
     /// untyped capability that is a copy, or has copies, may not be carved.
     pub fn carve(&mut self, slot: usize, size_bits: u8) -> Result<u64, CapError> {
         let cap = *self.get(slot).ok_or(self.missing(slot))?;
-        let Object::Untyped {
-            base,
-            size_bits: block_bits,
-        } = cap.object
-        else {
+        let Some((base, block_bits)) = cap.object.untyped() else {
             return Err(CapError::WrongObjectType);
         };
         if self.is_copy(slot) || self.has_copies(slot) {
@@ -353,12 +367,8 @@ impl<const N: usize> CNode<N> {
 
     /// Bytes still free (ignoring alignment) in the untyped block in `slot`.
     pub fn untyped_free(&self, slot: usize) -> Option<u64> {
-        match self.get(slot)?.object {
-            Object::Untyped { size_bits, .. } => {
-                Some((1u64 << size_bits) - self.slots[slot].free_index)
-            }
-            _ => None,
-        }
+        let (_, size_bits) = self.get(slot)?.object.untyped()?;
+        Some((1u64 << size_bits) - self.slots[slot].free_index)
     }
 
     /// A copy refers to the same object as its parent (made by derive);
@@ -413,15 +423,7 @@ impl<const N: usize> CNode<N> {
             count += 1;
         }
         let s = &mut self.slots[slot];
-        if !s.raw
-            && matches!(
-                s.cap,
-                Some(Capability {
-                    object: Object::Untyped { .. },
-                    ..
-                })
-            )
-        {
+        if !s.raw && s.cap.is_some_and(|c| c.object.untyped().is_some()) {
             s.free_index = 0;
         }
         Ok(count)
@@ -706,6 +708,28 @@ mod tests {
         assert_eq!(c.carve(1, 4), Err(CapError::HasChildren));
         c.revoke(0).unwrap();
         assert!(c.carve(0, 4).is_ok());
+    }
+
+    #[test]
+    fn device_memory_carves_and_resets_like_untyped() {
+        let mut c = CNode::<16>::new();
+        let dev = Object::DeviceUntyped {
+            base: 0xe000_0000,
+            size_bits: 16,
+        };
+        c.insert_root(0, Capability::new(dev, Rights::ALL)).unwrap();
+        assert_eq!(c.untyped_free(0), Some(1 << 16));
+        let pa = c.carve(0, 12).unwrap();
+        assert_eq!(pa, 0xe000_0000);
+        let frame = Object::Frame {
+            paddr: pa,
+            size_bits: 12,
+        };
+        c.insert_child(0, 1, Capability::new(frame, Rights::ALL))
+            .unwrap();
+        assert_eq!(c.carve(0, 12), Ok(0xe000_1000));
+        c.revoke(0).unwrap();
+        assert_eq!(c.untyped_free(0), Some(1 << 16), "watermark reset");
     }
 
     #[test]

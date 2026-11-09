@@ -201,8 +201,49 @@ pub fn idle_wait() {
     };
 }
 
+/// MSI lines: the first [`MSI_COUNT`] interrupt IDs of the GICv2m frame.
+const MSI_COUNT: u32 = 8;
+
+fn msi_lines() -> core::ops::Range<u8> {
+    let (first, count) = gic::msi_spis();
+    let count = count.min(MSI_COUNT);
+    first as u8..(first + count) as u8
+}
+
 pub fn irq_routable(line: u8) -> bool {
-    line == UART_IRQ
+    line == UART_IRQ || msi_lines().contains(&line)
+}
+
+/// The message a device writes to raise MSI line `line`, if it is one:
+/// the line's interrupt ID, written to the GICv2m doorbell.
+pub fn msi_message(line: u8) -> Option<(u64, u64)> {
+    msi_lines()
+        .contains(&line)
+        .then_some((gic::MSI_DOORBELL, line as u64))
+}
+
+/// For the root task's PCI bus server: the ECAM configuration window
+/// (buses 0-15), a device-memory window to assign BARs from, and the MSI
+/// lines. These are QEMU `virt`'s addresses with `highmem=off`, which keeps
+/// ECAM below 4 GiB: ECAM at 0x3f00_0000, PCI memory from 0x1000_0000.
+pub fn pci_caps() -> (Capability, Capability, core::ops::Range<u8>) {
+    (
+        Capability::new(
+            Object::DeviceUntyped {
+                base: 0x3f00_0000,
+                size_bits: 24,
+            },
+            Rights::ALL,
+        ),
+        Capability::new(
+            Object::DeviceUntyped {
+                base: 0x1000_0000,
+                size_bits: 28,
+            },
+            Rights::ALL,
+        ),
+        msi_lines(),
+    )
 }
 
 pub fn irq_unmask(line: u8) {

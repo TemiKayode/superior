@@ -44,6 +44,13 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
         idt[PIC_BASE + COM1_IRQ]
             .set_handler_addr(VirtAddr::new(syscall::com1_entry as *const () as u64));
     }
+    for (n, entry) in syscall::MSI_ENTRIES.iter().enumerate() {
+        // SAFETY: each entry saves the user frame like the timer's.
+        unsafe {
+            idt[MSI_VECTOR_BASE + n as u8]
+                .set_handler_addr(VirtAddr::new(*entry as *const () as u64));
+        }
+    }
     idt[apic::SPURIOUS_VECTOR].set_handler_fn(spurious);
     // The PIC's spurious IRQ 7 and 15.
     idt[PIC_BASE + 7].set_handler_fn(spurious);
@@ -56,8 +63,26 @@ pub const PIC_BASE: u8 = 0x20;
 /// COM1's interrupt line, handed to the serial driver.
 pub const COM1_IRQ: u8 = 4;
 /// Lines user space may own: only COM1 for now.
+/// MSI vectors: interrupt lines `MSI_LINE_BASE ..` arrive on vectors
+/// `MSI_VECTOR_BASE ..` at the local APIC.
+pub const MSI_VECTOR_BASE: u8 = 0x40;
+pub const MSI_LINE_BASE: u8 = 32;
+pub const MSI_COUNT: u8 = 8;
+
+/// Whether `line` is an MSI vector's.
+pub fn is_msi(line: u8) -> bool {
+    (MSI_LINE_BASE..MSI_LINE_BASE + MSI_COUNT).contains(&line)
+}
+
+/// The message that raises MSI line `line` on this CPU: address
+/// 0xfee0_0000 (the local APIC, destination ID 0, physical mode), data =
+/// the vector (fixed delivery, edge).
+pub fn msi_message(line: u8) -> Option<(u64, u64)> {
+    is_msi(line).then(|| (0xfee0_0000, (MSI_VECTOR_BASE + line - MSI_LINE_BASE) as u64))
+}
+
 pub fn irq_routable(line: u8) -> bool {
-    line == COM1_IRQ
+    line == COM1_IRQ || is_msi(line)
 }
 
 /// Masks a line on the master PIC (lines 0-7).
@@ -73,6 +98,9 @@ pub fn pic_mask(line: u8) {
 
 /// Unmasks a line on the master PIC.
 pub fn pic_unmask(line: u8) {
+    if line >= 16 {
+        return; // not a PIC line (an MSI vector: never masked)
+    }
     use x86_64::instructions::port::Port;
     let mut data = Port::<u8>::new(0x21);
     // SAFETY: as in `pic_mask`.

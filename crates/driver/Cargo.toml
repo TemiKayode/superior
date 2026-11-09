@@ -1,0 +1,12 @@
+[package]
+name = "superior-driver"
+description = "The Superior Driver SDK: PCI access through the bus server, MMIO registers, DMA pages and virtqueue rings."
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+edition = "2024"
+publish = false
+
+[dependencies]
+superior-objects = { path = "../objects" }
+superior-sys = { path = "../sys" }

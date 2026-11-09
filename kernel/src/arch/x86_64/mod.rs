@@ -96,6 +96,37 @@ pub fn irq_routable(line: u8) -> bool {
     interrupts::irq_routable(line)
 }
 
+/// The message a device writes to raise MSI line `line`, if it is one.
+pub fn msi_message(line: u8) -> Option<(u64, u64)> {
+    interrupts::msi_message(line)
+}
+
+/// For the root task's PCI bus server: configuration space (the legacy
+/// 0xcf8/0xcfc address and data ports), a device-memory window to assign
+/// BARs from, and the MSI lines. QEMU's `pc` machine puts RAM below
+/// 0xe000_0000 (with up to 3.5 GiB) and firmware assigns BARs from the
+/// top of the hole down towards it, so its first 128 MiB are free.
+pub fn pci_caps() -> (Capability, Capability, core::ops::Range<u8>) {
+    let rw = Rights::READ | Rights::WRITE;
+    (
+        Capability::new(
+            Object::IoPort {
+                base: 0xcf8,
+                count: 8,
+            },
+            rw,
+        ),
+        Capability::new(
+            Object::DeviceUntyped {
+                base: 0xe000_0000,
+                size_bits: 27,
+            },
+            Rights::ALL,
+        ),
+        interrupts::MSI_LINE_BASE..interrupts::MSI_LINE_BASE + interrupts::MSI_COUNT,
+    )
+}
+
 pub fn irq_unmask(line: u8) {
     interrupts::pic_unmask(line)
 }

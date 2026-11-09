@@ -8,7 +8,7 @@
 //! - **Its own address space and CSpace.** Each component instance gets
 //!   an untyped block of its own (`memory` bits), and everything the
 //!   instance is made of is retyped from it: an address-space object, a
-//!   32-slot CNode, a thread, the frames its executable is loaded into,
+//!   64-slot CNode, a thread, the frames its executable is loaded into,
 //!   its stack. Revoking that block destroys the instance completely.
 //! - **Only the capabilities its manifest names**, placed in the slots it
 //!   names: services it provides or uses, devices, notifications, untyped
@@ -56,6 +56,7 @@ use superior_sys::{Ret, USER_BASE, syscall};
 // Rights masks.
 const READ: u64 = 1 << 0;
 const WRITE: u64 = 1 << 1;
+const GRANT: u64 = 1 << 2;
 const GRANT_REPLY: u64 = 1 << 3;
 const ALL: u64 = 0x1f;
 
@@ -64,7 +65,7 @@ const ALL: u64 = 0x1f;
 /// The control endpoint: reports, faults and watcher requests arrive here.
 const CONTROL: u64 = root::FIRST_FREE;
 /// Service endpoints, one per service in the manifest, in order.
-const SERVICES: u64 = 16;
+const SERVICES: u64 = CONTROL + 8;
 const MAX_SERVICES: usize = 32;
 /// Watcher threads, one per service of a lazy component, with their
 /// stacks, a scratch slot for forwarding, and their control capability.
@@ -237,10 +238,14 @@ impl<'a> Manager<'a> {
                 }
                 CapKind::Uses(s) => {
                     let ep = SERVICES + self.service_index(s).unwrap() as u64;
-                    cnode_copy(cnode, slot, ep, WRITE | GRANT_REPLY, i as u64 + 1)
+                    // Grant: a client may lend the server a capability
+                    // (a buffer frame to DMA into, say).
+                    cnode_copy(cnode, slot, ep, WRITE | GRANT | GRANT_REPLY, i as u64 + 1)
                 }
                 CapKind::Device(d) => match device(d) {
-                    Some(src) => cnode_copy(cnode, slot, src, ALL, 0),
+                    Some((src, count)) => {
+                        (0..count).try_for_each(|k| cnode_copy(cnode, slot + k, src + k, ALL, 0))
+                    }
                     None => return Err(("unknown device", 0)),
                 },
                 CapKind::Notification => retype_into(ut, ObjectType::Notification, 0, cnode, slot),
@@ -371,12 +376,17 @@ fn ticks() -> u64 {
 }
 
 /// The manager's slot holding the device capability called `name`.
-fn device(name: &str) -> Option<u64> {
+/// `msi` is all the MSI vectors, in consecutive slots from the one named;
+/// the rest are one capability each. Returns (first slot, count).
+fn device(name: &str) -> Option<(u64, u64)> {
     Some(match name {
-        "uart" => root::UART,
-        "uart-irq" => root::UART_IRQ,
-        "timer" => root::TIMER,
-        "exit" => root::EXIT_PORT,
+        "uart" => (root::UART, 1),
+        "uart-irq" => (root::UART_IRQ, 1),
+        "timer" => (root::TIMER, 1),
+        "exit" => (root::EXIT_PORT, 1),
+        "pci-config" => (root::PCI_CONFIG, 1),
+        "pci-mmio" => (root::PCI_MMIO, 1),
+        "msi" => (root::MSI, root::MSI_COUNT),
         _ => return None,
     })
 }

@@ -1,0 +1,18 @@
+[package]
+name = "superior-pcibus"
+description = "The PCI bus server: enumerates PCI, assigns BARs, mediates configuration space and hands each driver exactly one device."
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "superior-pcibus"
+test = false
+bench = false
+
+[dependencies]
+superior-objects = { path = "../../crates/objects" }
+superior-sys = { path = "../../crates/sys" }
+superior-driver = { path = "../../crates/driver" }

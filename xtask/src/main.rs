@@ -15,6 +15,10 @@
 //!   cargo xtask supervise-test [arch]  supervision: boot
 //!                                  `boot/supervise.manifest` (restarts, state,
 //!                                  retries, giving up) and check the log
+//!   cargo xtask drivers-test [arch]    the driver framework: boot
+//!                                  `boot/drivers.manifest` with a virtio
+//!                                  disk (PCI bus server, virtio-blk driver,
+//!                                  a client) and check the log
 //!   cargo xtask bench              time IPC under hardware virtualization
 //!                                  (WHPX or KVM, x86-64) and check it against
 //!                                  seL4's published figures
@@ -81,6 +85,8 @@ struct Image {
     arch: Arch,
     /// seL4 with the shell as its root task, rather than Superior.
     sel4: bool,
+    /// A disk image to attach as a virtio block device (PCI).
+    disk: Option<PathBuf>,
 }
 
 fn main() -> ExitCode {
@@ -98,6 +104,8 @@ fn main() -> ExitCode {
                         .and_then(|img| cm_test(&img))
                         .and_then(|_| image_with(false, a, "supervise"))
                         .and_then(|img| supervise_test(&img))
+                        .and_then(|_| image_with(false, a, "drivers"))
+                        .and_then(|img| drivers_test(&img))
                         .and_then(|_| image(false, a))
                         .and_then(|img| shell_session(&img))
                 })
@@ -108,12 +116,15 @@ fn main() -> ExitCode {
         Some("boot-test") => image(true, arch).and_then(|img| boot(&img, true)),
         Some("shell-test") => image(false, arch).and_then(|img| shell_session(&img)),
         Some("cm-test") => image_with(false, arch, "test").and_then(|img| cm_test(&img)),
+        Some("drivers-test") => {
+            image_with(false, arch, "drivers").and_then(|img| drivers_test(&img))
+        }
         Some("supervise-test") => {
             image_with(false, arch, "supervise").and_then(|img| supervise_test(&img))
         }
         Some("bench") => image(false, Arch::X86_64).and_then(|img| bench(&img)),
         _ => Err(
-            "usage: cargo xtask <image | run | test | boot-test | shell-test | cm-test | supervise-test | bench | sel4-test> [x86_64 | aarch64]"
+            "usage: cargo xtask <image | run | test | boot-test | shell-test | cm-test | supervise-test | drivers-test | bench | sel4-test> [x86_64 | aarch64]"
                 .into(),
         ),
     });
@@ -211,6 +222,8 @@ fn bundle(arch: Arch, manifest: &str) -> Result<PathBuf, String> {
         ("shell", "superior-shell"),
         ("echo", "superior-echo"),
         ("counter", "superior-counter"),
+        ("pcibus", "superior-pcibus"),
+        ("virtio-blk", "superior-virtio-blk"),
         ("testclient", "superior-testclient"),
     ] {
         let path = user_program(package, arch)?;
@@ -302,10 +315,16 @@ fn image_with(selftest: bool, arch: Arch, manifest: &str) -> Result<Image, Strin
             elf
         }
     };
+    let disk = if manifest == "drivers" {
+        Some(test_disk()?)
+    } else {
+        None
+    };
     Ok(Image {
         path,
         arch,
         sel4: false,
+        disk,
     })
 }
 
@@ -394,6 +413,7 @@ fn sel4_image() -> Result<Image, String> {
         path: out.join("superior-shell-sel4.elf"),
         arch: Arch::Aarch64,
         sel4: true,
+        disk: None,
     })
 }
 
@@ -421,7 +441,13 @@ fn qemu_command(img: &Image) -> Command {
                 .args(["-device", "isa-debug-exit,iobase=0xf4,iosize=0x04"]);
         }
         Arch::Aarch64 => {
-            let machine = if img.sel4 { SEL4_MACHINE } else { "virt" };
+            // highmem=off keeps PCI's ECAM window below 4 GiB, where the
+            // kernel hands it to the PCI bus server.
+            let machine = if img.sel4 {
+                SEL4_MACHINE
+            } else {
+                "virt,highmem=off"
+            };
             q.args(["-machine", machine, "-cpu", "cortex-a72", "-kernel"])
                 .arg(&img.path);
             if img.sel4 {
@@ -439,6 +465,15 @@ fn qemu_command(img: &Image) -> Command {
     }
     if img.arch == Arch::X86_64 {
         q.args(["-m", "512M"]);
+    }
+    if let Some(disk) = &img.disk {
+        // Modern only (virtio 1.x): no legacy I/O BAR.
+        q.arg("-drive")
+            .arg(format!(
+                "if=none,id=blk0,format=raw,readonly=on,file={}",
+                disk.display()
+            ))
+            .args(["-device", "virtio-blk-pci,drive=blk0,disable-legacy=on"]);
     }
     q.args(["-serial", "stdio", "-no-reboot"]);
     q
@@ -534,7 +569,6 @@ fn supervise_test(img: &Image) -> Result<(), String> {
         "[cm] counter faulted: page fault",
         "[cm] restarting counter (one-for-one)",
         "[pass] supervise: the counter crashed under a call",
-        "counter: instance 2 starting, value 5",
         "[pass] supervise: after the restart: value 5 (instance 2)",
         "counter: instance 3 starting, value 15",
         "[pass] supervise: add 10 (request 2), crashed before replying, retried: 15 (from the journal: 1)",
@@ -554,6 +588,11 @@ fn supervise_test(img: &Image) -> Result<(), String> {
             None => return Err(format!("supervision test: missing (in order) {step:?}")),
         }
     }
+    // The new counter and the client are ready together after the
+    // restart, at one priority: either may print first.
+    if !out.contains("counter: instance 2 starting, value 5") {
+        return Err("supervision test: the restarted counter did not find its value".into());
+    }
     // Independent of the client's order: the crasher's five restarts and
     // the manager giving up.
     let restarts = out.matches("[cm] restarting crasher (one-for-one)").count();
@@ -571,6 +610,73 @@ fn supervise_test(img: &Image) -> Result<(), String> {
         }
     }
     println!("== supervision test passed ({})", img.arch.name());
+    Ok(())
+}
+
+/// Writes the drivers test's disk: 128 sectors, word `k` (little-endian
+/// u64) of sector `s` being `0x5355 << 48 | s << 16 | k`, so a client can
+/// check every word it reads (`user/testclient`).
+fn test_disk() -> Result<PathBuf, String> {
+    let mut bytes = Vec::with_capacity(128 * 512);
+    for s in 0..128u64 {
+        for k in 0..64u64 {
+            bytes.extend_from_slice(&(0x5355u64 << 48 | s << 16 | k).to_le_bytes());
+        }
+    }
+    let path = root().join("target").join("drivers-test-disk.img");
+    std::fs::write(&path, bytes).map_err(|e| format!("writing {}: {e}", path.display()))?;
+    Ok(path)
+}
+
+/// Boots `boot/drivers.manifest` with the test disk on virtio-blk and
+/// checks that
+/// - the PCI bus server finds the device and gives it to the driver, which
+///   brings it up with an MSI-X interrupt;
+/// - the client reads the disk by DMA into its own page, every word right;
+/// - the bus server refuses the client the driver's device and its BARs;
+/// - a crashed driver is restarted, its device reset and reopened, and
+///   reads work again.
+fn drivers_test(img: &Image) -> Result<(), String> {
+    println!("== driver framework test on {}", img.path.display());
+    let out = run_to_exit(img, Duration::from_secs(60))?;
+    let steps = [
+        "[cm] manifest: 3 components",
+        "pci: BAR window at",
+        "1af4:1042 class 010000",
+        "given to client 2 (reset:",
+        "virtio-blk: ready:",
+        "[pass] block: 128 sectors of 512 bytes",
+        "[pass] block: read 8 sectors from 0 by DMA into its page: every word right",
+        "[pass] block: read 8 sectors from 100 by DMA into its page: every word right",
+        "[pass] block: read 1 sectors from 127 by DMA into its page: every word right",
+        "may not have",
+        "[pass] block: the bus server will not give it the driver's device",
+        "[pass] block: nor any BAR page",
+        "virtio-blk: crashing (fault injection)",
+        "[cm] restarting virtio-blk (one-for-one)",
+        "reopened by client 2 (reset:",
+        "virtio-blk: ready:",
+        "[pass] block: the driver crashed under a call",
+        "[pass] block: read 8 sectors from 64 after the restart: every word right",
+        "[cm] client asked to shut down (pass)",
+    ];
+    let mut at = 0;
+    for step in steps {
+        match out[at..].find(step) {
+            Some(i) => at += i + step.len(),
+            None => {
+                return Err(format!(
+                    "driver framework test: missing (in order) {step:?}"
+                ));
+            }
+        }
+    }
+    for bad in ["[fail]", "could not", "panic"] {
+        if out.contains(bad) {
+            return Err(format!("driver framework test: log contains {bad:?}"));
+        }
+    }
+    println!("== driver framework test passed ({})", img.arch.name());
     Ok(())
 }
 

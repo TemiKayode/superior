@@ -408,6 +408,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "superior-driver"
+version = "0.1.0"
+dependencies = [
+ "superior-objects",
+ "superior-sys",
+]
+
+[[package]]
 name = "superior-echo"
 version = "0.1.0"
 dependencies = [
@@ -429,6 +437,15 @@ dependencies = [
 [[package]]
 name = "superior-objects"
 version = "0.1.0"
+
+[[package]]
+name = "superior-pcibus"
+version = "0.1.0"
+dependencies = [
+ "superior-driver",
+ "superior-objects",
+ "superior-sys",
+]
 
 [[package]]
 name = "superior-pingpong"
@@ -457,6 +474,15 @@ dependencies = [
 name = "superior-testclient"
 version = "0.1.0"
 dependencies = [
+ "superior-objects",
+ "superior-sys",
+]
+
+[[package]]
+name = "superior-virtio-blk"
+version = "0.1.0"
+dependencies = [
+ "superior-driver",
  "superior-objects",
  "superior-sys",
 ]

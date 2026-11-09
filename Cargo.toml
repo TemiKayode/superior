@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["kernel", "crates/objects", "crates/sys", "user/pingpong", "user/shell", "user/cm", "user/echo", "user/counter", "user/testclient", "xtask"]
+members = ["kernel", "crates/objects", "crates/sys", "user/pingpong", "user/shell", "user/cm", "user/echo", "user/counter", "user/testclient", "user/pcibus", "user/virtio-blk", "crates/driver", "xtask"]
 # The kernel only builds for x86_64-unknown-none, so plain `cargo build` / `cargo test`
 # on the host covers the host-testable crates. Use `cargo xtask` for the kernel.
 default-members = ["crates/objects", "xtask"]

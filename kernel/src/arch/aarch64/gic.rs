@@ -9,6 +9,12 @@ const GICD_ISENABLER: u64 = 0x100;
 const GICD_ICENABLER: u64 = 0x180;
 const GICD_IPRIORITYR: u64 = 0x400;
 const GICD_ITARGETSR: u64 = 0x800;
+const GICD_ICFGR: u64 = 0xc00;
+/// The GICv2m MSI frame: a device raises SPI `n` by writing `n` to
+/// `SETSPI_NS`. `TYPER` says which SPIs are the frame's.
+const V2M: u64 = 0x0802_0000;
+const V2M_TYPER: u64 = 0x008;
+const V2M_SETSPI_NS: u64 = 0x040;
 const GICC_CTLR: u64 = 0x000;
 const GICC_PMR: u64 = 0x004;
 const GICC_IAR: u64 = 0x00c;
@@ -17,7 +23,8 @@ const GICC_EOIR: u64 = 0x010;
 /// Interrupt IDs of 1020 and up are special (1023: spurious).
 const FIRST_SPECIAL: u32 = 1020;
 /// Interrupts the kernel may enable: PPIs and the first SPIs.
-const MAX_ID: u32 = 64;
+/// Interrupt IDs the kernel manages (it keeps lines as `u8`).
+const MAX_ID: u32 = 256;
 
 fn write32(addr: u64, v: u32) {
     // SAFETY: GIC registers, identity-mapped as device memory.
@@ -44,6 +51,12 @@ pub fn init() {
             // Shared interrupts go to CPU 0.
             write8(GICD + GICD_ITARGETSR + id as u64, 1);
         }
+    }
+    // MSIs are edges: a write, not a level held up.
+    let (first, count) = msi_spis();
+    for id in first..first + count {
+        let reg = GICD + GICD_ICFGR + 4 * (id / 16) as u64;
+        write32(reg, read32(reg) | 2 << (2 * (id % 16)));
     }
     write32(GICD + GICD_CTLR, 1);
     write32(GICC + GICC_PMR, 0xff);
@@ -73,3 +86,16 @@ pub fn acknowledge() -> Option<(u32, u32)> {
 pub fn end_of_interrupt(iar: u32) {
     write32(GICC + GICC_EOIR, iar);
 }
+
+/// The interrupt IDs the GICv2m frame raises, as (first, count), clipped
+/// to the IDs the kernel manages.
+pub fn msi_spis() -> (u32, u32) {
+    let typer = read32(V2M + V2M_TYPER);
+    let first = (typer >> 16) & 0x3ff;
+    let count = typer & 0x3ff;
+    let count = count.min(MAX_ID.saturating_sub(first));
+    (first, count)
+}
+
+/// The doorbell a device writes an MSI's interrupt ID to.
+pub const MSI_DOORBELL: u64 = V2M + V2M_SETSPI_NS;

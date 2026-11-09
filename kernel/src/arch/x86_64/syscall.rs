@@ -494,6 +494,66 @@ extern "C" fn com1_handler(frame: &mut UserFrame) -> Exit {
     crate::task::handle_irq(frame, super::interrupts::COM1_IRQ)
 }
 
+/// Entries for the MSI vectors, one per vector: each saves the user
+/// registers as the timer's does and passes its vector's index on.
+macro_rules! msi_entries {
+    ($($entry:ident $handler:ident $n:literal),* $(,)?) => {
+        $(
+            #[unsafe(naked)]
+            pub unsafe extern "C" fn $entry() {
+                naked_asm!(
+                    "push r11",
+                    "push rcx",
+                    "push rax",
+                    "push rbx",
+                    "push rdx",
+                    "push rsi",
+                    "push rdi",
+                    "push rbp",
+                    "push r8",
+                    "push r9",
+                    "push r10",
+                    "push r12",
+                    "push r13",
+                    "push r14",
+                    "push r15",
+                    "mov rdi, rsp",
+                    "call {handler}",
+                    "jmp {ret}",
+                    handler = sym $handler,
+                    ret = sym return_to_user,
+                )
+            }
+
+            extern "C" fn $handler(frame: &mut UserFrame) -> Exit {
+                msi_handler(frame, $n)
+            }
+        )*
+
+        /// The entry for each MSI vector, in order.
+        pub const MSI_ENTRIES: [unsafe extern "C" fn(); super::interrupts::MSI_COUNT as usize] =
+            [$($entry),*];
+    };
+}
+
+msi_entries!(
+    msi0_entry msi0_handler 0,
+    msi1_entry msi1_handler 1,
+    msi2_entry msi2_handler 2,
+    msi3_entry msi3_handler 3,
+    msi4_entry msi4_handler 4,
+    msi5_entry msi5_handler 5,
+    msi6_entry msi6_handler 6,
+    msi7_entry msi7_handler 7,
+);
+
+/// An MSI is edge-triggered and raised by the device writing a message:
+/// nothing to mask, just end it at the local APIC and signal the line.
+fn msi_handler(frame: &mut UserFrame, n: u8) -> Exit {
+    super::apic::end_of_interrupt();
+    crate::task::handle_irq(frame, super::interrupts::MSI_LINE_BASE + n)
+}
+
 extern "C" fn timer_handler(frame: &mut UserFrame) -> Exit {
     super::apic::end_of_interrupt();
     crate::task::handle_timer(frame)
