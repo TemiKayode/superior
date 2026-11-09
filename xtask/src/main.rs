@@ -98,14 +98,24 @@ struct Image {
     disk: Option<PathBuf>,
     /// The disk may be written (the filesystem tests).
     writable: bool,
-    /// Attach the disk as an NVMe controller rather than virtio-blk.
-    nvme: bool,
+    /// The disk's driver, and so how the disk is attached: `virtio-blk`,
+    /// `nvme` or `ahci`.
+    driver: &'static str,
 }
 
-/// The disk driver an image's manifest names: `virtio-blk` as written,
-/// or `nvme` in its place.
-fn driver(nvme: bool) -> &'static str {
-    if nvme { "nvme" } else { "virtio-blk" }
+/// The disk drivers, each with the PCI function its test disk appears as
+/// and the test client's role for it (which device it must be refused).
+const DISK_DRIVERS: [(&str, &str, u64); 3] = [
+    ("virtio-blk", "1af4:1042 class 010000", 4),
+    ("nvme", "1b36:0010 class 010802", 11),
+    ("ahci", "8086:2922 class 010601", 12),
+];
+
+fn disk_driver(name: &str) -> (&'static str, &'static str, u64) {
+    *DISK_DRIVERS
+        .iter()
+        .find(|d| d.0 == name)
+        .expect("a disk driver")
 }
 
 fn main() -> ExitCode {
@@ -127,10 +137,9 @@ fn main() -> ExitCode {
                         .and_then(|img| drivers_test(&img))
                         .and_then(|_| image_with(false, a, "memory"))
                         .and_then(|img| memory_test(&img))
-                        .and_then(|_| fs_test(a, false))
-                        .and_then(|_| image_for(false, a, "drivers", true))
-                        .and_then(|img| drivers_test(&img))
-                        .and_then(|_| fs_test(a, true))
+                        .and_then(|_| fs_test(a, "virtio-blk"))
+                        .and_then(|_| disk_test(a, "nvme"))
+                        .and_then(|_| disk_test(a, "ahci"))
                         .and_then(|_| image(false, a))
                         .and_then(|img| shell_session(&img))
                 })
@@ -147,16 +156,15 @@ fn main() -> ExitCode {
         Some("supervise-test") => {
             image_with(false, arch, "supervise").and_then(|img| supervise_test(&img))
         }
-        Some("fs-test") => fs_test(arch, false),
-        Some("nvme-test") => image_for(false, arch, "drivers", true)
-            .and_then(|img| drivers_test(&img))
-            .and_then(|_| fs_test(arch, true)),
+        Some("fs-test") => fs_test(arch, "virtio-blk"),
+        Some("nvme-test") => disk_test(arch, "nvme"),
+        Some("ahci-test") => disk_test(arch, "ahci"),
         Some("memory-test") => {
             image_with(false, arch, "memory").and_then(|img| memory_test(&img))
         }
         Some("bench") => image(false, Arch::X86_64).and_then(|img| bench(&img)),
         _ => Err(
-            "usage: cargo xtask <image | run | test | boot-test | shell-test | cm-test | supervise-test | drivers-test | memory-test | fs-test | nvme-test | bench | sel4-test> [x86_64 | aarch64]"
+            "usage: cargo xtask <image | run | test | boot-test | shell-test | cm-test | supervise-test | drivers-test | memory-test | fs-test | nvme-test | ahci-test | bench | sel4-test> [x86_64 | aarch64]"
                 .into(),
         ),
     });
@@ -246,13 +254,21 @@ fn user_program(package: &str, arch: Arch) -> Result<PathBuf, String> {
 
 /// Packs `boot/<manifest>.manifest` and every component executable into a
 /// boot bundle (format in `superior_objects::bundle`) and returns its path.
-fn bundle(arch: Arch, manifest: &str, nvme: bool) -> Result<PathBuf, String> {
+fn bundle(arch: Arch, manifest: &str, driver: &str) -> Result<PathBuf, String> {
     let mut text = std::fs::read(root().join("boot").join(format!("{manifest}.manifest")))
         .map_err(|e| format!("reading boot/{manifest}.manifest: {e}"))?;
-    if nvme {
-        text = String::from_utf8_lossy(&text)
-            .replace("virtio-blk", "nvme")
-            .into_bytes();
+    if driver != "virtio-blk" {
+        // The manifest names virtio-blk; the drivers test's client (role 4)
+        // takes the role that knows this driver's device.
+        let role = disk_driver(driver).2;
+        let mut t = String::from_utf8_lossy(&text)
+            .replace("\r\n", "\n")
+            .replace("virtio-blk", driver);
+        if manifest == "drivers" {
+            assert_eq!(t.matches("  arg 4\n").count(), 1, "the drivers client");
+            t = t.replace("  arg 4\n", &format!("  arg {role}\n"));
+        }
+        text = t.into_bytes();
     }
     let mut files = vec![("manifest".to_string(), text)];
     for (name, package) in [
@@ -262,6 +278,7 @@ fn bundle(arch: Arch, manifest: &str, nvme: bool) -> Result<PathBuf, String> {
         ("pcibus", "superior-pcibus"),
         ("virtio-blk", "superior-virtio-blk"),
         ("nvme", "superior-nvme"),
+        ("ahci", "superior-ahci"),
         ("memserver", "superior-memserver"),
         ("fs", "superior-fs"),
         ("testclient", "superior-testclient"),
@@ -301,16 +318,21 @@ fn image(selftest: bool, arch: Arch) -> Result<Image, String> {
 /// programs; any other boots the Component Manager with the bundle for
 /// `boot/<manifest>.manifest`.
 fn image_with(selftest: bool, arch: Arch, manifest: &str) -> Result<Image, String> {
-    image_for(selftest, arch, manifest, false)
+    image_for(selftest, arch, manifest, "virtio-blk")
 }
 
-/// As [`image_with`]; with `nvme`, the manifest's disk driver is the NVMe
-/// one and the disk is attached as an NVMe controller.
-fn image_for(selftest: bool, arch: Arch, manifest: &str, nvme: bool) -> Result<Image, String> {
+/// As [`image_with`], with `driver` in place of the manifest's disk driver
+/// and the disk attached as its device.
+fn image_for(
+    selftest: bool,
+    arch: Arch,
+    manifest: &str,
+    driver: &'static str,
+) -> Result<Image, String> {
     let user = user_program("superior-pingpong", arch)?;
     let shell = user_program("superior-shell", arch)?;
     let cm = user_program("superior-cm", arch)?;
-    let bundle = bundle(arch, manifest, nvme)?;
+    let bundle = bundle(arch, manifest, driver)?;
     println!(
         "== building kernel ({}{})",
         arch.name(),
@@ -345,7 +367,10 @@ fn image_for(selftest: bool, arch: Arch, manifest: &str, nvme: bool) -> Result<I
     } else if manifest == "shell" {
         String::new()
     } else {
-        format!("-{manifest}{}", if nvme { "-nvme" } else { "" })
+        match driver {
+            "virtio-blk" => format!("-{manifest}"),
+            d => format!("-{manifest}-{d}"),
+        }
     };
     let path = match arch {
         Arch::X86_64 => {
@@ -375,7 +400,7 @@ fn image_for(selftest: bool, arch: Arch, manifest: &str, nvme: bool) -> Result<I
         sel4: false,
         disk,
         writable: fs,
-        nvme,
+        driver,
     })
 }
 
@@ -466,7 +491,7 @@ fn sel4_image() -> Result<Image, String> {
         sel4: true,
         disk: None,
         writable: false,
-        nvme: false,
+        driver: "virtio-blk",
     })
 }
 
@@ -495,9 +520,20 @@ fn qemu_command(img: &Image) -> Command {
             if img.disk.is_some() {
                 q.args(["-machine", "q35", "-device", "intel-iommu,intremap=off"]);
             }
-            q.arg("-drive")
-                .arg(format!("format=raw,file={}", img.path.display()))
-                .args(["-device", "isa-debug-exit,iobase=0xf4,iosize=0x04"]);
+            if img.disk.is_some() && img.driver == "ahci" {
+                // The boot disk would be q35's AHCI port 0, the first disk the
+                // driver finds: put it on port 1, the test disk on port 0.
+                q.arg("-drive")
+                    .arg(format!(
+                        "if=none,id=boot,format=raw,file={}",
+                        img.path.display()
+                    ))
+                    .args(["-device", "ide-hd,drive=boot,bus=ide.1,bootindex=0"]);
+            } else {
+                q.arg("-drive")
+                    .arg(format!("format=raw,file={}", img.path.display()));
+            }
+            q.args(["-device", "isa-debug-exit,iobase=0xf4,iosize=0x04"]);
         }
         Arch::Aarch64 => {
             // highmem=off keeps PCI's ECAM window below 4 GiB, where the
@@ -528,15 +564,35 @@ fn qemu_command(img: &Image) -> Command {
     if img.arch == Arch::X86_64 {
         q.args(["-m", "512M"]);
     }
-    if let (Some(disk), true) = (&img.disk, img.nvme) {
+    // QEMU's IDE disks cannot be read-only; the drivers test's disk is
+    // made afresh for every run anyway.
+    let drive = |id: &str, disk: &PathBuf| {
+        let writable = img.writable || img.driver == "ahci";
+        format!(
+            "if=none,id={id},format=raw,readonly={},file={}",
+            if writable { "off" } else { "on" },
+            disk.display()
+        )
+    };
+    if let (Some(disk), "nvme") = (&img.disk, img.driver) {
         // QEMU's NVMe controller does its DMA through the IOMMU.
         q.arg("-drive")
-            .arg(format!(
-                "if=none,id=nvm0,format=raw,readonly={},file={}",
-                if img.writable { "off" } else { "on" },
-                disk.display()
-            ))
+            .arg(drive("nvm0", disk))
             .args(["-device", "nvme,serial=superior0,drive=nvm0"]);
+    } else if let (Some(disk), "ahci") = (&img.disk, img.driver) {
+        // q35 has an AHCI controller (ICH9, 00:1f.2); virt needs one added.
+        // Its DMA goes through the IOMMU.
+        q.arg("-drive").arg(drive("sata0", disk));
+        if img.arch == Arch::X86_64 {
+            q.args(["-device", "ide-hd,drive=sata0,bus=ide.0"]);
+        } else {
+            q.args([
+                "-device",
+                "ahci,id=ahci",
+                "-device",
+                "ide-hd,drive=sata0,bus=ahci.0",
+            ]);
+        }
     } else if let Some(disk) = &img.disk {
         // Modern only (virtio 1.x): no legacy I/O BAR. iommu_platform:
         // the device's DMA goes through the IOMMU (QEMU's virtio devices
@@ -716,12 +772,7 @@ fn test_disk() -> Result<PathBuf, String> {
 fn drivers_test(img: &Image) -> Result<(), String> {
     println!("== driver framework test on {}", img.path.display());
     let out = run_to_exit(img, Duration::from_secs(60))?;
-    let d = driver(img.nvme);
-    let device = if img.nvme {
-        "1b36:0010 class 010802"
-    } else {
-        "1af4:1042 class 010000"
-    };
+    let (d, device, _) = disk_driver(img.driver);
     let ready = format!("{d}: ready:");
     let stray = format!("{d}: stray DMA: page untouched");
     let crashing = format!("{d}: crashing (fault injection)");
@@ -788,10 +839,17 @@ fn fs_disk() -> PathBuf {
 ///   more is acknowledged and the machine stops at once (a power cut);
 /// - `boot/fs-verify.manifest`: every acknowledged record is on the disk,
 ///   and another component's container does not hold the file.
-fn fs_test(arch: Arch, nvme: bool) -> Result<(), String> {
-    let first = image_for(false, arch, "fs", nvme)?;
-    let second = image_for(false, arch, "fs-verify", nvme)?;
-    let killing = format!("[cm] fault injection: killing {}", driver(nvme));
+/// The driver framework and filesystem tests with the disk on `driver`.
+fn disk_test(arch: Arch, driver: &'static str) -> Result<(), String> {
+    image_for(false, arch, "drivers", driver)
+        .and_then(|img| drivers_test(&img))
+        .and_then(|_| fs_test(arch, driver))
+}
+
+fn fs_test(arch: Arch, driver: &'static str) -> Result<(), String> {
+    let first = image_for(false, arch, "fs", driver)?;
+    let second = image_for(false, arch, "fs-verify", driver)?;
+    let killing = format!("[cm] fault injection: killing {driver}");
     let disk = fs_disk();
     std::fs::write(&disk, vec![0u8; 16 << 20])
         .map_err(|e| format!("writing {}: {e}", disk.display()))?;
@@ -859,7 +917,7 @@ fn fs_test(arch: Arch, nvme: bool) -> Result<(), String> {
     if out.contains("fs: formatted") {
         return Err("filesystem test: the second boot formatted the disk".into());
     }
-    println!("== filesystem test passed ({})", arch.name());
+    println!("== filesystem test passed ({}, {driver})", arch.name());
     Ok(())
 }
 

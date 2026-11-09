@@ -67,6 +67,7 @@ const CMD_BUS_MASTER: u32 = 1 << 2;
 const CMD_INTX_DISABLE: u32 = 1 << 10;
 const CAP_PCIE: u8 = 0x10;
 const CAP_MSIX: u8 = 0x11;
+const CAP_MSI: u8 = 0x05;
 
 macro_rules! say {
     ($($t:tt)*) => { print_line(format_args!("pci: {}", format_args!($($t)*))) };
@@ -337,6 +338,10 @@ impl Bus {
             let ctl = self.read16(i, cap + 2) as u32;
             self.write(i, cap + 2, ctl & !(1 << 15), 2);
         }
+        if let Some(cap) = self.capability(i, CAP_MSI) {
+            let ctl = self.read16(i, cap + 2) as u32;
+            self.write(i, cap + 2, ctl & !1, 2);
+        }
         let flr = self
             .capability(i, CAP_PCIE)
             .filter(|&cap| self.read(i, cap + 4) & 1 << 28 != 0);
@@ -507,6 +512,38 @@ impl Bus {
         Ok((slot, b.size))
     }
 
+    /// Programs function `i`'s MSI capability with its vector 0's message
+    /// and enables it (one vector), or disables it.
+    fn msi(&mut self, i: usize, on: bool) -> Result<(), Status> {
+        let cap = self.capability(i, CAP_MSI).ok_or(Status::NotFound)?;
+        // Enable off, one vector (multiple message enable 0).
+        let ctl = self.read16(i, cap + 2) as u32 & !(1 | 7 << 4);
+        self.write(i, cap + 2, ctl, 2);
+        if !on {
+            return Ok(());
+        }
+        let v = self.funcs[i].unwrap().msi[0].ok_or(Status::Invalid)?;
+        let r = syscall(Syscall::IrqMsiMessage, MSI + v as u64, [0; 4]);
+        if r.status != 0 {
+            return Err(Status::DeviceError);
+        }
+        let (address, data) = (r.msg[0], r.msg[1] as u32);
+        let wide = ctl & 1 << 7 != 0;
+        if !wide && address >> 32 != 0 {
+            return Err(Status::Invalid);
+        }
+        self.write(i, cap + 4, address as u32, 4);
+        let data_at = if wide {
+            self.write(i, cap + 8, (address >> 32) as u32, 4);
+            cap + 12
+        } else {
+            cap + 8
+        };
+        self.write(i, data_at, data & 0xffff, 2);
+        self.write(i, cap + 2, ctl | 1, 2);
+        Ok(())
+    }
+
     fn msi_vector(&mut self, i: usize, n: u64) -> Result<u64, Status> {
         let n = n as usize;
         if n >= MSI_COUNT {
@@ -563,6 +600,10 @@ impl Bus {
                     status(Status::Ok)
                 }
                 None => status(Status::NotFound),
+            },
+            pci::MSI => match self.msi(i, m[1] != 0) {
+                Ok(()) => status(Status::Ok),
+                Err(s) => status(s),
             },
             pci::MSI_VECTOR => match self.msi_vector(i, m[1]) {
                 Ok(slot) => ([Status::Ok as u64, 0, 0, 0], Some(slot)),

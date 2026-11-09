@@ -93,6 +93,11 @@ pub mod pci {
     /// instance]`: as `OPEN`, but claims the `instance`th function of
     /// this class, whoever made it (a class driver: NVMe, xHCI, AHCI).
     pub const OPEN_CLASS: u64 = 7;
+    /// `[MSI, on]`: for a function with plain MSI rather than MSI-X: the
+    /// bus server writes the message of the function's vector 0 (taken
+    /// first with `MSI_VECTOR`) into its MSI capability and enables it,
+    /// one vector, legacy interrupts off; or disables it.
+    pub const MSI: u64 = 8;
 }
 
 /// Block devices: what a storage driver serves.

@@ -251,7 +251,9 @@ fn read_and_check(sector: u64, count: u64) -> Result<(), &'static str> {
     Ok(())
 }
 
-fn block_client() -> ! {
+/// The block client, for the disk driver whose device is opened by `open`
+/// (the bus server's `OPEN` or `OPEN_CLASS` call).
+fn block_client(open: [u64; 4]) -> ! {
     let mut t = Checks(0, "block");
     let r = syscall(Syscall::Call, BLOCK, [block::INFO, block::VERSION, 0, 0]);
     t.check(
@@ -278,24 +280,12 @@ fn block_client() -> ! {
             ),
         );
     }
-    // Exactly one driver per device: whichever disk the driver has (a
-    // virtio one by its IDs, or any NVMe controller by its class), the bus
-    // server refuses it; the other is not there.
-    let ids = 0x1af4u64 << 16 | 0x1042;
-    let by_ids = syscall(Syscall::Call, BLOCK_PCI, [pci::OPEN, pci::VERSION, ids, 0]);
-    let by_class = syscall(
-        Syscall::Call,
-        BLOCK_PCI,
-        [pci::OPEN_CLASS, pci::VERSION, 0x01_08_02, 0],
-    );
-    let (in_use, missing) = (Status::InUse as u64, Status::NotFound as u64);
+    // Exactly one driver per device: the bus server refuses the client the
+    // driver's, asked for the way the driver asked (a virtio disk by its
+    // IDs, an NVMe or AHCI controller by its class).
+    let r = syscall(Syscall::Call, BLOCK_PCI, open);
     t.check(
-        by_ids.status == 0
-            && by_class.status == 0
-            && matches!(
-                (by_ids.msg[0], by_class.msg[0]),
-                (a, b) if (a == in_use && b == missing) || (a == missing && b == in_use)
-            ),
+        r.status == 0 && r.msg[0] == Status::InUse as u64,
         format_args!("the bus server will not give it the driver's device"),
     );
     let r = syscall(Syscall::Call, BLOCK_PCI, [pci::BAR_PAGE, 4, 0, 0]);
@@ -1344,7 +1334,9 @@ pub extern "C" fn _start(role: u64) -> ! {
         0 => client(),
         2 => supervise(),
         3 => crasher(),
-        4 => block_client(),
+        4 => block_client([pci::OPEN, pci::VERSION, 0x1af4 << 16 | 0x1042, 0]),
+        11 => block_client([pci::OPEN_CLASS, pci::VERSION, 0x01_08_02, 0]),
+        12 => block_client([pci::OPEN_CLASS, pci::VERSION, 0x01_06_01, 0]),
         5 => memory_client(),
         6 => hog(),
         7 => fs_client(),

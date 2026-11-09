@@ -129,6 +129,12 @@ impl Pci {
         self.call([pci::MSIX, on as u64, 0, 0], None).map(drop)
     }
 
+    /// For a function with plain MSI: has the bus server program vector 0
+    /// (take it first with [`Pci::msi_vector`]) and enable it.
+    pub fn msi(&self, on: bool) -> Result<(), Failure> {
+        self.call([pci::MSI, on as u64, 0, 0], None).map(drop)
+    }
+
     /// Takes MSI vector `n` into `slot`, binds it to the notification in
     /// `notification`, and returns the message the device must write to
     /// raise it: (address, data).
