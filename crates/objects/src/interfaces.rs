@@ -45,6 +45,9 @@ pub enum Status {
     /// The address could not be resolved (no answer to ARP) or no driver
     /// is there to send through; the caller may try again.
     Unreachable = 12,
+    /// A path went through too many symbolic links (a loop, likely), or
+    /// `NOFOLLOW` met one.
+    TooManyLinks = 13,
 }
 
 impl Status {
@@ -62,6 +65,7 @@ impl Status {
             10 => Status::NoSpace,
             11 => Status::Empty,
             12 => Status::Unreachable,
+            13 => Status::TooManyLinks,
             _ => Status::Invalid,
         }
     }
@@ -325,6 +329,15 @@ pub mod fs {
     //! skipped, `..` is refused (the POSIX view resolves it). Operations
     //! taking a path have it at the start of a granted frame.
     //!
+    //! Symbolic links: a link holds a path, its target, relative to the
+    //! directory holding the link or, with a leading `/`, to the
+    //! container's root; a target may use `..`, which never goes above
+    //! the container's root, so no link leads out of the container. Links
+    //! are followed in every component of a path but the last, and in the
+    //! last by `OPEN` (unless `NOFOLLOW`); `MKDIR`, `UNLINK`, `RENAME`,
+    //! `SYMLINK` and `READLINK` act on the link itself. A path may go
+    //! through at most [`MAX_LINKS`] links (`TooManyLinks` otherwise).
+    //!
     //! Every operation may be retried after `PeerRestarted` (the server was
     //! restarted): `OPEN`, `MKDIR`, `READ`, `WRITE` and `TRUNCATE` give
     //! the same result again; a retried `UNLINK` or `RENAME` that had
@@ -345,6 +358,11 @@ pub mod fs {
     /// What a handle or directory entry is.
     pub const KIND_FILE: u64 = 1;
     pub const KIND_DIR: u64 = 2;
+    pub const KIND_LINK: u64 = 3;
+    /// The longest link target.
+    pub const MAX_LINK: u64 = 1024;
+    /// Links one path may go through.
+    pub const MAX_LINKS: u32 = 8;
 
     /// `OPEN` flags.
     pub const CREATE: u64 = 1;
@@ -354,6 +372,8 @@ pub mod fs {
     pub const TRUNC: u64 = 4;
     /// `NotDir` unless it is a directory.
     pub const DIRECTORY: u64 = 8;
+    /// `TooManyLinks` if the last component is a symbolic link.
+    pub const NOFOLLOW: u64 = 16;
 
     /// `[OPEN, path length, flags]`, path granted: opens a file or
     /// directory (`""` or `"/"` is the container's root). `CREATE` makes
@@ -388,6 +408,15 @@ pub mod fs {
     pub const TRUNCATE: u64 = 10;
     /// `[STATFS]`: reply `[status, free blocks, free inodes]`.
     pub const STATFS: u64 = 11;
+    /// `[SYMLINK, path length, target length]`, granted frame holding the
+    /// link's path and its target back to back: makes a symbolic link.
+    /// `Exists` if the name is taken (`Ok` if by a link to the same
+    /// target, so a retry gives the same result).
+    pub const SYMLINK: u64 = 15;
+    /// `[READLINK, path length]`, path granted (writable): copies the
+    /// link's target into the start of the frame. Reply `[status, target
+    /// length]`; `Invalid` if it is not a link.
+    pub const READLINK: u64 = 16;
 
     /// `[RING_ATTACH, page]` with page `page` of the caller's ring granted
     /// (pages 0 to [`ring::PAGES`] - 1, in order; page 0 drops a ring the

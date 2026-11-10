@@ -820,6 +820,23 @@ fn fs_rename(from: &str, to: &str) -> u64 {
     done(fs_call([fs::RENAME, l1, l2, 0], true))
 }
 
+/// Makes a symbolic link at `path` to `target`.
+fn fs_symlink(path: &str, target: &str) -> u64 {
+    let b = fs_bytes();
+    let l1 = fs::put_path(b, path).unwrap();
+    let l2 = fs::put_path(&mut b[l1 as usize..], target).unwrap();
+    fs_call([fs::SYMLINK, l1, l2, 0], true).0[0]
+}
+
+/// Whether the link at `path` holds `target`; or the status.
+fn fs_readlink(path: &str, target: &str) -> Result<bool, u64> {
+    let (r, _) = fs_path(fs::READLINK, path, 0);
+    match r[0] {
+        OK => Ok(&fs_bytes()[..r[1] as usize] == target.as_bytes()),
+        s => Err(s),
+    }
+}
+
 fn fs_unlink(path: &str) -> u64 {
     done(fs_path(fs::UNLINK, path, 0))
 }
@@ -937,6 +954,108 @@ fn list(h: u64, names: &[&str]) -> (u64, bool) {
         cookie = r[2];
     }
     (total, found == (1u64 << names.len()) - 1)
+}
+
+/// Symbolic links, under fault injection; `links/` stays for the second
+/// boot (`fs_verify`).
+fn symlink_checks(t: &mut Checks) {
+    fs_path(fs::MKDIR, "links", 0);
+    fs_path(fs::MKDIR, "links/dir", 0);
+    let target = fs_open("links/dir/target", fs::CREATE)[1];
+    let b = fs_bytes();
+    b[..10].copy_from_slice(b"link data!");
+    fs_call([fs::WRITE, target, 0, 10], true);
+    let made = [
+        ("links/to-file", "dir/target"),
+        ("links/to-dir", "dir"),
+        ("links/abs", "/links/dir/target"),
+        ("links/up", "../links/./dir/target"),
+        ("links/escape", "../../../../../links/dir/target"),
+        ("links/chain", "to-dir/../to-file"),
+        ("links/loop1", "loop2"),
+        ("links/loop2", "loop1"),
+        ("links/dangling", "dir/made-through-a-link"),
+    ]
+    .iter()
+    .all(|(p, to)| fs_symlink(p, to) == OK);
+    // Each leads to the same file.
+    let opened = ["links/to-file", "links/to-dir/target", "links/abs", "links/up", "links/chain"]
+        .iter()
+        .all(|p| {
+            let r = fs_open(p, 0);
+            r[0] == OK && r[1] == target && r[2] == 10
+        });
+    t.check(
+        made && opened,
+        format_args!("9 symbolic links made; relative, absolute, through a directory, with .. and chained, each opens links/dir/target"),
+    );
+    // `..` in a target stops at the container's root: no way out.
+    let escape = fs_open("links/escape", 0);
+    t.check(
+        escape[0] == OK && escape[1] == target,
+        format_args!("a target climbing past the root stays in the container"),
+    );
+    let looped = fs_open("links/loop1", 0)[0];
+    let nofollow = fs_open("links/to-file", fs::NOFOLLOW)[0];
+    let excl = fs_open("links/to-file", fs::CREATE | fs::EXCL)[0];
+    t.check(
+        looped == Status::TooManyLinks as u64
+            && nofollow == Status::TooManyLinks as u64
+            && excl == Status::Exists as u64,
+        format_args!("a loop of links and NOFOLLOW answer TooManyLinks; an exclusive create finds the name taken"),
+    );
+    let read = fs_readlink("links/to-file", "dir/target");
+    let not_link = fs_readlink("links/dir/target", "");
+    let again = fs_symlink("links/to-file", "dir/target");
+    let taken = fs_symlink("links/to-file", "elsewhere");
+    let over_file = fs_symlink("links/dir/target", "x");
+    let mkdir_on = fs_path(fs::MKDIR, "links/to-dir", 0).0[0];
+    t.check(
+        read == Ok(true)
+            && not_link == Err(Status::Invalid as u64)
+            && again == OK
+            && taken == Status::Exists as u64
+            && over_file == Status::Exists as u64
+            && mkdir_on == Status::Exists as u64,
+        format_args!("READLINK gives the target (and refuses a file); a name taken is refused, the same link again is not"),
+    );
+    // Creating through a dangling link makes its target.
+    let created = fs_open("links/dangling", fs::CREATE);
+    let there = fs_open("links/dir/made-through-a-link", 0);
+    t.check(
+        created[0] == OK && there[0] == OK && there[1] == created[1],
+        format_args!("creating through a dangling link makes links/dir/made-through-a-link"),
+    );
+    // Unlink and rename act on the link, not what it names.
+    let gone = fs_unlink("links/to-dir");
+    let still = fs_open("links/dir/target", 0)[1];
+    let link_gone = fs_open("links/to-dir/target", 0)[0];
+    let moved = fs_rename("links/abs", "links/abs2");
+    let renamed = fs_readlink("links/abs2", "/links/dir/target");
+    let links = fs_open("links", fs::DIRECTORY)[1];
+    let mut kinds_right = false;
+    let (r, _) = fs_call([fs::READDIR, links, 0, 0], true);
+    if r[0] == OK {
+        let b = fs_bytes();
+        kinds_right = (0..r[1] as usize).all(|i| {
+            let e = fs::Entry(&b[i * fs::ENTRY..(i + 1) * fs::ENTRY]);
+            let want = if e.name() == b"dir" { fs::KIND_DIR } else { fs::KIND_LINK };
+            e.kind() == want
+        }) && r[1] == 9;
+    }
+    t.check(
+        gone == OK
+            && still == target
+            && link_gone == Status::NotFound as u64
+            && moved == OK
+            && renamed == Ok(true)
+            && kinds_right,
+        format_args!("unlinking a link leaves its target; a renamed link keeps its target; links list as links"),
+    );
+    // The loops and the dangling one go; the rest stay for the next boot.
+    for p in ["links/loop1", "links/loop2", "links/dangling", "links/escape"] {
+        fs_unlink(p);
+    }
 }
 
 /// The file client under fault injection (`arg 7`).
@@ -1097,6 +1216,7 @@ fn fs_client() -> ! {
         made == 70 && n70 == 70 && ends && removed == 70 && n0 == 0,
         format_args!("70 files in one directory (two blocks of entries) listed, then removed"),
     );
+    symlink_checks(&mut t);
 
     // The same kind of work through a ring, still under fault injection.
     ring_phase(&mut t);
@@ -1448,12 +1568,29 @@ fn fs_verify() -> ! {
     let g2 = fs_open("g2", 0);
     let ag = fs_open("a/g", 0)[0];
     let root = fs_open("/", fs::DIRECTORY);
-    let (count, all) = list(root[1], &["logs", "data", "a", "many", "g2", "ring.log"]);
+    let (count, all) = list(root[1], &["logs", "data", "a", "many", "g2", "ring.log", "links"]);
     t.check(
-        g2[0] == OK && g2[2] == 100 && ag == Status::NotFound as u64 && count == 6 && all,
+        g2[0] == OK && g2[2] == 100 && ag == Status::NotFound as u64 && count == 7 && all,
         format_args!(
             "the last rename survived: g2 is there, a/g is not; the root lists {count} entries"
         ),
+    );
+    let to_file = fs_open("links/to-file", 0);
+    let target = fs_open("links/dir/target", 0)[1];
+    let up = fs_open("links/up", 0)[1] == target;
+    // chain went through to-dir, which the first boot unlinked.
+    let dangling = fs_open("links/chain", 0)[0] == Status::NotFound as u64;
+    let abs2 = fs_readlink("links/abs2", "/links/dir/target");
+    let gone = fs_open("links/loop1", fs::NOFOLLOW)[0];
+    t.check(
+        to_file[0] == OK
+            && to_file[1] == target
+            && to_file[2] == 10
+            && up
+            && dangling
+            && abs2 == Ok(true)
+            && gone == Status::NotFound as u64,
+        format_args!("symbolic links survived the power cut: links/to-file and up open links/dir/target, chain dangles (to-dir is gone), abs2 reads back, the removed loop is gone"),
     );
     let log = fs_open("ring.log", 0);
     let per = fs::BLOCK / RING_RECORD;

@@ -310,6 +310,12 @@ holds the rest):
     indirect block); a read or write of up to 4 KiB may span two blocks.
     Handles carry a generation, so a handle to a removed file never reaches the
     inode's next owner.
+  - Symbolic links: `SYMLINK` and `READLINK`; relative or absolute targets (an
+    absolute one starts at the component's own root, and `..` stops there, so no
+    target leads out of the tree). Paths follow up to 8 links, then answer
+    `TooManyLinks`, as does `OPEN` with `NOFOLLOW` on a link; creating through a
+    dangling link makes its target; `UNLINK` and `RENAME` act on the link itself.
+    Clients cannot write `..` in a path; targets can.
   - Crash-only, with a write-ahead journal of up to 8 blocks per change. Changed
     blocks go to the journal, then a flush, then a header with their home
     addresses and a checksum, then a flush: only then is the change acknowledged.
@@ -343,13 +349,15 @@ holds the rest):
     a removed file's blocks come back and its handle is dead; nested
     directories, renames, refused operations (exclusive create, a path through
     a file, `..`, a directory into itself, removing a non-empty directory);
-    70 files in one directory, listed and removed;
+    70 files in one directory, listed and removed; 9 symbolic links (relative,
+    absolute, through a directory, with `..`, chained, climbing past the root, a
+    loop, a dangling one created through), read back, renamed and removed;
   - through a ring, 15 in flight: a file opened, 300 1 KiB records written and read
     back, with the ring set up again after each server restart (about 15 a run);
   - one more record and a rename are acknowledged and the machine stops at once
     (a power cut);
   - the second boot finds all 401 records, the rename, the big file, the ring's
-    file and the tree, and another component's tree does not have them. Every
+    file, the tree and its links (one left dangling by the first boot), and another component's tree does not have them. Every
     mount's check must pass. With no faults, 300 reads through a ring cost about
     40 system calls (a handful of doorbells, the rest sleeps), where calls cost at
     least one each.

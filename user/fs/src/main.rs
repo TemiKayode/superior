@@ -31,6 +31,13 @@
 //! journal blocks, 10-17 inodes (512 of 64 bytes; 0 is never used), 18 the
 //! block bitmap, then data. An unformatted disk is formatted at mount.
 //!
+//! Symbolic links (`fs::SYMLINK`) are inodes of their own kind whose one
+//! data block holds the target. A path is walked one component at a time
+//! from the container's root; meeting a link, the walker splices its
+//! target in front of the rest of the path and goes on, from the root for
+//! an absolute target, at most `fs::MAX_LINKS` times. `..` (allowed only
+//! in targets) goes to the parent, and stays at the root.
+//!
 //! Inode: container (u16), kind (u8), flags (u8: 1 = root), generation
 //! (u32), size (u64), parent (u32), 4 spare bytes, 9 direct blocks and one
 //! indirect block (u32 each). A handle is `inode | generation << 32`, so a
@@ -81,8 +88,14 @@ const B_IND: u64 = B_LOOK + 1;
 const B_DATA: u64 = B_IND + 1;
 /// The path(s) of the request.
 const B_PATH: u64 = B_DATA + 1;
+/// Paths being walked, with link targets spliced in (two: a rename walks
+/// both of its paths).
+const B_WALK: u64 = B_PATH + 1;
+const B_WALK2: u64 = B_WALK + 1;
+/// A link's target, read while walking.
+const B_LINK: u64 = B_WALK2 + 1;
 /// Blocks a transaction changes that have no buffer of their own.
-const B_TX: u64 = B_PATH + 1;
+const B_TX: u64 = B_LINK + 1;
 const NTX: u64 = 6;
 const BUFS: u64 = B_TX + NTX - BUF0;
 const BUF_VA: u64 = USER_BASE + 0x4000_0000;
@@ -125,6 +138,7 @@ const ENTRIES: u64 = fs::BLOCK / fs::ENTRY as u64;
 
 const KIND_FILE: u8 = fs::KIND_FILE as u8;
 const KIND_DIR: u8 = fs::KIND_DIR as u8;
+const KIND_LINK: u8 = fs::KIND_LINK as u8;
 const ROOT: u8 = 1;
 
 const SUPER_MAGIC: u64 = u64::from_le_bytes(*b"SUPFS002");
@@ -389,17 +403,38 @@ impl Tx {
     }
 }
 
-/// Splits a path into its components, refusing `..` and long names.
-fn components(path: &'static [u8]) -> impl Iterator<Item = R<&'static [u8]>> {
-    path.split(|&c| c == b'/')
-        .filter(|c| !c.is_empty() && *c != b".")
-        .map(|c| {
-            if c == b".." || c.len() > fs::MAX_NAME || c.contains(&0) {
-                Err(Status::Invalid)
-            } else {
-                Ok(c)
-            }
-        })
+/// A client's path: no `..`, no long names, no NUL.
+fn plain(path: &[u8]) -> R<()> {
+    let bad = path
+        .split(|&c| c == b'/')
+        .any(|c| c == b".." || c.len() > fs::MAX_NAME || c.contains(&0));
+    if bad { Err(Status::Invalid) } else { Ok(()) }
+}
+
+/// The next component of `p` from `at`, skipping `/` and `.`: its range.
+fn next_component(p: &[u8], mut at: usize) -> Option<(usize, usize)> {
+    loop {
+        while at < p.len() && p[at] == b'/' {
+            at += 1;
+        }
+        if at == p.len() {
+            return None;
+        }
+        let end = p[at..].iter().position(|&c| c == b'/').map_or(p.len(), |i| at + i);
+        if &p[at..end] != b"." {
+            return Some((at, end));
+        }
+        at = end;
+    }
+}
+
+/// Where a path leads.
+#[derive(Clone, Copy)]
+enum Walked {
+    /// A directory reached with no last name: the root, or through `..`.
+    Dir(Inode),
+    /// The last component, in its directory (it may not exist).
+    Entry(Inode, &'static [u8]),
 }
 
 /// A directory entry found by name: the entry's block and index, and
@@ -842,23 +877,79 @@ impl Fs {
         })
     }
 
-    /// The directory holding the last component of `path`, and that
-    /// component; `None` for the root itself.
-    fn parent_of(&self, root: Inode, path: &'static [u8]) -> R<Option<(Inode, &'static [u8])>> {
-        let mut dir = root;
-        let mut last: Option<&'static [u8]> = None;
-        for c in components(path) {
-            let c = c?;
-            if let Some(prev) = last {
-                let f = self.lookup(dir, prev).ok_or(Status::NotFound)?;
-                dir = Inode::of(f.ino);
-                if dir.kind() != KIND_DIR {
-                    return Err(Status::NotDir);
-                }
-            }
-            last = Some(c);
+    /// Reads link `n`'s target into `B_LINK`; its length.
+    fn target(&self, n: Inode) -> usize {
+        let len = (n.size() as usize).min(fs::MAX_LINK as usize);
+        match n.ptr(0) {
+            0 => buf(B_LINK)[..len].fill(0),
+            b => read_block(b, B_LINK),
         }
-        Ok(last.map(|l| (dir, l)))
+        len
+    }
+
+    /// Walks `path` from `root`, in buffer `wb`, following symbolic links
+    /// in every component but the last, and in the last if `follow`.
+    fn walk(&self, root: Inode, path: &[u8], follow: bool, wb: u64) -> R<Walked> {
+        plain(path)?;
+        let w = buf(wb);
+        let mut len = path.len().min(w.len());
+        w[..len].copy_from_slice(&path[..len]);
+        let (mut dir, mut at, mut links) = (root, 0, 0);
+        loop {
+            let Some((s, e)) = next_component(&w[..len], at) else {
+                return Ok(Walked::Dir(dir));
+            };
+            at = e;
+            let c = &buf(wb)[s..e];
+            if c == b".." {
+                // Only from a link's target; never above the root.
+                if !dir.is_root() {
+                    dir = Inode::of(dir.parent());
+                }
+                continue;
+            }
+            if c.len() > fs::MAX_NAME || c.contains(&0) {
+                return Err(Status::Invalid);
+            }
+            let last = next_component(&w[..len], at).is_none();
+            let found = self.lookup(dir, c);
+            let n = found.map(|f| Inode::of(f.ino));
+            match n {
+                Some(n) if n.kind() == KIND_LINK && (follow || !last) => {
+                    links += 1;
+                    if links > fs::MAX_LINKS {
+                        return Err(Status::TooManyLinks);
+                    }
+                    // The target, then the rest of the path.
+                    let t = self.target(n);
+                    let rest = len - at;
+                    if t == 0 || t + 1 + rest > w.len() {
+                        return Err(Status::Invalid);
+                    }
+                    w.copy_within(at..len, t + 1);
+                    w[..t].copy_from_slice(&buf(B_LINK)[..t]);
+                    w[t] = b'/';
+                    len = t + 1 + rest;
+                    at = 0;
+                    if w[0] == b'/' {
+                        dir = root;
+                    }
+                }
+                _ if last => return Ok(Walked::Entry(dir, c)),
+                Some(n) if n.kind() == KIND_DIR => dir = n,
+                Some(_) => return Err(Status::NotDir),
+                None => return Err(Status::NotFound),
+            }
+        }
+    }
+
+    /// The directory and last name `path` names, its last component not
+    /// followed; `Invalid` for a directory reached with no last name.
+    fn entry(&self, root: Inode, path: &[u8], wb: u64) -> R<(Inode, &'static [u8])> {
+        match self.walk(root, path, false, wb)? {
+            Walked::Entry(d, n) => Ok((d, n)),
+            Walked::Dir(_) => Err(Status::Invalid),
+        }
     }
 
     fn add_entry(&self, tx: &mut Tx, dir: Inode, name: &[u8], n: Inode) -> R<()> {
@@ -921,17 +1012,24 @@ impl Fs {
             true => self.ensure_root(c)?,
             false => self.root(c).ok_or(Status::NotFound)?,
         };
-        let Some((dir, name)) = self.parent_of(root, path)? else {
-            if flags & fs::EXCL != 0 && create {
+        // With EXCL a link is not followed: its name is taken.
+        let follow = flags & fs::NOFOLLOW == 0 && !(create && flags & fs::EXCL != 0);
+        let (dir, name) = match self.walk(root, path, follow, B_WALK)? {
+            Walked::Dir(d) if flags & fs::EXCL != 0 && create => {
+                let _ = d;
                 return Err(Status::Exists);
             }
-            return Ok([root.handle(), root.size(), fs::KIND_DIR]);
+            Walked::Dir(d) => return Ok([d.handle(), d.size(), fs::KIND_DIR]),
+            Walked::Entry(d, n) => (d, n),
         };
         let mut tx = Tx::new();
         let r = match self.lookup(dir, name) {
             Some(f) => {
                 let n = Inode::of(f.ino);
-                if create && flags & fs::EXCL != 0 {
+                if n.kind() == KIND_LINK && !(create && flags & fs::EXCL != 0) {
+                    // Only with NOFOLLOW is a link the last thing reached.
+                    Err(Status::TooManyLinks)
+                } else if create && flags & fs::EXCL != 0 {
                     Err(Status::Exists)
                 } else if flags & fs::DIRECTORY != 0 && n.kind() != KIND_DIR {
                     Err(Status::NotDir)
@@ -956,7 +1054,10 @@ impl Fs {
     fn mkdir(&mut self, c: u64, m: [u64; 4], io: Io) -> R<[u64; 3]> {
         let path = Fs::take_path(m[1], io)?;
         let root = self.ensure_root(c)?;
-        let (dir, name) = self.parent_of(root, path)?.ok_or(Status::Exists)?;
+        let (dir, name) = match self.walk(root, path, false, B_WALK)? {
+            Walked::Entry(d, n) => (d, n),
+            Walked::Dir(_) => return Err(Status::Exists),
+        };
         if let Some(f) = self.lookup(dir, name) {
             return match Inode::of(f.ino).kind() {
                 KIND_DIR => Ok([0; 3]),
@@ -973,7 +1074,7 @@ impl Fs {
     fn unlink(&mut self, c: u64, m: [u64; 4], io: Io) -> R<[u64; 3]> {
         let path = Fs::take_path(m[1], io)?;
         let root = self.root(c).ok_or(Status::NotFound)?;
-        let (dir, name) = self.parent_of(root, path)?.ok_or(Status::Invalid)?;
+        let (dir, name) = self.entry(root, path, B_WALK)?;
         let f = self.lookup(dir, name).ok_or(Status::NotFound)?;
         let n = Inode::of(f.ino);
         if n.kind() == KIND_DIR && !self.is_empty_dir(n) {
@@ -990,8 +1091,8 @@ impl Fs {
         let both = Fs::take_path(l1.saturating_add(l2), io)?;
         let (from, to) = both.split_at(l1 as usize);
         let root = self.root(c).ok_or(Status::NotFound)?;
-        let (sdir, sname) = self.parent_of(root, from)?.ok_or(Status::Invalid)?;
-        let (ddir, dname) = self.parent_of(root, to)?.ok_or(Status::Invalid)?;
+        let (sdir, sname) = self.entry(root, from, B_WALK)?;
+        let (ddir, dname) = self.entry(root, to, B_WALK2)?;
         let src = self.lookup(sdir, sname).ok_or(Status::NotFound)?;
         let n = Inode::of(src.ino);
         let dst = self.lookup(ddir, dname);
@@ -1016,8 +1117,8 @@ impl Fs {
             Some(d) => {
                 let old = Inode::of(d.ino);
                 match (n.kind(), old.kind()) {
-                    (KIND_DIR, KIND_FILE) => Err(Status::NotDir),
-                    (KIND_FILE, KIND_DIR) => Err(Status::IsDir),
+                    (KIND_DIR, KIND_FILE | KIND_LINK) => Err(Status::NotDir),
+                    (KIND_FILE | KIND_LINK, KIND_DIR) => Err(Status::IsDir),
                     (KIND_DIR, _) if !self.is_empty_dir(old) => Err(Status::NotEmpty),
                     _ => {
                         self.free_inode(&mut tx, old);
@@ -1039,6 +1140,55 @@ impl Fs {
             [0; 3]
         });
         self.finish(tx, r)
+    }
+
+    fn symlink(&mut self, c: u64, m: [u64; 4], io: Io) -> R<[u64; 3]> {
+        let (l1, l2) = (m[1], m[2]);
+        let both = Fs::take_path(l1.saturating_add(l2), io)?;
+        let (path, target) = both.split_at(l1 as usize);
+        if target.is_empty() || target.len() as u64 > fs::MAX_LINK || target.contains(&0) {
+            return Err(Status::Invalid);
+        }
+        let root = self.ensure_root(c)?;
+        let (dir, name) = match self.walk(root, path, false, B_WALK)? {
+            Walked::Entry(d, n) => (d, n),
+            Walked::Dir(_) => return Err(Status::Exists),
+        };
+        if let Some(f) = self.lookup(dir, name) {
+            let n = Inode::of(f.ino);
+            let t = if n.kind() == KIND_LINK { self.target(n) } else { 0 };
+            return match n.kind() == KIND_LINK && buf(B_LINK)[..t] == *target {
+                true => Ok([0; 3]),
+                false => Err(Status::Exists),
+            };
+        }
+        let mut tx = Tx::new();
+        let r = self.alloc_inode(&mut tx, c, KIND_LINK, dir.ino).and_then(|n| {
+            let blk = self.bmap_write(&mut tx, n, 0)?;
+            blk[..target.len()].copy_from_slice(target);
+            n.set_size(target.len() as u64);
+            tx.inode(n);
+            self.add_entry(&mut tx, dir, name, n)
+        });
+        self.finish(tx, r).map(|_| [0; 3])
+    }
+
+    fn readlink(&mut self, c: u64, m: [u64; 4], io: Io) -> R<[u64; 3]> {
+        let path = Fs::take_path(m[1], io)?;
+        let root = self.root(c).ok_or(Status::NotFound)?;
+        let (dir, name) = self.entry(root, path, B_WALK)?;
+        let n = Inode::of(self.lookup(dir, name).ok_or(Status::NotFound)?.ino);
+        if n.kind() != KIND_LINK {
+            return Err(Status::Invalid);
+        }
+        let t = self.target(n);
+        let out = io.begin(true).ok_or(Status::Invalid)?;
+        let ok = out.len() >= t;
+        if ok {
+            out[..t].copy_from_slice(&buf(B_LINK)[..t]);
+        }
+        io.end();
+        if ok { Ok([t as u64, 0, 0]) } else { Err(Status::Invalid) }
     }
 
     fn truncate_to(&self, tx: &mut Tx, n: Inode, size: u64) -> R<()> {
@@ -1206,7 +1356,7 @@ impl Fs {
         let seen = buf(B_SCRATCH);
         seen.fill(0);
         let mut refs = [0u8; NINODES as usize];
-        let (mut used, mut files, mut dirs) = (0u64, 0u64, 0u64);
+        let (mut used, mut files, mut dirs, mut links) = (0u64, 0u64, 0u64, 0u64);
         let mut bad: Option<(&str, u64)> = None;
         let mut mark = |b: u64, bad: &mut Option<(&str, u64)>| {
             if !(DATA..self.blocks).contains(&b) {
@@ -1225,6 +1375,12 @@ impl Fs {
             }
             match n.kind() {
                 KIND_FILE => files += 1,
+                KIND_LINK => {
+                    links += 1;
+                    if n.size() == 0 || n.size() > fs::MAX_LINK || n.ptr(0) == 0 {
+                        bad.get_or_insert(("a link without a target", ino));
+                    }
+                }
                 _ => dirs += 1,
             }
             for i in 0..DIRECT {
@@ -1287,8 +1443,11 @@ impl Fs {
             }
         }
         match bad {
-            None => say!(
+            None if links == 0 => say!(
                 "check: {used} blocks used by {files} files and {dirs} directories; all accounted for"
+            ),
+            None => say!(
+                "check: {used} blocks used by {files} files, {dirs} directories and {links} symbolic links; all accounted for"
             ),
             Some((what, n)) => say!("check FAILED: {what} ({n})"),
         }
@@ -1307,6 +1466,8 @@ impl Fs {
             fs::READDIR => self.readdir(c, m, io),
             fs::TRUNCATE => self.truncate(c, m),
             fs::STATFS => Ok(self.statfs()),
+            fs::SYMLINK => self.symlink(c, m, io),
+            fs::READLINK => self.readlink(c, m, io),
             _ => Err(Status::Invalid),
         })
     }
