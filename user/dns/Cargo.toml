@@ -1,0 +1,17 @@
+[package]
+name = "superior-dns"
+description = "A DNS resolver: names to IPv4 addresses over the network server's UDP, with a cache."
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "superior-dns"
+test = false
+bench = false
+
+[dependencies]
+superior-objects = { path = "../../crates/objects" }
+superior-sys = { path = "../../crates/sys" }

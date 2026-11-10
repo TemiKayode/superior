@@ -1,13 +1,14 @@
 # The network test (cargo xtask net-test).
 #
 # The virtio-net driver serves the nic interface to the network server,
-# which serves net to the client. On QEMU's user-mode network the client
-# pings the gateway and has the host echo UDP datagrams back, while the
-# injector kills the network server and the driver at pseudo-random
-# moments: every ping and datagram must come back, the client sending
-# again when an answer is late and binding again when the server forgot
-# its socket. Component numbers matter: the injector kills components 1
-# and 2.
+# which serves net to the resolver and the client. On QEMU's user-mode
+# network the client pings the gateway, has the host echo UDP datagrams
+# back and resolves names through the resolver, while the injector kills
+# the driver, the network server and the resolver at pseudo-random
+# moments: every ping, datagram and name must come back right, the client
+# sending again when an answer is late and binding again when the server
+# forgot its socket. Component numbers matter: the injector kills
+# components 1, 2 and 3.
 
 component pcibus
   image pcibus
@@ -38,17 +39,28 @@ component net
   untyped 16 2
   state 17
 
+# Names: asks the gateway's port 47053, where xtask answers DNS on the
+# host (QEMU's own DNS server would ask the real internet).
+component dns
+  image dns
+  arg 47053
+  priority 9
+  uses net 0
+  provides dns 1
+  untyped 12 2
+
 component client
   image testclient
   arg 13
   priority 8
   uses net 0
+  uses dns 5
   control 1
   untyped 12 2
 
 component injector
   image testclient
-  arg 10
+  arg 16
   priority 8
   control 0
   fault-injector

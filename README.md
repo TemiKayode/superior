@@ -378,6 +378,16 @@ holds the rest):
     again, if it runs out or the DHCP server refuses it. Everything else the server
     holds is lost on a restart, but the lease is kept in its `state` page, so a
     restarted server goes on with the same address at once.
+  - A DNS resolver (`user/dns/`), a component of its own, serves the `dns`
+    interface: a client lends a page holding a name and gets its IPv4 address. It
+    answers from its cache while an answer's TTL lasts; otherwise it sends a
+    recursive query for an A record to the DNS server the network server got from
+    DHCP, through a UDP socket of the network server's, again every second for up
+    to four tries, follows CNAMEs in the answer (with compression pointers) to the
+    address, and caches what it learns, names that do not exist included (for
+    10 s). It is crash-only too: a restart loses the cache and fails the call it
+    was serving with `PeerRestarted`, and when the network server restarts it binds
+    a new socket and asks again.
   `cargo xtask net-test` boots `boot/net.manifest` on QEMU's user-mode network, set
   to 10.0.3.0/24 rather than QEMU's default so nothing can assume an address, while
   xtask echoes UDP on the host. The server must lease 10.0.3.30/24 via 10.0.3.2
@@ -385,12 +395,19 @@ holds the rest):
   and renew it at least twice (every 2 s here); the client must see that address,
   gateway, netmask and DNS server. For at least 2 s the client pings the gateway, then for
   at least 5 s it sends UDP datagrams of 1 to 1,400 bytes that the host echoes back;
-  meanwhile the injector kills the server and the driver every 30 to 150 ms. Every
-  ping and every datagram must come back with every byte right (the client sends
-  again after 300 ms, or binds again when its socket is gone), and both components
-  must have been killed at least 10 times, among the pings and among the echoes. A
-  run does about 1,000 to 3,000 pings and 2,000 to 3,600 echoes through some 35
-  kills of each.
+  meanwhile the injector kills the driver, the server and the resolver in turn
+  every 30 to 150 ms. Every ping and every datagram must come back with every byte
+  right (the client sends again after 300 ms, or binds again when its socket is
+  gone), and the components must have been killed at least 10 times, among the pings
+  and among the echoes. Then the client resolves names through the resolver, which
+  asks a DNS server xtask runs on the host (at the gateway's port 47053, as QEMU's
+  own DNS server would ask the real internet): an A record, a CNAME, a name that
+  does not exist and a malformed one; a name with a 300 s TTL 20 times, at least
+  15 from the cache (the host must be asked at most 5 times); a name with a 1 s TTL
+  twice, 1.5 s apart, the second asked of the host again; and for at least 3 s a
+  new name each time, every address right, with the resolver killed at least 10
+  times meanwhile. A run does about 1,000 to 3,000 pings, 2,000 to 3,800 echoes and
+  1,500 to 2,000 names through some 30 to 40 kills of each.
 - USB: an xHCI host controller driver (`user/xhci/`) and a HID keyboard driver
   (`user/hid/`).
   - The xHCI driver opens the first function of class 0c:03:30, resets the controller,
@@ -455,7 +472,7 @@ these buses have none); more than one command per queue in the NVMe driver,
 more than two commands in flight per disk in the AHCI driver, ATAPI
 and port multipliers; in the xHCI driver isochronous and bulk endpoints, USB 3 streams,
 hubs and more than one interrupter, and HID devices other than boot keyboards; in the network server
-TCP, IPv6, fragments, DNS, routes beyond one gateway, and rings in place of a
+TCP, IPv6, fragments, DNS records other than A and CNAME (and DNS over TCP), routes beyond one gateway, and rings in place of a
 call per frame; buses behind bridges; the async executor, buffer pools and
 power callbacks of the SDK; an IDL compiler for the interfaces; escalating a component
 given up on to a supervisor above it (today the
@@ -489,6 +506,7 @@ https://claude.ai/artifact/QKJS8qH5Dfbjzn58RStq1j
 | `user/ahci/` | The AHCI (SATA) class driver |
 | `user/virtio-net/` | The virtio network driver |
 | `user/net/` | The network server |
+| `user/dns/` | The DNS resolver |
 | `user/xhci/` | The xHCI (USB) host controller driver |
 | `user/hid/` | The USB HID keyboard driver |
 | `user/echo/`, `user/counter/`, `user/testclient/` | Test components for the Component Manager, supervision and drivers |

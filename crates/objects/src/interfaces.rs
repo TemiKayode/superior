@@ -225,6 +225,26 @@ pub mod net {
     }
 }
 
+/// DNS: names to IPv4 addresses, served by the resolver (`user/dns`).
+///
+/// Answers come from the resolver's cache while their time to live lasts,
+/// otherwise from the DNS server. A restarted resolver has lost its cache
+/// and fails the call it was serving with `PeerRestarted`: the client
+/// asks again.
+pub mod dns {
+    pub const VERSION: u64 = 1;
+    /// The longest name, without a final dot.
+    pub const MAX_NAME: u64 = 253;
+
+    /// `[RESOLVE, VERSION, length]` with a frame lent whose first `length`
+    /// bytes are the name (ASCII, labels separated by dots): reply
+    /// `[status, the address (as in net::addr), seconds the answer stays
+    /// good, 1 if it came from the cache]`. `NotFound` if the name does
+    /// not exist or has no IPv4 address, `Unreachable` if no DNS server
+    /// answered, `Invalid` if the name is malformed.
+    pub const RESOLVE: u64 = 1;
+}
+
 /// USB: what a host controller driver serves to class drivers.
 ///
 /// The host controller driver finds and addresses the devices on its root

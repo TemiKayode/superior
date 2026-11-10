@@ -291,6 +291,7 @@ fn bundle(arch: Arch, manifest: &str, driver: &str) -> Result<PathBuf, String> {
         ("ahci", "superior-ahci"),
         ("virtio-net", "superior-virtio-net"),
         ("net", "superior-net"),
+        ("dns", "superior-dns"),
         ("xhci", "superior-xhci"),
         ("hid", "superior-hid"),
         ("memserver", "superior-memserver"),
@@ -1084,10 +1085,91 @@ const ECHO_PORT: u16 = 47001;
 /// here echoes UDP datagrams back, and checks that every ping and every
 /// datagram came back right while the injector killed the network server
 /// and the virtio-net driver.
+/// The port xtask answers DNS on in the network test, reached from the
+/// guest at the gateway.
+const DNS_PORT: u16 = 47053;
+
+/// The network test's DNS answer to a query for `name` (lower case, no
+/// final dot): records `(owner, type, TTL, data)` (A or CNAME), or none
+/// for a name that does not exist.
+fn dns_records(name: &str) -> Option<Vec<(String, u16, u32, Vec<u8>)>> {
+    let a = |owner: &str, ttl: u32, ip: [u8; 4]| (owner.to_string(), 1u16, ttl, ip.to_vec());
+    Some(match name {
+        "www.superior.test" => vec![a(name, 60, [192, 0, 2, 10])],
+        "alias.superior.test" => vec![
+            (name.to_string(), 5, 60, dns_name("www.superior.test")),
+            a("www.superior.test", 60, [192, 0, 2, 10]),
+        ],
+        "cached.superior.test" => vec![a(name, 300, [192, 0, 2, 20])],
+        "short.superior.test" => vec![a(name, 1, [192, 0, 2, 30])],
+        _ => {
+            let k: u16 = name.strip_prefix('n')?.strip_suffix(".superior.test")?.parse().ok()?;
+            vec![a(name, 60, [198, 51, (k >> 8) as u8, k as u8])]
+        }
+    })
+}
+
+/// `name` in DNS wire form.
+fn dns_name(name: &str) -> Vec<u8> {
+    let mut v = Vec::new();
+    for label in name.split('.') {
+        v.push(label.len() as u8);
+        v.extend_from_slice(label.as_bytes());
+    }
+    v.push(0);
+    v
+}
+
+/// Answers one DNS query (`q`): the response, and the name asked.
+fn dns_answer(q: &[u8]) -> Option<(Vec<u8>, String)> {
+    if q.len() < 12 || q[2] & 0x80 != 0 || u16::from_be_bytes([q[4], q[5]]) != 1 {
+        return None;
+    }
+    let mut at = 12;
+    let mut labels = Vec::new();
+    while q[at] != 0 {
+        let n = q[at] as usize;
+        labels.push(String::from_utf8_lossy(q.get(at + 1..at + 1 + n)?).to_lowercase());
+        at += 1 + n;
+    }
+    let question = q.get(12..at + 5)?;
+    let qtype = u16::from_be_bytes([q[at + 1], q[at + 2]]);
+    let name = labels.join(".");
+    let records = dns_records(&name);
+    let answers: Vec<_> = records
+        .iter()
+        .flatten()
+        .filter(|r| qtype == 1 || r.1 == qtype)
+        .collect();
+    let mut r = Vec::new();
+    r.extend_from_slice(&q[0..2]);
+    // A response, recursion available; NXDOMAIN for an unknown name.
+    r.extend_from_slice(&[0x81, if records.is_none() { 0x83 } else { 0x80 }]);
+    r.extend_from_slice(&[0, 1]);
+    r.extend_from_slice(&(answers.len() as u16).to_be_bytes());
+    r.extend_from_slice(&[0, 0, 0, 0]);
+    r.extend_from_slice(question);
+    for (owner, kind, ttl, data) in answers {
+        // The question's name by a compression pointer, others in full.
+        if *owner == name {
+            r.extend_from_slice(&[0xc0, 12]);
+        } else {
+            r.extend_from_slice(&dns_name(owner));
+        }
+        r.extend_from_slice(&kind.to_be_bytes());
+        r.extend_from_slice(&[0, 1]);
+        r.extend_from_slice(&ttl.to_be_bytes());
+        r.extend_from_slice(&(data.len() as u16).to_be_bytes());
+        r.extend_from_slice(data);
+    }
+    Some((r, name))
+}
+
 fn net_test(arch: Arch) -> Result<(), String> {
+    use std::collections::HashMap;
     use std::net::UdpSocket;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
     let img = image_with(false, arch, "net")?;
     let socket = UdpSocket::bind(("127.0.0.1", ECHO_PORT))
         .map_err(|e| format!("binding the echo port {ECHO_PORT}: {e}"))?;
@@ -1109,10 +1191,32 @@ fn net_test(arch: Arch) -> Result<(), String> {
             }
         })
     };
+    // A DNS server for the resolver, counting the queries for each name.
+    let resolver = UdpSocket::bind(("127.0.0.1", DNS_PORT))
+        .map_err(|e| format!("binding the DNS port {DNS_PORT}: {e}"))?;
+    resolver
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .map_err(|e| e.to_string())?;
+    let asked = Arc::new(Mutex::new(HashMap::<String, u32>::new()));
+    let answering = {
+        let (stop, asked) = (stop.clone(), asked.clone());
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 512];
+            while !stop.load(Ordering::Relaxed) {
+                if let Ok((n, from)) = resolver.recv_from(&mut buf) {
+                    if let Some((r, name)) = dns_answer(&buf[..n]) {
+                        *asked.lock().unwrap().entry(name).or_default() += 1;
+                        let _ = resolver.send_to(&r, from);
+                    }
+                }
+            }
+        })
+    };
     println!("== network test on {}", img.path.display());
     let out = run_to_exit(&img, Duration::from_secs(120));
     stop.store(true, Ordering::Relaxed);
     let _ = echo.join();
+    let _ = answering.join();
     let out = out?;
     let steps = [
         "virtio-net: ready:",
@@ -1125,6 +1229,12 @@ fn net_test(arch: Arch) -> Result<(), String> {
         "net: lease kept: 10.0.3.30/24 via 10.0.3.2",
         "pings to 10.0.3.2 answered, every byte right",
         "UDP datagrams of 1 to 1400 bytes echoed by the host, every byte right",
+        "[pass] net: www.superior.test is 192.0.2.10",
+        "[pass] net: alias.superior.test, a CNAME for www, is 192.0.2.10",
+        "[pass] net: nowhere.superior.test does not exist, and no..dots is no name",
+        "[pass] net: cached.superior.test resolved 20 times,",
+        "[pass] net: short.superior.test (TTL 1 s) asked of the server again after 1.5 s",
+        "names resolved under fault injection, every address right",
         "[cm] client asked to shut down (pass)",
     ];
     check_log("network test", &out, &steps)?;
@@ -1138,7 +1248,7 @@ fn net_test(arch: Arch) -> Result<(), String> {
                 .matches(&format!("[cm] fault injection: killing {what}\r\n"))
                 .count()
     };
-    let (server, driver) = (kills("net"), kills("virtio-net"));
+    let (server, driver, resolver) = (kills("net"), kills("virtio-net"), kills("dns"));
     // Kills land among the pings and the echoes, not only after them.
     let during = |what: &str| {
         out.find(what).map_or(0, |i| {
@@ -1146,6 +1256,24 @@ fn net_test(arch: Arch) -> Result<(), String> {
         })
     };
     let (by_pings, by_echoes) = (during("pings to 10.0.3.2"), during("echoed by the host"));
+    let by_names = during("names resolved under fault injection");
+    // The resolver asked the host for a cached name once (once more per
+    // restart in between at most), and for the 1 s one again.
+    let asked = asked.lock().unwrap().clone();
+    let count = |name: &str| asked.get(name).copied().unwrap_or(0);
+    if count("cached.superior.test") > 5 || count("short.superior.test") < 2 {
+        return Err(format!(
+            "network test: the host was asked for cached.superior.test {} times and short.superior.test {}; want at most 5 and at least 2",
+            count("cached.superior.test"),
+            count("short.superior.test")
+        ));
+    }
+    if resolver < 5 || by_names < by_echoes + 10 {
+        return Err(format!(
+            "network test: the resolver was killed {resolver} times, {} times while names were resolved; want 5 and 10",
+            by_names - by_echoes
+        ));
+    }
     // A restarted server keeps its lease: it asks DHCP only once.
     let discovered = out.matches("net: leased ").count();
     let kept = out.matches("net: lease kept").count();
@@ -1161,8 +1289,9 @@ fn net_test(arch: Arch) -> Result<(), String> {
         ));
     }
     println!(
-        "== the server was killed {server} times and the driver {driver}; the host echoed {} datagrams",
-        echoed.load(Ordering::Relaxed)
+        "== the server was killed {server} times, the driver {driver} and the resolver {resolver}; the host echoed {} datagrams and answered {} DNS queries",
+        echoed.load(Ordering::Relaxed),
+        asked.values().sum::<u32>()
     );
     println!("== network test passed ({})", arch.name());
     Ok(())

@@ -53,7 +53,7 @@
 use core::sync::atomic::{AtomicU32, Ordering, fence};
 use superior_objects::abi::{CapTransfer, Error, ObjectType, Syscall, root};
 use superior_objects::interfaces::fs::ring;
-use superior_objects::interfaces::{Status, block, fs, input, mem, net, pci};
+use superior_objects::interfaces::{Status, block, dns, fs, input, mem, net, pci};
 use superior_sys::{Called, USER_BASE, call_retry, print_line, syscall, syscall_x};
 
 const ECHO: u64 = 0;
@@ -1508,7 +1508,8 @@ fn fs_other() -> ! {
     }
 }
 
-fn injector() -> ! {
+/// Kills `targets` (component numbers) in turn, at pseudo-random moments.
+fn injector(targets: &[u64]) -> ! {
     // A fixed seed: the moments vary with timing, not between runs.
     let mut seed = 0x2545_f491_4f6c_dd1du64;
     // Let the client get going first.
@@ -1526,7 +1527,7 @@ fn injector() -> ! {
         while ticks() < start + wait {
             syscall(Syscall::Yield, 0, [0; 4]);
         }
-        let target = if n % 2 == 0 { FS_INDEX } else { DRIVER_INDEX };
+        let target = targets[n % targets.len()];
         syscall(Syscall::Call, 0, [OP_KILL, target, 0, 0]);
     }
     unreachable!()
@@ -1700,6 +1701,124 @@ impl Sock {
     }
 }
 
+/// The resolver (`boot/net.manifest`), whose host-side server
+/// (`cargo xtask net-test`) knows the names below.
+const DNS: u64 = 5;
+/// Names resolved under fault injection, at least, and for how long.
+const NAMES: u64 = 100;
+const NAME_TICKS: u64 = 300;
+/// Times a call is made again (the resolver or the network server
+/// restarted, or nothing answered in time) before giving up.
+const DNS_TRIES: u32 = 60;
+
+/// Writes formatted text into the start of the page; returns its length.
+fn put_text(args: core::fmt::Arguments) -> u64 {
+    struct Page(usize);
+    impl core::fmt::Write for Page {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            let p = net_page();
+            p.get_mut(self.0..self.0 + s.len())
+                .ok_or(core::fmt::Error)?
+                .copy_from_slice(s.as_bytes());
+            self.0 += s.len();
+            Ok(())
+        }
+    }
+    let mut p = Page(0);
+    let _ = core::fmt::Write::write_fmt(&mut p, args);
+    p.0 as u64
+}
+
+/// Resolves the name `args` gives, asking again while the resolver or
+/// the network is restarting: the reply, and how many calls were made
+/// again.
+fn resolve(args: core::fmt::Arguments) -> ([u64; 4], u32) {
+    let x = CapTransfer {
+        grant: Some(NET_PAGE as u16),
+        accept: None,
+    };
+    let mut again = 0;
+    for _ in 0..DNS_TRIES {
+        let len = put_text(args);
+        let r = syscall_x(Syscall::Call, DNS, [dns::RESOLVE, dns::VERSION, len, 0], x);
+        if r.status == 0 && r.msg[0] != Status::Unreachable as u64 {
+            return (r.msg, again);
+        }
+        again += 1;
+        syscall(Syscall::Yield, 0, [0; 4]);
+    }
+    ([Status::Unreachable as u64, 0, 0, 0], again)
+}
+
+fn pause(t: u64) {
+    let end = ticks() + t;
+    while ticks() < end {
+        syscall(Syscall::Yield, 0, [0; 4]);
+    }
+}
+
+fn dns_checks(t: &mut Checks) {
+    let a = |ip: [u8; 4]| net::addr(ip, 0);
+    let (r, _) = resolve(format_args!("www.superior.test"));
+    t.check(
+        r[0] == OK && r[1] == a([192, 0, 2, 10]),
+        format_args!("www.superior.test is {}", Dotted(r[1])),
+    );
+    let (r, _) = resolve(format_args!("Alias.Superior.Test."));
+    t.check(
+        r[0] == OK && r[1] == a([192, 0, 2, 10]),
+        format_args!("alias.superior.test, a CNAME for www, is {}", Dotted(r[1])),
+    );
+    let (r, _) = resolve(format_args!("nowhere.superior.test"));
+    let (bad, _) = resolve(format_args!("no..dots"));
+    t.check(
+        r[0] == Status::NotFound as u64 && bad[0] == Status::Invalid as u64,
+        format_args!("nowhere.superior.test does not exist, and no..dots is no name"),
+    );
+    // Cached for its TTL (300 s): asked of the server once, unless the
+    // resolver was killed in between.
+    let mut cached = 0;
+    let mut right = 0;
+    for _ in 0..20 {
+        let (r, _) = resolve(format_args!("cached.superior.test"));
+        right += (r[0] == OK && r[1] == a([192, 0, 2, 20])) as u32;
+        cached += r[3];
+    }
+    t.check(
+        right == 20 && cached >= 15,
+        format_args!("cached.superior.test resolved 20 times, {cached} from the cache"),
+    );
+    // A TTL of 1 s: after 1.5 s the answer is not in the cache.
+    let (first, _) = resolve(format_args!("short.superior.test"));
+    pause(150);
+    let (second, _) = resolve(format_args!("short.superior.test"));
+    t.check(
+        first[0] == OK
+            && second[0] == OK
+            && second[1] == a([192, 0, 2, 30])
+            && first[2] <= 1
+            && second[3] == 0,
+        format_args!("short.superior.test (TTL 1 s) asked of the server again after 1.5 s"),
+    );
+    // Many names, each new to the resolver, while the injector kills it,
+    // the network server and the driver.
+    let (mut names, mut ok, mut again) = (0u64, 0u64, 0u32);
+    let start = ticks();
+    while names < NAMES || ticks() < start + NAME_TICKS {
+        let k = names;
+        names += 1;
+        let (r, n) = resolve(format_args!("n{k}.superior.test"));
+        again += n;
+        ok += (r[0] == OK && r[1] == a([198, 51, (k >> 8) as u8, k as u8])) as u64;
+    }
+    t.check(
+        ok == names,
+        format_args!(
+            "{ok} of {names} names resolved under fault injection, every address right ({again} calls made again)"
+        ),
+    );
+}
+
 /// Echo `k`'s length and byte `j`.
 fn echo_len(k: u64) -> u64 {
     1 + k * 97 % 1400
@@ -1837,6 +1956,7 @@ fn net_client() -> ! {
             stats.0, stats.1
         ),
     );
+    dns_checks(&mut t);
     syscall(Syscall::Call, NET_CONTROL, [OP_SHUTDOWN, t.0, 0, 0]);
     loop {
         syscall(Syscall::Yield, 0, [0; 4]);
@@ -1974,7 +2094,9 @@ pub extern "C" fn _start(role: u64) -> ! {
         7 => fs_client(),
         8 => fs_verify(),
         9 => fs_other(),
-        10 => injector(),
+        10 => injector(&[FS_INDEX, DRIVER_INDEX]),
+        // The network test: the driver, the network server, the resolver.
+        16 => injector(&[1, 2, 3]),
         _ => probe(),
     }
 }
