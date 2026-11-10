@@ -31,6 +31,7 @@ mod task;
 pub use arch::serial;
 
 use core::panic::PanicInfo;
+use core::sync::atomic::{AtomicU64, Ordering};
 use superior_objects::cap::{Capability, Object, Rights};
 
 /// The boot self-test program, built by `cargo xtask` (empty if none).
@@ -82,7 +83,7 @@ fn kernel_start(untyped_caps: usize) -> ! {
     // Component Manager, which starts everything else (or, built without
     // one, the shell directly).
     let started = if !cfg!(feature = "selftest") && !CM_IMAGE.is_empty() {
-        start_component_manager()
+        start_component_manager().inspect(|_| task::set_root_builder(start_component_manager))
     } else if cfg!(feature = "selftest") || SHELL_IMAGE.is_empty() {
         if USER_IMAGE.is_empty() {
             kprintln!("no boot user program embedded; idle");
@@ -108,9 +109,34 @@ fn kernel_start(untyped_caps: usize) -> ! {
 /// configuration space, device memory for BARs and the MSI vectors) and the
 /// boot bundle mapped read-only, and builds every other process from them
 /// according to the manifest in the bundle.
+///
+/// After a fast reboot (`task::fast_reboot`) this runs again: the same
+/// untyped block (everything made from it is gone), the same state store
+/// with its contents, and the root task's own pages from the start of its
+/// arena again. Nothing leaks, however many times it runs.
 fn start_component_manager() -> Result<(), &'static str> {
     use superior_objects::abi::root;
-    let base = memory::carve(root::UNTYPED_BITS).ok_or("no memory for the Component Manager")?;
+    // Made once, at the first start.
+    static UNTYPED: AtomicU64 = AtomicU64::new(0);
+    static STATE_STORE: AtomicU64 = AtomicU64::new(0);
+    if UNTYPED.load(Ordering::SeqCst) == 0 {
+        let base =
+            memory::carve(root::UNTYPED_BITS).ok_or("no memory for the Component Manager")?;
+        let store = memory::carve(12 + root::STATE_PAGES.ilog2() as u8)
+            .ok_or("no memory for the state store")?;
+        // SAFETY: just carved, so no one else has it; RAM the kernel maps.
+        unsafe {
+            core::ptr::write_bytes(
+                arch::vm::phys_ptr(store),
+                0,
+                (root::STATE_PAGES * 4096) as usize,
+            )
+        };
+        UNTYPED.store(base, Ordering::SeqCst);
+        STATE_STORE.store(store, Ordering::SeqCst);
+    }
+    let base = UNTYPED.load(Ordering::SeqCst);
+    let store = STATE_STORE.load(Ordering::SeqCst);
     let (uart, irq) = arch::console_caps();
     let caps = [
         (
@@ -168,23 +194,39 @@ fn start_component_manager() -> Result<(), &'static str> {
             Capability::new(Object::IommuControl, Rights::ALL),
         )
     });
-    let mut all = [(0, caps[0].1); 24];
+    let state = (0..root::STATE_PAGES).map(|p| {
+        let frame = Object::Frame {
+            paddr: store + p * 4096,
+            size_bits: 12,
+        };
+        (
+            (root::STATE_STORE + p) as usize,
+            Capability::new(frame, Rights::ALL),
+        )
+    });
+    let mut all = [(0, caps[0].1); 48];
     let mut n = 0;
-    for c in caps.into_iter().chain(pci).chain(iommu) {
+    for c in caps.into_iter().chain(pci).chain(iommu).chain(state) {
         all[n] = c;
         n += 1;
     }
     let caps = &all[..n];
-    task::give_cnode(0, root::CNODE_BITS, root::SELF_CNODE as usize)?;
+    task::give_cnode(task::ROOT_TID, root::CNODE_BITS, root::SELF_CNODE as usize)?;
     let bundle_va = arch::vm::USER_BASE + root::BUNDLE_OFFSET;
-    task::spawn_process_with(
-        0,
+    if !memory::arena_on() {
+        return Err("no memory for the Component Manager's arena");
+    }
+    let arg = BUNDLE.len() as u64 | task::reboots() << root::REBOOTS_SHIFT;
+    let r = task::spawn_process_with(
+        task::ROOT_TID,
         CM_IMAGE,
         root::PRIORITY,
-        BUNDLE.len() as u64,
+        arg,
         caps,
         &[(bundle_va, BUNDLE)],
-    )?;
+    );
+    memory::arena_off();
+    r?;
     kprintln!(
         "[ok] Component Manager loaded; boot bundle of {} KiB",
         BUNDLE.len() >> 10

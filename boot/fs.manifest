@@ -34,8 +34,8 @@ component fs
   priority 10
   uses block 0
   provides fs 1
-  untyped 17 2
-  cspace 7
+  untyped 18 2
+  cspace 8
 
 component client
   image testclient

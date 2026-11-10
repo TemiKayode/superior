@@ -56,7 +56,7 @@ use crate::smp::{self, MAX_CPUS};
 use crate::{kprint, kprintln};
 use core::mem::ManuallyDrop;
 use core::ops::{Deref, DerefMut};
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use spin::{Mutex, MutexGuard};
 use superior_objects::abi::{
     CNODE_SLOT_BITS, CapTransfer, Error, FaultKind, FaultReply, MAP_EXEC, MAP_WRITE, ObjectType,
@@ -113,6 +113,12 @@ const MAX_TIMERS: usize = 64;
 /// the test instead of idling forever.
 #[cfg(feature = "selftest")]
 const SELFTEST_TIMEOUT_SECS: u64 = 60;
+/// The root task's thread (the Component Manager).
+pub const ROOT_TID: Tid = 0;
+/// More fast reboots than this within [`REBOOT_WINDOW`] ticks and the
+/// kernel gives up: the root task is failing at once, every time.
+const MAX_REBOOTS: usize = 5;
+const REBOOT_WINDOW: u64 = 60 * superior_objects::abi::TICK_HZ;
 
 #[derive(Clone, Copy, Default)]
 struct Stats {
@@ -219,6 +225,9 @@ struct Kernel {
     /// they are still wanted: saved into `frames` when that CPU next
     /// enters the kernel.
     running: [Option<Tid>; MAX_CPUS],
+    /// When each of the last [`MAX_REBOOTS`] fast reboots happened, as a
+    /// ring indexed by the reboot count.
+    reboot_ticks: [u64; MAX_REBOOTS],
     stats: Stats,
 }
 
@@ -260,6 +269,7 @@ static KERNEL: Mutex<Kernel> = Mutex::new(Kernel {
     fresh: [false; MAX_THREADS],
     preempted: [false; MAX_THREADS],
     running: [None; MAX_CPUS],
+    reboot_ticks: [0; MAX_REBOOTS],
     stats: Stats {
         ticks: 0,
         preemptions: 0,
@@ -322,9 +332,16 @@ pub fn spawn_process_with(
         .iter()
         .position(Option::is_none)
         .ok_or("address-space table full")?;
+    // The root task's address space grows (page tables for what it maps)
+    // from its arena, which a fast reboot hands out again.
+    let pool = if crate::memory::arena_active() {
+        TablePool::Arena
+    } else {
+        TablePool::Kernel
+    };
     k.vspaces[id] = Some(VSpace {
         root: space,
-        pool: TablePool::Kernel,
+        pool,
         object: false,
     });
     k.frames[t] = UserFrame::new_thread(entry, stack_top, arg);
@@ -515,8 +532,14 @@ pub fn handle_syscall(frame: &mut UserFrame) -> Exit {
 
     let a = frame.args();
     let msg = [a.a1, a.a2, a.a3, a.a4];
+    let mut reboot = false;
     let result = match Syscall::from_u64(a.nr) {
         None => Err(Error::IllegalOperation.code()),
+        Some(Syscall::Reboot) => {
+            let r = reboot_allowed(k, cur, a.a0);
+            reboot = r.is_ok();
+            r
+        }
         Some(Syscall::CapRevoke) => cap_revoke(k, cur, a.a0),
         Some(Syscall::CapDelete) => cap_delete(k, cur, a.a0),
         Some(Syscall::FrameMap) => frame_map(k, cur, &a),
@@ -571,6 +594,9 @@ pub fn handle_syscall(frame: &mut UserFrame) -> Exit {
     // thread that has since taken the CPU.
     k.ipc.set_status_of(cur, result.err().unwrap_or(0));
     complete_transfers(k);
+    if reboot {
+        guard = fast_reboot(guard, "the Component Manager asked for a restart");
+    }
     resume(guard, frame)
 }
 
@@ -671,9 +697,105 @@ pub fn handle_fault(frame: &mut UserFrame, kind: FaultKind, code: u64, addr: u64
                 stop_thread(k, cur, kind, addr, frame.pc());
             }
         }
+        None if cur == ROOT_TID && rebootable() => {
+            kprintln!(
+                "[fault] the Component Manager: {kind:?} at pc {:#x}, address {addr:#x}",
+                frame.pc()
+            );
+            k.stats.faults_unhandled += 1;
+            guard = fast_reboot(guard, "the Component Manager failed");
+        }
         None => stop_thread(k, cur, kind, addr, frame.pc()),
     }
     resume(guard, frame)
+}
+
+/// Rebuilds the root task for a fast reboot (set by `main` once it has
+/// started the Component Manager): a `fn() -> Result<(), &'static str>`.
+static ROOT_BUILDER: AtomicUsize = AtomicUsize::new(0);
+static REBOOTS: AtomicU64 = AtomicU64::new(0);
+
+/// Makes fast reboots possible: `build` starts the root task again.
+pub fn set_root_builder(build: fn() -> Result<(), &'static str>) {
+    ROOT_BUILDER.store(build as usize, Ordering::SeqCst);
+}
+
+/// How many fast reboots there have been.
+pub fn reboots() -> u64 {
+    REBOOTS.load(Ordering::SeqCst)
+}
+
+fn rebootable() -> bool {
+    ROOT_BUILDER.load(Ordering::SeqCst) != 0
+}
+
+/// The fast reboot (spec section 4): the Component Manager or the Memory
+/// Server failed, and neither can be restarted in place. Everything made
+/// from the root task's memory is destroyed (every component, endpoint,
+/// address space and I/O domain), then the root task itself, and it is
+/// started again from the boot bundle. Hardware state the drivers left
+/// is theirs to reset when they start again, as after any restart; the
+/// IOMMU blocks a device still aiming at memory it no longer has. The state
+/// store keeps its contents.
+fn fast_reboot(mut guard: KernelGuard, why: &str) -> KernelGuard {
+    let k = &mut *guard;
+    let now = k.stats.ticks;
+    let n = REBOOTS.load(Ordering::SeqCst);
+    let oldest = k.reboot_ticks[n as usize % MAX_REBOOTS];
+    if n >= MAX_REBOOTS as u64 && now.saturating_sub(oldest) < REBOOT_WINDOW {
+        panic!("{why}: more than {MAX_REBOOTS} fast reboots within 60 s; giving up");
+    }
+    k.reboot_ticks[n as usize % MAX_REBOOTS] = now;
+    kprintln!("[reboot] {why}: fast reboot {}", n + 1);
+    tear_down_root(k);
+    REBOOTS.store(n + 1, Ordering::SeqCst);
+    drop(guard);
+    let addr = ROOT_BUILDER.load(Ordering::SeqCst);
+    // SAFETY: only `set_root_builder` stores here, a function of this type.
+    let build: fn() -> Result<(), &'static str> = unsafe { core::mem::transmute(addr) };
+    if let Err(e) = build() {
+        panic!("fast reboot: {e}");
+    }
+    let guard = lock_kernel();
+    kprintln!(
+        "[reboot] Component Manager started again, {} ms after the failure",
+        (guard.stats.ticks - now) * 1000 / superior_objects::abi::TICK_HZ
+    );
+    guard
+}
+
+/// Destroys the root task and everything made from its memory.
+fn tear_down_root(k: &mut Kernel) {
+    let t = ROOT_TID;
+    if let Some(s) = cap_slot(k, t, superior_objects::abi::root::UNTYPED as usize) {
+        if k.caps.get(s).is_some() {
+            let _ = revoke_index(k, s);
+        }
+    }
+    let space = k.spaces[t as usize];
+    let (base, size) = k.cspace[t as usize];
+    destroy_thread(k, t);
+    // Its CSpace holds a capability to itself, so nothing else frees it.
+    if size > 0 {
+        if let Some(c) = (base as usize).checked_sub(CNODE_POOL) {
+            destroy_cnode(k, c / CNODE_CHUNK);
+        }
+    }
+    if let Some(id) = space {
+        destroy_vspace(k, id);
+    }
+    reap(k);
+}
+
+/// `Reboot`: rdi = the root task's untyped capability.
+fn reboot_allowed(k: &Kernel, cur: Tid, slot: u64) -> Result<(), u64> {
+    let root = cap_slot(k, ROOT_TID, superior_objects::abi::root::UNTYPED as usize);
+    let own = own_slot(k, cur, slot);
+    let untyped = own.and_then(|s| k.caps.get(s)).is_some_and(|c| c.object.untyped().is_some());
+    if cur != ROOT_TID || !rebootable() || own.is_none() || own != root || !untyped {
+        return Err(Error::InvalidCapability.code());
+    }
+    Ok(())
 }
 
 /// A device interrupt (already masked and acknowledged at the PIC): signal

@@ -125,7 +125,7 @@ const JHDR: u64 = 1;
 const JDATA: u64 = 2;
 const JMAX: usize = 8;
 const INODES: u64 = JDATA + JMAX as u64;
-const INODE_BLOCKS: u64 = 8;
+const INODE_BLOCKS: u64 = 32;
 const BITMAP: u64 = INODES + INODE_BLOCKS;
 const DATA: u64 = BITMAP + 1;
 /// Blocks one bitmap block covers.
@@ -141,7 +141,7 @@ const KIND_DIR: u8 = fs::KIND_DIR as u8;
 const KIND_LINK: u8 = fs::KIND_LINK as u8;
 const ROOT: u8 = 1;
 
-const SUPER_MAGIC: u64 = u64::from_le_bytes(*b"SUPFS002");
+const SUPER_MAGIC: u64 = u64::from_le_bytes(*b"SUPFS003");
 const JOURNAL_MAGIC: u64 = u64::from_le_bytes(*b"SUPJRNL2");
 const FNV: u64 = 0xcbf2_9ce4_8422_2325;
 
@@ -329,6 +329,14 @@ impl Inode {
     }
     fn set_parent(&self, p: u64) {
         set_u32(self.bytes(), 16, p);
+    }
+    /// The double indirect block: `PER_IND` indirect blocks of `PER_IND`
+    /// blocks each, after the indirect block's.
+    fn dind(&self) -> u64 {
+        u32_at(self.bytes(), 20)
+    }
+    fn set_dind(&self, b: u64) {
+        set_u32(self.bytes(), 20, b);
     }
     /// Direct block `i` (`i < DIRECT`), or the indirect block (`DIRECT`).
     fn ptr(&self, i: u64) -> u64 {
@@ -692,14 +700,45 @@ impl Fs {
         if bi < DIRECT {
             return n.ptr(bi);
         }
-        match n.ptr(DIRECT) {
-            0 => 0,
-            ind if bi < fs::MAX_BLOCKS => {
-                read_block(ind, B_IND);
-                u32_at(buf(B_IND), 4 * (bi - DIRECT) as usize)
-            }
-            _ => 0,
+        if bi >= fs::MAX_BLOCKS {
+            return 0;
         }
+        if bi < DIRECT + PER_IND {
+            return match n.ptr(DIRECT) {
+                0 => 0,
+                ind => {
+                    read_block(ind, B_IND);
+                    u32_at(buf(B_IND), 4 * (bi - DIRECT) as usize)
+                }
+            };
+        }
+        let j = bi - DIRECT - PER_IND;
+        let dind = n.dind();
+        if dind == 0 {
+            return 0;
+        }
+        read_block(dind, B_IND);
+        match u32_at(buf(B_IND), 4 * (j / PER_IND) as usize) {
+            0 => 0,
+            ind => {
+                read_block(ind, B_IND);
+                u32_at(buf(B_IND), 4 * (j % PER_IND) as usize)
+            }
+        }
+    }
+
+    /// Entry `i` of indirect block `ind` (in the transaction), made if it
+    /// is 0; with whether it was.
+    fn entry_write(&self, tx: &mut Tx, ind: u64, i: u64) -> R<(u64, bool)> {
+        let at = 4 * i as usize;
+        Ok(match u32_at(tx.get(ind, false), at) {
+            0 => {
+                let b = self.alloc(tx)?;
+                set_u32(tx.get(ind, false), at, b);
+                (b, true)
+            }
+            b => (b, false),
+        })
     }
 
     /// The disk block holding file block `bi`, made if it is a hole, in
@@ -718,7 +757,7 @@ impl Fs {
                 }
                 b => (b, false),
             }
-        } else {
+        } else if bi < DIRECT + PER_IND {
             let ind = match n.ptr(DIRECT) {
                 0 => {
                     let b = self.alloc(tx)?;
@@ -729,15 +768,24 @@ impl Fs {
                 }
                 b => b,
             };
-            let at = 4 * (bi - DIRECT) as usize;
-            match u32_at(tx.get(ind, false), at) {
+            self.entry_write(tx, ind, bi - DIRECT)?
+        } else {
+            let j = bi - DIRECT - PER_IND;
+            let dind = match n.dind() {
                 0 => {
                     let b = self.alloc(tx)?;
-                    set_u32(tx.get(ind, false), at, b);
-                    (b, true)
+                    n.set_dind(b);
+                    tx.inode(n);
+                    tx.get(b, true);
+                    b
                 }
-                b => (b, false),
+                b => b,
+            };
+            let (ind, fresh) = self.entry_write(tx, dind, j / PER_IND)?;
+            if fresh {
+                tx.get(ind, true);
             }
+            self.entry_write(tx, ind, j % PER_IND)?
         };
         Ok(tx.get(b, fresh))
     }
@@ -753,28 +801,65 @@ impl Fs {
             }
         }
         let ind = n.ptr(DIRECT);
-        if ind == 0 {
+        if ind != 0 && from < DIRECT + PER_IND {
+            if from <= DIRECT {
+                self.free_all(tx, ind);
+                n.set_ptr(DIRECT, 0);
+                tx.inode(n);
+            } else {
+                self.free_entries(tx, ind, from - DIRECT);
+            }
+        }
+        let dind = n.dind();
+        if dind == 0 {
             return;
         }
-        if from <= DIRECT {
-            read_block(ind, B_IND);
-            for i in 0..PER_IND as usize {
-                let b = u32_at(buf(B_IND), 4 * i);
-                if b != 0 {
-                    self.free(tx, b);
-                }
+        let first = from.saturating_sub(DIRECT + PER_IND);
+        // The double indirect block, in a transaction buffer: its
+        // indirect blocks are read through B_IND meanwhile.
+        let t = tx.get(dind, false);
+        let k0 = first / PER_IND;
+        for k in k0..PER_IND {
+            let ind = u32_at(t, 4 * k as usize);
+            if ind == 0 {
+                continue;
             }
-            self.free(tx, ind);
-            n.set_ptr(DIRECT, 0);
+            if k == k0 && first % PER_IND != 0 {
+                // The indirect block block `first` falls in loses its tail.
+                self.free_entries(tx, ind, first % PER_IND);
+            } else {
+                self.free_all(tx, ind);
+                set_u32(t, 4 * k as usize, 0);
+            }
+        }
+        if first == 0 {
+            self.free(tx, dind);
+            n.set_dind(0);
             tx.inode(n);
-        } else {
-            let t = tx.get(ind, false);
-            for i in (from - DIRECT) as usize..PER_IND as usize {
-                let b = u32_at(t, 4 * i);
-                if b != 0 {
-                    self.free(tx, b);
-                    set_u32(t, 4 * i, 0);
-                }
+        }
+    }
+
+    /// Frees indirect block `ind` and every block it names.
+    fn free_all(&self, tx: &mut Tx, ind: u64) {
+        read_block(ind, B_IND);
+        for i in 0..PER_IND as usize {
+            let b = u32_at(buf(B_IND), 4 * i);
+            if b != 0 {
+                self.free(tx, b);
+            }
+        }
+        self.free(tx, ind);
+    }
+
+    /// Frees the blocks indirect block `ind` names from entry `from` on,
+    /// changing it in the transaction.
+    fn free_entries(&self, tx: &mut Tx, ind: u64, from: u64) {
+        let t = tx.get(ind, false);
+        for i in from as usize..PER_IND as usize {
+            let b = u32_at(t, 4 * i);
+            if b != 0 {
+                self.free(tx, b);
+                set_u32(t, 4 * i, 0);
             }
         }
     }
@@ -1394,6 +1479,27 @@ impl Fs {
                     let b = u32_at(buf(B_IND), 4 * i);
                     if b != 0 {
                         mark(b, &mut bad);
+                    }
+                }
+            }
+            let dind = n.dind();
+            if dind != 0 {
+                mark(dind, &mut bad);
+                // The double block through B_LOOK, each indirect one
+                // through B_IND.
+                read_block(dind, B_LOOK);
+                for k in 0..PER_IND as usize {
+                    let ind = u32_at(buf(B_LOOK), 4 * k);
+                    if ind == 0 {
+                        continue;
+                    }
+                    mark(ind, &mut bad);
+                    read_block(ind, B_IND);
+                    for i in 0..PER_IND as usize {
+                        let b = u32_at(buf(B_IND), 4 * i);
+                        if b != 0 {
+                            mark(b, &mut bad);
+                        }
                     }
                 }
             }

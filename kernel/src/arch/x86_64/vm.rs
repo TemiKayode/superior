@@ -9,7 +9,7 @@
 //! cannot touch it.
 
 pub use crate::memory::MapError;
-use crate::memory::{TablePool, ROOT_CNODE, ROOT_CNODE_SLOTS};
+use crate::memory::TablePool;
 use superior_objects::elf::{Elf, Machine};
 use x86_64::registers::control::Cr3;
 use x86_64::structures::paging::{
@@ -65,8 +65,7 @@ pub struct UntypedFrames;
 // zeroed before use.
 unsafe impl FrameAllocator<Size4KiB> for UntypedFrames {
     fn allocate_frame(&mut self) -> Option<PhysFrame> {
-        let mut cnode = ROOT_CNODE.lock();
-        let pa = (0..ROOT_CNODE_SLOTS).find_map(|slot| cnode.retype(slot, 12).ok())?;
+        let pa = crate::memory::user_page()?;
         let frame = PhysFrame::containing_address(PhysAddr::new(pa));
         // SAFETY: the frame is fresh untyped memory, mapped at PHYS_OFFSET.
         unsafe { core::ptr::write_bytes(phys_to_virt(frame.start_address()), 0, PAGE as usize) };

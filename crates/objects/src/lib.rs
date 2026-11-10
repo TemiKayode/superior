@@ -17,6 +17,7 @@ pub mod elf;
 pub mod interfaces;
 pub mod ipc;
 pub mod manifest;
+pub mod pages;
 #[cfg(test)]
 pub mod model;
 #[cfg(test)]

@@ -1,0 +1,30 @@
+# The fast reboot test (cargo xtask reboot-test).
+#
+# The Component Manager and the Memory Server cannot be restarted in place
+# (spec section 4): if either fails, the kernel destroys everything and
+# starts the manager again, which rebuilds every component. Only the state
+# store survives. The client writes its state page, has the Memory Server
+# killed (the manager asks for the fast reboot), checks its state on the
+# next boot, crashes the manager itself (the kernel reboots unasked), and
+# checks its state once more.
+
+component memserver
+  image memserver
+  priority 12
+  restart never
+  memory 22
+  cspace 9
+  # CSpace of 2^9 slots, pool of 2^21 bytes: 9 | 21 << 8.
+  arg 5385
+  provides mem 0
+  untyped 21 1
+
+component client
+  image testclient
+  arg 20
+  uses mem 0
+  control 1
+  state 2
+  quota 8
+  heap 4
+  fault-injector

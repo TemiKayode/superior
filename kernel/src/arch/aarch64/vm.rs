@@ -11,7 +11,7 @@
 //! CNode, never from a kernel heap. The kernel reaches any physical page
 //! through its identity map.
 
-use crate::memory::{MapError, TablePool, ROOT_CNODE, ROOT_CNODE_SLOTS};
+use crate::memory::{MapError, TablePool};
 use superior_objects::elf::{Elf, Machine};
 
 pub const USER_L0_INDEX: usize = 224;
@@ -139,8 +139,7 @@ fn flush_tlb() {
 
 /// A zeroed 4 KiB frame retyped from the root CNode's untyped memory.
 fn alloc_frame() -> Option<u64> {
-    let mut cnode = ROOT_CNODE.lock();
-    let pa = (0..ROOT_CNODE_SLOTS).find_map(|slot| cnode.retype(slot, 12).ok())?;
+    let pa = crate::memory::user_page()?;
     zero_frame(pa);
     Some(pa)
 }

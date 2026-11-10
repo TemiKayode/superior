@@ -31,9 +31,10 @@ component net
   priority 10
   uses nic 0
   provides net 1
-  untyped 19 2
+  memory 21
+  untyped 20 2
   state 17
-  cspace 7
+  cspace 8
 
 component client
   image testclient

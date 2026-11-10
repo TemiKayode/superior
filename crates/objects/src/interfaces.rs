@@ -441,10 +441,11 @@ pub mod fs {
     /// Bytes in a block; one `READ` or `WRITE` moves at most this many
     /// (it may span two blocks).
     pub const BLOCK: u64 = 4096;
-    /// Blocks a file can hold: 9 direct and 1024 through one indirect
-    /// block.
-    pub const MAX_BLOCKS: u64 = 9 + BLOCK / 4;
-    /// Largest file, in bytes (a little over 4 MiB).
+    /// Blocks a file can hold: 9 direct, 1024 through an indirect block
+    /// and 1024 * 1024 through a double indirect one.
+    pub const MAX_BLOCKS: u64 = 9 + BLOCK / 4 + (BLOCK / 4) * (BLOCK / 4);
+    /// Largest file, in bytes (a little over 4 GiB; the disk, at most 128
+    /// MiB, runs out first).
     pub const MAX_FILE: u64 = MAX_BLOCKS * BLOCK;
 
     /// What a handle or directory entry is.
@@ -640,11 +641,25 @@ pub mod mem {
     /// Manager only. `[FAULT, component, quota, address]` with the
     /// component's address space lent: maps a zeroed page at `address`
     /// (its heap took a page fault there), charged to the component.
-    /// `Denied` over quota.
+    /// `Denied` over quota. If a copy-on-write page is mapped there, the
+    /// component gets a private writable copy instead (or the page itself,
+    /// writable, if nobody else maps it any more), at no extra charge.
     pub const FAULT: u64 = 0x10;
     /// Manager only. `[RELEASE, component]`: takes back every page the
     /// component holds (it is being stopped). Reply `[status, pages]`.
     pub const RELEASE: u64 = 0x11;
+    /// Manager only. `[SHARE, component]` with the component's address
+    /// space lent: every heap page it holds becomes copy-on-write (mapped
+    /// read-only; the next write fault, through `FAULT`, gives the writer
+    /// its own copy). Reply `[status, pages]`.
+    pub const SHARE: u64 = 0x12;
+    /// Manager only. `[CLONE, parent, child, child's quota]` with the
+    /// child's address space lent, after `SHARE` of the parent: maps every
+    /// copy-on-write heap page of the parent read-only at the same address
+    /// in the child, charged to the child. `Denied` over the child's quota,
+    /// `InUse` if this server has no slot left for the copies. Reply
+    /// `[status, pages]`.
+    pub const CLONE: u64 = 0x13;
 
     /// The badge on component `index`'s capability, with `quota` pages.
     pub const fn badge(index: usize, quota: u64) -> u64 {

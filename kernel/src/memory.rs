@@ -22,6 +22,75 @@ pub fn carve(size_bits: u8) -> Option<u64> {
     (0..ROOT_CNODE_SLOTS).find_map(|slot| cnode.retype(slot, size_bits).ok())
 }
 
+/// The root task's arena: one block carved once, from which the kernel
+/// makes everything of the root task's own (its page tables, the pages of
+/// its image, stack and boot bundle). A fast reboot destroys the root task
+/// and hands the whole arena out again, from the start, to the next one.
+struct Arena {
+    start: u64,
+    next: u64,
+    end: u64,
+    /// Kernel-built address spaces take their pages from here (while the
+    /// root task is being built).
+    on: bool,
+}
+
+static ARENA: Mutex<Arena> = Mutex::new(Arena {
+    start: 0,
+    next: 0,
+    end: 0,
+    on: false,
+});
+
+/// Size of the root task's arena, in bits.
+pub const ARENA_BITS: u8 = 23;
+
+/// Starts (or, after a fast reboot, starts again) handing out the root
+/// task's arena: from now until [`arena_off`], [`user_page`] takes pages
+/// from it. False if there is no memory for it.
+pub fn arena_on() -> bool {
+    let mut a = ARENA.lock();
+    if a.end == 0 {
+        let Some(base) = carve(ARENA_BITS) else {
+            return false;
+        };
+        a.start = base;
+        a.end = base + (1 << ARENA_BITS);
+    }
+    a.next = a.start;
+    a.on = true;
+    true
+}
+
+/// Whether the root task is being built (see [`arena_on`]).
+pub fn arena_active() -> bool {
+    ARENA.lock().on
+}
+
+pub fn arena_off() {
+    ARENA.lock().on = false;
+}
+
+/// A page from the root task's arena (not zeroed).
+pub fn arena_page() -> Option<u64> {
+    let mut a = ARENA.lock();
+    if a.next >= a.end {
+        return None;
+    }
+    let pa = a.next;
+    a.next += 4096;
+    Some(pa)
+}
+
+/// A page (not zeroed) for an address space the kernel builds: from the
+/// root task's arena while it is being built, else from the root CNode.
+pub fn user_page() -> Option<u64> {
+    if ARENA.lock().on {
+        return arena_page();
+    }
+    carve(12)
+}
+
 #[derive(Default)]
 pub struct Summary {
     pub regions: usize,
@@ -83,6 +152,8 @@ pub enum TablePool {
     /// The root CNode's untyped memory: address spaces the kernel builds
     /// at boot.
     Kernel,
+    /// The root task's arena (see [`arena_on`]): its own address space.
+    Arena,
     /// Pages `next..end` of the address-space object's own memory, handed
     /// out in order. Nothing is freed until the whole object is.
     Own { next: u64, end: u64 },
@@ -92,7 +163,8 @@ impl TablePool {
     /// A zeroed 4 KiB frame for a page table, by physical address.
     pub fn alloc(&mut self, zero: impl Fn(u64)) -> Option<u64> {
         let pa = match self {
-            TablePool::Kernel => carve(12)?,
+            TablePool::Kernel => user_page()?,
+            TablePool::Arena => arena_page()?,
             TablePool::Own { next, end } => {
                 if *next >= *end {
                     return None;

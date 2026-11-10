@@ -33,9 +33,10 @@
 //!   sixty seconds and the manager gives up: the component stays down and
 //!   a tombstone answers its services with `SERVICE_UNAVAILABLE`, so
 //!   clients fail fast instead of hanging.
-//! - **State is external.** A `state` capability is a page the manager
-//!   makes once and hands to every instance, so a new instance finds what
-//!   the last one wrote (a journal of the requests it applied, say).
+//! - **State is external.** A `state` capability is component `i`'s page
+//!   of the kernel's state store (`root::STATE_STORE + i`), handed to
+//!   every instance, so a new instance finds what the last one wrote (a
+//!   journal of the requests it applied, say), even after a fast reboot.
 //! - **Memory.** The component providing `mem` is the Memory Server. A
 //!   component's capability to it carries the component's `quota` in its
 //!   badge. A page fault in a component's `heap` is not a crash: the
@@ -43,7 +44,19 @@
 //!   the component's address space) and resumes the thread, unless the
 //!   quota is spent. Stopping a component gives every page it held back
 //!   to the Memory Server first. The Memory Server itself cannot be
-//!   restarted in place (spec section 4): if it fails, the system stops.
+//!   restarted in place (spec section 4).
+//! - **Fast reboot.** If the Memory Server fails, the manager asks the
+//!   kernel for a fast reboot (`Reboot`); if the manager itself fails, the
+//!   kernel does it unasked. Either way every object is destroyed and this
+//!   program starts again from the boot bundle, rebuilding every
+//!   component; the state store keeps its contents, so state survives.
+//! - **Copy-on-write clones.** A component may ask (`OP_CLONE`) for a
+//!   `start clone` component with the same image to be started with a
+//!   copy-on-write copy of its heap: the Memory Server makes the sender's
+//!   heap pages read-only and maps them in the clone too, and the first
+//!   write to a page by either gives the writer its own copy. This is the
+//!   address-space cloning a POSIX `fork` is built on; the clone runs from
+//!   its entry with its own stack. A clone is not restarted.
 //!
 //! Capabilities from the kernel are in `superior_objects::abi::root`.
 
@@ -86,12 +99,9 @@ const FAULT_CAP: u64 = WATCHER_CONTROL + MAX_SERVICES as u64;
 /// their stacks.
 const TOMB_TCB: u64 = FAULT_CAP + MAX_COMPONENTS as u64;
 const TOMB_STACK: u64 = TOMB_TCB + MAX_SERVICES as u64;
-/// Each component's state page, if it has one: made once, outliving
-/// every instance.
-const STATE_PAGE: u64 = TOMB_STACK + 2 * MAX_SERVICES as u64;
 /// Pages components share with servers (`shared`): made once, handed out
 /// from here in manifest order, outliving every instance on both sides.
-const SHARED_PAGES: u64 = STATE_PAGE + MAX_COMPONENTS as u64;
+const SHARED_PAGES: u64 = TOMB_STACK + 2 * MAX_SERVICES as u64;
 const SHARED_SLOTS: u64 = 160;
 const _: () = assert!(SHARED_PAGES + SHARED_SLOTS <= BLOCKS);
 /// Each component's block of slots: its untyped memory, then the objects
@@ -119,6 +129,14 @@ const OP_SHUTDOWN: u64 = 2;
 /// `[OP_KILL, component index]`, from a `fault-injector` only: kill the
 /// component as if it had crashed (supervision restarts it).
 const OP_KILL: u64 = 3;
+/// `[OP_CLONE, component index]`: start that component (`start clone`) as
+/// a copy-on-write clone of the sender's heap. Reply `[status]`.
+const OP_CLONE: u64 = 4;
+/// `[OP_EXIT, failures]`: stop the sender for good (no restart).
+const OP_EXIT: u64 = 5;
+/// `[OP_CRASH_MANAGER]`, from a `fault-injector` only: the manager itself
+/// faults (the kernel's fast reboot follows).
+const OP_CRASH_MANAGER: u64 = 6;
 
 // ---- the manager's own address space -----------------------------------
 
@@ -217,10 +235,25 @@ impl<'a> Manager<'a> {
         self.manifest.components[i].as_ref().unwrap()
     }
 
-    /// Builds and starts an instance of component `i`. Its untyped block
-    /// (and state page) are made the first time and kept: a later instance
-    /// is built from the same block once [`Manager::stop`] has emptied it.
+    /// Builds and starts an instance of component `i`.
     fn start(&mut self, i: usize) -> Result<(), Failure> {
+        self.build(i)?;
+        self.resume(i)
+    }
+
+    /// Starts the thread of component `i`, built by [`Manager::build`].
+    fn resume(&mut self, i: usize) -> Result<(), Failure> {
+        let tcb = BLOCKS + i as u64 * BLOCK + B_THREAD;
+        sys(Syscall::ThreadResume, tcb, [0; 4]).map_err(|e| ("resume", e))?;
+        self.status[i] = Status::Running;
+        Ok(())
+    }
+
+    /// Builds an instance of component `i`, its thread not yet started.
+    /// Its untyped block (and state page) are made the first time and
+    /// kept: a later instance is built from the same block once
+    /// [`Manager::stop`] has emptied it.
+    fn build(&mut self, i: usize) -> Result<(), Failure> {
         let c = *self.component(i);
         let block = BLOCKS + i as u64 * BLOCK;
         let ut = block + B_UNTYPED;
@@ -228,10 +261,6 @@ impl<'a> Manager<'a> {
         if !self.made[i] {
             retype(root::UNTYPED, ObjectType::Untyped, c.memory_bits as u64, ut)
                 .map_err(|e| ("no memory for the component", e))?;
-            if c.caps().any(|x| x.kind == CapKind::State) {
-                retype(root::UNTYPED, ObjectType::Frame, 0, STATE_PAGE + i as u64)
-                    .map_err(|e| ("no memory for the state page", e))?;
-            }
             if let Some(n) = c.caps().find_map(|x| match x.kind {
                 CapKind::Shared(n) => Some(n as u64),
                 _ => None,
@@ -298,7 +327,7 @@ impl<'a> Manager<'a> {
                 CapKind::Control => {
                     cnode_copy(cnode, slot, CONTROL, WRITE, BADGE_REPORT + i as u64)
                 }
-                CapKind::State => cnode_copy(cnode, slot, STATE_PAGE + i as u64, ALL, 0),
+                CapKind::State => cnode_copy(cnode, slot, root::STATE_STORE + i as u64, ALL, 0),
                 CapKind::Shared(n) => (0..n as u64)
                     .try_for_each(|p| cnode_copy(cnode, slot + p, self.shared[i] + p, ALL, 0)),
             };
@@ -316,8 +345,63 @@ impl<'a> Manager<'a> {
         let fault = FAULT_CAP + i as u64;
         sys(Syscall::ThreadSetFaultHandler, tcb, [fault, 0, 0, 0])
             .map_err(|e| ("set fault handler", e))?;
-        sys(Syscall::ThreadResume, tcb, [0; 4]).map_err(|e| ("resume", e))?;
-        self.status[i] = Status::Running;
+        // Built: stopping it now must take its pages and objects back.
+        self.status[i] = Status::Stopped;
+        Ok(())
+    }
+
+    /// `[OP_CLONE, t]` from component `i`: starts component `t` (`start
+    /// clone`, the same image and heap size) with a copy-on-write copy of
+    /// `i`'s heap. Its image, stack and capabilities are its own, built
+    /// fresh from the manifest; it runs from its entry with its own `arg`.
+    fn clone_into(&mut self, i: usize, t: usize) -> Result<(), Reply> {
+        let ok = t < MAX_COMPONENTS
+            && t != i
+            && self.manifest.components[t].is_some()
+            && self.status[t] != Status::Running
+            && self.status[t] != Status::Failed;
+        if !ok {
+            return Err(Reply::Invalid);
+        }
+        let (c, p) = (*self.component(t), *self.component(i));
+        if c.start != Start::Clone || c.image != p.image || c.heap_pages != p.heap_pages {
+            return Err(Reply::Denied);
+        }
+        let ep = self.memory_server().ok_or(Reply::Unreachable)?;
+        if let Err((what, code)) = self.build(t) {
+            say!("could not build {}: {what} (error {code})", c.name);
+            self.stop(t);
+            return Err(Reply::NoSpace);
+        }
+        let lend = |j: usize, m: [u64; 4]| {
+            let vspace = BLOCKS + j as u64 * BLOCK + B_VSPACE;
+            let x = CapTransfer {
+                grant: Some(vspace as u16),
+                accept: None,
+            };
+            let r = syscall_x(Syscall::Call, ep, m, x);
+            match Reply::from_u64(r.msg[0]) {
+                Reply::Ok if r.status == 0 => Ok(r.msg[1]),
+                _ if r.status != 0 => Err(Reply::DeviceError),
+                e => Err(e),
+            }
+        };
+        let (pi, ti) = (i as u64 + 1, t as u64 + 1);
+        let r = lend(i, [mem::SHARE, pi, 0, 0])
+            .and_then(|_| lend(t, [mem::CLONE, pi, ti, c.quota_pages]));
+        let pages = match r {
+            Ok(n) => n,
+            Err(e) => {
+                self.stop(t);
+                return Err(e);
+            }
+        };
+        if let Err((what, code)) = self.resume(t) {
+            say!("could not start {}: {what} (error {code})", c.name);
+            self.stop(t);
+            return Err(Reply::DeviceError);
+        }
+        say!("started {} (a clone of {}, sharing {pages} heap pages)", c.name, p.name);
         Ok(())
     }
 
@@ -414,6 +498,11 @@ impl<'a> Manager<'a> {
             say!("restarting {name} and {others} after it ({policy})");
         }
         for j in (0..MAX_COMPONENTS).filter(|&j| group[j]) {
+            if self.component(j).start == Start::Clone {
+                // Its heap came from a parent: a fresh one would not be it.
+                say!("{} stays stopped (a clone is not restarted)", self.component(j).name);
+                continue;
+            }
             self.start_logged(j, "restart");
         }
     }
@@ -685,6 +774,14 @@ fn bundle_error(e: BundleError) -> &'static str {
 
 // ---- main ---------------------------------------------------------------
 
+/// The fast reboot (spec section 4): the kernel destroys everything and
+/// starts this program again; only the state store survives.
+fn reboot() -> ! {
+    let r = syscall(Syscall::Reboot, root::UNTYPED, [0; 4]);
+    say!("[fail] fast reboot refused (error {})", r.status);
+    shutdown(false)
+}
+
 fn shutdown(pass: bool) -> ! {
     // QEMU's isa-debug-exit: (value << 1) | 1; 0x10 is the pass code.
     let value = if pass { 0x10 } else { 0x11 };
@@ -693,7 +790,9 @@ fn shutdown(pass: bool) -> ! {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn _start(bundle_len: u64) -> ! {
+pub extern "C" fn _start(arg: u64) -> ! {
+    let bundle_len = arg & ((1 << root::REBOOTS_SHIFT) - 1);
+    let reboots = arg >> root::REBOOTS_SHIFT;
     // SAFETY: the kernel mapped the bundle read-only at BUNDLE_VA, and it
     // stays mapped for as long as this program runs.
     let bytes = unsafe { core::slice::from_raw_parts(BUNDLE_VA as *const u8, bundle_len as usize) };
@@ -726,6 +825,9 @@ pub extern "C" fn _start(bundle_len: u64) -> ! {
         restarts: [[0; MAX_RESTARTS]; MAX_COMPONENTS],
         restart_count: [0; MAX_COMPONENTS],
     };
+    if reboots > 0 {
+        say!("started again after fast reboot {reboots}; state store kept");
+    }
     say!(
         "manifest: {} components, bundle of {} files",
         m.manifest.len(),
@@ -815,8 +917,8 @@ pub extern "C" fn _start(bundle_len: u64) -> ! {
                 if m.is_memory_server(i) {
                     // Every component's memory is in its hands: no
                     // restart in place (spec section 4).
-                    say!("the Memory Server failed; the system must restart");
-                    shutdown(false);
+                    say!("the Memory Server failed; fast reboot");
+                    reboot();
                 }
                 m.supervise(i, false);
                 None
@@ -828,14 +930,46 @@ pub extern "C" fn _start(bundle_len: u64) -> ! {
                 let killable = t < MAX_COMPONENTS
                     && t != i
                     && m.manifest.components[t].is_some()
-                    && m.status[t] == Status::Running
-                    && !m.is_memory_server(t);
+                    && m.status[t] == Status::Running;
+                if killable && m.is_memory_server(t) {
+                    // As if it had failed: a fast reboot.
+                    say!("fault injection: killing {}", m.component(t).name);
+                    syscall(Syscall::Reply, 0, [0; 4]);
+                    say!("the Memory Server failed; fast reboot");
+                    reboot();
+                }
                 if killable {
                     say!("fault injection: killing {}", m.component(t).name);
                     m.status[t] = Status::Stopped;
                     m.supervise(t, true);
                 }
                 Some([!killable as u64, 0, 0, 0])
+            }
+            BADGE_REPORT
+                if i < MAX_COMPONENTS && msg.msg[0] == OP_CRASH_MANAGER && m.component(i).injector =>
+            {
+                say!("fault injection: the Component Manager crashes");
+                syscall(Syscall::Reply, 0, [0; 4]);
+                // SAFETY: deliberately not: nothing is mapped at 0, so this
+                // faults, and the kernel's fast reboot takes over.
+                let v = unsafe { core::ptr::read_volatile(core::ptr::null::<u64>()) };
+                say!("[fail] read {v:#x} at address 0");
+                reboot()
+            }
+            BADGE_REPORT if i < MAX_COMPONENTS && msg.msg[0] == OP_CLONE => {
+                let r = m.clone_into(i, msg.msg[1] as usize);
+                if let Err(e) = r {
+                    say!("{} could not clone itself into component {}: status {}", m.component(i).name, msg.msg[1], e as u64);
+                }
+                Some([r.err().unwrap_or(Reply::Ok) as u64, 0, 0, 0])
+            }
+            BADGE_REPORT if i < MAX_COMPONENTS && msg.msg[0] == OP_EXIT => {
+                // Answer first, so the manager owes no reply to an
+                // instance about to be destroyed.
+                syscall(Syscall::Reply, 0, [0; 4]);
+                say!("{} exited", m.component(i).name);
+                m.stop(i);
+                None
             }
             BADGE_REPORT if i < MAX_COMPONENTS && msg.msg[0] == OP_SHUTDOWN => {
                 let name = m.component(i).name;
@@ -866,5 +1000,6 @@ pub extern "C" fn _start(bundle_len: u64) -> ! {
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
     say!("panic: {info}");
-    shutdown(false)
+    // The manager failed: the fast reboot starts everything again.
+    reboot()
 }

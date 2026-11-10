@@ -23,6 +23,10 @@
 //!                                  `boot/memory.manifest` (quotas, demand-zero
 //!                                  heaps, pages back on restart) and check
 //!                                  the log
+//!   cargo xtask reboot-test [arch]     the fast reboot: boot
+//!                                  `boot/reboot.manifest`, fail the Memory
+//!                                  Server and then the Component Manager, and
+//!                                  check the state store survives both
 //!   cargo xtask fs-test [arch]     the filesystem server: boot
 //!                                  `boot/fs.manifest` on a fresh disk (writes
 //!                                  under fault injection, then a power cut),
@@ -143,6 +147,8 @@ fn main() -> ExitCode {
                         .and_then(|img| drivers_test(&img))
                         .and_then(|_| image_with(false, a, "memory"))
                         .and_then(|img| memory_test(&img))
+                        .and_then(|_| image_with(false, a, "reboot"))
+                        .and_then(|img| reboot_test(&img))
                         .and_then(|_| fs_test(a, "virtio-blk"))
                         .and_then(|_| disk_test(a, "nvme"))
                         .and_then(|_| disk_test(a, "ahci"))
@@ -174,9 +180,12 @@ fn main() -> ExitCode {
         Some("memory-test") => {
             image_with(false, arch, "memory").and_then(|img| memory_test(&img))
         }
+        Some("reboot-test") => {
+            image_with(false, arch, "reboot").and_then(|img| reboot_test(&img))
+        }
         Some("bench") => image(false, Arch::X86_64).and_then(|img| bench(&img)),
         _ => Err(
-            "usage: cargo xtask <image | run | test | boot-test | shell-test | cm-test | supervise-test | drivers-test | memory-test | fs-test | nvme-test | ahci-test | net-test | tcp-test | keyboard-test | bench | sel4-test> [x86_64 | aarch64]"
+            "usage: cargo xtask <image | run | test | boot-test | shell-test | cm-test | supervise-test | drivers-test | memory-test | reboot-test | fs-test | nvme-test | ahci-test | net-test | tcp-test | keyboard-test | bench | sel4-test> [x86_64 | aarch64]"
                 .into(),
         ),
     });
@@ -241,9 +250,11 @@ fn user_program(package: &str, arch: Arch) -> Result<PathBuf, String> {
     build.env("CARGO_PROFILE_RELEASE_STRIP", "debuginfo");
     if arch == Arch::Aarch64 {
         // x86_64-unknown-none is static-pie by default; this target is not.
+        // Segments aligned to 4 KiB pages, not 64 KiB: the loader counts the
+        // gaps against a component's image pages.
         build.env(
             "CARGO_TARGET_AARCH64_UNKNOWN_NONE_SOFTFLOAT_RUSTFLAGS",
-            "-C relocation-model=pie -C link-arg=-pie -C link-arg=--no-dynamic-linker",
+            "-C relocation-model=pie -C link-arg=-pie -C link-arg=--no-dynamic-linker -C link-arg=-zmax-page-size=4096",
         );
     }
     run(build.args([
@@ -996,7 +1007,9 @@ fn fs_test(arch: Arch, driver: &'static str) -> Result<(), String> {
     std::fs::write(&disk, vec![0u8; 16 << 20])
         .map_err(|e| format!("writing {}: {e}", disk.display()))?;
     println!("== filesystem test, first boot: {}", first.path.display());
-    let out = run_to_exit(&first, Duration::from_secs(120))?;
+    // Generous: 600 files into one directory under fault injection take
+    // AArch64 under emulated NVMe over two minutes.
+    let out = run_to_exit(&first, Duration::from_secs(360))?;
     // The server may be killed during the format (and format again, or
     // find it done); either way the first mount sees an empty filesystem.
     let steps = [
@@ -1012,10 +1025,12 @@ fn fs_test(arch: Arch, driver: &'static str) -> Result<(), String> {
         "[pass] fs: a 280000-byte file (through its indirect block) reads back",
         "[pass] fs: truncated to 10000 and written at 20000: 20004 bytes, zeros between",
         "[pass] fs: unlinking a 53248-byte file returned its 14 blocks; its handle is dead",
+        "[pass] fs: a sparse 9004096-byte file through the double indirect block: every piece reads back, the holes read as zeros, 10 blocks used",
+        "[pass] fs: cut to 4300100 bytes and written past the end again; unlinked, every block came back",
         "[pass] fs: a/b/c/f: exclusive create refused",
         "[pass] fs: renamed a/b/c/f to a/g (the same file); a cannot move into itself",
         "[pass] fs: a non-empty directory stays; a lists b and g, then g alone",
-        "[pass] fs: 70 files in one directory (two blocks of entries) listed, then removed",
+        "[pass] fs: 600 files in one directory (ten blocks of entries, through its indirect block) listed, then removed, every inode back",
         "[pass] fs: 9 symbolic links made; relative, absolute, through a directory, with .. and chained, each opens links/dir/target",
         "[pass] fs: a target climbing past the root stays in the container",
         "[pass] fs: a loop of links and NOFOLLOW answer TooManyLinks; an exclusive create finds the name taken",
@@ -1347,6 +1362,7 @@ fn tcp_test(arch: Arch) -> Result<(), String> {
         "[pass] tcp: this host is 10.0.3.30",
         "[pass] tcp: a connection to a closed port of this host's is refused, through the loopback",
         "[pass] tcp: 100000 bytes echoed by the host with one segment in 20 dropped each way, every byte right",
+        "[pass] tcp: 14 connections at once echoed by the host, 20000 bytes each, every byte right",
         "[pass] tcp: listening on port 8080, which a second listener cannot take",
         "[pass] tcp: 3 connections from the host accepted, 90000 bytes checked and echoed back, every byte right",
         "[pass] tcp: a connection between two sockets of this host's carried 20000 bytes each way, every byte right",
@@ -1651,7 +1667,7 @@ fn memory_test(img: &Image) -> Result<(), String> {
     println!("== Memory Server test on {}", img.path.display());
     let out = run_to_exit(img, Duration::from_secs(60))?;
     let steps = [
-        "[cm] manifest: 3 components",
+        "[cm] manifest: 4 components",
         "mem: pool of 512 pages",
         "hog: touching 12 heap pages with a quota of 8",
         "mem: client 2: heap page refused (8 pages is its quota)",
@@ -1672,6 +1688,16 @@ fn memory_test(img: &Image) -> Result<(), String> {
         "[pass] memory: 39 pages in use after freeing one",
         "[pass] memory: so another frame is granted",
         "[pass] memory: a component may not release another's pages",
+        "[cm] started clone (a clone of client, sharing 32 heap pages)",
+        "[pass] memory: cloned into clone, still 40 pages charged to it",
+        "[pass] memory: its write to shared page 0 is its own, at no extra charge",
+        "[pass] clone: 32 heap pages charged to it, quota 40",
+        "[pass] clone: every page reads as the client wrote it before the clone",
+        "[pass] clone: its write to page 1 stays its own, at no extra charge",
+        "clone: done (0 failed)",
+        "[cm] clone exited",
+        "[pass] memory: the clone exited and the pool is back to",
+        "[pass] memory: the clone's write to page 1 never reached the client",
         "[cm] client asked to shut down (pass)",
     ];
     if let Err(step) = find_in_order(&out, &steps) {
@@ -1683,6 +1709,39 @@ fn memory_test(img: &Image) -> Result<(), String> {
         }
     }
     println!("== Memory Server test passed ({})", img.arch.name());
+    Ok(())
+}
+
+/// Boots `boot/reboot.manifest`: the Memory Server is killed (the manager
+/// asks for a fast reboot), then the manager crashes (the kernel reboots
+/// unasked); each time every component is rebuilt and the state store
+/// keeps what the client wrote.
+fn reboot_test(img: &Image) -> Result<(), String> {
+    println!("== fast reboot test on {}", img.path.display());
+    let out = run_to_exit(img, Duration::from_secs(60))?;
+    let steps = [
+        "[cm] manifest: 2 components",
+        "[pass] reboot: boot 0: 4 heap pages from the Memory Server, zeroed",
+        "reboot: state written; killing the Memory Server",
+        "[cm] fault injection: killing memserver",
+        "[cm] the Memory Server failed; fast reboot",
+        "[reboot] the Component Manager asked for a restart: fast reboot 1",
+        "[reboot] Component Manager started again",
+        "[cm] started again after fast reboot 1; state store kept",
+        "[pass] reboot: boot 1: 4 heap pages from the Memory Server, zeroed",
+        "[pass] reboot: after the Memory Server failed, the state store kept what was written",
+        "reboot: crashing the Component Manager",
+        "[cm] fault injection: the Component Manager crashes",
+        "[fault] the Component Manager: PageFault",
+        "[reboot] the Component Manager failed: fast reboot 2",
+        "[reboot] Component Manager started again",
+        "[cm] started again after fast reboot 2; state store kept",
+        "[pass] reboot: boot 2: 4 heap pages from the Memory Server, zeroed",
+        "[pass] reboot: after the Component Manager failed, the state store kept it too",
+        "[cm] client asked to shut down (pass)",
+    ];
+    check_log("fast reboot test", &out, &steps)?;
+    println!("== fast reboot test passed ({})", img.arch.name());
     Ok(())
 }
 

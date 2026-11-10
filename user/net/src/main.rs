@@ -28,10 +28,11 @@
 //! the server has no address: `INFO` and `SEND` answer `Unreachable`.
 //!
 //! Slots: 0 the `nic` endpoint, 1 the `net` endpoint (receive), 2 untyped
-//! memory (512 KiB), 17 the state page.
+//! memory (1 MiB), 17 the state page.
 //!
 //! TCP (`superior_inet::tcp`): up to [`CONNS`] connections, each with
-//! 8 KiB rings each way in pages made at start. A connection the client
+//! 8 KiB rings each way in pages made at start, and using window scaling,
+//! timestamps and SACK with peers that offer them. A connection the client
 //! closed goes on until its FIN is acknowledged (or [`LINGER`] passes).
 //! For tests, `arg`'s high 32 bits, when not 0, make the server drop one
 //! TCP segment in that many at random, both ways.
@@ -72,8 +73,6 @@ const RX_FRAME: u64 = 6;
 const TX_FRAME: u64 = 7;
 /// Where a client's page arrives.
 const LENT: u64 = 8;
-/// Socket `i`'s notification.
-const SOCK_NTFN: u64 = 9;
 /// The state page, which outlives instances: the DHCP lease.
 const STATE: u64 = 17;
 /// The sockets' queue pages, SOCKETS * QUEUE of them.
@@ -82,6 +81,8 @@ const QUEUE_PAGES: u64 = 18;
 const TCP_PAGES: u64 = QUEUE_PAGES + (SOCKETS * QUEUE) as u64;
 /// The loopback queue's pages, LOOPBACK of them.
 const LOOP_PAGES: u64 = TCP_PAGES + (CONNS * 4) as u64;
+/// Socket `i`'s notification.
+const SOCK_NTFN: u64 = LOOP_PAGES + LOOPBACK as u64;
 
 const RX_VA: u64 = USER_BASE + 0x4000_0000;
 const TX_VA: u64 = RX_VA + 0x1000;
@@ -135,9 +136,9 @@ const REASSEMBLY_TICKS: u64 = 500;
 /// The most IP payload in one 1500-byte frame, a multiple of 8.
 const FRAGMENT: usize = 1480;
 
-const SOCKETS: usize = 8;
+const SOCKETS: usize = 16;
 /// TCP connections, and each ring's size.
-const CONNS: usize = 6;
+const CONNS: usize = 16;
 const TCP_BUF: usize = 8192;
 /// Connections a listening socket holds until they are accepted.
 const BACKLOG: usize = 2;

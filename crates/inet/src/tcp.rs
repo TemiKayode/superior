@@ -10,8 +10,16 @@
 //! Karn's rule, backing off), fast retransmit after three duplicate ACKs,
 //! slow start and congestion avoidance (RFC 5681), probes of a zero
 //! window, half-close, `TIME-WAIT`, resets (RFC 5961's checks against
-//! blind ones), and giving up after [`MAX_RETRIES`] timeouts. Not done:
-//! window scaling, timestamps, SACK, urgent data.
+//! blind ones), and giving up after [`MAX_RETRIES`] timeouts.
+//!
+//! Options, each used only if both SYNs carry it: window scaling (RFC
+//! 7323), so a receive ring over 64 KiB can be offered whole; timestamps
+//! (RFC 7323), which time every round trip, retransmissions included, and
+//! drop old duplicates (PAWS); and selective acknowledgements (RFC 2018):
+//! the receiver reports the ranges it holds past a gap, most recent first,
+//! and the sender in fast recovery resends the holes one by one, each
+//! further duplicate ACK or partial ACK letting the next go, instead of
+//! waiting a timeout for each loss after the first. Not done: urgent data.
 //!
 //! Times are in ticks of 10 ms. Each connection's bytes live in two rings
 //! the caller owns ([`Bufs`]), powers of two in size, indexed by sequence
@@ -90,6 +98,42 @@ pub struct Header {
     pub window: u16,
     /// The MSS option, on a SYN.
     pub mss: Option<u16>,
+    /// The window scale option (a shift), on a SYN.
+    pub wscale: Option<u8>,
+    /// The SACK-permitted option, on a SYN.
+    pub sack_ok: bool,
+    /// The timestamps option: TSval and TSecr.
+    pub ts: Option<(u32, u32)>,
+    /// SACK blocks (start, end), the first `nsack` of them.
+    pub sack: [(u32, u32); MAX_SACK],
+    pub nsack: u8,
+}
+
+/// SACK blocks a segment carries at most (four fit in the options, three
+/// beside timestamps).
+pub const MAX_SACK: usize = 4;
+
+impl Header {
+    /// Bytes of options this header takes, padded to whole words.
+    pub fn options_len(&self) -> usize {
+        let mut n = 0;
+        if self.mss.is_some() {
+            n += 4;
+        }
+        if self.ts.is_some() {
+            n += 12;
+        }
+        if self.wscale.is_some() {
+            n += 4;
+        }
+        if self.sack_ok {
+            n += 4;
+        }
+        if self.nsack > 0 {
+            n += 4 + 8 * self.nsack as usize;
+        }
+        n
+    }
 }
 
 use crate::{fold, pseudo, sum};
@@ -113,7 +157,7 @@ pub fn parse(b: &[u8], src: u128, dst: u128) -> Option<(Header, &[u8])> {
         ack: be32(8),
         flags: b[13] & 0x3f,
         window: be16(14),
-        mss: None,
+        ..Header::default()
     };
     let mut at = 20;
     while at < off {
@@ -125,8 +169,20 @@ pub fn parse(b: &[u8], src: u128, dst: u128) -> Option<(Header, &[u8])> {
                 if n < 2 || at + n > off {
                     return None;
                 }
-                if kind == 2 && n == 4 {
-                    h.mss = Some(be16(at + 2));
+                match (kind, n) {
+                    (2, 4) => h.mss = Some(be16(at + 2)),
+                    (3, 3) => h.wscale = Some(b[at + 2]),
+                    (4, 2) => h.sack_ok = true,
+                    (5, _) if (n - 2) % 8 == 0 => {
+                        let k = ((n - 2) / 8).min(MAX_SACK);
+                        for (i, block) in h.sack.iter_mut().take(k).enumerate() {
+                            let o = at + 2 + 8 * i;
+                            *block = (be32(o), be32(o + 4));
+                        }
+                        h.nsack = k as u8;
+                    }
+                    (8, 10) => h.ts = Some((be32(at + 2), be32(at + 6))),
+                    _ => {}
                 }
                 at += n;
             }
@@ -138,7 +194,8 @@ pub fn parse(b: &[u8], src: u128, dst: u128) -> Option<(Header, &[u8])> {
 /// Writes segment `h` with payload `a` then `b` into `out`, from `src` to
 /// `dst`, checksum and all; returns its length.
 pub fn encode(out: &mut [u8], src: u128, dst: u128, h: &Header, a: &[u8], b: &[u8]) -> usize {
-    let hl = if h.mss.is_some() { 24 } else { 20 };
+    let hl = 20 + h.options_len();
+    assert!(hl <= 60, "too many TCP options");
     let len = hl + a.len() + b.len();
     let s = &mut out[..len];
     s[0..2].copy_from_slice(&h.src_port.to_be_bytes());
@@ -149,10 +206,32 @@ pub fn encode(out: &mut [u8], src: u128, dst: u128, h: &Header, a: &[u8], b: &[u
     s[13] = h.flags;
     s[14..16].copy_from_slice(&h.window.to_be_bytes());
     s[16..20].fill(0);
+    let mut at = 20;
+    let mut put = |bytes: &[u8]| {
+        s[at..at + bytes.len()].copy_from_slice(bytes);
+        at += bytes.len();
+    };
     if let Some(m) = h.mss {
-        s[20] = 2;
-        s[21] = 4;
-        s[22..24].copy_from_slice(&m.to_be_bytes());
+        let m = m.to_be_bytes();
+        put(&[2, 4, m[0], m[1]]);
+    }
+    if let Some((val, ecr)) = h.ts {
+        put(&[1, 1, 8, 10]);
+        put(&val.to_be_bytes());
+        put(&ecr.to_be_bytes());
+    }
+    if let Some(w) = h.wscale {
+        put(&[1, 3, 3, w]);
+    }
+    if h.sack_ok {
+        put(&[1, 1, 4, 2]);
+    }
+    if h.nsack > 0 {
+        put(&[1, 1, 5, 2 + 8 * h.nsack]);
+        for &(a, b) in &h.sack[..h.nsack as usize] {
+            put(&a.to_be_bytes());
+            put(&b.to_be_bytes());
+        }
     }
     s[hl..hl + a.len()].copy_from_slice(a);
     s[hl + a.len()..].copy_from_slice(b);
@@ -184,7 +263,8 @@ pub fn reset_for(h: &Header, len: usize) -> Option<Header> {
 }
 
 /// A connection's two rings: bytes to send (until acknowledged) and bytes
-/// received (until read). Each a power of two in size, at most 64 KiB.
+/// received (until read). Each a power of two in size; the receive ring at
+/// most 1 GiB (past 64 KiB it is offered whole only to a peer that scales).
 pub struct Bufs<'a> {
     pub tx: &'a mut [u8],
     pub rx: &'a mut [u8],
@@ -225,6 +305,13 @@ pub struct Stats {
     pub out_of_order: u64,
     /// Zero-window probes.
     pub probes: u64,
+    /// Holes resent in fast recovery past the first, from the peer's SACK
+    /// blocks.
+    pub sack_resent: u64,
+    /// Old duplicates dropped by their timestamps (PAWS).
+    pub paws: u64,
+    /// The largest window the peer offered.
+    pub peak_wnd: u32,
 }
 
 /// One connection: its transmission control block.
@@ -269,7 +356,29 @@ pub struct Tcb {
     fin_at: Option<u32>,
     fin_received: bool,
     holes: [Option<(u32, u32)>; HOLES],
+    /// The out-of-order range that grew last (reported first in SACK).
+    last_hole: Option<(u32, u32)>,
     need_ack: bool,
+    /// Whether this side offers options in its SYN (no only for tests
+    /// playing an old peer).
+    offer: bool,
+    /// Window scaling: the shift this side would use on the windows it
+    /// advertises, and the shifts in use (0 unless both SYNs had it).
+    my_shift: u8,
+    rcv_shift: u8,
+    snd_shift: u8,
+    /// Timestamps in use; the TSval to echo; the last ACK number sent.
+    ts_on: bool,
+    ts_recent: u32,
+    last_ack_sent: u32,
+    /// SACK in use, and ranges the peer reported holding above `snd_una`.
+    sack_on: bool,
+    scoreboard: [Option<(u32, u32)>; HOLES],
+    /// Fast recovery: until `snd_una` reaches `recover`; holes are resent
+    /// from `rexmit_next` on.
+    in_recovery: bool,
+    recover: u32,
+    rexmit_next: u32,
     /// A reset to send, with this sequence number.
     pending_rst: Option<u32>,
     /// RFC 6298's estimates: SRTT times 8, RTTVAR times 4.
@@ -286,7 +395,12 @@ pub struct Tcb {
 
 impl Tcb {
     fn new(iss: u32, local_port: u16, remote: u128, remote_port: u16, tx_size: usize, rx_size: usize) -> Tcb {
-        assert!(tx_size.is_power_of_two() && rx_size.is_power_of_two() && rx_size <= 65536);
+        assert!(tx_size.is_power_of_two() && rx_size.is_power_of_two() && rx_size <= 1 << 30);
+        // The least shift that fits the whole receive ring in 16 bits.
+        let mut my_shift = 0;
+        while (rx_size >> my_shift) > 65535 {
+            my_shift += 1;
+        }
         Tcb {
             state: State::Closed,
             error: None,
@@ -319,7 +433,20 @@ impl Tcb {
             fin_at: None,
             fin_received: false,
             holes: [None; HOLES],
+            last_hole: None,
             need_ack: false,
+            offer: true,
+            my_shift,
+            rcv_shift: 0,
+            snd_shift: 0,
+            ts_on: false,
+            ts_recent: 0,
+            last_ack_sent: 0,
+            sack_on: false,
+            scoreboard: [None; HOLES],
+            in_recovery: false,
+            recover: iss,
+            rexmit_next: iss,
             pending_rst: None,
             srtt8: 0,
             rttvar4: 0,
@@ -348,20 +475,82 @@ impl Tcb {
         t
     }
 
+    /// Offers no options but the MSS (or answers a SYN with none): a peer
+    /// from before RFC 2018 and 7323, for tests. Before any output.
+    pub fn without_options(mut self) -> Tcb {
+        self.offer = false;
+        self.rcv_shift = 0;
+        self.snd_shift = 0;
+        self.ts_on = false;
+        self.sack_on = false;
+        self
+    }
+
     /// Takes the peer's sequence numbers and options from its SYN.
     fn synchronize(&mut self, syn: &Header) {
         self.rcv_nxt = syn.seq.wrapping_add(1);
         self.rcv_read = self.rcv_nxt;
         self.mss = syn.mss.map_or(DEFAULT_MSS, |m| (m as u32).clamp(64, self.max_seg));
         self.cwnd = 4 * self.mss;
+        // A window in a SYN is never scaled.
         self.snd_wnd = syn.window as u32;
+        let offer = self.offer;
+        (self.rcv_shift, self.snd_shift) = match syn.wscale {
+            Some(w) if offer => (self.my_shift, w.min(14)),
+            _ => (0, 0),
+        };
+        self.ts_on = offer && syn.ts.is_some();
+        if let Some((val, _)) = syn.ts {
+            self.ts_recent = val;
+        }
+        self.sack_on = offer && syn.sack_ok;
         self.snd_wl1 = syn.seq;
         self.snd_wl2 = syn.ack;
     }
 
-    /// The receive window: room left in the receive ring.
+    /// The receive window: room left in the receive ring, as far as the
+    /// window field (scaled, if it is) can say.
     fn rcv_wnd(&self) -> u32 {
-        self.rx_size - self.rcv_nxt.wrapping_sub(self.rcv_read)
+        let room = self.rx_size - self.rcv_nxt.wrapping_sub(self.rcv_read);
+        room.min(65535 << self.rcv_shift)
+    }
+
+    /// The window the peer offers in `h` (scaled, unless in a SYN).
+    fn peer_wnd(&self, h: &Header) -> u32 {
+        if h.flags & SYN != 0 {
+            h.window as u32
+        } else {
+            (h.window as u32) << self.snd_shift
+        }
+    }
+
+    /// The SACK blocks to report: the range that grew last, then the
+    /// others (RFC 2018), as many as fit beside the timestamps.
+    fn sack_blocks(&self) -> ([(u32, u32); MAX_SACK], u8) {
+        let mut out = [(0, 0); MAX_SACK];
+        if !self.sack_on {
+            return (out, 0);
+        }
+        let room = if self.ts_on { 3 } else { 4 };
+        let first = self.last_hole.filter(|l| self.holes.contains(&Some(*l)));
+        let rest = self.holes.iter().flatten().copied().filter(|r| Some(*r) != first);
+        let mut n = 0;
+        for r in first.into_iter().chain(rest).take(room) {
+            out[n] = r;
+            n += 1;
+        }
+        (out, n as u8)
+    }
+
+    /// The most data one segment carries: the MSS less the options it
+    /// carries.
+    fn seg_size(&self) -> u32 {
+        let mut opts = if self.ts_on { 12 } else { 0 };
+        let blocks = self.sack_blocks().1 as u32;
+        if blocks > 0 {
+            opts += 4 + 8 * blocks;
+        }
+        self.mss.saturating_sub(opts).max(1)
     }
 
     /// The first byte of data not yet acknowledged.
@@ -493,6 +682,15 @@ impl Tcb {
             stripped.seq = stripped.seq.wrapping_add(1);
             h = &stripped;
         }
+        // PAWS (RFC 7323 5.3): an old duplicate, by its timestamp, is
+        // acknowledged and dropped.
+        if let (true, Some((val, _))) = (self.ts_on, h.ts) {
+            if h.flags & RST == 0 && lt(val, self.ts_recent) {
+                self.stats.paws += 1;
+                self.need_ack = true;
+                return;
+            }
+        }
         let syn_fin = (h.flags & SYN != 0) as u32 + (h.flags & FIN != 0) as u32;
         let seg_len = data.len() as u32 + syn_fin;
         let wnd = self.rcv_wnd();
@@ -537,13 +735,20 @@ impl Tcb {
             self.need_ack = true;
             return;
         }
+        // The timestamp to echo: the one on the segment our next ACK
+        // answers (RFC 7323 4.3).
+        if let (true, Some((val, _))) = (self.ts_on, h.ts) {
+            if le(h.seq, self.last_ack_sent) && le(self.ts_recent, val) {
+                self.ts_recent = val;
+            }
+        }
         if h.flags & ACK == 0 {
             return;
         }
         if self.state == State::SynReceived {
             if lt(self.snd_una, h.ack) && le(h.ack, self.snd_max) {
                 self.state = State::Established;
-                self.snd_wnd = h.window as u32;
+                self.snd_wnd = self.peer_wnd(h);
                 self.snd_wl1 = h.seq;
                 self.snd_wl2 = h.ack;
                 self.changed = true;
@@ -636,21 +841,53 @@ impl Tcb {
         // The peer is there: timeouts start counting again.
         self.retries = 0;
         let old_wnd = self.snd_wnd;
+        let wnd = self.peer_wnd(h);
+        self.note_sacks(h);
         if lt(self.snd_una, ack) {
             let acked = ack.wrapping_sub(self.snd_una);
             self.snd_una = ack;
             if lt(self.snd_nxt, ack) {
                 self.snd_nxt = ack;
             }
-            if let Some((end, at)) = self.timing {
-                if le(end, ack) {
+            if lt(self.rexmit_next, ack) {
+                self.rexmit_next = ack;
+            }
+            for r in self.scoreboard.iter_mut() {
+                if matches!(*r, Some((_, e)) if le(e, ack)) {
+                    *r = None;
+                }
+            }
+            // Timestamps time every ACK, retransmissions too (RFC 7323
+            // 4.1); without them, the one segment being timed.
+            match h.ts {
+                Some((_, ecr)) if self.ts_on => {
+                    let r = (now as u32).wrapping_sub(ecr);
+                    if (r as i32) >= 0 {
+                        self.sample(r as u64);
+                    }
                     self.timing = None;
-                    self.sample(now - at);
+                }
+                _ => {
+                    if let Some((end, at)) = self.timing {
+                        if le(end, ack) {
+                            self.timing = None;
+                            self.sample(now - at);
+                        }
+                    }
                 }
             }
             self.dupacks = 0;
-            // Slow start, then congestion avoidance.
-            if self.cwnd < self.ssthresh {
+            if self.in_recovery {
+                self.cwnd = self.ssthresh;
+                if lt(ack, self.recover) {
+                    // A partial ACK: the next hole goes at once (RFC 6582,
+                    // RFC 6675).
+                    self.fast_retransmit = true;
+                } else {
+                    self.in_recovery = false;
+                }
+            } else if self.cwnd < self.ssthresh {
+                // Slow start, then congestion avoidance.
                 self.cwnd += acked.min(self.mss);
             } else {
                 self.cwnd += (self.mss * self.mss / self.cwnd).max(1);
@@ -670,23 +907,32 @@ impl Tcb {
             }
         } else if len == 0
             && h.flags & (SYN | FIN) == 0
-            && h.window as u32 == self.snd_wnd
+            && wnd == self.snd_wnd
             && self.snd_wnd > 0
             && self.snd_una != self.snd_max
         {
             self.dupacks += 1;
-            if self.dupacks == 3 {
+            if self.dupacks == 3 && !self.in_recovery {
                 let flight = self.snd_max.wrapping_sub(self.snd_una);
                 self.ssthresh = (flight / 2).max(2 * self.mss);
                 self.cwnd = self.ssthresh + 3 * self.mss;
                 self.fast_retransmit = true;
+                self.in_recovery = true;
+                self.recover = self.snd_max;
+                self.rexmit_next = self.snd_una;
                 self.stats.fast += 1;
             } else if self.dupacks > 3 {
                 self.cwnd += self.mss;
+                // Each further duplicate is a segment that left the
+                // network: with SACK, the next hole may go.
+                if self.sack_on && self.in_recovery {
+                    self.fast_retransmit = true;
+                }
             }
         }
+        self.stats.peak_wnd = self.stats.peak_wnd.max(wnd);
         if lt(self.snd_wl1, h.seq) || (self.snd_wl1 == h.seq && le(self.snd_wl2, ack)) {
-            self.snd_wnd = h.window as u32;
+            self.snd_wnd = wnd;
             self.snd_wl1 = h.seq;
             self.snd_wl2 = ack;
             if old_wnd == 0 && self.snd_wnd > 0 {
@@ -695,6 +941,68 @@ impl Tcb {
                 self.changed = true;
             }
         }
+    }
+
+    /// Notes the SACK blocks of `h` that lie above `snd_una`, merged.
+    fn note_sacks(&mut self, h: &Header) {
+        if !self.sack_on {
+            return;
+        }
+        for &(s, e) in &h.sack[..h.nsack as usize] {
+            // Only sane blocks: above what is acknowledged, within what was
+            // sent.
+            if !lt(s, e) || !lt(self.snd_una, e) || lt(self.snd_max, e) {
+                continue;
+            }
+            let (mut s, mut e) = (if lt(s, self.snd_una) { self.snd_una } else { s }, e);
+            for r in self.scoreboard.iter_mut() {
+                if let Some((rs, re)) = *r {
+                    if le(rs, e) && le(s, re) {
+                        if lt(rs, s) {
+                            s = rs;
+                        }
+                        if lt(e, re) {
+                            e = re;
+                        }
+                        *r = None;
+                    }
+                }
+            }
+            let una = self.snd_una;
+            let slot = match self.scoreboard.iter().position(Option::is_none) {
+                Some(i) => i,
+                // Full: the lowest range goes, the likeliest acked soon.
+                None => (0..HOLES).min_by_key(|&i| self.scoreboard[i].map_or(0, |r| r.0.wrapping_sub(una))).unwrap_or(0),
+            };
+            self.scoreboard[slot] = Some((s, e));
+        }
+    }
+
+    /// The next stretch to resend in fast recovery, from `from` on: its
+    /// start and length (at most a segment). Without SACK (or with nothing
+    /// reported), the oldest unacknowledged segment.
+    fn next_hole(&self, from: u32) -> Option<(u32, u32)> {
+        let seg = self.seg_size();
+        let limit = self.snd_end;
+        let ranges = || self.scoreboard.iter().flatten().copied();
+        if ranges().next().is_none() {
+            let at = self.snd_una;
+            let n = limit.wrapping_sub(at).min(seg);
+            return (lt(at, limit) && n > 0).then_some((at, n));
+        }
+        // Holes lie below the highest byte the peer reported holding.
+        let top = ranges().map(|r| r.1).fold(self.snd_una, |m, e| if lt(m, e) { e } else { m });
+        let mut at = if lt(from, self.snd_una) { self.snd_una } else { from };
+        while let Some(r) = ranges().find(|r| le(r.0, at) && lt(at, r.1)) {
+            at = r.1;
+        }
+        if !lt(at, top) || !lt(at, limit) {
+            return None;
+        }
+        // Up to the next range the peer holds.
+        let next = ranges().map(|r| r.0).filter(|&s| lt(at, s)).fold(top, |m, s| if lt(s, m) { s } else { m });
+        let n = next.wrapping_sub(at).min(seg).min(limit.wrapping_sub(at));
+        (n > 0).then_some((at, n))
     }
 
     /// Stores data that arrived; hands on what is now in order.
@@ -755,6 +1063,7 @@ impl Tcb {
             // With no room to note it, the range is simply sent again.
             if let Some(h) = self.holes.iter_mut().find(|h| h.is_none()) {
                 *h = Some((s, e));
+                self.last_hole = Some((s, e));
             }
         }
     }
@@ -833,30 +1142,57 @@ impl Tcb {
             self.deadline = None;
             return;
         }
-        // Go back to the oldest unacknowledged byte, starting slow.
+        // Go back to the oldest unacknowledged byte, starting slow. What
+        // the peer reported holding may since have been dropped (RFC 2018
+        // lets a receiver renege), so it all goes again.
+        self.in_recovery = false;
+        self.scoreboard = [None; HOLES];
         let flight = self.snd_max.wrapping_sub(self.snd_una);
         self.ssthresh = (flight / 2).max(2 * self.mss);
         self.cwnd = self.mss;
         self.snd_nxt = self.snd_una;
     }
 
-    fn header(&self, seq: u32, flags: u8) -> Header {
-        Header {
+    fn header(&mut self, now: u64, seq: u32, flags: u8) -> Header {
+        let syn = flags & SYN != 0;
+        let mut h = Header {
             src_port: self.local_port,
             dst_port: self.remote_port,
             seq,
             ack: if flags & ACK != 0 { self.rcv_nxt } else { 0 },
             flags,
-            window: self.rcv_wnd().min(65535) as u16,
-            mss: None,
+            // Never scaled in a SYN.
+            window: (self.rcv_wnd() >> if syn { 0 } else { self.rcv_shift }).min(65535) as u16,
+            ..Header::default()
+        };
+        if syn {
+            h.mss = Some(self.max_seg as u16);
+            // A SYN offers every option; a SYN-ACK those the SYN had.
+            let answer = flags & ACK != 0;
+            if self.offer && (!answer || self.rcv_shift > 0 || self.snd_shift > 0) {
+                h.wscale = Some(self.my_shift);
+            }
+            if self.offer && (!answer || self.ts_on) {
+                h.ts = Some((now as u32, if answer { self.ts_recent } else { 0 }));
+            }
+            h.sack_ok = self.offer && (!answer || self.sack_on);
+        } else if flags & RST == 0 {
+            if self.ts_on {
+                h.ts = Some((now as u32, self.ts_recent));
+            }
+            (h.sack, h.nsack) = self.sack_blocks();
         }
+        if flags & ACK != 0 {
+            self.last_ack_sent = h.ack;
+        }
+        h
     }
 
     /// Sends what is due through `emit` (a header, and the payload in two
     /// pieces): a SYN, data the windows allow, a FIN, an ACK, a reset.
     pub fn output(&mut self, now: u64, b: &Bufs, emit: &mut dyn FnMut(&Header, &[u8], &[u8])) {
         if let Some(seq) = self.pending_rst.take() {
-            let mut h = self.header(seq, RST);
+            let mut h = self.header(now, seq, RST);
             h.window = 0;
             emit(&h, &[], &[]);
         }
@@ -867,7 +1203,7 @@ impl Tcb {
             }
             State::TimeWait => {
                 if self.need_ack {
-                    let h = self.header(self.snd_max, ACK);
+                    let h = self.header(now, self.snd_max, ACK);
                     emit(&h, &[], &[]);
                     self.need_ack = false;
                 }
@@ -877,8 +1213,7 @@ impl Tcb {
                 let resend = self.state == State::SynReceived && self.need_ack;
                 if self.snd_nxt == self.iss || resend {
                     let flags = if self.state == State::SynSent { SYN } else { SYN | ACK };
-                    let mut h = self.header(self.iss, flags);
-                    h.mss = Some(self.max_seg as u16);
+                    let h = self.header(now, self.iss, flags);
                     emit(&h, &[], &[]);
                     if self.snd_max == self.iss {
                         self.timing = Some((self.iss.wrapping_add(1), now));
@@ -900,12 +1235,16 @@ impl Tcb {
         let mut sent = false;
         if self.fast_retransmit {
             self.fast_retransmit = false;
-            let n = (self.snd_end.wrapping_sub(self.snd_una) as usize).min(self.mss as usize);
-            if lt(self.snd_una, self.snd_end) && n > 0 {
-                let (a, c) = ring_slices(b.tx, self.snd_una, n);
-                let h = self.header(self.snd_una, ACK);
+            if let Some((at, n)) = self.next_hole(self.rexmit_next) {
+                let (a, c) = ring_slices(b.tx, at, n as usize);
+                let h = self.header(now, at, ACK);
                 emit(&h, a, c);
+                self.adv_wnd = (h.window as u32) << self.rcv_shift;
                 self.stats.retransmitted += 1;
+                if at != self.snd_una {
+                    self.stats.sack_resent += 1;
+                }
+                self.rexmit_next = at.wrapping_add(n);
                 self.timing = None;
                 sent = true;
             }
@@ -919,7 +1258,7 @@ impl Tcb {
             let wnd = self.snd_wnd.min(self.cwnd);
             let edge = self.snd_una.wrapping_add(wnd);
             let room = if lt(self.snd_nxt, edge) { edge.wrapping_sub(self.snd_nxt) } else { 0 };
-            let mut n = avail.min(room).min(self.mss);
+            let mut n = avail.min(room).min(self.seg_size());
             if n == 0 && avail > 0 && self.probe {
                 n = 1;
                 self.stats.probes += 1;
@@ -936,10 +1275,10 @@ impl Tcb {
             if n > 0 && n == avail {
                 flags |= PSH;
             }
-            let h = self.header(self.snd_nxt, flags);
+            let h = self.header(now, self.snd_nxt, flags);
             let (a, c) = ring_slices(b.tx, self.snd_nxt, n as usize);
             emit(&h, a, c);
-            self.adv_wnd = h.window as u32;
+            self.adv_wnd = (h.window as u32) << self.rcv_shift;
             let len = n + fin as u32;
             if self.snd_nxt == self.snd_max {
                 if self.timing.is_none() {
@@ -960,9 +1299,9 @@ impl Tcb {
         if self.need_ack && !sent {
             // At the highest number sent, not one gone back to: an ACK
             // below the peer's window would be dropped.
-            let h = self.header(self.snd_max, ACK);
+            let h = self.header(now, self.snd_max, ACK);
             emit(&h, &[], &[]);
-            self.adv_wnd = h.window as u32;
+            self.adv_wnd = (h.window as u32) << self.rcv_shift;
         }
         self.need_ack = false;
         // The retransmission timer runs while anything is unacknowledged;
@@ -1039,7 +1378,7 @@ mod tests {
         fn send(&mut self, now: u64, to_b: bool, h: &Header, a: &[u8], c: &[u8]) {
             let (x, y) = self.addrs;
             let (src, dst) = if to_b { (x, y) } else { (y, x) };
-            let mut buf = vec![0u8; 24 + a.len() + c.len()];
+            let mut buf = vec![0u8; 60 + a.len() + c.len()];
             let n = encode(&mut buf, src, dst, h, a, c);
             buf.truncate(n);
             self.sent += 1;
@@ -1077,6 +1416,8 @@ mod tests {
         close_after: bool,
         reading: bool,
         listening: Option<u16>,
+        /// Accepts as a peer with no options.
+        old: bool,
     }
 
     impl End {
@@ -1091,6 +1432,7 @@ mod tests {
                 close_after: true,
                 reading: true,
                 listening: None,
+                old: false,
             }
         }
 
@@ -1138,7 +1480,8 @@ mod tests {
                     Some(t) if !t.is_finished() => t.input(now, &h, data, &mut bufs),
                     _ => {
                         if end.listening == Some(h.dst_port) && h.flags & (SYN | ACK | RST) == SYN {
-                            end.tcb = Some(Tcb::accept(0x8000_0000 ^ 77, src, &h, end.tx.len(), end.rx.len()));
+                            let t = Tcb::accept(0x8000_0000 ^ 77, src, &h, end.tx.len(), end.rx.len());
+                            end.tcb = Some(if end.old { t.without_options() } else { t });
                             end.listening = None;
                         } else if let Some(r) = reset_for(&h, data.len()) {
                             link.send(now, !p.to_b, &r, &[], &[]);
@@ -1183,16 +1526,125 @@ mod tests {
             flags: SYN | ACK,
             window: 5,
             mss: Some(1460),
+            ..Header::default()
         };
         let mut buf = [0u8; 64];
         let n = encode(&mut buf, A, B, &h, b"he", b"llo");
         let (g, d) = parse(&buf[..n], A, B).unwrap();
         assert_eq!((g, d), (h, &b"hello"[..]));
+        // Every option, as on a SYN, and as on data with SACK blocks.
+        let syn = Header { wscale: Some(7), sack_ok: true, ts: Some((0xdead_beef, 0)), ..h };
+        let mut big = [0u8; 128];
+        let n = encode(&mut big, A, B, &syn, b"", b"");
+        assert_eq!(n, 20 + 24);
+        assert_eq!(parse(&big[..n], A, B).unwrap().0, syn);
+        let mut data = Header { flags: ACK, ts: Some((5, 6)), nsack: 3, ..Header::default() };
+        data.sack[..3].copy_from_slice(&[(100, 200), (300, 400), (u32::MAX - 5, 9)]);
+        let n = encode(&mut big, A, B, &data, b"x", b"");
+        assert_eq!(n, 20 + 40 + 1);
+        assert_eq!(parse(&big[..n], A, B).unwrap(), (data, &b"x"[..]));
         buf[25] ^= 1;
         assert!(parse(&buf[..n], A, B).is_none());
         // The pseudo-header counts.
         buf[25] ^= 1;
         assert!(parse(&buf[..n], A, B + 1).is_none());
+    }
+
+
+    /// A over a link that loses, with B in `old` mode or not; returns the
+    /// ends and the ticks taken.
+    fn lossy(seed: u64, size: usize, old: bool) -> (End, End, u64) {
+        let (mut a, mut b) = pair(size, pattern(200_000, 21), pattern(1_000, 22));
+        b.old = old;
+        let mut link = Link::new(seed, 8, 0, 4);
+        let t = run(&mut a, &mut b, &mut link, 400_000);
+        assert!(t < 400_000, "seed {seed}: not done");
+        assert!(b.got == a.out && a.got == b.out, "seed {seed}: bytes differ");
+        (a, b, t)
+    }
+
+    #[test]
+    fn options_are_used_only_when_both_offer_them() {
+        let (a, b, _) = lossy(31, 8192, false);
+        let (ta, tb) = (a.tcb.unwrap(), b.tcb.unwrap());
+        assert!(ta.ts_on && ta.sack_on && tb.ts_on && tb.sack_on);
+        let (a, b, _) = lossy(31, 8192, true);
+        let (ta, tb) = (a.tcb.unwrap(), b.tcb.unwrap());
+        assert!(!ta.ts_on && !ta.sack_on && !tb.ts_on && !tb.sack_on);
+        assert_eq!((ta.snd_shift, ta.rcv_shift, ta.stats.sack_resent), (0, 0, 0));
+    }
+
+    #[test]
+    fn a_window_over_64_kib_is_scaled() {
+        let size = 1 << 20;
+        let (mut a, mut b) = pair(size, pattern(3_000_000, 23), Vec::new());
+        b.reading = false;
+        let mut link = Link::new(41, 0, 0, 0);
+        run(&mut a, &mut b, &mut link, 3_000);
+        let (ta, tb) = (a.tcb.unwrap(), b.tcb.unwrap());
+        assert_eq!((ta.snd_shift, tb.rcv_shift), (5, 5));
+        // B offered (nearly) its whole megabyte, far past what 16 bits
+        // say, and A filled it.
+        assert!(ta.stats.peak_wnd > 1_000_000, "{:?}", ta.stats);
+        assert_eq!(tb.readable(), size);
+        b.reading = true;
+        let t = run(&mut a, &mut b, &mut link, 100_000);
+        assert!(t < 100_000);
+        assert_eq!(b.got, a.out);
+        // An old peer gets 64 KiB at most.
+        let (mut a, mut b) = pair(size, pattern(500_000, 24), Vec::new());
+        b.old = true;
+        let t = run(&mut a, &mut b, &mut Link::new(42, 0, 0, 0), 100_000);
+        assert!(t < 100_000);
+        assert_eq!(b.got, a.out);
+        assert!(a.tcb.unwrap().stats.peak_wnd <= 65535);
+    }
+
+    #[test]
+    fn sack_resends_every_hole_without_waiting_for_timeouts() {
+        let (mut with, mut without) = ((0, 0), (0, 0));
+        for seed in 1..=10 {
+            let (a, _, t) = lossy(seed * 104_729, 65536, false);
+            let s = a.tcb.unwrap().stats;
+            with = (with.0 + t, with.1 + s.sack_resent);
+            let (a, _, t) = lossy(seed * 104_729, 65536, true);
+            without.0 += t;
+            without.1 += a.tcb.unwrap().stats.sack_resent;
+        }
+        assert!(with.1 > 0 && without.1 == 0, "{with:?} {without:?}");
+        assert!(with.0 < without.0, "SACK was no faster: {with:?} {without:?}");
+    }
+
+    #[test]
+    fn an_old_duplicate_is_dropped_by_its_timestamp() {
+        let (mut a, mut b) = pair(4096, Vec::new(), b"hello".to_vec());
+        a.close_after = false;
+        b.close_after = false;
+        a.reading = false;
+        let mut link = Link::new(43, 0, 0, 0);
+        run(&mut a, &mut b, &mut link, 100);
+        let t = a.tcb.as_mut().unwrap();
+        assert_eq!(t.readable(), 5);
+        // A segment at the next number but stamped before the last one.
+        let h = Header {
+            src_port: 80,
+            dst_port: 40000,
+            seq: t.rcv_nxt,
+            ack: t.snd_max,
+            flags: ACK,
+            window: 100,
+            ts: Some((t.ts_recent.wrapping_sub(1), 0)),
+            ..Header::default()
+        };
+        let mut bufs = Bufs {
+            tx: &mut a.tx,
+            rx: &mut a.rx,
+        };
+        t.input(101, &h, b"stale", &mut bufs);
+        assert_eq!((t.readable(), t.stats.paws), (5, 1));
+        let h = Header { ts: Some((t.ts_recent, 0)), ..h };
+        t.input(102, &h, b"fresh", &mut bufs);
+        assert_eq!((t.readable(), t.stats.paws), (10, 1));
     }
 
     #[test]

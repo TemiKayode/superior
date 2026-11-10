@@ -8,7 +8,9 @@
 //! ```text
 //! component echo
 //!   image echo              # bundle entry holding its executable
-//!   start lazy              # boot (default): at boot; lazy: on first call
+//!   start lazy              # boot (default): at boot; lazy: on first call;
+//!                           # clone: only as a copy-on-write clone of a
+//!                           # running component with the same image
 //!   priority 10             # default 10
 //!   arg 0                   # passed in its first argument register
 //!   memory 20               # bits of untyped memory for this instance
@@ -54,6 +56,9 @@ pub const DEFAULT_MEMORY_BITS: u8 = 20;
 pub enum Start {
     Boot,
     Lazy,
+    /// Started only when a running component with the same image asks the
+    /// manager to clone itself into it (copy-on-write heap).
+    Clone,
 }
 
 /// What happens when the component dies (spec section 4).
@@ -232,11 +237,12 @@ impl<'a> Manifest<'a> {
                     None
                 }
                 "start" => {
-                    let w = arg("start needs boot or lazy")?;
+                    let w = arg("start needs boot, lazy or clone")?;
                     c.start = match w {
                         "boot" => Start::Boot,
                         "lazy" => Start::Lazy,
-                        _ => return Err(err("start must be boot or lazy", w)),
+                        "clone" => Start::Clone,
+                        _ => return Err(err("start must be boot, lazy or clone", w)),
                     };
                     None
                 }
@@ -372,6 +378,10 @@ impl<'a> Manifest<'a> {
             }
             if c.start == Start::Lazy && c.provides().next().is_none() {
                 return Err(err("a lazy component must provide a service", c.name));
+            }
+            // Its heap arrives from the component it is cloned from.
+            if c.start == Start::Clone && c.heap_pages == 0 {
+                return Err(err("a clone needs a heap", c.name));
             }
             // A heap is paged in by the Memory Server.
             if c.heap_pages > 0 && self.provider("mem").is_none() {
@@ -509,7 +519,13 @@ component memserver
         );
         assert_eq!(
             error("component a\n image a\n start soon"),
-            (3, "start must be boot or lazy")
+            (3, "start must be boot, lazy or clone")
+        );
+        assert_eq!(
+            error("component a
+ image a
+ start clone"),
+            (0, "a clone needs a heap")
         );
         assert_eq!(
             error("component a\n image a\n priority 63"),

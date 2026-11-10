@@ -315,15 +315,40 @@ holds the rest):
     is a crash and supervision takes over.
   - `FRAME`, `FREE` and `INFO` for pages a component asks for directly.
   - Stopping or restarting a component gives every page it held back first.
-  - The Memory Server cannot be restarted in place: if it fails, the system stops
-    (spec section 4; the fast reboot that should follow is not built yet).
+  - Copy-on-write cloning (for `fork`): `SHARE` makes a component's heap pages
+    read-only and shared, and `CLONE` maps them, read-only and at the same
+    addresses, in another component (manifest `start clone`, the clone of the
+    component before it with the same image and heap). Each mapping holds its own
+    copy of the page's original capability, so revoking the original still takes
+    every one. A write faults to the manager, and `FAULT` gives the writer a copy of
+    the page, or the frame itself once no one else maps it; each mapping is charged
+    to its holder, so breaking the sharing never needs more quota. The page logic
+    (`crates/objects/src/pages.rs`) is host-tested against a model kernel with
+    randomized requests (300 seeds of 400 steps each run; 20,000 on demand), checking
+    every component's view of every page after each step; it found both bugs planted
+    to test it.
+  - Fast reboot (spec section 4): the Component Manager and the Memory Server are
+    not restarted in place. If either fails (a fault, a panic, or the manager
+    asking with the new `Reboot` call), the kernel revokes the manager's untyped
+    memory, which takes every component, page and capability with it, tears the
+    manager down and starts it again from the same memory. Its page tables come from
+    an arena reset each time, so nothing leaks, and a state store of 16 pages,
+    zeroed once at first boot, is handed to each new manager, which gives components
+    their state pages from it, so they outlive the reboot. At most five reboots in
+    60 s, then the system stops.
   - Components may have larger CSpaces (manifest `cspace`, up to 2^10 slots).
   `cargo xtask memory-test` boots `boot/memory.manifest`:
   - a client pages its heap in by touching it, and every page arrives zeroed;
   - it takes frames up to its quota and is refused one more;
   - it frees one, and the capability is gone;
   - a hog touches more heap than its quota and is restarted, with all 8 pages back
-    in the pool; its next instance gets those same pages, zeroed.
+    in the pool; its next instance gets those same pages, zeroed;
+  - a clone of the client starts sharing its heap pages; each side writes some,
+    gets its own copies, and still sees the other's unwritten pages as they were.
+  `cargo xtask reboot-test` boots `boot/reboot.manifest`: a client with a state
+  page has the injector kill the Memory Server and then the manager itself; each
+  time the system reboots fast, the client starts again, its heap pages zeroed,
+  and finds its state page as it left it.
 - The filesystem server, v2 (`user/fs/`), over the block interface (which has
   `WRITE` and `FLUSH`; the virtio-blk driver negotiates the device's write cache).
   - No global namespace: each component sees only its own tree, under a root
@@ -333,8 +358,9 @@ holds the rest):
     directories; `OPEN` with create, exclusive and truncate flags; `MKDIR`,
     `UNLINK` (files and empty directories), `RENAME` (replacing a target of the
     same kind; a directory cannot move into itself), `READDIR`, `TRUNCATE`,
-    `STAT`, `STATFS`. Files to a little over 4 MiB (9 direct blocks and one
-    indirect block); a read or write of up to 4 KiB may span two blocks.
+    `STAT`, `STATFS`. Files to the size of the disk (9 direct blocks, an
+    indirect block of 1,024 and a double indirect block of 1,024 more indirect
+    ones: a little over 4 GiB, past the 128 MiB a disk may have); a read or write of up to 4 KiB may span two blocks.
     Handles carry a generation, so a handle to a removed file never reaches the
     inode's next owner.
   - Symbolic links: `SYMLINK` and `READLINK`; relative or absolute targets (an
@@ -363,8 +389,9 @@ holds the rest):
     sleeps until half of what it has in flight is done, and the server signals it once
     then, so signals coalesce. A client resubmits what had no completion after a
     restart.
-  - Limits: 511 files and directories, 58-byte names, one request at a time, four
-    rings.
+  - Limits: 2,047 files and directories (32 blocks of inodes, all held in
+    memory), 58-byte names, one request at a time, four rings, disks of up to
+    128 MiB (one bitmap block).
   - Fault injection: a manifest `fault-injector` component may ask the Component
     Manager to kill another (it is restarted as if it had crashed; such kills do
     not count towards the restart limit, which is there to stop crash loops).
@@ -373,10 +400,13 @@ holds the rest):
   (about 50 to 90 kills a run):
   - a client appends 400 records and every acknowledged one reads back; then
     a 280,000-byte file written in unaligned pieces, truncated and extended;
-    a removed file's blocks come back and its handle is dead; nested
+    a removed file's blocks come back and its handle is dead; a sparse 9 MB
+    file through the double indirect block, its holes read as zeros, cut back
+    and removed with every block returned; nested
     directories, renames, refused operations (exclusive create, a path through
     a file, `..`, a directory into itself, removing a non-empty directory);
-    70 files in one directory, listed and removed; 9 symbolic links (relative,
+    600 files in one directory (more than the 511 inodes there once were),
+    listed and removed; 9 symbolic links (relative,
     absolute, through a directory, with `..`, chained, climbing past the root, a
     loop, a dangling one created through), read back, renamed and removed;
   - through a ring, 15 in flight: a file opened, 300 1 KiB records written and read
@@ -437,9 +467,19 @@ holds the rest):
     congestion avoidance, zero-window probes, half-close, `TIME-WAIT`, resets
     checked against blind ones (RFC 5961) and ignored in `TIME-WAIT` (RFC 1337),
     ICMP "unreachable" ending a connection attempt, and giving up after ten
-    timeouts. Host unit tests run two ends over a link that loses, reorders and
-    repeats segments (up to 30% lost). The server holds up to six connections,
-    each with 8 KiB rings each way; `TCP_CONNECT`, `TCP_LISTEN` (two connections
+    timeouts. Options, each used only when both SYNs carry it: window scaling
+    (RFC 7323; a receive ring of up to 1 GiB offered whole), timestamps (RFC
+    7323: every ACK times a round trip, retransmissions included, and old
+    duplicates are dropped by PAWS), and SACK (RFC 2018: the receiver reports
+    the ranges it holds past a gap, most recent first; the sender in fast
+    recovery resends the holes one after another on each further duplicate or
+    partial ACK, NewReno-style without SACK, and forgets what was reported on a
+    timeout, since a receiver may renege). Host unit tests run two ends over a
+    link that loses, reorders and repeats segments (up to 30% lost), with and
+    without options on the far end: a 1 MiB window offered and filled, an old
+    duplicate dropped by its timestamp, and SACK finishing ten lossy transfers
+    in less time than the same transfers without it. The server holds up to
+    sixteen connections (and sixteen sockets), each with 8 KiB rings each way; `TCP_CONNECT`, `TCP_LISTEN` (two connections
     held until accepted), `TCP_ACCEPT`, `SEND` and `RECV` (never blocking: `Empty`
     means wait for the connection's notification), `TCP_SHUTDOWN`, `TCP_STATE`,
     and `CLOSE`, after which the server finishes the connection (a FIN, up to
@@ -580,13 +620,11 @@ these buses have none); more than one command per queue in the NVMe driver,
 more than two commands in flight per disk in the AHCI driver, ATAPI
 and port multipliers; in the xHCI driver isochronous and bulk endpoints, USB 3 streams,
 hubs and more than one interrupter, and HID devices other than boot keyboards; in the network server
-TCP window scaling, timestamps and SACK, more than six TCP connections, IPv6 routes beyond one router and stateful DHCPv6, datagrams over 4,000 bytes, DNS records other than A and CNAME (and DNS over TCP), routes beyond one gateway, and rings in place of a
+IPv6 routes beyond one router and stateful DHCPv6, datagrams over 4,000 bytes, DNS records other than A and CNAME (and DNS over TCP), routes beyond one gateway, and rings in place of a
 call per frame; buses behind bridges; the async executor, buffer pools and
 power callbacks of the SDK; an IDL compiler for the interfaces; escalating a component
 given up on to a supervisor above it (today the
-manager is the only one), restarting the Component Manager or Memory Server (spec: fast
-reboot instead, not built yet), copy-on-write address-space cloning for `fork` in the
-Memory Server, memory budgets from a policy service, giving the Memory Server all spare
+manager is the only one), memory budgets from a policy service, giving the Memory Server all spare
 RAM (today it gets a fixed pool from its manifest), page tables for boot processes paid for from user memory,
 multi-level CSpaces, the first call's capability forwarded by a lazy-start watcher, scheduling-context capabilities (budgets are set at boot), sporadic refills,
 timeout faults, per-CPU ready queues and thread affinity (one lock and shared queues
@@ -636,6 +674,7 @@ cargo xtask cm-test        # just the Component Manager test (add aarch64 for th
 cargo xtask supervise-test # just the supervision test (add aarch64 for that ISA)
 cargo xtask drivers-test   # just the driver framework test (add aarch64 for that ISA)
 cargo xtask memory-test    # just the Memory Server test (add aarch64 for that ISA)
+cargo xtask reboot-test    # just the fast reboot test (add aarch64 for that ISA)
 cargo xtask fs-test        # just the filesystem test, two boots (add aarch64 for that ISA)
 cargo xtask nvme-test      # the driver and filesystem tests on an NVMe disk (add aarch64 for that ISA)
 cargo xtask ahci-test      # the same on a SATA disk behind AHCI (add aarch64 for that ISA)

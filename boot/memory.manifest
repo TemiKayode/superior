@@ -4,7 +4,9 @@
 # quotas below. The client pages its heap in by touching it, takes frames
 # up to its quota and is refused one more, and frees one. The hog touches
 # more heap than its quota: the manager restarts it, every page it held
-# goes back to the pool, and its next instance finds them zeroed.
+# goes back to the pool, and its next instance finds them zeroed. Last,
+# the client clones itself: the clone starts with a copy-on-write copy of
+# its heap, and neither sees the other's writes.
 
 component memserver
   image memserver
@@ -12,9 +14,10 @@ component memserver
   # Cannot be restarted in place (spec section 4).
   restart never
   memory 22
-  cspace 9
-  # CSpace of 2^9 slots, pool of 2^21 bytes: 9 | 21 << 8.
-  arg 5385
+  cspace 10
+  # CSpace of 2^10 slots, pool of 2^21 bytes: 10 | 21 << 8. More slots
+  # than pages, so copy-on-write copies never crowd out the pool.
+  arg 5386
   provides mem 0
   untyped 21 1
 
@@ -31,6 +34,18 @@ component hog
 component client
   image testclient
   arg 5
+  uses mem 0
+  control 1
+  quota 40
+  heap 32
+
+# Started only when the client asks (OP_CLONE): with a copy-on-write copy
+# of the client's heap, which it checks and writes to before exiting.
+component clone
+  image testclient
+  start clone
+  arg 19
+  restart never
   uses mem 0
   control 1
   quota 40

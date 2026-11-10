@@ -680,7 +680,166 @@ fn memory_client() -> ! {
         r.msg[0] == Status::Denied as u64,
         format_args!("a component may not release another's pages"),
     );
+    clone_parent(&mut t);
     syscall(Syscall::Call, MEM_CONTROL, [OP_SHUTDOWN, t.0, 0, 0]);
+    superior_sys::park()
+}
+
+/// `[OP_CLONE, component]`: start that component with a copy-on-write
+/// copy of this one's heap. `[OP_EXIT]`: stop this component for good.
+const OP_CLONE: u64 = 4;
+const OP_EXIT: u64 = 5;
+/// The `clone` component's index in `boot/memory.manifest`.
+const CLONE_INDEX: u64 = 3;
+/// What the client writes to heap page 0 after cloning, and the clone to
+/// page 1.
+const PARENT_MARK: u64 = 0x5041_5245_4e54_0000;
+const CLONE_MARK: u64 = 0x434c_4f4e_4500_0000;
+
+fn heap_page(p: u64) -> &'static mut [u64] {
+    // SAFETY: the heap is this component's; every page is mapped (or
+    // faults in) on touch.
+    unsafe { core::slice::from_raw_parts_mut((HEAP + p * 4096) as *mut u64, 512) }
+}
+
+/// Every heap page from `from` holds what [`touch`] wrote.
+fn heap_intact(from: u64) -> bool {
+    (from..CLIENT_HEAP).all(|p| {
+        heap_page(p)
+            .iter()
+            .enumerate()
+            .all(|(k, &w)| w == heap_word(p, k as u64))
+    })
+}
+
+/// The memory client clones itself into `clone`, then writes to its own
+/// heap: neither sees the other's writes, and once the clone is gone the
+/// pool is back where it was.
+fn clone_parent(t: &mut Checks) {
+    let before = info();
+    let r = syscall(Syscall::Call, MEM_CONTROL, [OP_CLONE, CLONE_INDEX, 0, 0]);
+    let after = info();
+    // (The pool may already be a page down: the clone can run, and
+    // write, on another CPU before this.)
+    t.check(
+        r.status == 0 && r.msg[0] == Status::Ok as u64 && after[2] == before[2],
+        format_args!("cloned into clone, still {} pages charged to it", after[2]),
+    );
+    let mark = heap_page(0);
+    mark.iter_mut().for_each(|w| *w = PARENT_MARK);
+    t.check(
+        mark.iter().all(|&w| w == PARENT_MARK) && info()[2] == before[2],
+        format_args!("its write to shared page 0 is its own, at no extra charge"),
+    );
+    // Breaking the sharing took a page until the clone lets go of its
+    // copies: then the pool is exactly as before.
+    let start = superior_sys::ticks();
+    while info()[3] != before[3] && superior_sys::ticks() - start < 500 {
+        superior_sys::sleep(1);
+    }
+    let end = info();
+    t.check(
+        end[3] == before[3] && end[2] == before[2],
+        format_args!("the clone exited and the pool is back to {} free", end[3]),
+    );
+    t.check(
+        heap_page(0).iter().all(|&w| w == PARENT_MARK) && heap_intact(1),
+        format_args!("the clone's write to page 1 never reached the client"),
+    );
+}
+
+/// The reboot client (`boot/reboot.manifest`): memory in slot 0, control
+/// in slot 1, its state page in slot 2. Its state page records which boot
+/// it is on and a pattern, and the failures so far.
+const REBOOT_STATE: u64 = 2;
+const OP_CRASH_MANAGER: u64 = 6;
+const MEMSERVER_INDEX: u64 = 0;
+const REBOOT_HEAP: u64 = 4;
+
+fn reboot_word(k: u64) -> u64 {
+    0x5245_424f_4f54_0000 | k
+}
+
+/// Boot 0 writes its state and has the Memory Server killed; boot 1 (after
+/// that fast reboot) checks the state and crashes the Component Manager;
+/// boot 2 (after the second) checks it again and shuts down.
+fn reboot_client() -> ! {
+    let mut t = Checks(0, "reboot");
+    let mapped = syscall(Syscall::FrameMap, REBOOT_STATE, [STATE_VA, 1, 0, 0]).status == 0;
+    // SAFETY: the state page is mapped at STATE_VA (checked below).
+    let state = unsafe { core::slice::from_raw_parts_mut(STATE_VA as *mut u64, 512) };
+    if !mapped {
+        t.check(false, format_args!("its state page is mapped"));
+        syscall(Syscall::Call, MEM_CONTROL, [OP_SHUTDOWN, 1, 0, 0]);
+        superior_sys::park()
+    }
+    let boot = state[0];
+    t.0 = state[511];
+    // The Memory Server serves this boot: heap pages arrive, zeroed.
+    let zeroed = (0..REBOOT_HEAP).all(|p| {
+        let page = heap_page(p);
+        let z = page.iter().all(|&w| w == 0);
+        page[0] = boot + 1;
+        z && page[0] == boot + 1
+    });
+    t.check(
+        zeroed,
+        format_args!("boot {boot}: {REBOOT_HEAP} heap pages from the Memory Server, zeroed"),
+    );
+    let kept = state[1..64].iter().enumerate().all(|(k, &w)| w == reboot_word(k as u64));
+    match boot {
+        0 => {
+            state[1..64]
+                .iter_mut()
+                .enumerate()
+                .for_each(|(k, w)| *w = reboot_word(k as u64));
+            state[0] = 1;
+            state[511] = t.0;
+            say!("reboot: state written; killing the Memory Server");
+            syscall(Syscall::Call, MEM_CONTROL, [OP_KILL, MEMSERVER_INDEX, 0, 0]);
+        }
+        1 => {
+            t.check(
+                kept,
+                format_args!("after the Memory Server failed, the state store kept what was written"),
+            );
+            state[0] = 2;
+            state[511] = t.0;
+            say!("reboot: crashing the Component Manager");
+            syscall(Syscall::Call, MEM_CONTROL, [OP_CRASH_MANAGER, 0, 0, 0]);
+        }
+        _ => {
+            t.check(
+                boot == 2 && kept,
+                format_args!("after the Component Manager failed, the state store kept it too"),
+            );
+            syscall(Syscall::Call, MEM_CONTROL, [OP_SHUTDOWN, t.0, 0, 0]);
+        }
+    }
+    superior_sys::park()
+}
+
+/// The clone of the memory client: it starts with the client's heap.
+fn clone_child() -> ! {
+    let mut t = Checks(0, "clone");
+    let r = info();
+    t.check(
+        r[0] == 0 && r[1] == CLIENT_QUOTA && r[2] == CLIENT_HEAP,
+        format_args!("{} heap pages charged to it, quota {}", r[2], r[1]),
+    );
+    // Page 0 too, whether or not the client has written to it yet.
+    t.check(
+        heap_intact(0),
+        format_args!("every page reads as the client wrote it before the clone"),
+    );
+    let page = heap_page(1);
+    page.iter_mut().for_each(|w| *w = CLONE_MARK);
+    t.check(
+        page.iter().all(|&w| w == CLONE_MARK) && heap_intact(2) && info()[2] == CLIENT_HEAP,
+        format_args!("its write to page 1 stays its own, at no extra charge"),
+    );
+    say!("clone: done ({} failed)", t.0);
+    syscall(Syscall::Call, MEM_CONTROL, [OP_EXIT, t.0, 0, 0]);
     superior_sys::park()
 }
 
@@ -949,6 +1108,61 @@ fn check_big(h: u64, from: u64, to: u64, zero_from: u64, zero_to: u64) -> Result
     Ok(())
 }
 
+/// Writes bytes `off..off + len` of the big file's pattern (`len` at
+/// most a block) at `off` of `h`; whether it was acknowledged.
+fn put_big(h: u64, off: u64, len: u64) -> bool {
+    let b = fs_bytes();
+    for i in 0..len {
+        b[i as usize] = big_byte(off + i);
+    }
+    fs_call([fs::WRITE, h, off, len], true).0[0] == OK
+}
+
+/// A sparse file past 4 MiB, through the double indirect block: pieces
+/// written across the step from the indirect block to the double one, in
+/// its first indirect block and in a later one, the holes between read as
+/// zeros; cut back, written again, and its blocks all come back when it
+/// goes.
+fn huge_file(t: &mut Checks) {
+    // Block 1033 is the double indirect block's first.
+    const STEP: u64 = (9 + 1024) * 4096;
+    let pieces = [(STEP - 2000, 4096), (4_300_000, 4096), (9_000_000, 4096)];
+    let before = fs_statfs();
+    let h = fs_open("huge", fs::CREATE | fs::TRUNC)[1];
+    let wrote = pieces.iter().all(|&(off, len)| put_big(h, off, len));
+    let size = fs_call([fs::STAT, h, 0, 0], false).0[1];
+    let during = fs_statfs();
+    let read = pieces.iter().all(|&(off, len)| check_big(h, off, off + len, 0, 0).is_ok());
+    // Holes: before the first piece, between pieces, in a missing
+    // indirect block.
+    let holes = [(STEP - 6000, STEP - 2000), (STEP + 2096, STEP + 9000), (6_000_000, 6_004_000)];
+    let zeros = holes.iter().all(|&(a, b)| check_big(h, a, b, a, b).is_ok());
+    // Six data blocks, the indirect block, the double one and two of its
+    // indirect blocks.
+    t.check(
+        wrote && size == 9_004_096 && read && zeros && before[1] - during[1] == 10,
+        format_args!(
+            "a sparse {size}-byte file through the double indirect block: every piece reads back, the holes read as zeros, {} blocks used",
+            before[1] - during[1]
+        ),
+    );
+    // Cut into the double indirect range, then write past the end again.
+    let cut = fs_call([fs::TRUNCATE, h, 4_300_100, 0], false).0[0];
+    let again = put_big(h, 9_000_000, 4096);
+    let read = check_big(h, 4_300_000, 4_300_100, 0, 0).is_ok()
+        && check_big(h, 4_300_100, 4_304_096, 4_300_100, 4_304_096).is_ok()
+        && check_big(h, 9_000_000, 9_004_096, 0, 0).is_ok();
+    let gone = fs_unlink("huge");
+    let after = fs_statfs();
+    t.check(
+        cut == OK && again && read && gone == OK && after[1] == before[1] && after[2] == before[2],
+        format_args!("cut to 4300100 bytes and written past the end again; unlinked, every block came back"),
+    );
+}
+
+/// Files made in one directory: past the 511 inodes there once were.
+const MANY_FILES: usize = 600;
+
 /// Lists directory `h`: how many entries, and whether each of `names`
 /// is among them.
 fn list(h: u64, names: &[&str]) -> (u64, bool) {
@@ -1166,6 +1380,7 @@ fn fs_client() -> ! {
         ),
     );
     fs_unlink("tmp2");
+    huge_file(&mut t);
 
     // The tree.
     for d in ["a", "a/b", "a/b/c"] {
@@ -1208,27 +1423,32 @@ fn fs_client() -> ! {
         full == Status::NotEmpty as u64 && n1 == 2 && both && rm == (OK, OK) && n2 == 1 && only_g,
         format_args!("a non-empty directory stays; a lists b and g, then g alone"),
     );
-    // A directory past one block of entries.
+    // A directory past its direct blocks of entries, with more files
+    // than the 511 inodes there once were.
     fs_path(fs::MKDIR, "many", 0);
-    let mut names = [[0u8; 8]; 70];
+    let free = fs_statfs()[2];
+    let mut names = [[0u8; 9]; MANY_FILES];
     let mut made = 0;
     for (i, n) in names.iter_mut().enumerate() {
-        *n = *b"many/f00";
-        n[6] = b'0' + (i / 10) as u8;
-        n[7] = b'0' + (i % 10) as u8;
+        *n = *b"many/f000";
+        n[6] = b'0' + (i / 100) as u8;
+        n[7] = b'0' + (i / 10 % 10) as u8;
+        n[8] = b'0' + (i % 10) as u8;
         let p = core::str::from_utf8(n).unwrap_or("");
         made += (fs_open(p, fs::CREATE)[0] == OK) as u64;
     }
+    let used = free - fs_statfs()[2];
     let many = fs_open("many", fs::DIRECTORY)[1];
-    let (n70, ends) = list(many, &["f00", "f69"]);
+    let (listed, ends) = list(many, &["f000", "f599"]);
     let mut removed = 0;
     for n in &names {
         removed += (fs_unlink(core::str::from_utf8(n).unwrap_or("")) == OK) as u64;
     }
     let (n0, _) = list(many, &[]);
+    let n = MANY_FILES as u64;
     t.check(
-        made == 70 && n70 == 70 && ends && removed == 70 && n0 == 0,
-        format_args!("70 files in one directory (two blocks of entries) listed, then removed"),
+        made == n && used == n && listed == n && ends && removed == n && n0 == 0 && fs_statfs()[2] == free,
+        format_args!("{n} files in one directory (ten blocks of entries, through its indirect block) listed, then removed, every inode back"),
     );
     symlink_checks(&mut t);
 
@@ -2337,6 +2557,89 @@ fn tcp_under_faults(t: &mut Checks, to: Dest) {
 /// and out-of-order arrival all happen.
 const TCP_BULK: u64 = 100_000;
 const TCP_BULK6: u64 = 50_000;
+/// Connections echoed at once (the server holds 16), each this many bytes,
+/// and the first of the slots their notifications arrive in.
+const TCP_MANY: u64 = 14;
+const TCP_MANY_BYTES: u64 = 20_000;
+const MANY_NTFN: u64 = 48;
+
+/// `TCP_MANY` connections to the host's echo port at once, each sending
+/// its own stream a piece at a time in turn and checking what comes
+/// back. Whether all of them came back right.
+fn many_at_once(gw: u64) -> bool {
+    let mut streams: [Option<Stream>; TCP_MANY as usize] = [const { None }; TCP_MANY as usize];
+    for (i, s) in streams.iter_mut().enumerate() {
+        match Stream::connect(gw | TCP_ECHO_PORT as u64, MANY_NTFN + i as u64) {
+            Ok(c) => *s = Some(c),
+            Err(_) => return false,
+        }
+    }
+    // Per stream: bytes sent, bytes back, whether shut down, finished.
+    let mut sent = [0u64; TCP_MANY as usize];
+    let mut got = [0u64; TCP_MANY as usize];
+    let mut shut = [false; TCP_MANY as usize];
+    let mut done = [false; TCP_MANY as usize];
+    let mut right = true;
+    let mut last = ticks();
+    while done.iter().any(|d| !d) {
+        let mut moved = false;
+        for (i, s) in streams.iter().enumerate() {
+            let Some(s) = s else { continue };
+            if done[i] {
+                continue;
+            }
+            let k = 2000 + i as u64;
+            if sent[i] < TCP_MANY_BYTES {
+                let n = (TCP_MANY_BYTES - sent[i]).min(1500);
+                for (j, b) in net_page()[..n as usize].iter_mut().enumerate() {
+                    *b = tcp_byte(k, sent[i] + j as u64);
+                }
+                match s.send(n) {
+                    Ok(took) => {
+                        sent[i] += took;
+                        moved |= took > 0;
+                    }
+                    Err(_) => return false,
+                }
+            } else if !shut[i] {
+                if s.shutdown().is_err() {
+                    return false;
+                }
+                shut[i] = true;
+            }
+            loop {
+                match s.recv() {
+                    Ok(Some(0)) => {
+                        done[i] = true;
+                        right &= got[i] == TCP_MANY_BYTES;
+                        break;
+                    }
+                    Ok(Some(n)) => {
+                        right &= net_page()[..n as usize]
+                            .iter()
+                            .enumerate()
+                            .all(|(j, &b)| b == tcp_byte(k, got[i] + j as u64));
+                        got[i] += n;
+                        moved = true;
+                    }
+                    Ok(None) => break,
+                    Err(_) => return false,
+                }
+            }
+        }
+        if moved {
+            last = ticks();
+        } else if ticks() > last + TCP_STUCK {
+            return false;
+        } else {
+            superior_sys::sleep(1);
+        }
+    }
+    for s in streams.into_iter().flatten() {
+        s.close();
+    }
+    right
+}
 /// Connections the host makes to the listening port, and the bytes each
 /// sends (more than the server's 8 KiB window, so it shuts).
 const TCP_INBOUND: u64 = 3;
@@ -2487,6 +2790,18 @@ fn tcp_client() -> ! {
         bulk == Ok(true) && state == net::TCP_ESTABLISHED,
         format_args!(
             "{TCP_BULK} bytes echoed by the host with one segment in 20 dropped each way, every byte right, in {}.{:02} s",
+            took / 100,
+            took % 100
+        ),
+    );
+
+    let began = ticks();
+    let many = many_at_once(gw);
+    let took = ticks() - began;
+    t.check(
+        many,
+        format_args!(
+            "{TCP_MANY} connections at once echoed by the host, {TCP_MANY_BYTES} bytes each, every byte right, in {}.{:02} s",
             took / 100,
             took % 100
         ),
@@ -3030,6 +3345,8 @@ pub extern "C" fn _start(role: u64) -> ! {
         15 => df_spinner(),
         5 => memory_client(),
         6 => hog(),
+        19 => clone_child(),
+        20 => reboot_client(),
         7 => fs_client(),
         8 => fs_verify(),
         9 => fs_other(),

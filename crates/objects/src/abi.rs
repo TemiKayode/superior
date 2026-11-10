@@ -223,6 +223,13 @@ pub enum Syscall {
     /// capability, and no CPU spent waiting. Returns early with
     /// `Interrupted` if the thread is stopped meanwhile. 0 returns at once.
     Sleep = 43,
+    /// The fast reboot (spec section 4), for the root task only, showing
+    /// its untyped capability in slot `rdi`: the kernel destroys every
+    /// object made from that memory and the root task itself, then starts
+    /// the root task again from the boot bundle with the same capabilities.
+    /// The state store ([`root::STATE_STORE`]) keeps its contents. Also
+    /// what happens when the root task faults.
+    Reboot = 44,
     /// Maps the frame in slot `rdi` at page-aligned `rsi` in the address
     /// space in slot `r8` (Write right). `rdx` = [`MAP_WRITE`] and/or
     /// [`MAP_EXEC`], never both. Needs the frame's Map right, plus Write
@@ -291,6 +298,7 @@ impl Syscall {
             40 => Syscall::NotificationBind,
             41 => Syscall::TimerSignal,
             43 => Syscall::Sleep,
+            44 => Syscall::Reboot,
             42 => Syscall::IoFaults,
             0x100 => Syscall::DebugPutStr,
             0x101 => Syscall::DebugSelftestDone,
@@ -534,8 +542,15 @@ pub mod root {
     /// kernel drives: the right to bind I/O address spaces to PCI
     /// functions.
     pub const IOMMU: u64 = MSI + MSI_COUNT;
+    /// The state store: [`STATE_PAGES`] frames that keep their contents
+    /// across a fast reboot ([`Syscall::Reboot`]), zeroed at power-on.
+    pub const STATE_STORE: u64 = IOMMU + 1;
+    pub const STATE_PAGES: u64 = 16;
     /// The first slot with nothing in it.
-    pub const FIRST_FREE: u64 = IOMMU + 1;
+    pub const FIRST_FREE: u64 = STATE_STORE + STATE_PAGES;
+    /// The root task's argument: the bundle's length, and in the bits from
+    /// [`REBOOTS_SHIFT`] how many fast reboots came before this start.
+    pub const REBOOTS_SHIFT: u32 = 32;
     /// Size of [`UNTYPED`], in bits.
     pub const UNTYPED_BITS: u8 = 25;
     /// Where the bundle is mapped, as an offset from the user window's base.
