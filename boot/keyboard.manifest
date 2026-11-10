@@ -41,7 +41,8 @@ component client
 
 component injector
   image testclient
-  arg 10
+  # Kills every 30 to 150 ms, with a 0.5 s pause after every eighth.
+  arg 17
   priority 8
   control 0
   fault-injector
