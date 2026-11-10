@@ -210,9 +210,12 @@ pub mod net {
     pub const VERSION: u64 = 1;
     /// The largest UDP payload in one unfragmented 1500-byte IPv4 packet.
     pub const MAX_PAYLOAD: u64 = 1472;
-    /// The largest payload a socket sends or receives: bigger than
-    /// `MAX_PAYLOAD`, it goes (and arrives) in IPv4 fragments.
-    pub const MAX_DATAGRAM: u64 = 4000;
+    /// The largest payload a socket sends or receives, UDP's largest over
+    /// IPv4 (65,535 bytes less the IPv4 and UDP headers): bigger than
+    /// `MAX_PAYLOAD`, it goes (and arrives) in fragments. One that does
+    /// not fit the lent page goes in pieces: `SEND_PART` stages it, and
+    /// `RECV_PART` fetches what `RECV` could not copy.
+    pub const MAX_DATAGRAM: u64 = 65_507;
 
     /// `[INFO, VERSION]`: reply `[status, this host's address (IPv4, as
     /// in addr), its MAC address, the gateway's address]`; `Unreachable`
@@ -233,7 +236,10 @@ pub mod net {
     /// `[SEND, handle, address, length]` with a frame lent: sends a UDP
     /// datagram from the socket to `address`, or an ICMP echo request
     /// with the sequence number in its low 16 bits; the payload is the
-    /// first `length` bytes of the frame, at most `MAX_DATAGRAM`. Reply
+    /// first `length` bytes of the frame, or, for a `length` past the
+    /// frame (or past what follows `SEND6`'s address), the `length` bytes
+    /// `SEND_PART` staged (all of them; `Invalid` otherwise), at most
+    /// `MAX_DATAGRAM`. Reply
     /// `[status]`: `Unreachable` if the next hop did not answer ARP (the
     /// datagram is dropped), or for a datagram sent in fragments, whose
     /// next hop's address is not yet known (it is asked for).
@@ -244,7 +250,9 @@ pub mod net {
     /// `[status, length, peer address]`, a length of 0 meaning the peer
     /// has sent all it will.
     /// Reply `[status, length, source address]`; `Empty` if none is
-    /// waiting. A socket keeps the last few; more are dropped.
+    /// waiting. A socket keeps the last few; more are dropped. The length
+    /// is the datagram's: if it is more than the frame took, `RECV_PART`
+    /// gives the rest.
     pub const RECV: u64 = 5;
     /// `[CLOSE, handle]`: closes the socket; its notification is deleted.
     /// A TCP connection is closed gracefully (a FIN after what is queued,
@@ -311,6 +319,18 @@ pub mod net {
     /// prefix length, seconds the address has left, seconds the router
     /// has left]`; `Unreachable` until there is a global address.
     pub const INFO6: u64 = 19;
+    /// `[SEND_PART, handle, offset, length]` with a frame lent: stages
+    /// the frame's first `length` bytes (at most a page) as payload bytes
+    /// `offset..offset + length` of the socket's next datagram, for a
+    /// `SEND` or `SEND6` too long for its frame. `offset` 0 starts a new
+    /// datagram; any other must be where the last piece ended. Reply
+    /// `[status]`: `NoSpace` if the server has no room for it now.
+    pub const SEND_PART: u64 = 20;
+    /// `[RECV_PART, handle, offset]` with a frame lent: copies payload
+    /// bytes from `offset` (up to a page) of the datagram the socket last
+    /// received, which the server keeps until the next `RECV` or `RECV6`.
+    /// Reply `[status, bytes]`; `Empty` if there are none.
+    pub const RECV_PART: u64 = 21;
 
     /// TCP states, as `TCP_STATE` gives them (RFC 9293's names).
     pub const TCP_CLOSED: u64 = 0;

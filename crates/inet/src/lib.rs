@@ -55,9 +55,10 @@ pub fn pseudo(src: u128, dst: u128, proto: u8, len: usize) -> u32 {
     sum(0, &b)
 }
 
-/// The largest IP payload reassembled (a UDP datagram of up to 4000 bytes
-/// with its header, rounded up to whole 8-byte units).
-pub const MAX_REASSEMBLED: usize = 4008;
+/// The largest IP payload reassembled: a UDP datagram of the largest
+/// size (65,507 bytes, `net::MAX_DATAGRAM`) with its 8-byte header,
+/// rounded up to whole 8-byte units.
+pub const MAX_REASSEMBLED: usize = 65_520;
 const UNITS: usize = MAX_REASSEMBLED.div_ceil(8);
 
 /// What identifies one datagram's fragments (RFC 791, RFC 8200): source,
@@ -71,16 +72,24 @@ pub struct Key {
     pub id: u32,
 }
 
-#[derive(Clone, Copy)]
+/// One datagram being put together. All zeros is an unused slot.
 struct Partial {
+    used: bool,
     key: Key,
     /// When its first fragment arrived.
     started: u64,
-    /// The payload's length, once the last fragment has arrived.
-    total: Option<usize>,
+    /// The payload's length, once the last fragment has arrived (`ended`).
+    ended: bool,
+    total: usize,
     /// Which 8-byte units have arrived.
     have: [u64; UNITS.div_ceil(64)],
     data: [u8; MAX_REASSEMBLED],
+}
+
+impl Partial {
+    fn has(&self, u: usize) -> bool {
+        self.have[u / 64] & 1 << (u % 64) != 0
+    }
 }
 
 /// What happened to a fragment.
@@ -97,32 +106,35 @@ pub enum Outcome {
 
 /// Reassembles up to `N` datagrams at once; when all are in progress, a
 /// new one takes the place of the oldest.
+///
+/// Each slot holds a whole datagram (64 KiB), so the network server keeps
+/// this in pages of its own rather than in its image: all zeros is an
+/// empty reassembler ([`Reassembler::init`]).
 pub struct Reassembler<const N: usize> {
-    slots: [Option<Partial>; N],
+    slots: [Partial; N],
     /// Datagrams completed, and dropped (malformed, too big, pushed out or
     /// timed out).
     pub completed: u64,
     pub dropped: u64,
 }
 
-impl<const N: usize> Default for Reassembler<N> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl<const N: usize> Reassembler<N> {
-    pub const fn new() -> Self {
-        Reassembler {
-            slots: [None; N],
-            completed: 0,
-            dropped: 0,
+    /// An empty reassembler in the memory at `p`.
+    ///
+    /// # Safety
+    /// `p` must be valid for writes of a `Reassembler<N>` and aligned.
+    pub unsafe fn init(p: *mut Self) -> &'static mut Self {
+        // SAFETY: the caller's promise; all zeros is a valid, empty value
+        // (bools false, numbers 0).
+        unsafe {
+            p.write_bytes(0, 1);
+            &mut *p
         }
     }
 
     /// Datagrams in progress.
     pub fn pending(&self) -> usize {
-        self.slots.iter().flatten().count()
+        self.slots.iter().filter(|p| p.used).count()
     }
 
     /// Takes a fragment: its datagram's `key`, its byte `offset`, whether
@@ -144,21 +156,18 @@ impl<const N: usize> Reassembler<N> {
             || offset % 8 != 0
             // Every fragment but the last carries whole units.
             || (more && (data.is_empty() || data.len() % 8 != 0));
-        let p = self.slots[slot].as_mut().unwrap();
+        let p = &mut self.slots[slot];
         let bad = bad
-            || match (p.total, more) {
+            || match (p.ended, more) {
                 // Nothing may lie past the end, and there is one end.
-                (Some(t), true) => end > t,
-                (Some(t), false) => end != t,
-                (None, false) => {
-                    // No unit already received may lie past this end.
-                    let last = end.div_ceil(8);
-                    (last..UNITS).any(|u| p.have[u / 64] & 1 << (u % 64) != 0)
-                }
-                (None, true) => false,
+                (true, true) => end > p.total,
+                (true, false) => end != p.total,
+                // No unit already received may lie past this end.
+                (false, false) => (end.div_ceil(8)..UNITS).any(|u| p.has(u)),
+                (false, true) => false,
             };
         if bad {
-            self.slots[slot] = None;
+            p.used = false;
             self.dropped += 1;
             return Outcome::Dropped;
         }
@@ -167,16 +176,15 @@ impl<const N: usize> Reassembler<N> {
             p.have[u / 64] |= 1 << (u % 64);
         }
         if !more {
-            p.total = Some(end);
+            p.ended = true;
+            p.total = end;
         }
-        let Some(total) = p.total else {
-            return Outcome::Pending;
-        };
-        if (0..total.div_ceil(8)).any(|u| p.have[u / 64] & 1 << (u % 64) == 0) {
+        if !p.ended || (0..p.total.div_ceil(8)).any(|u| !p.has(u)) {
             return Outcome::Pending;
         }
+        let total = p.total;
         out[..total].copy_from_slice(&p.data[..total]);
-        self.slots[slot] = None;
+        p.used = false;
         self.completed += 1;
         Outcome::Complete(total)
     }
@@ -185,9 +193,9 @@ impl<const N: usize> Reassembler<N> {
     /// before `now`; returns how many.
     pub fn expire(&mut self, now: u64, timeout: u64) -> usize {
         let mut n = 0;
-        for s in &mut self.slots {
-            if s.is_some_and(|p| now.saturating_sub(p.started) > timeout) {
-                *s = None;
+        for p in &mut self.slots {
+            if p.used && now.saturating_sub(p.started) > timeout {
+                p.used = false;
                 n += 1;
             }
         }
@@ -196,24 +204,23 @@ impl<const N: usize> Reassembler<N> {
     }
 
     /// The slot for `key`'s datagram: its own, a free one, or the oldest
-    /// one's (that datagram is dropped).
+    /// one's (that datagram is dropped). Set up in place: only the record
+    /// of which units arrived is cleared, not the data.
     fn slot(&mut self, now: u64, key: Key) -> usize {
-        if let Some(i) = (0..N).find(|&i| self.slots[i].is_some_and(|p| p.key == key)) {
+        if let Some(i) = (0..N).find(|&i| self.slots[i].used && self.slots[i].key == key) {
             return i;
         }
-        let i = (0..N).find(|&i| self.slots[i].is_none()).unwrap_or_else(|| {
+        let i = (0..N).find(|&i| !self.slots[i].used).unwrap_or_else(|| {
             self.dropped += 1;
-            (0..N)
-                .min_by_key(|&i| self.slots[i].map_or(0, |p| p.started))
-                .unwrap()
+            (0..N).min_by_key(|&i| self.slots[i].started).unwrap()
         });
-        self.slots[i] = Some(Partial {
-            key,
-            started: now,
-            total: None,
-            have: [0; UNITS.div_ceil(64)],
-            data: [0; MAX_REASSEMBLED],
-        });
+        let p = &mut self.slots[i];
+        p.used = true;
+        p.key = key;
+        p.started = now;
+        p.ended = false;
+        p.total = 0;
+        p.have = [0; UNITS.div_ceil(64)];
         i
     }
 }
@@ -230,6 +237,18 @@ mod tests {
         proto: 17,
         id: 7,
     };
+
+    /// A reassembler on the heap (each is N times 64 KiB).
+    fn new<const N: usize>() -> std::boxed::Box<Reassembler<N>> {
+        let layout = std::alloc::Layout::new::<Reassembler<N>>();
+        // SAFETY: the layout is the type's; init zeroes it, which is a
+        // valid empty reassembler, and the box takes the allocation.
+        unsafe {
+            let p = std::alloc::alloc(layout) as *mut Reassembler<N>;
+            Reassembler::init(p);
+            std::boxed::Box::from_raw(p)
+        }
+    }
 
     fn payload(n: usize) -> Vec<u8> {
         (0..n).map(|i| (i * 7 + i / 251) as u8).collect()
@@ -258,7 +277,7 @@ mod tests {
     #[test]
     fn in_order() {
         let p = payload(4008);
-        let mut r = Reassembler::<4>::new();
+        let mut r = new::<4>();
         let mut out = [0u8; 4096];
         let got = feed(&mut r, &split(&p, 1480), &mut out);
         assert_eq!(got.last(), Some(&Outcome::Complete(4008)));
@@ -273,7 +292,7 @@ mod tests {
         let mut f = split(&p, 1000 / 8 * 8);
         f.reverse();
         f.insert(1, f[0]);
-        let mut r = Reassembler::<4>::new();
+        let mut r = new::<4>();
         let mut out = [0u8; 4096];
         let got = feed(&mut r, &f, &mut out);
         assert_eq!(got.last(), Some(&Outcome::Complete(3000)));
@@ -284,7 +303,7 @@ mod tests {
     fn overlapping_pieces() {
         let p = payload(2000);
         let f = [(0, true, &p[0..1200]), (800, true, &p[800..1600]), (1600, false, &p[1600..])];
-        let mut r = Reassembler::<4>::new();
+        let mut r = new::<4>();
         let mut out = [0u8; 4096];
         assert_eq!(feed(&mut r, &f, &mut out)[2], Outcome::Complete(2000));
         assert_eq!(&out[..2000], &p[..]);
@@ -294,7 +313,7 @@ mod tests {
     fn missing_piece_waits_then_expires() {
         let p = payload(3000);
         let f = split(&p, 1480);
-        let mut r = Reassembler::<4>::new();
+        let mut r = new::<4>();
         let mut out = [0u8; 4096];
         assert_eq!(r.add(10, KEY, f[0].0, f[0].1, f[0].2, &mut out), Outcome::Pending);
         assert_eq!(r.add(20, KEY, f[2].0, f[2].1, f[2].2, &mut out), Outcome::Pending);
@@ -310,7 +329,7 @@ mod tests {
         let (a, b) = (payload(2500), payload(1600));
         let kb = Key { id: 8, ..KEY };
         let (fa, fb) = (split(&a, 1480), split(&b, 1480));
-        let mut r = Reassembler::<4>::new();
+        let mut r = new::<4>();
         let mut out = [0u8; 4096];
         assert_eq!(r.add(0, KEY, fa[0].0, true, fa[0].2, &mut out), Outcome::Pending);
         assert_eq!(r.add(0, kb, fb[1].0, false, fb[1].2, &mut out), Outcome::Pending);
@@ -323,11 +342,11 @@ mod tests {
     #[test]
     fn too_big_or_malformed_is_dropped() {
         let p = payload(4100);
-        let mut r = Reassembler::<4>::new();
-        let mut out = [0u8; 8192];
+        let mut r = new::<4>();
+        let mut out = std::vec![0u8; 70_000];
         assert_eq!(r.add(0, KEY, 0, true, &p[..1480], &mut out), Outcome::Pending);
         // Past the largest datagram: the whole datagram goes.
-        assert_eq!(r.add(0, KEY, 2960, false, &p[2960..], &mut out), Outcome::Dropped);
+        assert_eq!(r.add(0, KEY, 65_000, false, &p[..600], &mut out), Outcome::Dropped);
         assert_eq!(r.pending(), 0);
         // A middle piece not a whole number of units.
         assert_eq!(r.add(0, KEY, 0, true, &p[..100], &mut out), Outcome::Dropped);
@@ -344,9 +363,42 @@ mod tests {
     }
 
     #[test]
+    fn the_largest_datagram_in_any_order() {
+        // A UDP datagram of 65,507 bytes with its header, in 1480-byte
+        // pieces (as IPv4 sends it), shuffled, two of them twice.
+        let p = payload(65_515);
+        let mut f = split(&p, 1480);
+        let n = f.len();
+        for i in 0..n {
+            f.swap(i, (i * 17 + 5) % n);
+        }
+        f.push(f[3]);
+        f.insert(10, f[20]);
+        let mut r = new::<4>();
+        let mut out = std::vec![0u8; MAX_REASSEMBLED];
+        let got = feed(&mut r, &f, &mut out);
+        let done: Vec<_> = got.iter().filter(|o| **o == Outcome::Complete(65_515)).collect();
+        assert_eq!(done.len(), 1);
+        assert_eq!(&out[..65_515], &p[..]);
+        // The duplicate after completion starts a datagram of its own.
+        assert_eq!(r.completed, 1);
+        // A slot used for a big datagram is clean for the next: a small
+        // one after it in the same slot completes with its own bytes.
+        let q = payload(2000);
+        let k = Key { id: 99, ..KEY };
+        let mut r = new::<1>();
+        for (o, m, d) in split(&p, 1480).into_iter().take(5) {
+            r.add(0, KEY, o, m, d, &mut out);
+        }
+        assert_eq!(r.add(1, k, 1480, false, &q[1480..], &mut out), Outcome::Pending);
+        assert_eq!(r.add(1, k, 0, true, &q[..1480], &mut out), Outcome::Complete(2000));
+        assert_eq!(&out[..2000], &q[..]);
+    }
+
+    #[test]
     fn full_table_pushes_out_the_oldest() {
         let p = payload(3000);
-        let mut r = Reassembler::<2>::new();
+        let mut r = new::<2>();
         let mut out = [0u8; 4096];
         for (t, id) in [(1, 1), (2, 2), (3, 3)] {
             let k = Key { id, ..KEY };

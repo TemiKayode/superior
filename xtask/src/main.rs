@@ -1425,7 +1425,8 @@ fn net_test(arch: Arch) -> Result<(), String> {
             .map_err(|e| e.to_string())?;
         let (stop, echoed) = (stop.clone(), echoed.clone());
         echoes.push(std::thread::spawn(move || {
-            let mut buf = [0u8; 8192];
+            // The largest datagram: the guest's go up to 65,507 bytes.
+            let mut buf = vec![0u8; 65_536];
             while !stop.load(Ordering::Relaxed) {
                 if let Ok((n, from)) = socket.recv_from(&mut buf) {
                     if socket.send_to(&buf[..n], from).is_ok() {
@@ -1478,6 +1479,8 @@ fn net_test(arch: Arch) -> Result<(), String> {
         "net: lease kept: 10.0.3.30/24 via 10.0.3.2",
         "pings to 10.0.3.2 answered, every byte right",
         "UDP datagrams of 1 to 4000 bytes echoed by the host, every byte right",
+        "UDP datagrams of 4097 to 65507 bytes echoed by the host, every byte right",
+        "[pass] net: datagrams of 5000, 40000 and 65507 bytes sent to itself in fragments, and a 65507-byte ping of this host answered, every byte right",
         "datagrams reassembled from fragments,",
         "[pass] net: www.superior.test is 192.0.2.10",
         "[pass] net: alias.superior.test, a CNAME for www, is 192.0.2.10",
@@ -1493,6 +1496,7 @@ fn net_test(arch: Arch) -> Result<(), String> {
         "pings to fd00:3::2 over IPv6 answered, every byte right",
         "UDP datagrams of 1 to 1452 bytes over IPv6 echoed by the host, every byte right",
         "UDP datagrams of 1453 to 4000 bytes sent to itself over IPv6, in fragments, every byte right",
+        "[pass] net: datagrams of 4097, 30000 and 65507 bytes sent to itself over IPv6, and a 20000-byte IPv6 ping of this host answered, every byte right",
         "TCP connections over IPv6 echoed",
         "[cm] client asked to shut down (pass)",
     ];

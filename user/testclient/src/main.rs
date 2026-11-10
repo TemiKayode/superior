@@ -1936,6 +1936,58 @@ impl core::fmt::Display for Dotted {
     }
 }
 
+/// Datagrams past a page and up to the largest (`net::MAX_DATAGRAM`),
+/// echoed by the host in turn: at least `BIG_ECHOES`, for at least
+/// `BIG_TICKS`.
+const BIG_SIZES: [u64; 6] = [4097, 9000, 16_384, 33_333, 50_000, net::MAX_DATAGRAM];
+const BIG_ECHOES: u64 = 12;
+const BIG_TICKS: u64 = 200;
+
+/// The IPv4 address in an address word (`net::addr`), mapped into IPv6.
+fn mapped4(word: u64) -> u128 {
+    0xffff_0000_0000 | (word >> 16) as u32 as u128
+}
+
+/// Datagrams past a page: echoed by the host under fault injection, sent
+/// to the socket itself (round the server's loopback, in fragments), and
+/// a ping of the largest size to this host, which answers it.
+fn big_checks(t: &mut Checks, gw: u64, me: u64) {
+    let (mut ok, mut n, mut stats) = (0, 0, (0, 0));
+    if let Some(mut s) = Sock::new(true) {
+        let start = ticks();
+        while n < BIG_ECHOES || ticks() < start + BIG_TICKS {
+            let k = n;
+            n += 1;
+            let len = BIG_SIZES[k as usize % BIG_SIZES.len()];
+            ok += s.big_exchange(mapped4(gw), ECHO_PORT, false, len, |j| echo_at(k, j)) as u64;
+        }
+        stats = (s.resent, s.rebinds);
+    }
+    t.check(
+        ok == n && n >= BIG_ECHOES,
+        format_args!(
+            "{ok} of {n} UDP datagrams of 4097 to 65507 bytes echoed by the host, every byte right ({} sent again, {} sockets bound again)",
+            stats.0, stats.1
+        ),
+    );
+    let mut ok = 0;
+    if let Some(mut s) = Sock::new(true) {
+        for (k, len) in [(100, 5000), (101, 40_000), (102, net::MAX_DATAGRAM)] {
+            ok += s.big_exchange(mapped4(me), 0, true, len, |j| echo_at(k, j)) as u64;
+        }
+    }
+    let mut pinged = false;
+    if let Some(mut s) = Sock::new(false) {
+        pinged = s.big_exchange(mapped4(me), 7, false, net::MAX_DATAGRAM, |j| echo_at(103, j));
+    }
+    t.check(
+        ok == 3 && pinged,
+        format_args!(
+            "datagrams of 5000, 40000 and 65507 bytes sent to itself in fragments, and a 65507-byte ping of this host answered, every byte right"
+        ),
+    );
+}
+
 fn net_page() -> &'static mut [u8] {
     // SAFETY: the page is mapped at NET_PAGE_VA for good.
     unsafe { core::slice::from_raw_parts_mut(NET_PAGE_VA as *mut u8, 4096) }
@@ -2108,6 +2160,110 @@ impl Sock {
                             self.rebind_if_lost();
                             continue 'send;
                         }
+                    }
+                }
+                let now = ticks();
+                if now >= deadline {
+                    continue 'send;
+                }
+                syscall(Syscall::TimerSignal, NET_NTFN, [deadline - now, 0, 0, 0]);
+                if syscall(Syscall::Wait, NET_NTFN, [0; 4]).status != 0 {
+                    self.rebind();
+                    continue 'send;
+                }
+            }
+        }
+        false
+    }
+
+    /// Sends a `len`-byte datagram whose byte `j` is `byte(j)` to `to`
+    /// (an IPv4 address mapped, or IPv6) port `port` (with `to_self`, the
+    /// socket's own; for ICMP echo, the sequence number), and waits for
+    /// an answer from `to` with the same bytes. Past what follows the
+    /// address on the page, the payload is staged first (`SEND_PART`) and
+    /// an answer's rest fetched (`RECV_PART`). Sends again on a timeout,
+    /// binds again after a restart; false if no answer came at all.
+    fn big_exchange(&mut self, to: u128, port: u16, to_self: bool, len: u64, byte: impl Fn(u64) -> u8) -> bool {
+        const ROOM: u64 = 4096 - 16;
+        let mut tries = 0;
+        'send: while tries < NET_TRIES {
+            tries += 1;
+            if tries > 1 {
+                self.resent += 1;
+            }
+            let port = if to_self { self.port } else { port };
+            if len > ROOM {
+                let mut at = 0;
+                while at < len {
+                    let n = (len - at).min(4096);
+                    for j in 0..n {
+                        net_page()[j as usize] = byte(at + j);
+                    }
+                    match net_call([net::SEND_PART, self.handle, at, n]) {
+                        Some(r) if r[0] == OK => at += n,
+                        Some(r) if r[0] == Status::NotFound as u64 => {
+                            self.rebind();
+                            continue 'send;
+                        }
+                        Some(r) if r[0] == Status::NoSpace as u64 => {
+                            superior_sys::sleep(1);
+                            continue 'send;
+                        }
+                        _ => {
+                            self.rebind_if_lost();
+                            continue 'send;
+                        }
+                    }
+                }
+            } else {
+                for j in 0..len {
+                    net_page()[16 + j as usize] = byte(j);
+                }
+            }
+            net_page()[..16].copy_from_slice(&to.to_be_bytes());
+            match net_call([net::SEND6, self.handle, port as u64, len]) {
+                Some(r) if r[0] == OK => {}
+                Some(r) if r[0] == Status::NotFound as u64 => {
+                    self.rebind();
+                    continue;
+                }
+                _ => {
+                    self.rebind_if_lost();
+                    continue;
+                }
+            }
+            let deadline = ticks() + NET_TIMEOUT;
+            loop {
+                loop {
+                    let r = match net_call([net::RECV6, self.handle, 0, 0]) {
+                        Some(r) if r[0] == OK => r,
+                        Some(r) if r[0] == Status::Empty as u64 => break,
+                        _ => {
+                            self.rebind_if_lost();
+                            continue 'send;
+                        }
+                    };
+                    let n = r[1];
+                    let first = n.min(ROOM);
+                    let mut right = page_addr(0) == to
+                        && n == len
+                        && (0..first).all(|j| net_page()[16 + j as usize] == byte(j));
+                    // The rest, a page at a time.
+                    let mut at = first;
+                    while right && at < n {
+                        match net_call([net::RECV_PART, self.handle, at, 0]) {
+                            Some(p) if p[0] == OK && p[1] > 0 => {
+                                right = (0..p[1]).all(|j| net_page()[j as usize] == byte(at + j));
+                                at += p[1];
+                            }
+                            _ => {
+                                self.rebind_if_lost();
+                                continue 'send;
+                            }
+                        }
+                    }
+                    if right {
+                        return true;
                     }
                 }
                 let now = ticks();
@@ -2515,6 +2671,24 @@ fn ipv6_checks(t: &mut Checks) {
             );
         }
     }
+    // Past a page, to itself over IPv6 (QEMU does not fragment IPv6), in
+    // 1448-byte fragments round the loopback.
+    let mut ok = 0;
+    if let Some(mut s) = Sock::new(true) {
+        for (k, len) in [(200, 4097), (201, 30_000), (202, net::MAX_DATAGRAM)] {
+            ok += s.big_exchange(HOST6, 0, true, len, |j| echo_at(k, j)) as u64;
+        }
+    }
+    let mut pinged = false;
+    if let Some(mut s) = Sock::new(false) {
+        pinged = s.big_exchange(HOST6, 9, false, 20_000, |j| echo_at(203, j));
+    }
+    t.check(
+        ok == 3 && pinged,
+        format_args!(
+            "datagrams of 4097, 30000 and 65507 bytes sent to itself over IPv6, and a 20000-byte IPv6 ping of this host answered, every byte right"
+        ),
+    );
     tcp_under_faults(t, Dest::V6(GW6, TCP_ECHO_PORT));
 }
 
@@ -3288,6 +3462,7 @@ fn net_client() -> ! {
             stats.0, stats.1
         ),
     );
+    big_checks(&mut t, gw, info[1]);
     let s = syscall(Syscall::Call, NET, [net::STATS, net::VERSION, 0, 0]).msg;
     t.check(
         s[0] == OK && s[1] > 0 && s[2] > 0,

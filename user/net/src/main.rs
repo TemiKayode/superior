@@ -28,7 +28,7 @@
 //! the server has no address: `INFO` and `SEND` answer `Unreachable`.
 //!
 //! Slots: 0 the `nic` endpoint, 1 the `net` endpoint (receive), 2 untyped
-//! memory (1 MiB), 17 the state page.
+//! memory (2 MiB), 17 the state page.
 //!
 //! TCP (`superior_inet::tcp`): up to [`CONNS`] connections, each with
 //! 8 KiB rings each way in pages made at start, and using window scaling,
@@ -43,11 +43,18 @@
 //! IPv6 (`ip6`) runs beside IPv4 on the same sockets and connections:
 //! addresses are 128 bits everywhere, IPv4 ones mapped (`::ffff:a.b.c.d`).
 //!
-//! Datagrams up to `net::MAX_DATAGRAM` bytes go and come in IPv4
+//! Datagrams up to `net::MAX_DATAGRAM` bytes (65,507) go and come in
 //! fragments: a datagram too big for one frame is sent in 1480-byte
-//! pieces, and fragments that arrive are put back together
-//! (`superior_inet::Reassembler`), up to four datagrams at once, each
-//! given 5 s; one that does not complete in time is dropped.
+//! pieces (1448 over IPv6), and fragments that arrive are put back
+//! together (`superior_inet::Reassembler`), up to four datagrams at once,
+//! each given 5 s; one that does not complete in time is dropped. Queued
+//! datagrams live in a pool of pages ([`POOL`]), a page for each 4 KiB
+//! of a datagram, as do the pieces a client stages to send one too big for
+//! its page (`SEND_PART`) and the rest of one too big for the page it
+//! received into (`RECV_PART`); one socket holds at most [`SOCKET_POOL`]
+//! of them, so one flooded socket cannot starve the others. The loopback
+//! is a link like the Ethernet (a big datagram to this host goes round in
+//! fragments), with room for [`LOOPBACK`] of them.
 
 #![no_std]
 #![no_main]
@@ -75,22 +82,31 @@ const TX_FRAME: u64 = 7;
 const LENT: u64 = 8;
 /// The state page, which outlives instances: the DHCP lease.
 const STATE: u64 = 17;
-/// The sockets' queue pages, SOCKETS * QUEUE of them.
-const QUEUE_PAGES: u64 = 18;
+/// The datagram pool's pages, POOL of them.
+const POOL_PAGES: u64 = 18;
 /// The TCP connections' ring pages, CONNS * 4 of them.
-const TCP_PAGES: u64 = QUEUE_PAGES + (SOCKETS * QUEUE) as u64;
+const TCP_PAGES: u64 = POOL_PAGES + POOL as u64;
 /// The loopback queue's pages, LOOPBACK of them.
 const LOOP_PAGES: u64 = TCP_PAGES + (CONNS * 4) as u64;
+/// A reassembled datagram's pages, and those a datagram is built in to
+/// be sent in fragments (BIG_PAGES each).
+const WHOLE_PAGES: u64 = LOOP_PAGES + LOOPBACK as u64;
+const PIECES_PAGES: u64 = WHOLE_PAGES + BIG_PAGES as u64;
+/// The reassembler's pages.
+const REASM_PAGES: u64 = PIECES_PAGES + BIG_PAGES as u64;
 /// Socket `i`'s notification.
-const SOCK_NTFN: u64 = LOOP_PAGES + LOOPBACK as u64;
+const SOCK_NTFN: u64 = REASM_PAGES + REASM_SIZE.div_ceil(4096) as u64;
 
 const RX_VA: u64 = USER_BASE + 0x4000_0000;
 const TX_VA: u64 = RX_VA + 0x1000;
 const LENT_VA: u64 = RX_VA + 0x2000;
 const STATE_VA: u64 = RX_VA + 0x3000;
-const QUEUE_VA: u64 = RX_VA + 0x10_0000;
+const POOL_VA: u64 = RX_VA + 0x10_0000;
 const TCP_VA: u64 = RX_VA + 0x20_0000;
 const LOOP_VA: u64 = RX_VA + 0x30_0000;
+const WHOLE_VA: u64 = RX_VA + 0x40_0000;
+const PIECES_VA: u64 = RX_VA + 0x50_0000;
+const REASM_VA: u64 = RX_VA + 0x60_0000;
 
 /// Badges on this thread's notification.
 const RX: u64 = 1;
@@ -145,10 +161,19 @@ const BACKLOG: usize = 2;
 /// How long a closed connection may take to finish (30 s).
 const LINGER: u64 = 3000;
 /// Packets to this host's own address waiting to be handled, a page
-/// each (more are dropped, as a busy link would).
-const LOOPBACK: usize = 4;
+/// each (more are dropped, as a busy link would): room for a datagram of
+/// the largest size in fragments, and the start of its answer.
+const LOOPBACK: usize = 64;
 /// Datagrams a socket keeps until they are received.
 const QUEUE: usize = 4;
+/// Pages in the datagram pool, and the most one socket may hold (three
+/// datagrams of the largest size).
+const POOL: usize = 160;
+const SOCKET_POOL: usize = 3 * DATAGRAM_PAGES;
+/// Pages a datagram of the largest size takes, and a whole IP payload.
+const DATAGRAM_PAGES: usize = MAX_DATAGRAM.div_ceil(4096);
+const BIG_PAGES: usize = MAX_REASSEMBLED.div_ceil(4096);
+const REASM_SIZE: usize = core::mem::size_of::<Reassembler<REASSEMBLING>>();
 const ARP_CACHE: usize = 12;
 const WAITING: usize = 4;
 const MAX_FRAME: usize = nic::MAX_FRAME as usize;
@@ -197,12 +222,20 @@ struct Conn {
     counted: tcp::Stats,
 }
 
-/// A queued datagram; its bytes are in its queue page (`queue_page`).
+/// A queued datagram; its bytes are in pool pages (`pool_page`), the
+/// first `len.div_ceil(4096)` of `pages`.
 #[derive(Clone, Copy)]
 struct Datagram {
     len: u16,
     from: u128,
     port: u16,
+    pages: [u8; DATAGRAM_PAGES],
+}
+
+impl Datagram {
+    fn page_count(&self) -> usize {
+        (self.len as usize).div_ceil(4096).max(1)
+    }
 }
 
 struct Socket {
@@ -214,6 +247,16 @@ struct Socket {
     head: usize,
     count: usize,
     dropped: u64,
+    /// The datagram last received, while its rest may be fetched
+    /// (`RECV_PART`).
+    held: Option<Datagram>,
+    /// The datagram being staged to send (`SEND_PART`): its bytes so far,
+    /// in the first `stage_pages` of `stage`.
+    staged: usize,
+    stage_pages: usize,
+    stage: [u8; DATAGRAM_PAGES],
+    /// Pool pages it holds.
+    pooled: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -269,7 +312,8 @@ struct Net {
     resend: u64,
     /// Ticks between renewals (0: halfway through the lease).
     renew_every: u64,
-    reassembly: Reassembler<REASSEMBLING>,
+    /// Which pool pages are in use.
+    pool: [u64; POOL.div_ceil(64)],
     /// The last IPv4 identification used.
     ip_id: u16,
     /// MAC addresses learned from ARP and Neighbor Discovery.
@@ -299,12 +343,55 @@ const EMPTY: Datagram = Datagram {
     len: 0,
     from: 0,
     port: 0,
+    pages: [0; DATAGRAM_PAGES],
 };
 
-/// The page holding the bytes of socket `i`'s queue entry `j`: one page
-/// each, made at start, so the image stays small.
-fn queue_page(i: usize, j: usize) -> &'static mut [u8] {
-    page(QUEUE_VA + 0x1000 * (i * QUEUE + j) as u64)
+/// Pool page `p`, made at start, so the image stays small.
+fn pool_page(p: u8) -> &'static mut [u8] {
+    page(POOL_VA + 0x1000 * p as u64)
+}
+
+/// Copies bytes `at..at + out.len()` of the datagram in pool pages
+/// `pages` to `out`.
+fn pool_read(pages: &[u8], at: usize, out: &mut [u8]) {
+    let mut done = 0;
+    while done < out.len() {
+        let (p, o) = ((at + done) / 4096, (at + done) % 4096);
+        let n = (4096 - o).min(out.len() - done);
+        out[done..done + n].copy_from_slice(&pool_page(pages[p])[o..o + n]);
+        done += n;
+    }
+}
+
+/// Copies `data` into the datagram in pool pages `pages` from byte `at`.
+fn pool_write(pages: &[u8], at: usize, data: &[u8]) {
+    let mut done = 0;
+    while done < data.len() {
+        let (p, o) = ((at + done) / 4096, (at + done) % 4096);
+        let n = (4096 - o).min(data.len() - done);
+        pool_page(pages[p])[o..o + n].copy_from_slice(&data[done..done + n]);
+        done += n;
+    }
+}
+
+/// A reassembled datagram, while it is handled.
+fn whole() -> &'static mut [u8] {
+    // SAFETY: BIG_PAGES pages are mapped at WHOLE_VA for good; one thread,
+    // and each use ends before the next begins.
+    unsafe { core::slice::from_raw_parts_mut(WHOLE_VA as *mut u8, MAX_REASSEMBLED) }
+}
+
+/// A datagram's IP payload, while it is sent in fragments.
+fn pieces() -> &'static mut [u8] {
+    // SAFETY: as for `whole`, at PIECES_VA.
+    unsafe { core::slice::from_raw_parts_mut(PIECES_VA as *mut u8, MAX_REASSEMBLED) }
+}
+
+/// The reassembler, set up (`Reassembler::init`) at start.
+fn reassembly() -> &'static mut Reassembler<REASSEMBLING> {
+    // SAFETY: its pages are mapped at REASM_VA for good and it was set up
+    // in `start`; one thread.
+    unsafe { &mut *(REASM_VA as *mut Reassembler<REASSEMBLING>) }
 }
 
 /// The address word (`net::addr`) for `a` and `port`: 0 for an IPv6
@@ -352,11 +439,6 @@ fn state_number(s: tcp::State) -> u64 {
     }
 }
 
-/// A reassembled datagram, while it is handled.
-static mut WHOLE: [u8; MAX_REASSEMBLED] = [0; MAX_REASSEMBLED];
-/// A datagram's payload, while it is sent in fragments.
-static mut PIECES: [u8; MAX_REASSEMBLED] = [0; MAX_REASSEMBLED];
-
 static mut NET: Net = Net {
     mac: [0; 6],
     lease: None,
@@ -364,7 +446,7 @@ static mut NET: Net = Net {
     xid: 0,
     resend: 0,
     renew_every: 0,
-    reassembly: Reassembler::new(),
+    pool: [0; POOL.div_ceil(64)],
     ip_id: 0,
     arp: [None; ARP_CACHE],
     v6: V6::new(),
@@ -854,7 +936,8 @@ impl Net {
             lease.gateway
         };
         if len > FRAGMENT {
-            return self.fragments(lease.ip, dst, proto, len, hop);
+            pieces()[..len].copy_from_slice(&page(TX_VA)[34..34 + len]);
+            return self.fragments(lease.ip, dst, proto, len, Some(hop));
         }
         let total = 20 + len;
         self.ip_header(lease.ip, dst, proto, len, 0);
@@ -897,7 +980,9 @@ impl Net {
     /// Handles the packets this host sent itself, and those their answers
     /// send.
     fn run_loopback(&mut self) {
-        for _ in 0..64 {
+        // What a packet's handling sends itself is handled too, up to a
+        // bound.
+        for _ in 0..1024 {
             if self.loop_count == 0 {
                 break;
             }
@@ -916,15 +1001,43 @@ impl Net {
         }
     }
 
-    /// Sends the `len`-byte payload on the transmit page in fragments.
-    fn fragments(&mut self, src: u32, dst: u32, proto: u8, len: usize, hop: u32) -> Status {
-        let Some(mac) = self.lookup(mapped(hop)) else {
-            self.arp_send(1, [0; 6], hop);
+    /// Sends a packet whose IP payload (`len` bytes) is in `pieces()`,
+    /// in fragments if it does not fit a frame.
+    fn send_pieces(&mut self, dst: u128, proto: u8, len: usize) -> Status {
+        let Some(d) = ipv4(dst) else {
+            return self.send_pieces6(dst, proto, len);
+        };
+        let Some(lease) = self.lease else {
             return Status::Unreachable;
         };
-        // SAFETY: one thread; PIECES is used only here.
-        let pieces = unsafe { &mut *(&raw mut PIECES) };
-        pieces[..len].copy_from_slice(&page(TX_VA)[34..34 + len]);
+        if len <= FRAGMENT {
+            page(TX_VA)[34..34 + len].copy_from_slice(&pieces()[..len]);
+            return self.ip4_send(d, proto, len);
+        }
+        let hop = if d == lease.ip {
+            None
+        } else if d & lease.mask == lease.ip & lease.mask {
+            Some(d)
+        } else {
+            Some(lease.gateway)
+        };
+        self.fragments(lease.ip, d, proto, len, hop)
+    }
+
+    /// Sends the `len`-byte payload in `pieces()` in fragments, to `hop`
+    /// (`None`: round the loopback, to this host).
+    fn fragments(&mut self, src: u32, dst: u32, proto: u8, len: usize, hop: Option<u32>) -> Status {
+        let mac = match hop {
+            None => None,
+            Some(h) => match self.lookup(mapped(h)) {
+                Some(m) => Some(m),
+                None => {
+                    self.arp_send(1, [0; 6], h);
+                    return Status::Unreachable;
+                }
+            },
+        };
+        let pieces = pieces();
         self.ip_id = self.ip_id.wrapping_add(1);
         let id = self.ip_id;
         let mut at = 0;
@@ -935,6 +1048,11 @@ impl Net {
             // The same identification on every fragment: only the offset
             // (in 8-byte units) and "more fragments" differ.
             self.ip_header_as(src, dst, proto, n, id, (more as u16) << 13 | (at / 8) as u16);
+            let Some(mac) = mac else {
+                self.loop_push(20 + n);
+                at += n;
+                continue;
+            };
             self.ether(mac, ETH_IP);
             let s = self.transmit((14 + 20 + n).max(60));
             if s != Status::Ok {
@@ -986,7 +1104,7 @@ impl Net {
             k.tcb.tick(now);
             self.pump(c);
         }
-        let expired = self.reassembly.expire(ticks(), REASSEMBLY_TICKS);
+        let expired = reassembly().expire(ticks(), REASSEMBLY_TICKS);
         count(STAT_DROPPED, expired as u64);
         for w in 0..WAITING {
             let Some(mut f) = self.waiting[w] else {
@@ -1056,10 +1174,9 @@ impl Net {
                 proto: p[9],
                 id: be16(p, 4) as u32,
             };
-            // SAFETY: one thread; WHOLE holds this datagram until it has
-            // been handled, and nothing else uses it.
-            let whole = unsafe { &mut *(&raw mut WHOLE) };
-            match self.reassembly.add(ticks(), key, offset, more, &p[ihl..total], whole) {
+            // whole() holds this datagram until it has been handled.
+            let whole = whole();
+            match reassembly().add(ticks(), key, offset, more, &p[ihl..total], whole) {
                 Outcome::Complete(n) => {
                     count(STAT_REASSEMBLED, 1);
                     &whole[..n]
@@ -1088,17 +1205,27 @@ impl Net {
         let (id, seq) = (be16(m, 4), be16(m, 6));
         match m[0] {
             ICMP_ECHO => {
-                // Answer with the same identifier, sequence and data.
+                // Answer with the same identifier, sequence and data: on
+                // the transmit page, or if it does not fit there, built
+                // for fragments (`m` is never in `pieces()`).
                 let len = m.len().min(MAX_DATAGRAM + 8);
-                let tx = page(TX_VA);
-                let r = &mut tx[34..34 + len];
+                let big = 34 + len > 4096;
+                let r = if big {
+                    &mut pieces()[..len]
+                } else {
+                    &mut page(TX_VA)[34..34 + len]
+                };
                 r.copy_from_slice(&m[..len]);
                 r[0] = ICMP_ECHO_REPLY;
                 r[2] = 0;
                 r[3] = 0;
                 let c = fold(sum(0, r));
                 put16(r, 2, c);
-                self.ip_send(mapped(src), PROTO_ICMP, len);
+                if big {
+                    self.send_pieces(mapped(src), PROTO_ICMP, len);
+                } else {
+                    self.ip_send(mapped(src), PROTO_ICMP, len);
+                }
             }
             ICMP_ECHO_REPLY => self.deliver(Kind::Icmp(id), mapped(src), seq, &m[8..]),
             ICMP_UNREACHABLE => self.unreachable(m[1], &m[8..]),
@@ -1167,21 +1294,78 @@ impl Net {
         else {
             return;
         };
-        let s = self.sockets[i].as_mut().unwrap();
-        if s.count == QUEUE {
-            s.dropped += 1;
-            return;
-        }
-        let j = (s.head + s.count) % QUEUE;
         let n = data.len().min(MAX_DATAGRAM);
-        s.queue[j] = Datagram {
+        let mut d = Datagram {
             len: n as u16,
             from: src,
             port,
+            pages: [0; DATAGRAM_PAGES],
         };
-        queue_page(i, j)[..n].copy_from_slice(&data[..n]);
+        let full = self.sockets[i].as_ref().unwrap().count == QUEUE;
+        let k = d.page_count();
+        if full || !self.take_pages(i, &mut d.pages[..k]) {
+            self.sockets[i].as_mut().unwrap().dropped += 1;
+            return;
+        }
+        pool_write(&d.pages, 0, &data[..n]);
+        let s = self.sockets[i].as_mut().unwrap();
+        let j = (s.head + s.count) % QUEUE;
+        s.queue[j] = d;
         s.count += 1;
         syscall(Syscall::Signal, SOCK_NTFN + i as u64, [0; 4]);
+    }
+
+    /// Fills `out` with free pool pages for socket `i`, if it may have
+    /// that many more and there are; false (and none taken) if not.
+    fn take_pages(&mut self, i: usize, out: &mut [u8]) -> bool {
+        if self.sockets[i].as_ref().unwrap().pooled + out.len() > SOCKET_POOL {
+            return false;
+        }
+        for k in 0..out.len() {
+            let Some(p) = (0..POOL).find(|&p| self.pool[p / 64] & 1 << (p % 64) == 0) else {
+                self.give_pages(i, &out[..k]);
+                return false;
+            };
+            self.pool[p / 64] |= 1 << (p % 64);
+            out[k] = p as u8;
+        }
+        self.sockets[i].as_mut().unwrap().pooled += out.len();
+        true
+    }
+
+    /// Returns socket `i`'s pool pages `pages`.
+    fn give_pages(&mut self, i: usize, pages: &[u8]) {
+        for &p in pages {
+            self.pool[p as usize / 64] &= !(1 << (p % 64));
+        }
+        self.sockets[i].as_mut().unwrap().pooled -= pages.len();
+    }
+
+    /// Returns every pool page socket `i` holds: queued datagrams, the
+    /// one held for `RECV_PART` and what is staged.
+    fn release(&mut self, i: usize) {
+        self.drop_held(i);
+        self.drop_staged(i);
+        while let Some(s) = self.sockets[i].as_mut().filter(|s| s.count > 0) {
+            let d = s.queue[s.head];
+            s.head = (s.head + 1) % QUEUE;
+            s.count -= 1;
+            self.give_pages(i, &d.pages[..d.page_count()]);
+        }
+    }
+
+    fn drop_held(&mut self, i: usize) {
+        if let Some(d) = self.sockets[i].as_mut().unwrap().held.take() {
+            self.give_pages(i, &d.pages[..d.page_count()]);
+        }
+    }
+
+    fn drop_staged(&mut self, i: usize) {
+        let s = self.sockets[i].as_mut().unwrap();
+        let (stage, n) = (s.stage, s.stage_pages);
+        s.staged = 0;
+        s.stage_pages = 0;
+        self.give_pages(i, &stage[..n]);
     }
 
     /// Whether to drop this TCP segment (the test setting).
@@ -1444,6 +1628,7 @@ impl Net {
             }
             _ => {}
         }
+        self.release(i);
         self.sockets[i] = None;
         syscall(Syscall::CapRevoke, SOCK_NTFN + i as u64, [0; 4]);
     }
@@ -1485,6 +1670,11 @@ impl Net {
             head: 0,
             count: 0,
             dropped: 0,
+            held: None,
+            staged: 0,
+            stage_pages: 0,
+            stage: [0; DATAGRAM_PAGES],
+            pooled: 0,
         });
         Ok(handle)
     }
@@ -1501,10 +1691,12 @@ impl Net {
             .any(|s| s.kind == Kind::Udp(port))
     }
 
-    /// Sends `len` bytes of the client's page from socket `i` to `to`
-    /// (`port` being the port, or an echo's sequence number); with no
-    /// `to` (`SEND6`), the page starts with the address and the payload
-    /// follows it.
+    /// Sends a `len`-byte datagram from socket `i` to `to` (`port` being
+    /// the port, or an echo's sequence number); with no `to` (`SEND6`),
+    /// the client's page starts with the address. The payload follows on
+    /// the page, or, if it does not fit there, is what `SEND_PART`
+    /// staged. One too big for the transmit page is built in `pieces()`
+    /// and goes in fragments.
     fn send(&mut self, i: usize, to: Option<u128>, port: u16, len: usize) -> Status {
         if len > MAX_DATAGRAM || syscall(Syscall::FrameMap, LENT, [LENT_VA, 0, 0, 0]).status != 0 {
             return Status::Invalid;
@@ -1518,48 +1710,120 @@ impl Net {
                 (u128::from_be_bytes(a), 16)
             }
         };
-        let data = &lent[at..at + len];
+        let s = self.sockets[i].as_ref().unwrap();
+        let staged = len > 4096 - at;
+        if staged && s.staged != len {
+            syscall(Syscall::FrameUnmap, LENT, [0; 4]);
+            return Status::Invalid;
+        }
+        let (kind, stage) = (s.kind, s.stage);
         let off = Net::payload_at(dst);
-        let tx = page(TX_VA);
-        let status = match (self.source_for(dst), self.sockets[i].as_ref().unwrap().kind) {
-            (None, _) => Status::Unreachable,
+        let big = off + 8 + len > 4096;
+        // Where the headers and payload are built.
+        let out = if big {
+            &mut pieces()[..8 + len]
+        } else {
+            &mut page(TX_VA)[off..off + 8 + len]
+        };
+        if staged {
+            pool_read(&stage, 0, &mut out[8..]);
+        } else {
+            out[8..].copy_from_slice(&lent[at..at + len]);
+        }
+        syscall(Syscall::FrameUnmap, LENT, [0; 4]);
+        if staged {
+            self.drop_staged(i);
+        }
+        let proto = match (self.source_for(dst), kind) {
+            (None, _) => return Status::Unreachable,
             (Some(src), Kind::Udp(local)) => {
-                let u = &mut tx[off..off + 8 + len];
-                put16(u, 0, local);
-                put16(u, 2, port);
-                put16(u, 4, (8 + len) as u16);
-                put16(u, 6, 0);
-                u[8..].copy_from_slice(data);
-                let c = fold(sum(pseudo(src, dst, PROTO_UDP, 8 + len), u));
-                put16(u, 6, if c == 0 { 0xffff } else { c });
-                self.ip_send(dst, PROTO_UDP, 8 + len)
+                put16(out, 0, local);
+                put16(out, 2, port);
+                put16(out, 4, (8 + len) as u16);
+                put16(out, 6, 0);
+                let c = fold(sum(pseudo(src, dst, PROTO_UDP, 8 + len), out));
+                put16(out, 6, if c == 0 { 0xffff } else { c });
+                PROTO_UDP
             }
             (Some(src), Kind::Icmp(id)) => {
                 let six = ipv4(dst).is_none();
-                let m = &mut tx[off..off + 8 + len];
-                m[0] = if six { 128 } else { ICMP_ECHO };
-                m[1] = 0;
-                put16(m, 2, 0);
-                put16(m, 4, id);
-                put16(m, 6, port);
-                m[8..].copy_from_slice(data);
+                out[0] = if six { 128 } else { ICMP_ECHO };
+                out[1] = 0;
+                put16(out, 2, 0);
+                put16(out, 4, id);
+                put16(out, 6, port);
                 let c = if six {
-                    fold(sum(pseudo(src, dst, NH_ICMP6, 8 + len), m))
+                    fold(sum(pseudo(src, dst, NH_ICMP6, 8 + len), out))
                 } else {
-                    fold(sum(0, m))
+                    fold(sum(0, out))
                 };
-                put16(m, 2, c);
-                self.ip_send(dst, if six { NH_ICMP6 } else { PROTO_ICMP }, 8 + len)
+                put16(out, 2, c);
+                if six { NH_ICMP6 } else { PROTO_ICMP }
             }
-            (_, Kind::Listen(_) | Kind::Tcp(_)) => Status::Invalid,
+            (_, Kind::Listen(_) | Kind::Tcp(_)) => return Status::Invalid,
         };
+        if big {
+            self.send_pieces(dst, proto, 8 + len)
+        } else {
+            self.ip_send(dst, proto, 8 + len)
+        }
+    }
+
+    /// `SEND_PART`: stages `len` bytes of the client's page as bytes
+    /// `offset..` of socket `i`'s next datagram.
+    fn send_part(&mut self, i: usize, offset: usize, len: usize) -> Status {
+        if !matches!(self.kind(i), Kind::Udp(_) | Kind::Icmp(_)) {
+            return Status::Invalid;
+        }
+        if offset == 0 {
+            self.drop_staged(i);
+        }
+        let s = self.sockets[i].as_ref().unwrap();
+        if offset != s.staged || len > 4096 || offset + len > MAX_DATAGRAM {
+            return Status::Invalid;
+        }
+        let (have, need) = (s.stage_pages, (offset + len).div_ceil(4096));
+        if need > have {
+            let mut more = [0u8; DATAGRAM_PAGES];
+            if !self.take_pages(i, &mut more[..need - have]) {
+                return Status::NoSpace;
+            }
+            let s = self.sockets[i].as_mut().unwrap();
+            s.stage[have..need].copy_from_slice(&more[..need - have]);
+            s.stage_pages = need;
+        }
+        if syscall(Syscall::FrameMap, LENT, [LENT_VA, 0, 0, 0]).status != 0 {
+            return Status::Invalid;
+        }
+        let s = self.sockets[i].as_mut().unwrap();
+        pool_write(&s.stage, offset, &page(LENT_VA)[..len]);
+        s.staged = offset + len;
         syscall(Syscall::FrameUnmap, LENT, [0; 4]);
-        status
+        Status::Ok
+    }
+
+    /// `RECV_PART`: payload bytes `offset..` of the datagram socket `i`
+    /// last received, into the client's page.
+    fn recv_part(&mut self, i: usize, offset: usize) -> [u64; 4] {
+        let Some(d) = self.sockets[i].as_ref().unwrap().held else {
+            return [Status::Empty as u64, 0, 0, 0];
+        };
+        if offset >= d.len as usize {
+            return [Status::Empty as u64, 0, 0, 0];
+        }
+        if syscall(Syscall::FrameMap, LENT, [LENT_VA, 1, 0, 0]).status != 0 {
+            return [Status::Invalid as u64, 0, 0, 0];
+        }
+        let n = (d.len as usize - offset).min(4096);
+        pool_read(&d.pages, offset, &mut page(LENT_VA)[..n]);
+        syscall(Syscall::FrameUnmap, LENT, [0; 4]);
+        [Status::Ok as u64, n as u64, 0, 0]
     }
 
     /// `RECV`, or with `six` `RECV6` (the sender's address first in the
     /// page, then the payload).
     fn recv(&mut self, i: usize, six: bool) -> [u64; 4] {
+        self.drop_held(i);
         let s = self.sockets[i].as_mut().unwrap();
         if s.count == 0 {
             return [Status::Empty as u64, 0, 0, 0];
@@ -1571,14 +1835,20 @@ impl Net {
         let n = d.len as usize;
         let lent = page(LENT_VA);
         let at = if six { 16 } else { 0 };
-        let n = n.min(4096 - at);
-        lent[at..at + n].copy_from_slice(&queue_page(i, s.head)[..n]);
+        let first = n.min(4096 - at);
+        pool_read(&d.pages, 0, &mut lent[at..at + first]);
         if six {
             lent[..16].copy_from_slice(&d.from.to_be_bytes());
         }
         syscall(Syscall::FrameUnmap, LENT, [0; 4]);
         s.head = (s.head + 1) % QUEUE;
         s.count -= 1;
+        // Kept while the client may fetch the rest.
+        if first < n {
+            s.held = Some(d);
+        } else {
+            self.give_pages(i, &d.pages[..d.page_count()]);
+        }
         let family = if ipv4(d.from).is_some() { 4 } else { 6 };
         if six {
             [Status::Ok as u64, n as u64, d.port as u64, family]
@@ -1664,6 +1934,15 @@ impl Net {
             },
             net::SEND6 if lent => match self.socket(badge, m[1]).map(|i| (i, self.kind(i))) {
                 Some((i, Kind::Udp(_) | Kind::Icmp(_))) => status(self.send(i, None, m[2] as u16, m[3] as usize)),
+                Some(_) => status(Status::Invalid),
+                None => status(Status::NotFound),
+            },
+            net::SEND_PART if lent => match self.socket(badge, m[1]) {
+                Some(i) => status(self.send_part(i, m[2] as usize, m[3] as usize)),
+                None => status(Status::NotFound),
+            },
+            net::RECV_PART if lent => match self.socket(badge, m[1]).map(|i| (i, self.kind(i))) {
+                Some((i, Kind::Udp(_) | Kind::Icmp(_))) => (self.recv_part(i, m[2] as usize), false),
                 Some(_) => status(Status::Invalid),
                 None => status(Status::NotFound),
             },
@@ -1798,24 +2077,25 @@ fn start(n: &mut Net) -> Result<(), (&'static str, u64)> {
     for i in 0..SOCKETS as u64 {
         retype(ObjectType::Notification, SOCK_NTFN + i)?;
     }
-    for k in 0..(SOCKETS * QUEUE) as u64 {
-        retype(ObjectType::Frame, QUEUE_PAGES + k)?;
-        if syscall(Syscall::FrameMap, QUEUE_PAGES + k, [QUEUE_VA + 0x1000 * k, 1, 0, 0]).status != 0 {
-            return Err(("mapping a queue page", k));
+    // Pages made at start: (first slot, where they go, how many).
+    let runs = [
+        (POOL_PAGES, POOL_VA, POOL, "a pool page"),
+        (TCP_PAGES, TCP_VA, CONNS * 4, "a TCP page"),
+        (LOOP_PAGES, LOOP_VA, LOOPBACK, "a loopback page"),
+        (WHOLE_PAGES, WHOLE_VA, BIG_PAGES, "a reassembly page"),
+        (PIECES_PAGES, PIECES_VA, BIG_PAGES, "a fragmenting page"),
+        (REASM_PAGES, REASM_VA, REASM_SIZE.div_ceil(4096), "a reassembler page"),
+    ];
+    for (slot, va, n, what) in runs {
+        for k in 0..n as u64 {
+            retype(ObjectType::Frame, slot + k)?;
+            if syscall(Syscall::FrameMap, slot + k, [va + 0x1000 * k, 1, 0, 0]).status != 0 {
+                return Err((what, k));
+            }
         }
     }
-    for k in 0..(CONNS * 4) as u64 {
-        retype(ObjectType::Frame, TCP_PAGES + k)?;
-        if syscall(Syscall::FrameMap, TCP_PAGES + k, [TCP_VA + 0x1000 * k, 1, 0, 0]).status != 0 {
-            return Err(("mapping a TCP page", k));
-        }
-    }
-    for k in 0..LOOPBACK as u64 {
-        retype(ObjectType::Frame, LOOP_PAGES + k)?;
-        if syscall(Syscall::FrameMap, LOOP_PAGES + k, [LOOP_VA + 0x1000 * k, 1, 0, 0]).status != 0 {
-            return Err(("mapping a loopback page", k));
-        }
-    }
+    // SAFETY: its pages were just mapped, writable, at REASM_VA.
+    unsafe { Reassembler::init(REASM_VA as *mut Reassembler<REASSEMBLING>) };
     if syscall(Syscall::FrameMap, STATE, [STATE_VA, 1, 0, 0]).status != 0 {
         return Err(("mapping the state page", STATE));
     }

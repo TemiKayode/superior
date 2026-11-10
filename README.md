@@ -432,12 +432,17 @@ holds the rest):
   - The server speaks IPv4 over Ethernet: ARP (answering for itself, resolving next
     hops, holding frames that wait for an answer and asking again), ICMP echo (it
     answers pings) and UDP, with checksums, and IPv4 fragments: a datagram of up to
-    4,000 bytes too big for one frame goes in 1,480-byte pieces, and fragments that
-    arrive are put back together (`crates/inet`, up to four datagrams at once, each
-    dropped if not whole within 5 s; malformed, overlapping past the end and
-    oversized fragments are refused, which host unit tests check). It serves the `net`
+    65,507 bytes (UDP's largest) too big for one frame goes in 1,480-byte pieces, and
+    fragments that arrive are put back together (`crates/inet`, up to four datagrams
+    at once, each dropped if not whole within 5 s; malformed, overlapping past the
+    end and oversized fragments are refused, which host unit tests check, the
+    largest datagram arriving shuffled among them). It serves the `net`
     interface: UDP and ICMP-echo sockets, each owned by the client that bound it, send
-    and receive with a lent page; `STATS` counts datagrams reassembled, sent in
+    and receive with a lent page; a datagram longer than the page goes in pieces
+    (`SEND_PART` stages it a page at a time, and `RECV_PART` fetches what `RECV`
+    could not copy). Queued datagrams live in a pool of 160 pages, a page per 4 KiB,
+    with at most 48 to a socket, so a flooded socket cannot starve the others;
+    the loopback carries a big datagram to this host in fragments too; `STATS` counts datagrams reassembled, sent in
     fragments and dropped half reassembled, kept across restarts in the state page. Each socket comes with a notification of the server's, signalled when
     something arrives: a client waits on it, with a `TimerSignal` on it for a timeout,
     and a server restart deletes it, which wakes the client to bind again. The server's
@@ -509,7 +514,7 @@ holds the rest):
     included, is kept in the state page so a restarted server goes on at once.
     ICMPv6 echo both ways, "unreachable" ending a connection attempt, UDP and
     TCP (MSS 1,440) over IPv6, extension headers skipped, and fragments both
-    ways (1,448-byte pieces up to 4,000 bytes, put back together with the IPv4
+    ways (1,448-byte pieces up to 65,507 bytes, put back together with the IPv4
     reassembler). The `net` interface's `SEND6`, `RECV6`, `TCP_CONNECT6`,
     `TCP_PEER` and `INFO6` take and give 16-byte addresses in the lent page;
     the IPv4 calls go on unchanged.
@@ -521,7 +526,8 @@ holds the rest):
   gateway, netmask and DNS server. For at least 2 s the client pings the gateway, then for
   at least 5 s it sends UDP datagrams of 1 to 4,000 bytes that the host echoes back
   (those over 1,472 bytes go out in fragments, which QEMU puts back together, and
-  come back in fragments, which the server must; it must have done both);
+  come back in fragments, which the server must; it must have done both), then for
+  at least 2 s datagrams of 4,097 to 65,507 bytes, staged and fetched in pieces;
   meanwhile the injector kills the driver, the server and the resolver in turn
   every 30 to 150 ms. Every ping and every datagram must come back with every byte
   right (the client sends again after 300 ms, or binds again when its socket is
@@ -546,7 +552,10 @@ holds the rest):
   server fd00:3::3, each address passing detection once and kept across every
   restart; pings to the host (fd00:3::2) for at least 2 s; UDP datagrams of 1 to
   1,452 bytes echoed by the host (on ::1); datagrams of 1,453 to 4,000 bytes sent
-  to the client's own socket in fragments and put back together; and TCP echoes
+  to the client's own socket in fragments and put back together, and ones of
+  4,097, 30,000 and 65,507 bytes and a 20,000-byte ping of this host (as over
+  IPv4: 5,000, 40,000 and 65,507 bytes to itself and a 65,507-byte ping), QEMU
+  not fragmenting IPv6; and TCP echoes
   for at least 5 s, every byte right.
   `cargo xtask tcp-test` boots `boot/tcp.manifest`, where the server drops one TCP
   segment in 20 at random each way (a test setting in its `arg`): a connection to
@@ -626,7 +635,7 @@ these buses have none); more than one command per queue in the NVMe driver,
 more than two commands in flight per disk in the AHCI driver, ATAPI
 and port multipliers; in the xHCI driver isochronous and bulk endpoints, USB 3 streams,
 hubs and more than one interrupter, and HID devices other than boot keyboards; in the network server
-IPv6 routes beyond one router and stateful DHCPv6, datagrams over 4,000 bytes, DNS records other than A, AAAA and CNAME (and DNS over TCP), routes beyond one gateway, and rings in place of a
+IPv6 routes beyond one router and stateful DHCPv6, DNS records other than A, AAAA and CNAME (and DNS over TCP), routes beyond one gateway, and rings in place of a
 call per frame; buses behind bridges; the async executor, buffer pools and
 power callbacks of the SDK; an IDL compiler for the interfaces; escalating a component
 given up on to a supervisor above it (today the

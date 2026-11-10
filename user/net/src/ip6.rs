@@ -354,10 +354,25 @@ impl Net {
             return Status::Unreachable;
         };
         if len > PAYLOAD6 {
+            pieces()[..len].copy_from_slice(&page(TX_VA)[54..54 + len]);
             return self.fragments6(src, dst, next, len);
         }
         self.ip6_header(src, dst, next, len, 64);
         self.out6(dst, 40 + len)
+    }
+
+    /// Sends a packet whose payload (`len` bytes) is in `pieces()`, in
+    /// fragments if it does not fit a frame.
+    pub fn send_pieces6(&mut self, dst: u128, next: u8, len: usize) -> Status {
+        let Some(src) = self.source6(dst) else {
+            return Status::Unreachable;
+        };
+        if len <= PAYLOAD6 {
+            page(TX_VA)[54..54 + len].copy_from_slice(&pieces()[..len]);
+            self.ip6_header(src, dst, next, len, 64);
+            return self.out6(dst, 40 + len);
+        }
+        self.fragments6(src, dst, next, len)
     }
 
     /// Sends the packet (`total` bytes) on the transmit page: round the
@@ -388,12 +403,10 @@ impl Net {
         Status::Ok
     }
 
-    /// Sends the `len`-byte payload on the transmit page in fragments,
-    /// each with a fragment header (RFC 8200 4.5).
+    /// Sends the `len`-byte payload in `pieces()` in fragments, each with
+    /// a fragment header (RFC 8200 4.5).
     fn fragments6(&mut self, src: u128, dst: u128, next: u8, len: usize) -> Status {
-        // SAFETY: one thread; PIECES is used only while fragmenting.
-        let pieces = unsafe { &mut *(&raw mut PIECES) };
-        pieces[..len].copy_from_slice(&page(TX_VA)[54..54 + len]);
+        let pieces = pieces();
         self.v6.frag_id = self.v6.frag_id.wrapping_add(1) ^ (self.epoch as u32) << 16;
         let id = self.v6.frag_id;
         let mut at = 0;
@@ -564,10 +577,10 @@ impl Net {
                         id: be32(p, at + 4),
                     };
                     let (offset, more) = ((off & !7) as usize, off & 1 != 0);
-                    // SAFETY: one thread; WHOLE holds this datagram until
+                    // whole() holds this datagram until
                     // it has been handled, and nothing else uses it.
-                    let whole = unsafe { &mut *(&raw mut WHOLE) };
-                    match self.reassembly.add(ticks(), key, offset, more, &p[at + 8..total], whole) {
+                    let whole = whole();
+                    match reassembly().add(ticks(), key, offset, more, &p[at + 8..total], whole) {
                         Outcome::Complete(n) => {
                             count(STAT_REASSEMBLED, 1);
                             next = key.proto;
@@ -602,17 +615,28 @@ impl Net {
         match m[0] {
             ICMP6_ECHO if self.ours6(dst) || dst == ALL_NODES => {
                 let len = m.len().min(MAX_DATAGRAM + 8);
-                let r = &mut page(TX_VA)[54..54 + len];
-                r.copy_from_slice(&m[..len]);
-                r[0] = ICMP6_ECHO_REPLY;
                 let Some(me) = self.source6(src) else {
                     return;
                 };
+                // Too big for the transmit page: built for fragments (`m`
+                // is never in `pieces()`).
+                let big = 54 + len > 4096;
+                let r = if big {
+                    &mut pieces()[..len]
+                } else {
+                    &mut page(TX_VA)[54..54 + len]
+                };
+                r.copy_from_slice(&m[..len]);
+                r[0] = ICMP6_ECHO_REPLY;
                 if len > PAYLOAD6 {
                     put16(r, 2, 0);
                     let c = fold(sum(pseudo(me, src, NH_ICMP6, len), r));
                     put16(r, 2, c);
-                    self.ip6_send(src, NH_ICMP6, len);
+                    if big {
+                        self.send_pieces6(src, NH_ICMP6, len);
+                    } else {
+                        self.ip6_send(src, NH_ICMP6, len);
+                    }
                 } else {
                     self.icmp6_send(me, src, len, 64);
                 }
