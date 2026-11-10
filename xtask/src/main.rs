@@ -593,10 +593,23 @@ fn qemu_command(img: &Image) -> Command {
         )
     };
     if let (Some(disk), "nvme") = (&img.disk, img.driver) {
-        // QEMU's NVMe controller does its DMA through the IOMMU.
+        // QEMU's NVMe controller does its DMA through the IOMMU. Two
+        // namespaces: the disk, and a small one of its own pattern.
         q.arg("-drive")
             .arg(drive("nvm0", disk))
-            .args(["-device", "nvme,serial=superior0,drive=nvm0"]);
+            .arg("-drive")
+            .arg(format!(
+                "if=none,id=nvm1,format=raw,readonly=on,file={}",
+                second_namespace().display()
+            ))
+            .args([
+                "-device",
+                "nvme,id=nvme0,serial=superior0",
+                "-device",
+                "nvme-ns,drive=nvm0,bus=nvme0,nsid=1",
+                "-device",
+                "nvme-ns,drive=nvm1,bus=nvme0,nsid=2",
+            ]);
     } else if let (Some(disk), "ahci") = (&img.disk, img.driver) {
         // q35 has an AHCI controller (ICH9, 00:1f.2); virt needs one added.
         // Its DMA goes through the IOMMU.
@@ -791,6 +804,23 @@ fn supervise_test(img: &Image) -> Result<(), String> {
     Ok(())
 }
 
+/// The NVMe tests' second namespace: 64 sectors, word `k` of sector `s`
+/// being `0x4e32 << 48 | s << 16 | k`. Written afresh each time (it is
+/// small).
+fn second_namespace() -> PathBuf {
+    let mut bytes = Vec::with_capacity(64 * 512);
+    for s in 0..64u64 {
+        for k in 0..64u64 {
+            bytes.extend_from_slice(&(0x4e32u64 << 48 | s << 16 | k).to_le_bytes());
+        }
+    }
+    let path = root().join("target").join("nvme-namespace-2.img");
+    if let Err(e) = std::fs::write(&path, bytes) {
+        eprintln!("xtask: writing {}: {e}", path.display());
+    }
+    path
+}
+
 /// Writes the drivers test's disk: 128 sectors, word `k` (little-endian
 /// u64) of sector `s` being `0x5355 << 48 | s << 16 | k`, so a client can
 /// check every word it reads (`user/testclient`).
@@ -840,6 +870,10 @@ fn drivers_test(img: &Image) -> Result<(), String> {
         }
     );
     let forged: &str = if d == "virtio-blk" { &forged } else { "" };
+    // NVMe: two I/O queues, each with its own thread, and the second
+    // namespace a unit of its own.
+    let nvme = d == "nvme";
+    let pick = |s: &'static str| if nvme { s } else { "" };
     let steps: &[&str] = &[
         remap,
         remap_at,
@@ -849,10 +883,19 @@ fn drivers_test(img: &Image) -> Result<(), String> {
         "given to client 2 (reset:",
         "new, empty IOMMU domain",
         &ready,
+        pick("2 I/O queues, interrupts on MSI-X vectors 0-1"),
+        pick("nvme: unit 0: namespace 1, 128 blocks of 512 bytes"),
+        pick("nvme: unit 1: namespace 2, 64 blocks of 512 bytes"),
         "[pass] block: 128 sectors of 512 bytes",
         "[pass] block: read 8 sectors from 0 by DMA into its page: every word right",
         "[pass] block: read 8 sectors from 100 by DMA into its page: every word right",
         "[pass] block: read 1 sectors from 127 by DMA into its page: every word right",
+        pick("[pass] block: unit 1 of 2: 64 sectors of 512 bytes"),
+        pick("[pass] block: read 8 sectors from 0 of unit 1: its own data, every word right"),
+        pick("[pass] block: read 4 sectors from 60 of unit 1: its own data, every word right"),
+        pick("[pass] block: unit 1 ends at its own size, and there is no unit 2"),
+        "[pass] block: two threads read 40 times each at once: every word right",
+        pick("[pass] block: the driver used all 2 of its I/O queues, with up to 2 commands in flight at once"),
         "may not have",
         "[pass] block: the bus server will not give it the driver's device",
         "[pass] block: nor any BAR page",
@@ -921,8 +964,10 @@ fn fs_test(arch: Arch, driver: &'static str) -> Result<(), String> {
         .map_err(|e| format!("writing {}: {e}", disk.display()))?;
     println!("== filesystem test, first boot: {}", first.path.display());
     let out = run_to_exit(&first, Duration::from_secs(120))?;
+    // The server may be killed during the format (and format again, or
+    // find it done); either way the first mount sees an empty filesystem.
     let steps = [
-        "fs: formatted",
+        "fs: formatting",
         "fs: mounted in",
         "fs: check: 0 blocks used by 0 files and 0 directories; all accounted for",
         "[pass] fs: created an empty logs/app.log",
@@ -980,7 +1025,7 @@ fn fs_test(arch: Arch, driver: &'static str) -> Result<(), String> {
     for step in steps {
         check_log("filesystem test (second boot)", &out, &[step])?;
     }
-    if out.contains("fs: formatted") {
+    if out.contains("fs: formatting") {
         return Err("filesystem test: the second boot formatted the disk".into());
     }
     println!("== filesystem test passed ({}, {driver})", arch.name());

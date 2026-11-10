@@ -514,6 +514,8 @@ impl Fs {
     }
 
     fn format(&mut self) {
+        // Said first: the injector may kill the server before the end.
+        say!("formatting {} blocks", self.blocks);
         buf(B_SCRATCH).fill(0);
         write_block(JHDR, B_SCRATCH);
         for b in 0..INODE_BLOCKS {

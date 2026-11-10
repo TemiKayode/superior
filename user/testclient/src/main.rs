@@ -284,39 +284,122 @@ const BLOCK_MEMORY: u64 = 2;
 const BLOCK_CONTROL: u64 = 3;
 const BUFFER: u64 = 4;
 const BUFFER_VA: u64 = USER_BASE + 0x4000_0000;
+/// A second thread that reads at the same time as the first: its thread,
+/// stack pages, buffer and the notification it signals when done. In its
+/// own CSpace: the block endpoint in 0, the notification in 2 and its
+/// buffer in `BUFFER`, so it reads like the main thread.
+const HELPER: u64 = 5;
+const HELPER_STACK: u64 = 6;
+const HELPER_BUFFER: u64 = 8;
+const HELPER_DONE: u64 = 9;
+const H_DONE: u64 = 2;
+const HELPER_STACK_VA: u64 = USER_BASE + 0x4800_0000;
+const HELPER_BUFFER_VA: u64 = BUFFER_VA + 0x1000;
+/// Reads each thread makes at the same time.
+const ROUNDS: u64 = 40;
+/// Reads the helper got wrong (or `u64::MAX` until it is done).
+static HELPER_FAILED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+/// The NVMe driver's test operation: its I/O queues and how busy they got.
+const OP_QUEUES: u64 = 0x9e5e;
 
-/// Word `k` of sector `s` of the test disk (see `xtask`).
+/// Word `k` of sector `s` of the test disk (see `xtask`), and of the
+/// second namespace's disk (NVMe).
 fn disk_word(s: u64, k: u64) -> u64 {
     0x5355_0000_0000_0000 | s << 16 | k
+}
+
+fn disk2_word(s: u64, k: u64) -> u64 {
+    0x4e32_0000_0000_0000 | s << 16 | k
 }
 
 /// Reads `count` sectors from `sector` into the buffer (lent with the
 /// call; retried if the driver restarts under it) and checks them.
 fn read_and_check(sector: u64, count: u64) -> Result<(), &'static str> {
+    read_unit(0, sector, count, BUFFER_VA, disk_word)
+}
+
+/// Reads `count` sectors from `sector` of `unit` into the buffer in slot
+/// `BUFFER`, mapped at `va`, and checks each word against `word`.
+fn read_unit(
+    unit: u64,
+    sector: u64,
+    count: u64,
+    va: u64,
+    word: fn(u64, u64) -> u64,
+) -> Result<(), &'static str> {
     let words = (count * block::SECTOR / 8) as usize;
-    // SAFETY: the buffer frame is mapped at BUFFER_VA.
-    let buf = unsafe { core::slice::from_raw_parts_mut(BUFFER_VA as *mut u64, 512) };
+    // SAFETY: the buffer frame is mapped at `va`.
+    let buf = unsafe { core::slice::from_raw_parts_mut(va as *mut u64, 512) };
     buf.fill(0);
     let lend = CapTransfer {
         grant: Some(BUFFER as u16),
         accept: None,
     };
     let peer_restarted = Error::PeerRestarted.code();
-    let mut r = syscall_x(Syscall::Call, BLOCK, [block::READ, sector, count, 0], lend);
+    let msg = [block::READ, sector, count, unit];
+    let mut r = syscall_x(Syscall::Call, BLOCK, msg, lend);
     for _ in 0..3 {
         if r.status != peer_restarted {
             break;
         }
-        r = syscall_x(Syscall::Call, BLOCK, [block::READ, sector, count, 0], lend);
+        r = syscall_x(Syscall::Call, BLOCK, msg, lend);
     }
     if r.status != 0 || r.msg[0] != Status::Ok as u64 {
         return Err("the read failed");
     }
     for (k, w) in buf[..words].iter().enumerate() {
         let k = k as u64;
-        if *w != disk_word(sector + k / 64, k % 64) {
+        if *w != word(sector + k / 64, k % 64) {
             return Err("wrong data");
         }
+    }
+    Ok(())
+}
+
+/// The helper thread: `ROUNDS` reads of the test disk, then it says how
+/// many went wrong.
+extern "C" fn block_helper(_: u64) -> ! {
+    let failed = (0..ROUNDS)
+        .filter(|&i| read_unit(0, (i * 8) % 128, 8, HELPER_BUFFER_VA, disk_word).is_err())
+        .count() as u64;
+    HELPER_FAILED.store(failed, Ordering::SeqCst);
+    syscall(Syscall::Signal, H_DONE, [0; 4]);
+    // Not waiting on H_DONE: that could take the signal back before the
+    // main thread sees it. The main thread suspends this one.
+    loop {
+        syscall(Syscall::Yield, 0, [0; 4]);
+    }
+}
+
+/// Starts the helper thread: Ok, or what failed.
+fn start_helper() -> Result<(), &'static str> {
+    let made = |ty: ObjectType, slot: u64| {
+        syscall(Syscall::Retype, BLOCK_MEMORY, [ty as u64, 0, slot, 0]).status == 0
+    };
+    let map = |slot: u64, va: u64| syscall(Syscall::FrameMap, slot, [va, 1, 0, 0]).status == 0;
+    if !(made(ObjectType::Thread, HELPER)
+        && made(ObjectType::Frame, HELPER_STACK)
+        && made(ObjectType::Frame, HELPER_STACK + 1)
+        && map(HELPER_STACK, HELPER_STACK_VA)
+        && map(HELPER_STACK + 1, HELPER_STACK_VA + 0x1000)
+        && made(ObjectType::Frame, HELPER_BUFFER)
+        && map(HELPER_BUFFER, HELPER_BUFFER_VA)
+        && made(ObjectType::Notification, HELPER_DONE))
+    {
+        return Err("out of memory");
+    }
+    for (from, to) in [(BLOCK, BLOCK), (HELPER_DONE, H_DONE), (HELPER_BUFFER, BUFFER)] {
+        if syscall(Syscall::ThreadCopyCap, HELPER, [from, to, 0xff, 0]).status != 0 {
+            return Err("could not give it its capabilities");
+        }
+    }
+    let entry = block_helper as *const () as u64;
+    let top = HELPER_STACK_VA + 0x2000;
+    let configured = (0..=255u64).rev().any(|prio| {
+        syscall(Syscall::ThreadConfigure, HELPER, [entry, top, 0, prio]).status == 0
+    });
+    if !configured || syscall(Syscall::ThreadResume, HELPER, [0; 4]).status != 0 {
+        return Err("could not start it");
     }
     Ok(())
 }
@@ -330,6 +413,7 @@ fn block_client(open: [u64; 4]) -> ! {
         r.status == 0 && r.msg[0] == 0 && r.msg[1] == 128 && r.msg[2] == 512,
         format_args!("{} sectors of {} bytes", r.msg[1], r.msg[2]),
     );
+    let units = r.msg[3];
     let made = syscall(
         Syscall::Retype,
         BLOCK_MEMORY,
@@ -347,6 +431,68 @@ fn block_client(open: [u64; 4]) -> ! {
             format_args!(
                 "read {count} sectors from {sector} by DMA into its page: {}",
                 r.err().unwrap_or("every word right")
+            ),
+        );
+    }
+    // A second unit (NVMe's second namespace) is a disk of its own: its
+    // own size, its own data, its own bounds.
+    if units > 1 {
+        let r = syscall(Syscall::Call, BLOCK, [block::INFO, block::VERSION, 1, 0]);
+        t.check(
+            r.status == 0 && r.msg[0] == 0 && r.msg[1] == 64 && r.msg[3] == units,
+            format_args!("unit 1 of {units}: {} sectors of {} bytes", r.msg[1], r.msg[2]),
+        );
+        for (sector, count) in [(0, 8), (60, 4)] {
+            let r = read_unit(1, sector, count, BUFFER_VA, disk2_word);
+            t.check(
+                r.is_ok(),
+                format_args!(
+                    "read {count} sectors from {sector} of unit 1: {}",
+                    r.err().unwrap_or("its own data, every word right")
+                ),
+            );
+        }
+        let lend = CapTransfer {
+            grant: Some(BUFFER as u16),
+            accept: None,
+        };
+        let past = syscall_x(Syscall::Call, BLOCK, [block::READ, 64, 1, 1], lend);
+        let none = syscall(Syscall::Call, BLOCK, [block::INFO, block::VERSION, units, 0]);
+        t.check(
+            past.msg[0] == Status::Invalid as u64 && none.msg[0] == Status::NotFound as u64,
+            format_args!("unit 1 ends at its own size, and there is no unit {units}"),
+        );
+    }
+    // Two threads reading at once; the NVMe driver serves them on two
+    // queues, each with its own thread and vector.
+    let helper = start_helper();
+    let mut failed = 0;
+    if helper.is_ok() {
+        failed = (0..ROUNDS)
+            .filter(|&i| read_and_check((i * 8 + 64) % 128, 8).is_err())
+            .count() as u64;
+        syscall(Syscall::Wait, HELPER_DONE, [0; 4]);
+        syscall(Syscall::ThreadSuspend, HELPER, [0; 4]);
+    }
+    let helper_failed = HELPER_FAILED.load(Ordering::SeqCst);
+    t.check(
+        helper.is_ok() && failed == 0 && helper_failed == 0,
+        format_args!(
+            "two threads read {ROUNDS} times each at once: {}",
+            match helper {
+                Err(e) => e,
+                Ok(()) if failed + helper_failed == 0 => "every word right",
+                Ok(()) => "some reads went WRONG",
+            }
+        ),
+    );
+    let r = syscall(Syscall::Call, BLOCK, [OP_QUEUES, 0, 0, 0]);
+    if r.status == 0 && r.msg[0] == Status::Ok as u64 {
+        let (queues, peak, used) = (r.msg[1], r.msg[2], r.msg[3]);
+        t.check(
+            queues >= 2 && used == (1 << queues) - 1 && peak >= 2,
+            format_args!(
+                "the driver used all {queues} of its I/O queues, with up to {peak} commands in flight at once"
             ),
         );
     }

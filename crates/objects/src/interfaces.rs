@@ -114,22 +114,27 @@ pub mod block {
     /// Bytes per sector.
     pub const SECTOR: u64 = 512;
 
-    /// `[INFO, VERSION]`: reply `[status, capacity in sectors, sector
-    /// size, 0]`.
+    /// A driver serves one or more units (NVMe namespaces; a virtio or
+    /// AHCI disk is one unit), numbered from 0; calls name one in their
+    /// last word, so a client that knows of none uses unit 0.
+    ///
+    /// `[INFO, VERSION, unit]`: reply `[status, the unit's capacity in
+    /// sectors, sector size, how many units there are]`; `NotFound` for a
+    /// unit there is not.
     pub const INFO: u64 = 1;
-    /// `[READ, first sector, count]` with a frame granted: reads `count`
+    /// `[READ, first sector, count, unit]` with a frame granted: reads `count`
     /// sectors (at most 8, one page) into the frame by DMA. The frame is
     /// the caller's: the driver hands it back (deletes its copy) before
     /// replying. Reply: `[status]`. Reads are idempotent, so a client may
     /// retry one that failed with `PeerRestarted`.
     pub const READ: u64 = 2;
-    /// `[WRITE, first sector, count]` with a frame granted: writes `count`
+    /// `[WRITE, first sector, count, unit]` with a frame granted: writes `count`
     /// sectors (at most 8) from the frame. The driver hands the frame back
     /// before replying. A write is not durable until a `FLUSH` after it
     /// succeeds. Idempotent, so it may be retried.
     pub const WRITE: u64 = 3;
-    /// `[FLUSH]`: every write that succeeded before it is on stable
-    /// storage when it succeeds. Idempotent.
+    /// `[FLUSH]`: every write that succeeded before it, to any unit, is on
+    /// stable storage when it succeeds. Idempotent.
     pub const FLUSH: u64 = 4;
     /// Most sectors one `READ` or `WRITE` moves.
     pub const MAX_SECTORS: u64 = 4096 / SECTOR;

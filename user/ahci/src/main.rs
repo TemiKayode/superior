@@ -423,8 +423,12 @@ impl Disk {
     fn serve(&mut self, m: [u64; 4], lent: bool, faults: bool) -> [u64; 4] {
         let status = |s: Status| [s as u64, 0, 0, 0];
         match m[0] {
-            block::INFO if m[1] == block::VERSION => {
-                [Status::Ok as u64, self.sectors, block::SECTOR, 0]
+            // One unit: the disk.
+            block::INFO if m[1] == block::VERSION && m[2] == 0 => {
+                [Status::Ok as u64, self.sectors, block::SECTOR, 1]
+            }
+            block::INFO | block::READ | block::WRITE if m[if m[0] == block::INFO { 2 } else { 3 }] != 0 => {
+                status(Status::NotFound)
             }
             block::FLUSH if self.cache => status(self.status(ATA_FLUSH_EXT, 0, 0, 0)),
             // No write cache: every completed write is already durable.

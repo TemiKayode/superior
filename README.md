@@ -222,9 +222,16 @@ holds the rest):
   - An NVMe driver (`user/nvme/`), the first class driver: it opens the first
     function of class 01:08:02 (`pci::OPEN_CLASS`), whoever made it, and serves the
     same `block` interface. It disables the controller, sets up the admin queues,
-    identifies the controller (its write cache) and namespace 1 (its size and block
-    size), and creates one I/O queue pair whose completions raise MSI-X vector 0.
-    One command at a time, one PRP entry each (a request is at most a page).
+    identifies the controller (its write cache) and every active namespace (size and
+    block size), and creates two I/O queue pairs (as many as the controller grants,
+    up to two), each with its own MSI-X vector and its own thread: the main thread
+    serves the first, and a thread the driver makes in its address space, with a
+    small CSpace laid out like the main one, serves the second. Both receive on the
+    one `block` endpoint, so two requests are in flight at once, one PRP entry each
+    (a request is at most a page). Each namespace is a unit of the `block`
+    interface: calls name a unit in their last word (0 for the first), and `INFO`
+    says how many there are. Every command waits on a timer as well as its
+    interrupt, so one that never completes times out.
   - An AHCI (SATA) driver (`user/ahci/`), opening the first function of class
     01:06:01. The bus server cannot reset such a controller (no Function Level
     Reset), so the driver resets the whole controller itself on every start, then
@@ -244,7 +251,12 @@ holds the rest):
     bypass left on, the same test fails), and the IOMMU must report a blocked
     write to exactly that page;
   - the driver is crashed, restarted, its device reset and reopened, and reads work
-    again.
+    again;
+  - two client threads read 40 times each at once, every word right; NVMe must
+    report using both of its I/O queues with two commands in flight at once.
+  With NVMe the controller has a second namespace, a small disk of its own
+  pattern: the client must see it as unit 1, of its own size, read its own data
+  from it, and be refused past its end and for a unit 2.
   `cargo xtask nvme-test` and `cargo xtask ahci-test` run that test and the
   filesystem test with the disk on QEMU's NVMe controller or on an AHCI port (q35's
   own ICH9 controller on x86-64, with the boot disk moved to port 1; one added on
@@ -418,8 +430,8 @@ holds the rest):
 Not yet: an interrupt for IOMMU faults (they are collected on
 the timer tick), buses behind bridges in the IOMMU (requester IDs on bus 0 only); Function
 Level Reset is exercised only by the NVMe controller (QEMU's virtio devices on
-these buses have none); several queues and commands in flight in the NVMe driver,
-namespaces other than 1, several commands (NCQ) and ports in the AHCI driver, ATAPI
+these buses have none); more than one command per queue in the NVMe driver,
+several commands (NCQ) and ports in the AHCI driver, ATAPI
 and port multipliers; in the xHCI driver isochronous and bulk endpoints, USB 3 streams,
 hubs and more than one interrupter, and HID devices other than boot keyboards; in the network server
 DHCP, TCP, IPv6, fragments, DNS, routes beyond one gateway, and rings in place of a
