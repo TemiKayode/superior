@@ -1,0 +1,44 @@
+# The TCP test (cargo xtask tcp-test).
+#
+# The network server drops one TCP segment in 20 at random, both ways
+# (arg's high 32 bits: 20 << 32, plus the 2 s lease renewal of the network
+# test), so retransmission, fast retransmit and out-of-order arrival all
+# happen. The client is refused by a closed port on the host, has 100,000
+# bytes echoed by the host, and serves connections the host makes to its
+# listening port through QEMU's forwarding.
+
+component pcibus
+  image pcibus
+  priority 12
+  provides pci 0
+  device pci-config 1
+  device pci-mmio 2
+  device msi 3
+  device iommu 11
+  untyped 18 12
+
+component virtio-net
+  image virtio-net
+  priority 11
+  uses pci 0
+  provides nic 1
+  notification 2
+  untyped 16 3
+
+component net
+  image net
+  arg 85899345120
+  priority 10
+  uses nic 0
+  provides net 1
+  untyped 19 2
+  state 17
+  cspace 7
+
+component client
+  image testclient
+  arg 18
+  priority 8
+  uses net 0
+  control 1
+  untyped 12 2

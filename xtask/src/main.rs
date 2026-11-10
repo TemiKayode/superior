@@ -147,6 +147,7 @@ fn main() -> ExitCode {
                         .and_then(|_| disk_test(a, "nvme"))
                         .and_then(|_| disk_test(a, "ahci"))
                         .and_then(|_| net_test(a))
+                        .and_then(|_| tcp_test(a))
                         .and_then(|_| keyboard_test(a))
                         .and_then(|_| image(false, a))
                         .and_then(|img| shell_session(&img))
@@ -168,13 +169,14 @@ fn main() -> ExitCode {
         Some("nvme-test") => disk_test(arch, "nvme"),
         Some("ahci-test") => disk_test(arch, "ahci"),
         Some("net-test") => net_test(arch),
+        Some("tcp-test") => tcp_test(arch),
         Some("keyboard-test") => keyboard_test(arch),
         Some("memory-test") => {
             image_with(false, arch, "memory").and_then(|img| memory_test(&img))
         }
         Some("bench") => image(false, Arch::X86_64).and_then(|img| bench(&img)),
         _ => Err(
-            "usage: cargo xtask <image | run | test | boot-test | shell-test | cm-test | supervise-test | drivers-test | memory-test | fs-test | nvme-test | ahci-test | net-test | keyboard-test | bench | sel4-test> [x86_64 | aarch64]"
+            "usage: cargo xtask <image | run | test | boot-test | shell-test | cm-test | supervise-test | drivers-test | memory-test | fs-test | nvme-test | ahci-test | net-test | tcp-test | keyboard-test | bench | sel4-test> [x86_64 | aarch64]"
                 .into(),
         ),
     });
@@ -416,7 +418,7 @@ fn image_for(
         disk,
         writable: fs,
         driver,
-        net: manifest == "net",
+        net: matches!(manifest, "net" | "tcp"),
         keyboard: manifest == "keyboard",
     })
 }
@@ -650,7 +652,8 @@ fn qemu_command(img: &Image) -> Command {
         // Modern virtio only, its DMA through the IOMMU.
         q.args([
             "-netdev",
-            "user,id=n0,net=10.0.3.0/24,dhcpstart=10.0.3.30",
+            // The TCP test's host connects in through 47004.
+            "user,id=n0,net=10.0.3.0/24,dhcpstart=10.0.3.30,hostfwd=tcp:127.0.0.1:47004-:8080",
             "-device",
             "virtio-net-pci,netdev=n0,disable-legacy=on,iommu_platform=on",
         ]);
@@ -1173,6 +1176,144 @@ fn dns_answer(q: &[u8]) -> Option<(Vec<u8>, String)> {
     Some((r, name))
 }
 
+/// The host's TCP echo for the guest (`net-test`, `tcp-test`), a port
+/// nothing listens on, and the port forwarded to the TCP test's listener.
+const TCP_ECHO_PORT: u16 = 47002;
+const TCP_FORWARD_PORT: u16 = 47004;
+
+/// Byte `j` of TCP stream `k`, as the guest's test client makes them.
+fn tcp_byte(k: u64, j: u64) -> u8 {
+    (k.wrapping_mul(0x9e37) ^ j.wrapping_mul(13) ^ j >> 9) as u8
+}
+
+/// Echoes TCP connections to `TCP_ECHO_PORT` until `stop`: what a
+/// connection sends comes back, and when it shuts down, so does the echo.
+/// Counts the bytes echoed.
+fn tcp_echo_server(
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    echoed: std::sync::Arc<std::sync::atomic::AtomicU64>,
+) -> Result<std::thread::JoinHandle<()>, String> {
+    use std::io::Read;
+    use std::net::{Shutdown, TcpListener};
+    use std::sync::atomic::Ordering;
+    let l = TcpListener::bind(("127.0.0.1", TCP_ECHO_PORT))
+        .map_err(|e| format!("binding the TCP echo port {TCP_ECHO_PORT}: {e}"))?;
+    l.set_nonblocking(true).map_err(|e| e.to_string())?;
+    Ok(std::thread::spawn(move || {
+        while !stop.load(Ordering::Relaxed) {
+            match l.accept() {
+                Ok((mut s, _)) => {
+                    let echoed = echoed.clone();
+                    std::thread::spawn(move || {
+                        let _ = s.set_nonblocking(false);
+                        let _ = s.set_read_timeout(Some(Duration::from_secs(30)));
+                        let mut buf = [0u8; 16384];
+                        loop {
+                            match s.read(&mut buf) {
+                                Ok(0) => {
+                                    let _ = s.shutdown(Shutdown::Write);
+                                    break;
+                                }
+                                Ok(n) => {
+                                    if s.write_all(&buf[..n]).is_err() {
+                                        break;
+                                    }
+                                    echoed.fetch_add(n as u64, Ordering::Relaxed);
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                    });
+                }
+                Err(_) => std::thread::sleep(Duration::from_millis(10)),
+            }
+        }
+    }))
+}
+
+/// Connects `n` times, one after another, to the guest's listener through
+/// QEMU's forwarding: each sends `len` bytes of stream 1000 + its number,
+/// shuts down, and must get them all back. Connections QEMU accepted
+/// before the guest listened come to nothing, and are made again. Returns
+/// the connections echoed right.
+fn tcp_inbound(n: u64, len: u64, stop: std::sync::Arc<std::sync::atomic::AtomicBool>) -> u64 {
+    use std::io::Read;
+    use std::net::{Shutdown, TcpStream};
+    use std::sync::atomic::Ordering;
+    let mut done = 0;
+    while done < n && !stop.load(Ordering::Relaxed) {
+        let k = 1000 + done;
+        let Ok(mut s) = TcpStream::connect(("127.0.0.1", TCP_FORWARD_PORT)) else {
+            std::thread::sleep(Duration::from_millis(200));
+            continue;
+        };
+        let _ = s.set_read_timeout(Some(Duration::from_secs(20)));
+        let data: Vec<u8> = (0..len).map(|j| tcp_byte(k, j)).collect();
+        let writer = s.try_clone().map(|mut w| {
+            let data = data.clone();
+            std::thread::spawn(move || {
+                let ok = w.write_all(&data).is_ok();
+                let _ = w.shutdown(Shutdown::Write);
+                ok
+            })
+        });
+        let mut back = Vec::new();
+        let read = s.read_to_end(&mut back).is_ok();
+        let wrote = writer.map(|w| w.join().unwrap_or(false)).unwrap_or(false);
+        if read && wrote && back == data {
+            done += 1;
+        } else {
+            std::thread::sleep(Duration::from_millis(300));
+        }
+    }
+    done
+}
+
+/// Boots `boot/tcp.manifest`: the network server drops one TCP segment in
+/// 20 each way; the client is refused by a closed port, has 100,000
+/// bytes echoed by the host, and echoes three connections the host makes
+/// to it (each 30,000 bytes, more than its window).
+fn tcp_test(arch: Arch) -> Result<(), String> {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    let img = image_with(false, arch, "tcp")?;
+    let stop = Arc::new(AtomicBool::new(false));
+    let echoed = Arc::new(AtomicU64::new(0));
+    let echo = tcp_echo_server(stop.clone(), echoed.clone())?;
+    let inbound = {
+        let stop = stop.clone();
+        std::thread::spawn(move || tcp_inbound(3, 30_000, stop))
+    };
+    println!("== TCP test on {}", img.path.display());
+    let out = run_to_exit(&img, Duration::from_secs(180));
+    stop.store(true, Ordering::Relaxed);
+    let _ = echo.join();
+    let served = inbound.join().unwrap_or(0);
+    let out = out?;
+    let steps = [
+        "virtio-net: ready:",
+        "net: leased 10.0.3.30/24",
+        "[pass] tcp: this host is 10.0.3.30",
+        "[pass] tcp: a connection to a closed port of this host's is refused, through the loopback",
+        "[pass] tcp: 100000 bytes echoed by the host with one segment in 20 dropped each way, every byte right",
+        "[pass] tcp: listening on port 8080, which a second listener cannot take",
+        "[pass] tcp: 3 connections from the host accepted, 90000 bytes checked and echoed back, every byte right",
+        "[pass] tcp: a connection between two sockets of this host's carried 20000 bytes each way, every byte right",
+        "segments sent again,",
+        "[cm] client asked to shut down (pass)",
+    ];
+    check_log("TCP test", &out, &steps)?;
+    if served != 3 {
+        return Err(format!("TCP test: the host got {served} of its 3 connections echoed back right"));
+    }
+    println!(
+        "== the host echoed {} bytes and had 3 connections echoed back",
+        echoed.load(Ordering::Relaxed)
+    );
+    println!("== TCP test passed ({})", arch.name());
+    Ok(())
+}
+
 fn net_test(arch: Arch) -> Result<(), String> {
     use std::collections::HashMap;
     use std::net::UdpSocket;
@@ -1220,10 +1361,13 @@ fn net_test(arch: Arch) -> Result<(), String> {
             }
         })
     };
+    let tcp_echoed = Arc::new(AtomicU64::new(0));
+    let tcp_echo = tcp_echo_server(stop.clone(), tcp_echoed.clone())?;
     println!("== network test on {}", img.path.display());
-    let out = run_to_exit(&img, Duration::from_secs(120));
+    let out = run_to_exit(&img, Duration::from_secs(180));
     stop.store(true, Ordering::Relaxed);
     let _ = echo.join();
+    let _ = tcp_echo.join();
     let _ = answering.join();
     let out = out?;
     let steps = [
@@ -1244,6 +1388,8 @@ fn net_test(arch: Arch) -> Result<(), String> {
         "[pass] net: cached.superior.test resolved 20 times,",
         "[pass] net: short.superior.test (TTL 1 s) asked of the server again after 1.5 s",
         "names resolved under fault injection, every address right",
+        "TCP connections echoed",
+        "bytes through the host under fault injection, every byte right",
         "[cm] client asked to shut down (pass)",
     ];
     check_log("network test", &out, &steps)?;
@@ -1266,6 +1412,7 @@ fn net_test(arch: Arch) -> Result<(), String> {
     };
     let (by_pings, by_echoes) = (during("pings to 10.0.3.2"), during("echoed by the host"));
     let by_names = during("names resolved under fault injection");
+    let by_tcp = during("bytes through the host under fault injection");
     // The resolver asked the host for a cached name once (once more per
     // restart in between at most), and for the 1 s one again.
     let asked = asked.lock().unwrap().clone();
@@ -1275,6 +1422,12 @@ fn net_test(arch: Arch) -> Result<(), String> {
             "network test: the host was asked for cached.superior.test {} times and short.superior.test {}; want at most 5 and at least 2",
             count("cached.superior.test"),
             count("short.superior.test")
+        ));
+    }
+    if by_tcp < by_names + 10 {
+        return Err(format!(
+            "network test: {} kills while TCP connections were echoed; want 10",
+            by_tcp - by_names
         ));
     }
     if resolver < 5 || by_names < by_echoes + 10 {
@@ -1298,8 +1451,9 @@ fn net_test(arch: Arch) -> Result<(), String> {
         ));
     }
     println!(
-        "== the server was killed {server} times, the driver {driver} and the resolver {resolver}; the host echoed {} datagrams and answered {} DNS queries",
+        "== the server was killed {server} times, the driver {driver} and the resolver {resolver}; the host echoed {} datagrams and {} TCP bytes and answered {} DNS queries",
         echoed.load(Ordering::Relaxed),
+        tcp_echoed.load(Ordering::Relaxed),
         asked.values().sum::<u32>()
     );
     println!("== network test passed ({})", arch.name());

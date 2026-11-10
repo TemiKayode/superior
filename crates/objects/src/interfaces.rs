@@ -48,6 +48,13 @@ pub enum Status {
     /// A path went through too many symbolic links (a loop, likely), or
     /// `NOFOLLOW` met one.
     TooManyLinks = 13,
+    /// Nothing listens at the address a TCP connection was made to.
+    Refused = 14,
+    /// The TCP connection was reset: by the peer, or because the network
+    /// server restarted and forgot it.
+    Reset = 15,
+    /// The TCP peer stopped answering.
+    TimedOut = 16,
 }
 
 impl Status {
@@ -66,6 +73,9 @@ impl Status {
             11 => Status::Empty,
             12 => Status::Unreachable,
             13 => Status::TooManyLinks,
+            14 => Status::Refused,
+            15 => Status::Reset,
+            16 => Status::TimedOut,
             _ => Status::Invalid,
         }
     }
@@ -172,8 +182,8 @@ pub mod nic {
     pub const SEND: u64 = 4;
 }
 
-/// The network: what the network server serves. IPv4 with ICMP echo and
-/// UDP; each socket belongs to the client that bound it.
+/// The network: what the network server serves. IPv4 with ICMP echo, UDP
+/// and TCP; each socket belongs to the client that bound it.
 ///
 /// An address and port travel in one word, [`net::addr`]: the IPv4
 /// address (its first byte the most significant) shifted up 16 bits, and
@@ -188,6 +198,14 @@ pub mod nic {
 /// server has no sockets: calls on old handles answer `NotFound` (or fail
 /// with `PeerRestarted`), and the client binds again. Datagrams are not
 /// reliable: one may be lost at any time, and the client resends.
+///
+/// TCP connections are reliable streams while they last, but the server
+/// is crash-only: a restart forgets them (the peer is reset when it next
+/// sends), and the client connects again and picks up where its own
+/// protocol lets it. `SEND` and `RECV` on a connection never block:
+/// `Empty` means "wait for the notification". A connection whose peer
+/// reset it, or which timed out, answers `Reset` or `TimedOut` (or
+/// `Refused`, for one nothing listened for) until it is closed.
 pub mod net {
     pub const VERSION: u64 = 1;
     /// The largest UDP payload in one unfragmented 1500-byte IPv4 packet.
@@ -208,6 +226,10 @@ pub mod net {
     /// carry its identifier, and the replies arrive on it. Reply `[status,
     /// handle]` and the socket's notification.
     pub const ICMP_BIND: u64 = 3;
+    /// On a TCP connection, `[SEND, handle, 0, length]` queues up to
+    /// `length` bytes of the frame (at most a page). Reply `[status, bytes
+    /// taken]`: `Empty` if none fit (wait for the notification).
+    ///
     /// `[SEND, handle, address, length]` with a frame lent: sends a UDP
     /// datagram from the socket to `address`, or an ICMP echo request
     /// with the sequence number in its low 16 bits; the payload is the
@@ -218,10 +240,16 @@ pub mod net {
     pub const SEND: u64 = 4;
     /// `[RECV, handle]` with a frame lent: the oldest datagram (or echo
     /// reply payload) that arrived on the socket, copied into the frame.
+    /// On a TCP connection, what has arrived in order, up to a page:
+    /// `[status, length, peer address]`, a length of 0 meaning the peer
+    /// has sent all it will.
     /// Reply `[status, length, source address]`; `Empty` if none is
     /// waiting. A socket keeps the last few; more are dropped.
     pub const RECV: u64 = 5;
     /// `[CLOSE, handle]`: closes the socket; its notification is deleted.
+    /// A TCP connection is closed gracefully (a FIN after what is queued,
+    /// which the server goes on sending); a listening socket's connections
+    /// not yet accepted are reset.
     pub const CLOSE: u64 = 6;
     /// `[LEASE, VERSION]`: reply `[status, the netmask (IPv4, as a 32-bit
     /// number), the DNS server's address (as in addr), seconds left on the
@@ -231,6 +259,42 @@ pub mod net {
     /// fragments, datagrams sent in fragments, datagrams dropped half
     /// reassembled]`, counted across the server's restarts.
     pub const STATS: u64 = 8;
+    /// `[TCP_CONNECT, address]`: opens a TCP connection to `address`
+    /// from a free port. Reply `[status, handle, local port]` and the
+    /// connection's notification, signalled once it is established (or
+    /// failed), and then whenever data or room arrives. `SEND` answers
+    /// `Empty` until it is established.
+    pub const TCP_CONNECT: u64 = 9;
+    /// `[TCP_LISTEN, port]`: listens for TCP connections on `port`. Reply
+    /// `[status, handle, port]` and a notification signalled when a
+    /// connection is ready to accept; `InUse` if the port is taken.
+    pub const TCP_LISTEN: u64 = 10;
+    /// `[TCP_ACCEPT, listening handle]`: the oldest connection made to
+    /// it. Reply `[status, handle, peer address]` and the connection's
+    /// notification; `Empty` if none is waiting.
+    pub const TCP_ACCEPT: u64 = 11;
+    /// `[TCP_SHUTDOWN, handle]`: no more data will be sent; the peer gets
+    /// a FIN after what is queued. Receiving goes on.
+    pub const TCP_SHUTDOWN: u64 = 12;
+    /// `[TCP_STATE, handle]`: reply `[status, state (TCP_* below), bytes
+    /// sent and not yet acknowledged, bytes waiting to be received]`.
+    pub const TCP_STATE: u64 = 13;
+    /// `[TCP_STATS, VERSION]`: reply `[status, TCP segments sent again,
+    /// segments dropped on purpose (a test setting), segments kept that
+    /// arrived out of order]`, counted across restarts.
+    pub const TCP_STATS: u64 = 14;
+
+    /// TCP states, as `TCP_STATE` gives them (RFC 9293's names).
+    pub const TCP_CLOSED: u64 = 0;
+    pub const TCP_SYN_SENT: u64 = 1;
+    pub const TCP_SYN_RECEIVED: u64 = 2;
+    pub const TCP_ESTABLISHED: u64 = 3;
+    pub const TCP_FIN_WAIT_1: u64 = 4;
+    pub const TCP_FIN_WAIT_2: u64 = 5;
+    pub const TCP_CLOSE_WAIT: u64 = 6;
+    pub const TCP_CLOSING: u64 = 7;
+    pub const TCP_LAST_ACK: u64 = 8;
+    pub const TCP_TIME_WAIT: u64 = 9;
 
     /// The word for IPv4 address `ip` and `port`.
     pub const fn addr(ip: [u8; 4], port: u16) -> u64 {

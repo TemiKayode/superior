@@ -361,7 +361,7 @@ holds the rest):
     mount's check must pass. With no faults, 300 reads through a ring cost about
     40 system calls (a handful of doorbells, the rest sleeps), where calls cost at
     least one each.
-- The network server, v1 (`user/net/`), and a virtio-net driver (`user/virtio-net/`).
+- The network server, v2 (`user/net/`), and a virtio-net driver (`user/virtio-net/`).
   - The driver serves the versioned `nic` interface: whole Ethernet frames copied
     between its own receive and transmit buffers (the only memory the device reaches,
     through the IOMMU) and a page the caller lends with each call. Its interrupt is
@@ -401,6 +401,26 @@ holds the rest):
     10 s). It is crash-only too: a restart loses the cache and fails the call it
     was serving with `PeerRestarted`, and when the network server restarts it binds
     a new socket and asks again.
+  - TCP (`crates/inet/src/tcp.rs`, a state machine with no I/O of its own, fed
+    segments and the timer by the server): the three-way handshake (active,
+    passive and simultaneous), the MSS option, sliding windows both ways, data
+    arriving out of order kept (up to four ranges) and handed on in order,
+    retransmission on a timeout estimated from round trips (RFC 6298, Karn's rule,
+    backing off), fast retransmit after three duplicate ACKs, slow start and
+    congestion avoidance, zero-window probes, half-close, `TIME-WAIT`, resets
+    checked against blind ones (RFC 5961) and ignored in `TIME-WAIT` (RFC 1337),
+    ICMP "unreachable" ending a connection attempt, and giving up after ten
+    timeouts. Host unit tests run two ends over a link that loses, reorders and
+    repeats segments (up to 30% lost). The server holds up to six connections,
+    each with 8 KiB rings each way; `TCP_CONNECT`, `TCP_LISTEN` (two connections
+    held until accepted), `TCP_ACCEPT`, `SEND` and `RECV` (never blocking: `Empty`
+    means wait for the connection's notification), `TCP_SHUTDOWN`, `TCP_STATE`,
+    and `CLOSE`, after which the server finishes the connection (a FIN, up to
+    30 s); `TIME-WAIT` connections give their slot to a new one when none is free.
+    The server is crash-only here too: a restart forgets every connection (the
+    peer is reset when it next sends; ports and initial sequence numbers differ
+    per instance), and the client connects again. Packets to the server's own
+    address go round a loopback queue.
   `cargo xtask net-test` boots `boot/net.manifest` on QEMU's user-mode network, set
   to 10.0.3.0/24 rather than QEMU's default so nothing can assume an address, while
   xtask echoes UDP on the host. The server must lease 10.0.3.30/24 via 10.0.3.2
@@ -421,8 +441,23 @@ holds the rest):
   15 from the cache (the host must be asked at most 5 times); a name with a 1 s TTL
   twice, 1.5 s apart, the second asked of the host again; and for at least 3 s a
   new name each time, every address right, with the resolver killed at least 10
-  times meanwhile. A run does about 1,000 to 3,000 pings, 2,000 to 3,800 echoes and
-  1,500 to 2,000 names through some 30 to 40 kills of each.
+  times meanwhile. Last, for at least 5 s, TCP connections to an echo on the host
+  (port 47002), each sending up to 8,000 bytes, reading them back and closing;
+  a connection a restart cuts is made again, no byte may come back wrong, and
+  the injector must have killed components at least 10 times meanwhile. A run
+  does about 1,000 to 3,000 pings, 2,000 to 3,800 echoes, 1,500 to 2,000 names and
+  some 300 TCP connections (about 1.3 MB, some 20 of them cut) through some 30 to
+  60 kills of each.
+  `cargo xtask tcp-test` boots `boot/tcp.manifest`, where the server drops one TCP
+  segment in 20 at random each way (a test setting in its `arg`): a connection to
+  a closed port of its own is refused (round the loopback: QEMU's user network
+  does not answer a refused connection on a Windows host); 100,000 bytes are
+  echoed by the host; the host makes three connections to the client's listening
+  port through QEMU's forwarding, each sending 30,000 bytes (more than the
+  window, which the client lets fill before reading) that the client checks and
+  sends back; and two sockets of the client's own exchange 20,000 bytes each way
+  through the loopback. Segments must have been sent again, dropped and kept out
+  of order.
 - USB: an xHCI host controller driver (`user/xhci/`) and a HID keyboard driver
   (`user/hid/`).
   - The xHCI driver opens the first function of class 0c:03:30, resets the controller,
@@ -489,7 +524,7 @@ these buses have none); more than one command per queue in the NVMe driver,
 more than two commands in flight per disk in the AHCI driver, ATAPI
 and port multipliers; in the xHCI driver isochronous and bulk endpoints, USB 3 streams,
 hubs and more than one interrupter, and HID devices other than boot keyboards; in the network server
-TCP, IPv6, datagrams over 4,000 bytes, DNS records other than A and CNAME (and DNS over TCP), routes beyond one gateway, and rings in place of a
+TCP window scaling, timestamps and SACK, more than six TCP connections, IPv6, datagrams over 4,000 bytes, DNS records other than A and CNAME (and DNS over TCP), routes beyond one gateway, and rings in place of a
 call per frame; buses behind bridges; the async executor, buffer pools and
 power callbacks of the SDK; an IDL compiler for the interfaces; escalating a component
 given up on to a supervisor above it (today the
@@ -510,7 +545,7 @@ https://claude.ai/artifact/QKJS8qH5Dfbjzn58RStq1j
 | `kernel/` | The microkernel (`no_std`, targets `x86_64-unknown-none` and `aarch64-unknown-none-softfloat`) |
 | `kernel/src/arch/` | Per-ISA code: boot, exceptions and system call entry, page tables, interrupts, timer, console (`x86_64/`, `aarch64/`) |
 | `crates/sys/` | User-side system call wrappers for both ISAs (one ABI by register position), and the seL4 runtime (`src/sel4.rs`) |
-| `crates/inet/` | Protocol pieces of the network server, unit-tested on the host: IPv4 fragment reassembly |
+| `crates/inet/` | Protocol pieces of the network server, unit-tested on the host: IPv4 fragment reassembly and TCP |
 | `crates/objects/` | Pure kernel logic, unit-tested on the host: capabilities and CNodes, untyped memory, the IPC and scheduling state machine, the syscall ABI, an ELF reader, the boot bundle and manifest formats |
 | `user/pingpong/` | Boot self-test program (IPC server, client and spinner) |
 | `user/cm/` | The Component Manager: the root task, which starts every component from the boot manifest |
@@ -528,7 +563,7 @@ https://claude.ai/artifact/QKJS8qH5Dfbjzn58RStq1j
 | `user/xhci/` | The xHCI (USB) host controller driver |
 | `user/hid/` | The USB HID keyboard driver |
 | `user/echo/`, `user/counter/`, `user/testclient/` | Test components for the Component Manager, supervision and drivers |
-| `boot/` | Component manifests: `shell.manifest` (normal boot), `test.manifest` (`cm-test`), `supervise.manifest` (`supervise-test`) , `drivers.manifest` (`drivers-test`) , `memory.manifest` (`memory-test`), `fs.manifest` and `fs-verify.manifest` (`fs-test`), `net.manifest` (`net-test`), `keyboard.manifest` (`keyboard-test`) |
+| `boot/` | Component manifests: `shell.manifest` (normal boot), `test.manifest` (`cm-test`), `supervise.manifest` (`supervise-test`) , `drivers.manifest` (`drivers-test`) , `memory.manifest` (`memory-test`), `fs.manifest` and `fs-verify.manifest` (`fs-test`), `net.manifest` (`net-test`), `tcp.manifest` (`tcp-test`), `keyboard.manifest` (`keyboard-test`) |
 | `sel4/` | Docker build of seL4 and rust-sel4's kernel loader, for running the shell on seL4 |
 | `xtask/` | Build driver: user program, kernel, disk image, QEMU boot |
 
@@ -537,7 +572,7 @@ https://claude.ai/artifact/QKJS8qH5Dfbjzn58RStq1j
 Needs Rust (the pinned nightly in `rust-toolchain.toml` installs itself) and QEMU.
 
 ```bash
-cargo xtask test           # host tests, model check, simulation; on both ISAs the boot self-tests, the Component Manager, supervision, driver, Memory Server and filesystem tests (the disk tests on all three disk drivers), the network and USB keyboard tests and a shell session; then the shell on seL4
+cargo xtask test           # host tests, model check, simulation; on both ISAs the boot self-tests, the Component Manager, supervision, driver, Memory Server and filesystem tests (the disk tests on all three disk drivers), the network, TCP and USB keyboard tests and a shell session; then the shell on seL4
 cargo xtask cm-test        # just the Component Manager test (add aarch64 for that ISA)
 cargo xtask supervise-test # just the supervision test (add aarch64 for that ISA)
 cargo xtask drivers-test   # just the driver framework test (add aarch64 for that ISA)
@@ -546,6 +581,7 @@ cargo xtask fs-test        # just the filesystem test, two boots (add aarch64 fo
 cargo xtask nvme-test      # the driver and filesystem tests on an NVMe disk (add aarch64 for that ISA)
 cargo xtask ahci-test      # the same on a SATA disk behind AHCI (add aarch64 for that ISA)
 cargo xtask net-test       # just the network test (add aarch64 for that ISA)
+cargo xtask tcp-test       # just the TCP test (add aarch64 for that ISA)
 cargo xtask keyboard-test  # just the USB keyboard test (add aarch64 for that ISA)
 cargo xtask run            # boot the shell in QEMU (x86-64), its console on this terminal
 cargo xtask run aarch64    # the same on QEMU's AArch64 virt machine

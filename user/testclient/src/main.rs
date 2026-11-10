@@ -1839,6 +1839,480 @@ impl Sock {
     }
 }
 
+// ---- TCP: in the network test, and the TCP test (`arg 18`,
+// boot/tcp.manifest) ----
+
+/// The host's TCP echo (`cargo xtask net-test` and `tcp-test`): what a
+/// connection sends comes back, and once the client shuts down, the echo
+/// closes too.
+const TCP_ECHO_PORT: u16 = 47002;
+/// A port nothing listens on.
+const TCP_CLOSED_PORT: u16 = 47003;
+/// The TCP test listens here; the host connects through QEMU's
+/// forwarding.
+const TCP_LISTEN_PORT: u16 = 8080;
+/// Notifications for the TCP test's listening socket and the connections
+/// it accepts.
+const LISTEN_NTFN: u64 = 6;
+const ACCEPTED_NTFN: u64 = 7;
+/// TCP echoes under fault injection: at least this many, for at least
+/// this long, and no longer than the limit.
+const TCP_ECHOES: u64 = 30;
+const TCP_TICKS: u64 = 500;
+const TCP_LIMIT: u64 = 4000;
+/// Ticks an echo may go without progress before it is given up as stuck.
+const TCP_STUCK: u64 = 3000;
+
+/// Why a connection ended early.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Cut {
+    /// The server restarted: a call failed, the handle is unknown, or the
+    /// notification is gone.
+    Lost,
+    /// A status: the connection was reset, refused or timed out.
+    Status(u64),
+}
+
+/// A TCP connection, and the slot its notification is in.
+struct Stream {
+    h: u64,
+    ntfn: u64,
+}
+
+fn tcp_reply(r: Option<[u64; 4]>) -> Result<[u64; 4], Cut> {
+    match r {
+        None => Err(Cut::Lost),
+        Some(r) if r[0] == Status::NotFound as u64 => Err(Cut::Lost),
+        Some(r) => Ok(r),
+    }
+}
+
+/// Byte `j` of TCP stream `k`.
+fn tcp_byte(k: u64, j: u64) -> u8 {
+    (k.wrapping_mul(0x9e37) ^ j.wrapping_mul(13) ^ j >> 9) as u8
+}
+
+impl Stream {
+    /// A call that grants a notification into `ntfn`.
+    fn granting(op: u64, arg: u64, ntfn: u64) -> Result<[u64; 4], Cut> {
+        syscall(Syscall::CapDelete, ntfn, [0; 4]);
+        let x = CapTransfer {
+            grant: None,
+            accept: Some(ntfn as u16),
+        };
+        let r = syscall_x(Syscall::Call, NET, [op, arg, 0, 0], x);
+        if r.status != 0 {
+            return Err(Cut::Lost);
+        }
+        if r.msg[0] != OK {
+            return Err(Cut::Status(r.msg[0]));
+        }
+        Ok(r.msg)
+    }
+
+    fn connect(to: u64, ntfn: u64) -> Result<Stream, Cut> {
+        let r = Stream::granting(net::TCP_CONNECT, to, ntfn)?;
+        Ok(Stream { h: r[1], ntfn })
+    }
+
+    /// Waits for the notification, `ticks` at most.
+    fn wait(&self, ticks: u64) -> Result<(), Cut> {
+        syscall(Syscall::TimerSignal, self.ntfn, [ticks, 0, 0, 0]);
+        if syscall(Syscall::Wait, self.ntfn, [0; 4]).status != 0 {
+            return Err(Cut::Lost);
+        }
+        Ok(())
+    }
+
+    fn state(&self) -> Result<[u64; 4], Cut> {
+        tcp_reply(net_call([net::TCP_STATE, self.h, 0, 0]))
+    }
+
+    /// Queues the first `n` bytes of the page; how many were taken.
+    fn send(&self, n: u64) -> Result<u64, Cut> {
+        let r = tcp_reply(net_call([net::SEND, self.h, 0, n]))?;
+        match r[0] {
+            OK => Ok(r[1]),
+            s if s == Status::Empty as u64 => Ok(0),
+            s => Err(Cut::Status(s)),
+        }
+    }
+
+    /// What has arrived, into the page: `Some(0)` at the end, `None` if
+    /// nothing yet.
+    fn recv(&self) -> Result<Option<u64>, Cut> {
+        let r = tcp_reply(net_call([net::RECV, self.h, 0, 0]))?;
+        match r[0] {
+            OK => Ok(Some(r[1])),
+            s if s == Status::Empty as u64 => Ok(None),
+            s => Err(Cut::Status(s)),
+        }
+    }
+
+    fn shutdown(&self) -> Result<(), Cut> {
+        match tcp_reply(net_call([net::TCP_SHUTDOWN, self.h, 0, 0]))?[0] {
+            OK => Ok(()),
+            s => Err(Cut::Status(s)),
+        }
+    }
+
+    fn close(self) {
+        net_call([net::CLOSE, self.h, 0, 0]);
+        syscall(Syscall::CapDelete, self.ntfn, [0; 4]);
+    }
+
+    /// Echoes with a peer that sends back what it gets: sends `len` bytes
+    /// of stream `k`, checking each that comes back, then shuts down and
+    /// reads to the end. Whether every byte came back right.
+    fn echo(&self, k: u64, len: u64) -> Result<bool, Cut> {
+        let (mut sent, mut got, mut right, mut shut) = (0, 0, true, false);
+        let mut last = ticks();
+        loop {
+            let mut moved = false;
+            if sent < len {
+                let n = (len - sent).min(4096);
+                for (j, b) in net_page()[..n as usize].iter_mut().enumerate() {
+                    *b = tcp_byte(k, sent + j as u64);
+                }
+                let took = self.send(n)?;
+                sent += took;
+                moved |= took > 0;
+            } else if !shut {
+                self.shutdown()?;
+                shut = true;
+            }
+            while let Some(n) = self.recv()? {
+                if n == 0 {
+                    return Ok(right && got == len);
+                }
+                right &= net_page()[..n as usize]
+                    .iter()
+                    .enumerate()
+                    .all(|(j, &b)| b == tcp_byte(k, got + j as u64));
+                got += n;
+                moved = true;
+            }
+            if moved {
+                last = ticks();
+            } else {
+                if ticks() > last + TCP_STUCK {
+                    return Err(Cut::Status(Status::TimedOut as u64));
+                }
+                self.wait(20)?;
+            }
+        }
+    }
+}
+
+/// TCP connections to the host's echo while the injector kills the
+/// server and the driver: each sends up to 8,000 bytes and reads them
+/// back. A connection a restart cuts is made again; no byte may come back
+/// wrong.
+fn tcp_under_faults(t: &mut Checks, gw: u64) {
+    let to = gw | TCP_ECHO_PORT as u64;
+    let (mut done, mut cut, mut wrong, mut k) = (0u64, 0u64, 0u64, 0u64);
+    let mut bytes = 0;
+    let start = ticks();
+    while (done < TCP_ECHOES || ticks() < start + TCP_TICKS) && ticks() < start + TCP_LIMIT {
+        k += 1;
+        let len = 1 + k * 1777 % 8000;
+        match Stream::connect(to, NET_NTFN) {
+            Ok(s) => {
+                let r = s.echo(k, len);
+                s.close();
+                match r {
+                    Ok(true) => {
+                        done += 1;
+                        bytes += len;
+                    }
+                    Ok(false) => wrong += 1,
+                    Err(_) => cut += 1,
+                }
+            }
+            Err(_) => {
+                cut += 1;
+                pause(5);
+            }
+        }
+    }
+    t.check(
+        done >= TCP_ECHOES && wrong == 0,
+        format_args!(
+            "{done} TCP connections echoed {bytes} bytes through the host under fault injection, every byte right ({cut} cut by a restart and made again, {wrong} wrong)"
+        ),
+    );
+}
+
+/// The TCP test (`arg 18`, boot/tcp.manifest): the network server drops
+/// one TCP segment in 20 each way, so retransmission, fast retransmit
+/// and out-of-order arrival all happen.
+const TCP_BULK: u64 = 100_000;
+/// Connections the host makes to the listening port, and the bytes each
+/// sends (more than the server's 8 KiB window, so it shuts).
+const TCP_INBOUND: u64 = 3;
+
+/// Bytes each way between two of this host's sockets.
+const LOCAL_BYTES: u64 = 20_000;
+
+/// Both ends of a connection here, through the loopback: a listener on
+/// `TCP_LISTEN_PORT + 1`, a connection to it, and the accepted end; each
+/// sends `LOCAL_BYTES` (streams 7 and 8) and reads the other's.
+fn local_pair(me: u64) -> bool {
+    let port = TCP_LISTEN_PORT as u64 + 1;
+    let Ok(lr) = Stream::granting(net::TCP_LISTEN, port, LISTEN_NTFN) else {
+        return false;
+    };
+    let l = Stream { h: lr[1], ntfn: LISTEN_NTFN };
+    let Ok(a) = Stream::connect(me | port, NET_NTFN) else {
+        l.close();
+        return false;
+    };
+    let mut b = None;
+    for _ in 0..100 {
+        if let Ok(r) = Stream::granting(net::TCP_ACCEPT, l.h, ACCEPTED_NTFN) {
+            b = Some(Stream { h: r[1], ntfn: ACCEPTED_NTFN });
+            break;
+        }
+        let _ = l.wait(5);
+    }
+    l.close();
+    let Some(b) = b else {
+        a.close();
+        return false;
+    };
+    // [sent, received, ended] for each end.
+    let mut st = [[0u64; 3]; 2];
+    let mut right = true;
+    let start = ticks();
+    while ticks() < start + 2000 && !(st[0][2] == 1 && st[1][2] == 1) {
+        let mut moved = false;
+        for (i, s) in [&a, &b].into_iter().enumerate() {
+            let (mine, theirs) = (7 + i as u64, 8 - i as u64);
+            let sent = st[i][0];
+            if sent < LOCAL_BYTES {
+                let n = (LOCAL_BYTES - sent).min(4096);
+                for (j, x) in net_page()[..n as usize].iter_mut().enumerate() {
+                    *x = tcp_byte(mine, sent + j as u64);
+                }
+                let took = s.send(n).unwrap_or(0);
+                st[i][0] += took;
+                moved |= took > 0;
+                if st[i][0] == LOCAL_BYTES {
+                    let _ = s.shutdown();
+                }
+            }
+            while let Ok(Some(n)) = s.recv() {
+                if n == 0 {
+                    st[i][2] = 1;
+                    break;
+                }
+                let got = st[i][1];
+                right &= net_page()[..n as usize]
+                    .iter()
+                    .enumerate()
+                    .all(|(j, &x)| x == tcp_byte(theirs, got + j as u64));
+                st[i][1] += n;
+                moved = true;
+            }
+        }
+        if !moved {
+            let _ = a.wait(2);
+        }
+    }
+    a.close();
+    b.close();
+    right && st.iter().all(|e| e[1] == LOCAL_BYTES && e[2] == 1)
+}
+
+fn tcp_client() -> ! {
+    let mut t = Checks(0, "tcp");
+    let made = syscall(
+        Syscall::Retype,
+        NET_MEMORY,
+        [ObjectType::Frame as u64, 0, NET_PAGE, 0],
+    );
+    let mapped = syscall(Syscall::FrameMap, NET_PAGE, [NET_PAGE_VA, 1, 0, 0]);
+    let start = ticks();
+    let info = loop {
+        let r = syscall(Syscall::Call, NET, [net::INFO, net::VERSION, 0, 0]);
+        if (r.status == 0 && r.msg[0] == OK) || ticks() > start + LEASE_TICKS {
+            break r.msg;
+        }
+        syscall(Syscall::Yield, 0, [0; 4]);
+    };
+    t.check(
+        made.status == 0 && mapped.status == 0 && info[0] == OK,
+        format_args!("this host is {}", Dotted(info[1])),
+    );
+    let gw = info[3];
+
+    // Nothing listens on this host's own closed port: the server's reset
+    // comes back round the loopback. (QEMU's user network does not answer
+    // a refused connection on every host.)
+    let refused = match Stream::connect(info[1] | TCP_CLOSED_PORT as u64, NET_NTFN) {
+        Ok(s) => {
+            let mut r = Ok(None);
+            for _ in 0..50 {
+                r = s.recv();
+                if r != Ok(None) {
+                    break;
+                }
+                let _ = s.wait(20);
+            }
+            s.close();
+            r
+        }
+        Err(e) => Err(e),
+    };
+    t.check(
+        refused == Err(Cut::Status(Status::Refused as u64)),
+        format_args!("a connection to a closed port of this host's is refused, through the loopback"),
+    );
+
+    // A bulk echo through the lossy server.
+    let began = ticks();
+    let (bulk, state) = match Stream::connect(gw | TCP_ECHO_PORT as u64, NET_NTFN) {
+        Ok(s) => {
+            let mut state = 0;
+            for _ in 0..100 {
+                state = s.state().map_or(0, |r| r[1]);
+                if state == net::TCP_ESTABLISHED {
+                    break;
+                }
+                let _ = s.wait(10);
+            }
+            let r = s.echo(1, TCP_BULK);
+            s.close();
+            (r, state)
+        }
+        Err(e) => (Err(e), 0),
+    };
+    let took = ticks() - began;
+    t.check(
+        bulk == Ok(true) && state == net::TCP_ESTABLISHED,
+        format_args!(
+            "{TCP_BULK} bytes echoed by the host with one segment in 20 dropped each way, every byte right, in {}.{:02} s",
+            took / 100,
+            took % 100
+        ),
+    );
+
+    // The host connects in: each connection's bytes are checked and sent
+    // back, until it shuts down; then this side does.
+    let listener = Stream::granting(net::TCP_LISTEN, TCP_LISTEN_PORT as u64, LISTEN_NTFN);
+    let taken = Stream::granting(net::TCP_LISTEN, TCP_LISTEN_PORT as u64, NET_NTFN);
+    t.check(
+        listener.is_ok() && taken == Err(Cut::Status(Status::InUse as u64)),
+        format_args!("listening on port {TCP_LISTEN_PORT}, which a second listener cannot take"),
+    );
+    let l = Stream {
+        h: listener.map_or(0, |r| r[1]),
+        ntfn: LISTEN_NTFN,
+    };
+    let (mut served, mut right, mut total) = (0, true, 0);
+    let mut first = true;
+    let start = ticks();
+    while served < TCP_INBOUND && ticks() < start + 6000 {
+        let r = Stream::granting(net::TCP_ACCEPT, l.h, ACCEPTED_NTFN);
+        let s = match r {
+            Ok(r) => Stream {
+                h: r[1],
+                ntfn: ACCEPTED_NTFN,
+            },
+            Err(_) => {
+                let _ = l.wait(10);
+                continue;
+            }
+        };
+        if first {
+            // Let the host fill the window before reading anything.
+            first = false;
+            pause(100);
+        }
+        // Echo until the host's end, checking its bytes (stream 1000 +
+        // its number, as the host makes them).
+        let k = 1000 + served;
+        let (mut got, mut back, mut ended) = (0u64, 0u64, false);
+        let mut ok = true;
+        let mut pending = [0u8; 4096];
+        let mut have = 0usize;
+        let began = ticks();
+        while ticks() < began + 3000 {
+            let mut moved = false;
+            if have == 0 && !ended {
+                match s.recv() {
+                    Ok(Some(0)) => ended = true,
+                    Ok(Some(n)) => {
+                        let p = &net_page()[..n as usize];
+                        ok &= p.iter().enumerate().all(|(j, &b)| b == tcp_byte(k, got + j as u64));
+                        pending[..n as usize].copy_from_slice(p);
+                        have = n as usize;
+                        got += n;
+                        moved = true;
+                    }
+                    Ok(None) => {}
+                    Err(_) => break,
+                }
+            }
+            if have > 0 {
+                net_page()[..have].copy_from_slice(&pending[..have]);
+                match s.send(have as u64) {
+                    Ok(0) => {}
+                    Ok(n) => {
+                        pending.copy_within(n as usize..have, 0);
+                        have -= n as usize;
+                        back += n;
+                        moved = true;
+                    }
+                    Err(_) => break,
+                }
+            }
+            if ended && have == 0 {
+                let _ = s.shutdown();
+                // Wait for our FIN to be acknowledged.
+                for _ in 0..100 {
+                    match s.state() {
+                        Ok(r) if r[2] > 0 => {
+                            let _ = s.wait(5);
+                        }
+                        _ => break,
+                    }
+                }
+                break;
+            }
+            if !moved {
+                let _ = s.wait(5);
+            }
+        }
+        s.close();
+        if ended && back == got {
+            served += 1;
+            total += got;
+            right &= ok;
+        }
+    }
+    l.close();
+    t.check(
+        served == TCP_INBOUND && right,
+        format_args!(
+            "{served} connections from the host accepted, {total} bytes checked and echoed back, every byte right"
+        ),
+    );
+    t.check(local_pair(info[1]), format_args!("a connection between two sockets of this host's carried {LOCAL_BYTES} bytes each way, every byte right"));
+    let s = syscall(Syscall::Call, NET, [net::TCP_STATS, net::VERSION, 0, 0]).msg;
+    t.check(
+        s[0] == OK && s[1] > 0 && s[2] > 0 && s[3] > 0,
+        format_args!(
+            "{} segments sent again, {} dropped on purpose, {} kept out of order",
+            s[1], s[2], s[3]
+        ),
+    );
+    syscall(Syscall::Call, NET_CONTROL, [OP_SHUTDOWN, t.0, 0, 0]);
+    loop {
+        syscall(Syscall::Yield, 0, [0; 4]);
+    }
+}
+
 /// The resolver (`boot/net.manifest`), whose host-side server
 /// (`cargo xtask net-test`) knows the names below.
 const DNS: u64 = 5;
@@ -2104,6 +2578,7 @@ fn net_client() -> ! {
         ),
     );
     dns_checks(&mut t);
+    tcp_under_faults(&mut t, gw);
     syscall(Syscall::Call, NET_CONTROL, [OP_SHUTDOWN, t.0, 0, 0]);
     loop {
         syscall(Syscall::Yield, 0, [0; 4]);
@@ -2247,6 +2722,7 @@ pub extern "C" fn _start(role: u64) -> ! {
         17 => injector(&[DRIVER_INDEX, FS_INDEX], true),
         // The network test: the driver, the network server, the resolver.
         16 => injector(&[1, 2, 3], false),
+        18 => tcp_client(),
         _ => probe(),
     }
 }

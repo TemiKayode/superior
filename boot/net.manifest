@@ -36,9 +36,11 @@ component net
   priority 10
   uses nic 0
   provides net 1
-  # 256 KiB: a page for each socket's queue entries, besides the rest.
-  untyped 18 2
+  # 512 KiB: a page for each socket's queue entries and four for each
+  # TCP connection's rings, besides the rest.
+  untyped 19 2
   state 17
+  cspace 7
 
 # Names: asks the gateway's port 47053, where xtask answers DNS on the
 # host (QEMU's own DNS server would ask the real internet).

@@ -1,7 +1,10 @@
 //! Internet protocol pieces for the network server (`user/net`), kept
-//! apart so host tests can check them: IPv4 fragment reassembly.
+//! apart so host tests can check them: IPv4 fragment reassembly and TCP
+//! ([`tcp`]).
 
 #![no_std]
+
+pub mod tcp;
 
 /// The largest IP payload reassembled (a UDP datagram of up to 4000 bytes
 /// with its header, rounded up to whole 8-byte units).

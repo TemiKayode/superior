@@ -1,12 +1,14 @@
-//! The network server: IPv4 over Ethernet with ARP, ICMP echo and UDP,
-//! serving the `net` interface (`superior_objects::interfaces::net`) to
+//! The network server: IPv4 over Ethernet with ARP, ICMP echo, UDP and
+//! TCP, serving the `net` interface (`superior_objects::interfaces::net`) to
 //! clients and using a NIC driver through the `nic` interface.
 //!
 //! It is crash-only. Its state is the ARP cache, the frames waiting for
-//! an ARP answer and the sockets with their queued datagrams; a restart
-//! loses all of it, which the interface allows: datagrams are unreliable,
-//! and each socket's notification belongs to this server, so its deletion
-//! wakes a waiting client to bind again. The one thing kept is the DHCP
+//! an ARP answer, the sockets with their queued datagrams and the TCP
+//! connections; a restart loses all of it, which the interface allows:
+//! datagrams are unreliable, a TCP peer that sends to a forgotten
+//! connection is reset, and each socket's notification belongs to this
+//! server, so its deletion wakes a waiting client to bind (or connect)
+//! again. The one thing kept is the DHCP
 //! lease, in the component's state page: a restarted server goes on with
 //! the address it had, until the lease runs out.
 //!
@@ -26,7 +28,16 @@
 //! the server has no address: `INFO` and `SEND` answer `Unreachable`.
 //!
 //! Slots: 0 the `nic` endpoint, 1 the `net` endpoint (receive), 2 untyped
-//! memory (256 KiB), 17 the state page.
+//! memory (512 KiB), 17 the state page.
+//!
+//! TCP (`superior_inet::tcp`): up to [`CONNS`] connections, each with
+//! 8 KiB rings each way in pages made at start. A connection the client
+//! closed goes on until its FIN is acknowledged (or [`LINGER`] passes).
+//! For tests, `arg`'s high 32 bits, when not 0, make the server drop one
+//! TCP segment in that many at random, both ways.
+//!
+//! Packets to this host's own address go round a loopback queue, so a
+//! client may talk to another on the same host.
 //!
 //! Datagrams up to `net::MAX_DATAGRAM` bytes go and come in IPv4
 //! fragments: a datagram too big for one frame is sent in 1480-byte
@@ -38,6 +49,7 @@
 #![no_main]
 
 use superior_objects::abi::{CapTransfer, Error, ObjectType, Syscall};
+use superior_inet::tcp::{self, Bufs, Tcb};
 use superior_inet::{Key, MAX_REASSEMBLED, Outcome, Reassembler};
 use superior_objects::interfaces::{Status, net, nic};
 use superior_sys::{USER_BASE, print_line, syscall, syscall_x};
@@ -63,12 +75,18 @@ const SOCK_NTFN: u64 = 9;
 const STATE: u64 = 17;
 /// The sockets' queue pages, SOCKETS * QUEUE of them.
 const QUEUE_PAGES: u64 = 18;
+/// The TCP connections' ring pages, CONNS * 4 of them.
+const TCP_PAGES: u64 = QUEUE_PAGES + (SOCKETS * QUEUE) as u64;
+/// The loopback queue's pages, LOOPBACK of them.
+const LOOP_PAGES: u64 = TCP_PAGES + (CONNS * 4) as u64;
 
 const RX_VA: u64 = USER_BASE + 0x4000_0000;
 const TX_VA: u64 = RX_VA + 0x1000;
 const LENT_VA: u64 = RX_VA + 0x2000;
 const STATE_VA: u64 = RX_VA + 0x3000;
 const QUEUE_VA: u64 = RX_VA + 0x10_0000;
+const TCP_VA: u64 = RX_VA + 0x20_0000;
+const LOOP_VA: u64 = RX_VA + 0x30_0000;
 
 /// Badges on this thread's notification.
 const RX: u64 = 1;
@@ -100,10 +118,14 @@ const REQUEST_TRIES: u8 = 4;
 const LEASE_MAGIC: u64 = 0x4448_4350_6c65_6173;
 /// Words of the state page after the lease: counts kept across restarts
 /// of datagrams reassembled, sent in fragments, and dropped half
-/// reassembled.
+/// reassembled; then of TCP segments sent again, dropped on purpose, and
+/// kept out of order.
 const STAT_REASSEMBLED: usize = 8;
 const STAT_FRAGMENTED: usize = 9;
 const STAT_DROPPED: usize = 10;
+const STAT_TCP_RESENT: usize = 11;
+const STAT_TCP_DROPPED: usize = 12;
+const STAT_TCP_OUT_OF_ORDER: usize = 13;
 /// Datagrams reassembled at once, and how long one may take (5 s).
 const REASSEMBLING: usize = 4;
 const REASSEMBLY_TICKS: u64 = 500;
@@ -111,6 +133,16 @@ const REASSEMBLY_TICKS: u64 = 500;
 const FRAGMENT: usize = 1480;
 
 const SOCKETS: usize = 8;
+/// TCP connections, and each ring's size.
+const CONNS: usize = 6;
+const TCP_BUF: usize = 8192;
+/// Connections a listening socket holds until they are accepted.
+const BACKLOG: usize = 2;
+/// How long a closed connection may take to finish (30 s).
+const LINGER: u64 = 3000;
+/// Packets to this host's own address waiting to be handled, a page
+/// each (more are dropped, as a busy link would).
+const LOOPBACK: usize = 4;
 /// Datagrams a socket keeps until they are received.
 const QUEUE: usize = 4;
 const ARP_CACHE: usize = 8;
@@ -121,9 +153,11 @@ const MAX_DATAGRAM: usize = net::MAX_DATAGRAM as usize;
 const ETH_ARP: u16 = 0x0806;
 const ETH_IP: u16 = 0x0800;
 const PROTO_ICMP: u8 = 1;
+const PROTO_TCP: u8 = 6;
 const PROTO_UDP: u8 = 17;
 const ICMP_ECHO_REPLY: u8 = 0;
 const ICMP_ECHO: u8 = 8;
+const ICMP_UNREACHABLE: u8 = 3;
 /// Ephemeral ports for `UDP_BIND` with port 0.
 const EPHEMERAL: u16 = 49152;
 
@@ -136,6 +170,24 @@ enum Kind {
     Udp(u16),
     /// ICMP echo, by identifier.
     Icmp(u16),
+    /// A listening TCP port.
+    Listen(u16),
+    /// TCP connection `n`.
+    Tcp(usize),
+}
+
+/// A TCP connection.
+#[derive(Clone, Copy)]
+struct Conn {
+    tcb: Tcb,
+    /// Its socket: from `TCP_CONNECT`, or once accepted.
+    socket: Option<usize>,
+    /// The listening socket it waits on until accepted.
+    listener: Option<usize>,
+    /// When its owner closed it; it goes on until finished.
+    closed_at: Option<u64>,
+    /// Its counts already added to the state page.
+    counted: tcp::Stats,
 }
 
 /// A queued datagram; its bytes are in its queue page (`queue_page`).
@@ -219,6 +271,15 @@ struct Net {
     /// Handles carry this, so an old instance's handles do not match.
     epoch: u64,
     next_id: u16,
+    conns: [Option<Conn>; CONNS],
+    /// The loopback queue: its first entry and how many are waiting.
+    loop_head: usize,
+    loop_count: usize,
+    /// The next ephemeral TCP port tried.
+    next_port: u16,
+    /// Drop one TCP segment in this many (0: none), from `random`.
+    drop_one_in: u64,
+    random: u64,
     need_attach: bool,
     received: u64,
     sent: u64,
@@ -230,6 +291,45 @@ const EMPTY: Datagram = Datagram { len: 0, from: 0 };
 /// each, made at start, so the image stays small.
 fn queue_page(i: usize, j: usize) -> &'static mut [u8] {
     page(QUEUE_VA + 0x1000 * (i * QUEUE + j) as u64)
+}
+
+/// Connection `c`'s rings.
+fn bufs(c: usize) -> Bufs<'static> {
+    let va = TCP_VA + 0x4000 * c as u64;
+    // SAFETY: CONNS * 4 pages are mapped from TCP_VA for good, and only
+    // connection `c` uses its four.
+    unsafe {
+        Bufs {
+            tx: core::slice::from_raw_parts_mut(va as *mut u8, TCP_BUF),
+            rx: core::slice::from_raw_parts_mut((va + 0x2000) as *mut u8, TCP_BUF),
+        }
+    }
+}
+
+/// The status for a connection that ended badly.
+fn failed(e: tcp::Error) -> Status {
+    match e {
+        tcp::Error::Refused => Status::Refused,
+        tcp::Error::Reset => Status::Reset,
+        tcp::Error::TimedOut => Status::TimedOut,
+        tcp::Error::Unreachable => Status::Unreachable,
+    }
+}
+
+fn state_number(s: tcp::State) -> u64 {
+    use tcp::State::*;
+    match s {
+        Closed => net::TCP_CLOSED,
+        SynSent => net::TCP_SYN_SENT,
+        SynReceived => net::TCP_SYN_RECEIVED,
+        Established => net::TCP_ESTABLISHED,
+        FinWait1 => net::TCP_FIN_WAIT_1,
+        FinWait2 => net::TCP_FIN_WAIT_2,
+        CloseWait => net::TCP_CLOSE_WAIT,
+        Closing => net::TCP_CLOSING,
+        LastAck => net::TCP_LAST_ACK,
+        TimeWait => net::TCP_TIME_WAIT,
+    }
 }
 
 /// A reassembled datagram, while it is handled.
@@ -252,6 +352,12 @@ static mut NET: Net = Net {
     sockets: [const { None }; SOCKETS],
     epoch: 0,
     next_id: 0,
+    conns: [None; CONNS],
+    loop_head: 0,
+    loop_count: 0,
+    next_port: 0,
+    drop_one_in: 0,
+    random: 0x2545_f491_4f6c_dd1d,
     need_attach: true,
     received: 0,
     sent: 0,
@@ -700,6 +806,9 @@ impl Net {
         let Some(lease) = self.lease else {
             return Status::Unreachable;
         };
+        if dst == lease.ip {
+            return self.loopback(proto, len);
+        }
         let hop = if dst & lease.mask == lease.ip & lease.mask {
             dst
         } else {
@@ -730,6 +839,39 @@ impl Net {
         self.waiting[slot] = Some(w);
         self.arp_send(1, [0; 6], hop);
         Status::Ok
+    }
+
+    /// A packet to this host's own address (its payload on the transmit
+    /// page): queued, and handled as if it had arrived once the current
+    /// work is done ([`Net::run_loopback`]).
+    fn loopback(&mut self, proto: u8, len: usize) -> Status {
+        let ip = self.addr();
+        let total = 20 + len;
+        if self.loop_count == LOOPBACK || total > 4096 {
+            return Status::Ok;
+        }
+        self.ip_header(ip, ip, proto, len, 0);
+        let slot = (self.loop_head + self.loop_count) % LOOPBACK;
+        page(LOOP_VA + 0x1000 * slot as u64)[..total].copy_from_slice(&page(TX_VA)[14..14 + total]);
+        self.loop_count += 1;
+        Status::Ok
+    }
+
+    /// Handles the packets this host sent itself, and those their answers
+    /// send.
+    fn run_loopback(&mut self) {
+        for _ in 0..64 {
+            if self.loop_count == 0 {
+                break;
+            }
+            // The entry stays queued while it is handled, so what it sends
+            // goes after it.
+            let p = page(LOOP_VA + 0x1000 * self.loop_head as u64);
+            let total = (be16(p, 2) as usize).min(4096);
+            self.ipv4(&p[..total]);
+            self.loop_head = (self.loop_head + 1) % LOOPBACK;
+            self.loop_count -= 1;
+        }
     }
 
     /// Sends the `len`-byte payload on the transmit page in fragments.
@@ -790,6 +932,17 @@ impl Net {
     /// The timer: DHCP, and ARP requests again for frames still waiting.
     fn tick(&mut self) {
         self.dhcp_tick();
+        let now = ticks();
+        for c in 0..CONNS {
+            let Some(k) = self.conns[c].as_mut() else {
+                continue;
+            };
+            if k.closed_at.is_some_and(|t| now >= t + LINGER) {
+                k.tcb.abort();
+            }
+            k.tcb.tick(now);
+            self.pump(c);
+        }
         let expired = self.reassembly.expire(ticks(), REASSEMBLY_TICKS);
         count(STAT_DROPPED, expired as u64);
         for w in 0..WAITING {
@@ -878,6 +1031,7 @@ impl Net {
         match p[9] {
             PROTO_ICMP if ours => self.icmp(src, body),
             PROTO_UDP => self.udp(src, dst, body, ours),
+            PROTO_TCP if ours => self.tcp(src, dst, body),
             _ => {}
         }
     }
@@ -902,7 +1056,33 @@ impl Net {
                 self.ip_send(src, PROTO_ICMP, len);
             }
             ICMP_ECHO_REPLY => self.deliver(Kind::Icmp(id), src, seq, &m[8..]),
+            ICMP_UNREACHABLE => self.unreachable(m[1], &m[8..]),
             _ => {}
+        }
+    }
+
+    /// An ICMP "destination unreachable" with code `code`, quoting the
+    /// start of the packet it is about: a TCP connection still
+    /// connecting fails (QEMU's user network answers a refused connection
+    /// with one, on some hosts, rather than a reset).
+    fn unreachable(&mut self, code: u8, q: &[u8]) {
+        if q.len() < 20 || q[9] != PROTO_TCP {
+            return;
+        }
+        let ihl = (q[0] & 0xf) as usize * 4;
+        let Some(t) = q.get(ihl..ihl + 8) else {
+            return;
+        };
+        let (dst, sport, dport, seq) = (be32(q, 16), be16(t, 0), be16(t, 2), be32(t, 4));
+        let found = (0..CONNS).find(|&c| {
+            matches!(&self.conns[c], Some(k) if k.tcb.local_port == sport
+                && k.tcb.remote == dst
+                && k.tcb.remote_port == dport)
+        });
+        if let Some(c) = found {
+            // Port or protocol unreachable: nothing listens there.
+            self.conns[c].as_mut().unwrap().tcb.unreachable(code == 2 || code == 3, seq);
+            self.pump(c);
         }
     }
 
@@ -947,6 +1127,259 @@ impl Net {
         syscall(Syscall::Signal, SOCK_NTFN + i as u64, [0; 4]);
     }
 
+    /// Whether to drop this TCP segment (the test setting).
+    fn drop_this(&mut self) -> bool {
+        if self.drop_one_in == 0 {
+            return false;
+        }
+        self.random ^= self.random << 13;
+        self.random ^= self.random >> 7;
+        self.random ^= self.random << 17;
+        if self.random % self.drop_one_in == 0 {
+            count(STAT_TCP_DROPPED, 1);
+            return true;
+        }
+        false
+    }
+
+    /// Sends a TCP segment to `dst`.
+    fn tcp_emit(&mut self, dst: u32, h: &tcp::Header, a: &[u8], b: &[u8]) {
+        if self.drop_this() {
+            return;
+        }
+        let len = tcp::encode(&mut page(TX_VA)[34..], self.addr(), dst, h, a, b);
+        self.ip_send(dst, PROTO_TCP, len);
+    }
+
+    /// An initial sequence number: a clock (RFC 9293's 4 µs one, from the
+    /// tick) mixed with the instance and a count, so a restarted server's
+    /// numbers do not repeat its predecessor's.
+    fn iss(&mut self) -> u32 {
+        self.next_id = self.next_id.wrapping_add(1);
+        (ticks() as u32).wrapping_mul(2500)
+            ^ (self.epoch as u32).wrapping_mul(0x9e37_79b9)
+            ^ (self.next_id as u32) << 20
+    }
+
+    /// Sends what connection `c` has due, tells its owner of changes, and
+    /// frees it once it is done with.
+    fn pump(&mut self, c: usize) {
+        let Some(k) = self.conns[c] else {
+            return;
+        };
+        let mut t = k.tcb;
+        let remote = t.remote;
+        t.output(ticks(), &bufs(c), &mut |h, a, b| self.tcp_emit(remote, h, a, b));
+        let k = self.conns[c].as_mut().unwrap();
+        k.tcb = t;
+        let s = t.stats;
+        count(STAT_TCP_RESENT, s.retransmitted - k.counted.retransmitted);
+        count(STAT_TCP_OUT_OF_ORDER, s.out_of_order - k.counted.out_of_order);
+        k.counted = s;
+        if t.changed {
+            k.tcb.changed = false;
+            if let Some(i) = k.socket {
+                syscall(Syscall::Signal, SOCK_NTFN + i as u64, [0; 4]);
+            } else if let Some(l) = k.listener.filter(|_| t.is_open()) {
+                syscall(Syscall::Signal, SOCK_NTFN + l as u64, [0; 4]);
+            }
+        }
+        if t.is_finished() && k.socket.is_none() {
+            self.conns[c] = None;
+        }
+    }
+
+    /// A TCP segment to this host.
+    fn tcp(&mut self, src: u32, dst: u32, seg: &[u8]) {
+        let Some((h, data)) = tcp::parse(seg, src, dst) else {
+            return;
+        };
+        if self.drop_this() {
+            return;
+        }
+        let now = ticks();
+        let found = (0..CONNS).find(|&c| {
+            matches!(&self.conns[c], Some(k) if k.tcb.local_port == h.dst_port
+                && k.tcb.remote == src
+                && k.tcb.remote_port == h.src_port
+                && !k.tcb.is_finished())
+        });
+        if let Some(c) = found {
+            let k = self.conns[c].as_mut().unwrap();
+            k.tcb.input(now, &h, data, &mut bufs(c));
+            self.pump(c);
+            return;
+        }
+        if h.flags & (tcp::SYN | tcp::ACK | tcp::RST) == tcp::SYN {
+            let listener = (0..SOCKETS)
+                .find(|&i| matches!(&self.sockets[i], Some(s) if s.kind == Kind::Listen(h.dst_port)));
+            if let Some(l) = listener {
+                let pending = self.conns.iter().flatten().filter(|k| k.listener == Some(l)).count();
+                let free = if pending < BACKLOG { self.free_conn() } else { None };
+                if let Some(c) = free {
+                    let iss = self.iss();
+                    self.conns[c] = Some(Conn {
+                        tcb: Tcb::accept(iss, src, &h, TCP_BUF, TCP_BUF),
+                        socket: None,
+                        listener: Some(l),
+                        closed_at: None,
+                        counted: tcp::Stats::default(),
+                    });
+                    self.pump(c);
+                }
+                // With no room, the SYN is dropped: the peer sends it again.
+                return;
+            }
+        }
+        if let Some(r) = tcp::reset_for(&h, data.len()) {
+            self.tcp_emit(src, &r, &[], &[]);
+        }
+    }
+
+    /// A free connection slot: an empty one, or else one whose owner is
+    /// gone and which only waits out `TIME-WAIT` (the slots are few, and
+    /// that wait guards against old segments, which a new connection's
+    /// fresh port and sequence numbers already do).
+    fn free_conn(&mut self) -> Option<usize> {
+        if let Some(c) = (0..CONNS).find(|&c| self.conns[c].is_none()) {
+            return Some(c);
+        }
+        let c = (0..CONNS).find(|&c| {
+            matches!(&self.conns[c], Some(k) if k.socket.is_none() && k.tcb.state == tcp::State::TimeWait)
+        })?;
+        self.conns[c] = None;
+        Some(c)
+    }
+
+    /// Whether a TCP port is in use, by a listener or a connection.
+    fn tcp_port_free(&self, port: u16) -> bool {
+        !self.sockets.iter().flatten().any(|s| s.kind == Kind::Listen(port))
+            && !self.conns.iter().flatten().any(|k| k.tcb.local_port == port)
+    }
+
+    /// A free ephemeral TCP port, starting somewhere each instance picks,
+    /// so a restarted server does not reuse its predecessor's.
+    fn tcp_port(&mut self) -> Option<u16> {
+        let span = u16::MAX - EPHEMERAL;
+        for _ in 0..span {
+            self.next_port = self.next_port.wrapping_add(1);
+            let p = EPHEMERAL + (self.next_port.wrapping_add((self.epoch as u16).wrapping_mul(97))) % span;
+            if self.tcp_port_free(p) {
+                return Some(p);
+            }
+        }
+        None
+    }
+
+    /// `TCP_CONNECT`: a connection, with its handle and port.
+    fn connect(&mut self, badge: u64, to: u64) -> Result<(u64, u16), Status> {
+        if self.lease.is_none() {
+            return Err(Status::Unreachable);
+        }
+        let c = self.free_conn().ok_or(Status::NoSpace)?;
+        let port = self.tcp_port().ok_or(Status::NoSpace)?;
+        let handle = self.bind(badge, Kind::Tcp(c))?;
+        let iss = self.iss();
+        self.conns[c] = Some(Conn {
+            tcb: Tcb::connect(iss, port, (to >> 16) as u32, to as u16, TCP_BUF, TCP_BUF),
+            socket: Some((handle & 0xff) as usize),
+            listener: None,
+            closed_at: None,
+            counted: tcp::Stats::default(),
+        });
+        self.pump(c);
+        Ok((handle, port))
+    }
+
+    /// `TCP_ACCEPT` on listening socket `l`.
+    fn accept(&mut self, badge: u64, l: usize) -> Result<(u64, u64), Status> {
+        let c = (0..CONNS)
+            .find(|&c| matches!(&self.conns[c], Some(k) if k.listener == Some(l) && k.tcb.is_open()))
+            .ok_or(Status::Empty)?;
+        let handle = self.bind(badge, Kind::Tcp(c))?;
+        let k = self.conns[c].as_mut().unwrap();
+        k.listener = None;
+        k.socket = Some((handle & 0xff) as usize);
+        Ok((handle, (k.tcb.remote as u64) << 16 | k.tcb.remote_port as u64))
+    }
+
+    /// `SEND` on connection `c`: bytes taken.
+    fn tcp_send(&mut self, c: usize, len: usize) -> [u64; 4] {
+        let t = self.conns[c].unwrap().tcb;
+        if let Some(e) = t.error {
+            return [failed(e) as u64, 0, 0, 0];
+        }
+        if !t.may_write() && !matches!(t.state, tcp::State::SynSent | tcp::State::SynReceived) {
+            // Shut down already.
+            return [Status::Invalid as u64, 0, 0, 0];
+        }
+        let n = len.min(4096).min(t.writable());
+        if n == 0 {
+            return [Status::Empty as u64, 0, 0, 0];
+        }
+        if syscall(Syscall::FrameMap, LENT, [LENT_VA, 0, 0, 0]).status != 0 {
+            return [Status::Invalid as u64, 0, 0, 0];
+        }
+        let k = self.conns[c].as_mut().unwrap();
+        let n = k.tcb.write(&mut bufs(c), &page(LENT_VA)[..n]);
+        syscall(Syscall::FrameUnmap, LENT, [0; 4]);
+        self.pump(c);
+        [Status::Ok as u64, n as u64, 0, 0]
+    }
+
+    /// `RECV` on connection `c`.
+    fn tcp_recv(&mut self, c: usize) -> [u64; 4] {
+        let t = self.conns[c].unwrap().tcb;
+        let peer = (t.remote as u64) << 16 | t.remote_port as u64;
+        if t.readable() == 0 {
+            return if t.eof() {
+                [Status::Ok as u64, 0, peer, 0]
+            } else if let Some(e) = t.error {
+                [failed(e) as u64, 0, 0, 0]
+            } else {
+                [Status::Empty as u64, 0, 0, 0]
+            };
+        }
+        if syscall(Syscall::FrameMap, LENT, [LENT_VA, 1, 0, 0]).status != 0 {
+            return [Status::Invalid as u64, 0, 0, 0];
+        }
+        let k = self.conns[c].as_mut().unwrap();
+        let n = k.tcb.read(&bufs(c), &mut page(LENT_VA)[..4096]);
+        syscall(Syscall::FrameUnmap, LENT, [0; 4]);
+        self.pump(c);
+        [Status::Ok as u64, n as u64, peer, 0]
+    }
+
+    /// Frees socket `i`; its notification is revoked.
+    fn unbind(&mut self, i: usize) {
+        match self.sockets[i].as_ref().map(|s| s.kind) {
+            Some(Kind::Tcp(c)) => {
+                if let Some(k) = self.conns[c].as_mut() {
+                    k.socket = None;
+                    k.closed_at = Some(ticks());
+                    if k.tcb.error.is_some() {
+                        k.tcb.abort();
+                    } else {
+                        k.tcb.close();
+                    }
+                }
+                self.pump(c);
+            }
+            Some(Kind::Listen(_)) => {
+                for c in 0..CONNS {
+                    if let Some(k) = self.conns[c].as_mut().filter(|k| k.listener == Some(i)) {
+                        k.tcb.abort();
+                        k.listener = None;
+                        self.pump(c);
+                    }
+                }
+            }
+            _ => {}
+        }
+        self.sockets[i] = None;
+        syscall(Syscall::CapRevoke, SOCK_NTFN + i as u64, [0; 4]);
+    }
+
     fn socket(&mut self, badge: u64, handle: u64) -> Option<usize> {
         let i = (handle & 0xff) as usize;
         match self.sockets.get(i) {
@@ -986,6 +1419,10 @@ impl Net {
             dropped: 0,
         });
         Ok(handle)
+    }
+
+    fn kind(&self, i: usize) -> Kind {
+        self.sockets[i].as_ref().unwrap().kind
     }
 
     fn port_free(&self, port: u16) -> bool {
@@ -1031,6 +1468,7 @@ impl Net {
                 put16(m, 2, c);
                 self.ip_send(dst, PROTO_ICMP, 8 + len)
             }
+            Kind::Listen(_) | Kind::Tcp(_) => Status::Invalid,
         };
         syscall(Syscall::FrameUnmap, LENT, [0; 4]);
         status
@@ -1100,22 +1538,75 @@ impl Net {
                     Err(s) => status(s),
                 }
             }
-            net::SEND if lent => match self.socket(badge, m[1]) {
-                Some(i) => status(self.send(i, m[2], m[3] as usize)),
+            net::SEND if lent => match self.socket(badge, m[1]).map(|i| (i, self.kind(i))) {
+                Some((_, Kind::Tcp(c))) => (self.tcp_send(c, m[3] as usize), false),
+                Some((_, Kind::Listen(_))) => status(Status::Invalid),
+                Some((i, _)) => status(self.send(i, m[2], m[3] as usize)),
                 None => status(Status::NotFound),
             },
-            net::RECV if lent => match self.socket(badge, m[1]) {
-                Some(i) => (self.recv(i), false),
+            net::RECV if lent => match self.socket(badge, m[1]).map(|i| (i, self.kind(i))) {
+                Some((_, Kind::Tcp(c))) => (self.tcp_recv(c), false),
+                Some((_, Kind::Listen(_))) => status(Status::Invalid),
+                Some((i, _)) => (self.recv(i), false),
                 None => status(Status::NotFound),
             },
             net::CLOSE => match self.socket(badge, m[1]) {
                 Some(i) => {
-                    self.sockets[i] = None;
-                    syscall(Syscall::CapRevoke, SOCK_NTFN + i as u64, [0; 4]);
+                    self.unbind(i);
                     status(Status::Ok)
                 }
                 None => status(Status::NotFound),
             },
+            net::TCP_CONNECT => match self.connect(badge, m[1]) {
+                Ok((h, port)) => ([Status::Ok as u64, h, port as u64, 0], true),
+                Err(s) => status(s),
+            },
+            net::TCP_LISTEN => {
+                let port = m[1] as u16;
+                if port == 0 || m[1] > u16::MAX as u64 {
+                    return status(Status::Invalid);
+                }
+                if !self.tcp_port_free(port) {
+                    return status(Status::InUse);
+                }
+                match self.bind(badge, Kind::Listen(port)) {
+                    Ok(h) => ([Status::Ok as u64, h, port as u64, 0], true),
+                    Err(s) => status(s),
+                }
+            }
+            net::TCP_ACCEPT => match self.socket(badge, m[1]).map(|i| (i, self.kind(i))) {
+                Some((l, Kind::Listen(_))) => match self.accept(badge, l) {
+                    Ok((h, peer)) => ([Status::Ok as u64, h, peer, 0], true),
+                    Err(s) => status(s),
+                },
+                Some(_) => status(Status::Invalid),
+                None => status(Status::NotFound),
+            },
+            net::TCP_SHUTDOWN | net::TCP_STATE => match self.socket(badge, m[1]).map(|i| self.kind(i)) {
+                Some(Kind::Tcp(c)) => {
+                    if m[0] == net::TCP_SHUTDOWN {
+                        self.conns[c].as_mut().unwrap().tcb.close();
+                        self.pump(c);
+                        return status(Status::Ok);
+                    }
+                    let t = self.conns[c].unwrap().tcb;
+                    (
+                        [Status::Ok as u64, state_number(t.state), t.unacked() as u64, t.readable() as u64],
+                        false,
+                    )
+                }
+                Some(_) => status(Status::Invalid),
+                None => status(Status::NotFound),
+            },
+            net::TCP_STATS if m[1] == net::VERSION => (
+                [
+                    Status::Ok as u64,
+                    counted(STAT_TCP_RESENT),
+                    counted(STAT_TCP_DROPPED),
+                    counted(STAT_TCP_OUT_OF_ORDER),
+                ],
+                false,
+            ),
             _ => status(Status::Invalid),
         }
     }
@@ -1150,6 +1641,18 @@ fn start(n: &mut Net) -> Result<(), (&'static str, u64)> {
         retype(ObjectType::Frame, QUEUE_PAGES + k)?;
         if syscall(Syscall::FrameMap, QUEUE_PAGES + k, [QUEUE_VA + 0x1000 * k, 1, 0, 0]).status != 0 {
             return Err(("mapping a queue page", k));
+        }
+    }
+    for k in 0..(CONNS * 4) as u64 {
+        retype(ObjectType::Frame, TCP_PAGES + k)?;
+        if syscall(Syscall::FrameMap, TCP_PAGES + k, [TCP_VA + 0x1000 * k, 1, 0, 0]).status != 0 {
+            return Err(("mapping a TCP page", k));
+        }
+    }
+    for k in 0..LOOPBACK as u64 {
+        retype(ObjectType::Frame, LOOP_PAGES + k)?;
+        if syscall(Syscall::FrameMap, LOOP_PAGES + k, [LOOP_VA + 0x1000 * k, 1, 0, 0]).status != 0 {
+            return Err(("mapping a loopback page", k));
         }
     }
     if syscall(Syscall::FrameMap, STATE, [STATE_VA, 1, 0, 0]).status != 0 {
@@ -1200,7 +1703,8 @@ fn start(n: &mut Net) -> Result<(), (&'static str, u64)> {
 pub extern "C" fn _start(arg: u64) -> ! {
     // SAFETY: the one thread is the only user of NET.
     let n = unsafe { &mut *(&raw mut NET) };
-    n.renew_every = arg;
+    n.renew_every = arg & 0xffff_ffff;
+    n.drop_one_in = arg >> 32;
     if let Err((what, code)) = start(n) {
         say!("[fail] {what} ({code})");
         loop {
@@ -1219,6 +1723,7 @@ pub extern "C" fn _start(arg: u64) -> ! {
                 n.tick();
             }
             n.drain();
+            n.run_loopback();
             continue;
         }
         if r.status != 0 {
@@ -1237,6 +1742,7 @@ pub extern "C" fn _start(arg: u64) -> ! {
         if grant {
             syscall(Syscall::CapDelete, MINT, [0; 4]);
         }
+        n.run_loopback();
     }
 }
 
