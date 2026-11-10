@@ -42,6 +42,9 @@ component net
   memory 22
   untyped 21 2
   state 17
+  # The frame rings it shares with the driver (nic::ring): kept by the
+  # manager, so a restart of either side leaves the other's mapped.
+  shared 13 18
   cspace 9
 
 # Names: asks the gateway's port 47053, where xtask answers DNS on the

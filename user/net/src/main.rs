@@ -27,8 +27,18 @@
 //! again, if it runs out or the server refuses it. Until there is a lease
 //! the server has no address: `INFO` and `SEND` answer `Unreachable`.
 //!
+//! Frames go to and from the driver through rings (`nic::ring`) in pages
+//! the manifest shares (`shared 13 18`), which the server attaches to the
+//! driver at start and again whenever the driver has been restarted:
+//! under load there is no call per frame, and neither side signals the
+//! other unless it sleeps. Nothing in those pages is trusted: a received
+//! frame is copied out before it is looked at. While there is no ring
+//! (none in the manifest, or the driver was just restarted) each frame
+//! takes a call, as before; the timer's call to the driver is what finds
+//! a restarted one.
+//!
 //! Slots: 0 the `nic` endpoint, 1 the `net` endpoint (receive), 2 untyped
-//! memory (2 MiB), 17 the state page.
+//! memory (2 MiB), 17 the state page, 18 to 30 the ring's shared pages.
 //!
 //! TCP (`superior_inet::tcp`): up to [`CONNS`] connections, each with
 //! 8 KiB rings each way in pages made at start, and using window scaling,
@@ -59,7 +69,9 @@
 #![no_std]
 #![no_main]
 
+use core::sync::atomic::{AtomicU32, Ordering, fence};
 use superior_objects::abi::{CapTransfer, Error, ObjectType, Syscall};
+use superior_objects::interfaces::nic::ring;
 use superior_inet::tcp::{self, Bufs, Tcb};
 use superior_inet::{Key, MAX_REASSEMBLED, Outcome, Reassembler, fold, ipv4, mapped, pseudo, sum};
 use superior_objects::interfaces::{Status, net, nic};
@@ -82,8 +94,12 @@ const TX_FRAME: u64 = 7;
 const LENT: u64 = 8;
 /// The state page, which outlives instances: the DHCP lease.
 const STATE: u64 = 17;
+/// The frame rings' pages (`shared` in the manifest), and the driver's
+/// doorbell.
+const RING_SHARED: u64 = 18;
+const DOORBELL: u64 = RING_SHARED + ring::PAGES;
 /// The datagram pool's pages, POOL of them.
-const POOL_PAGES: u64 = 18;
+const POOL_PAGES: u64 = DOORBELL + 1;
 /// The TCP connections' ring pages, CONNS * 4 of them.
 const TCP_PAGES: u64 = POOL_PAGES + POOL as u64;
 /// The loopback queue's pages, LOOPBACK of them.
@@ -107,6 +123,7 @@ const LOOP_VA: u64 = RX_VA + 0x30_0000;
 const WHOLE_VA: u64 = RX_VA + 0x40_0000;
 const PIECES_VA: u64 = RX_VA + 0x50_0000;
 const REASM_VA: u64 = RX_VA + 0x60_0000;
+const RING_VA: u64 = RX_VA + 0x70_0000;
 
 /// Badges on this thread's notification.
 const RX: u64 = 1;
@@ -146,6 +163,10 @@ const STAT_DROPPED: usize = 10;
 const STAT_TCP_RESENT: usize = 11;
 const STAT_TCP_DROPPED: usize = 12;
 const STAT_TCP_OUT_OF_ORDER: usize = 13;
+/// Frames through the rings, frames by a call each, rings set up.
+const STAT_RING_FRAMES: usize = 60;
+const STAT_CALL_FRAMES: usize = 61;
+const STAT_RINGS: usize = 62;
 /// Datagrams reassembled at once, and how long one may take (5 s).
 const REASSEMBLING: usize = 4;
 const REASSEMBLY_TICKS: u64 = 500;
@@ -335,6 +356,16 @@ struct Net {
     drop_one_in: u64,
     random: u64,
     need_attach: bool,
+    /// The frame rings are set up with the driver: frames go through
+    /// them, not by calls.
+    ring_up: bool,
+    /// The manifest shares no pages for a ring.
+    ring_absent: bool,
+    ring_mapped: bool,
+    /// The server's own ends of the rings: the next received frame to
+    /// take, and where the next frame to send goes.
+    rx_head: u32,
+    tx_tail: u32,
     received: u64,
     sent: u64,
 }
@@ -462,6 +493,11 @@ static mut NET: Net = Net {
     drop_one_in: 0,
     random: 0x2545_f491_4f6c_dd1d,
     need_attach: true,
+    ring_up: false,
+    ring_absent: false,
+    ring_mapped: false,
+    rx_head: 0,
+    tx_tail: 0,
     received: 0,
     sent: 0,
 };
@@ -510,6 +546,22 @@ fn put32(b: &mut [u8], at: usize, v: u32) {
     b[at..at + 4].copy_from_slice(&v.to_be_bytes());
 }
 
+
+/// How long (in ticks) the server waits, yielding the CPU, for a slot in
+/// a full transmit ring before it gives the frame up. The driver may be
+/// waiting for the device to send what it has, which takes real time.
+const FULL_RING_TICKS: u64 = 5;
+
+/// Word `off` of the ring's header page.
+fn hdr(off: usize) -> &'static AtomicU32 {
+    // SAFETY: only used once the ring's pages are mapped, for good.
+    unsafe { &*((RING_VA + off as u64) as *const AtomicU32) }
+}
+
+/// Where frame `i` of a ring whose slots start at page `page` lies.
+fn ring_slot(page: u64, i: u32, slots: u32) -> u64 {
+    RING_VA + page * 4096 + (i % slots) as u64 * ring::SLOT
+}
 
 /// Calls the driver, lending `frame`; tries again if it was restarted.
 fn nic_call(m: [u64; 4], frame: u64) -> Option<[u64; 4]> {
@@ -779,33 +831,200 @@ impl Net {
         self.need_attach = !(r.status == 0 && r.msg[0] == Status::Ok as u64);
     }
 
-    /// Takes every frame the driver has.
+    /// Sets the frame rings up with the driver: maps the shared pages
+    /// (once), attaches each, starts the ring and takes the doorbell.
+    /// Without them, or if the driver refuses, frames go by calls.
+    fn ring_setup(&mut self) {
+        self.ring_up = false;
+        if self.ring_absent {
+            return;
+        }
+        if !self.ring_mapped {
+            for p in 0..ring::PAGES {
+                let va = RING_VA + p * 4096;
+                if syscall(Syscall::FrameMap, RING_SHARED + p, [va, 1, 0, 0]).status != 0 {
+                    // The manifest shares no pages for a ring.
+                    self.ring_absent = true;
+                    return;
+                }
+            }
+            self.ring_mapped = true;
+        }
+        let ok = Status::Ok as u64;
+        for p in 0..ring::PAGES {
+            if nic_call([nic::RING_ATTACH, p, 0, 0], RING_SHARED + p).map(|r| r[0]) != Some(ok) {
+                return;
+            }
+        }
+        syscall(Syscall::CapDelete, DOORBELL, [0; 4]);
+        let x = CapTransfer {
+            grant: None,
+            accept: Some(DOORBELL as u16),
+        };
+        let r = syscall_x(Syscall::Call, NIC, [nic::RING_START, 0, 0, 0], x);
+        if r.status != 0 || r.msg[0] != ok || r.cap != Some(DOORBELL as u16) {
+            return;
+        }
+        // The driver cleared the header: both rings are empty.
+        (self.rx_head, self.tx_tail) = (0, 0);
+        self.ring_up = true;
+        count(STAT_RINGS, 1);
+        say!("frame rings set up with the driver ({} times so far)", counted(STAT_RINGS));
+    }
+
+    /// Wakes the driver. False (and the ring is given up) if its doorbell
+    /// is gone: the driver was restarted.
+    fn ring_bell(&mut self) -> bool {
+        if syscall(Syscall::Signal, DOORBELL, [0; 4]).status != 0 {
+            self.ring_up = false;
+            self.need_attach = true;
+        }
+        self.ring_up
+    }
+
+    /// Takes every frame in the receive ring.
+    fn drain_ring(&mut self) {
+        if !self.ring_up {
+            return;
+        }
+        let tail = hdr(ring::RX_TAIL).load(Ordering::Acquire);
+        let n = ring::waiting(self.rx_head, tail, ring::RX_SLOTS);
+        for _ in 0..n {
+            let at = self.rx_head % ring::RX_SLOTS;
+            let len = hdr(ring::RX_LEN + 4 * at as usize).load(Ordering::Relaxed);
+            let len = (len as usize).min(MAX_FRAME);
+            // Copied out first: the driver can write to the ring at any
+            // time, and what is parsed must hold still.
+            // SAFETY: the ring's pages and the receive page are mapped;
+            // `len` fits in a slot and in the page.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    ring_slot(ring::RX_PAGE, self.rx_head, ring::RX_SLOTS) as *const u8,
+                    RX_VA as *mut u8,
+                    len,
+                );
+            }
+            self.rx_head = self.rx_head.wrapping_add(1);
+            hdr(ring::RX_HEAD).store(self.rx_head, Ordering::Release);
+            self.received += 1;
+            count(STAT_RING_FRAMES, 1);
+            self.frame(&page(RX_VA)[..len]);
+        }
+        // The driver may be holding frames back from a ring that was
+        // full: there is room now.
+        if n > 0 {
+            fence(Ordering::SeqCst);
+            if hdr(ring::RX_STALLED).swap(0, Ordering::SeqCst) != 0 {
+                self.ring_bell();
+            }
+        }
+    }
+
+    /// Before the server waits: empties the receive ring, says it sleeps,
+    /// and looks once more, so a frame put there meanwhile is not left
+    /// with nobody to signal.
+    fn before_sleep(&mut self) {
+        while self.ring_up {
+            self.drain_ring();
+            hdr(ring::CALLER_SLEEPS).store(1, Ordering::SeqCst);
+            fence(Ordering::SeqCst);
+            let tail = hdr(ring::RX_TAIL).load(Ordering::Acquire);
+            if ring::waiting(self.rx_head, tail, ring::RX_SLOTS) == 0 {
+                break;
+            }
+            hdr(ring::CALLER_SLEEPS).store(0, Ordering::SeqCst);
+        }
+    }
+
+    /// Takes every frame the driver has by calls, which also finds a
+    /// driver that was restarted: it has lost the notification and the
+    /// ring, and gets both again.
     fn drain(&mut self) {
         for _ in 0..64 {
             let Some(r) = nic_call([nic::RECV, 0, 0, 0], RX_FRAME) else {
                 self.need_attach = true;
+                self.ring_up = false;
                 break;
             };
             if r[2] == 0 {
                 self.need_attach = true;
             }
+            if r[3] == 0 {
+                self.ring_up = false;
+            }
             if r[0] != Status::Ok as u64 {
                 break;
             }
             self.received += 1;
+            count(STAT_CALL_FRAMES, 1);
             let len = (r[1] as usize).min(MAX_FRAME);
             self.frame(&page(RX_VA)[..len]);
         }
         if self.need_attach {
             self.attach();
         }
+        if !self.ring_up {
+            self.ring_setup();
+        }
+    }
+
+    /// Puts the first `len` bytes of the transmit page in the transmit
+    /// ring. `None` if there is no ring to put it in (any more).
+    fn ring_transmit(&mut self, len: usize) -> Option<Status> {
+        if !self.ring_up {
+            return None;
+        }
+        // A full ring: the driver, on another CPU or about to be woken,
+        // is on its way through it, so wait for a slot rather than lose
+        // the frame (a datagram in 45 fragments fills the ring at once).
+        // Not for ever: the device may be stuck, or the driver dead.
+        let mut since = None;
+        loop {
+            let head = hdr(ring::TX_HEAD).load(Ordering::Acquire);
+            if ring::waiting(head, self.tx_tail, ring::TX_SLOTS) < ring::TX_SLOTS {
+                break;
+            }
+            if hdr(ring::DRIVER_SLEEPS).swap(0, Ordering::SeqCst) != 0 && !self.ring_bell() {
+                return None;
+            }
+            let now = ticks();
+            if now >= *since.get_or_insert(now) + FULL_RING_TICKS {
+                return Some(Status::NoSpace);
+            }
+            syscall(Syscall::Yield, 0, [0; 4]);
+        }
+        let at = self.tx_tail % ring::TX_SLOTS;
+        // SAFETY: the transmit page and the ring's pages are mapped; `len`
+        // (at most MAX_FRAME) fits in a slot.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                TX_VA as *const u8,
+                ring_slot(ring::TX_PAGE, self.tx_tail, ring::TX_SLOTS) as *mut u8,
+                len.min(MAX_FRAME),
+            );
+        }
+        hdr(ring::TX_LEN + 4 * at as usize).store(len.min(MAX_FRAME) as u32, Ordering::Relaxed);
+        self.tx_tail = self.tx_tail.wrapping_add(1);
+        hdr(ring::TX_TAIL).store(self.tx_tail, Ordering::Release);
+        fence(Ordering::SeqCst);
+        if hdr(ring::DRIVER_SLEEPS).swap(0, Ordering::SeqCst) != 0 && !self.ring_bell() {
+            // The driver is gone, and the frame with it: by a call, then.
+            return None;
+        }
+        self.sent += 1;
+        count(STAT_RING_FRAMES, 1);
+        Some(Status::Ok)
     }
 
     /// Sends the first `len` bytes of the transmit page.
     fn transmit(&mut self, len: usize) -> Status {
+        if let Some(s) = self.ring_transmit(len) {
+            return s;
+        }
         match nic_call([nic::SEND, len as u64, 0, 0], TX_FRAME) {
             Some(r) if r[0] == Status::Ok as u64 => {
                 self.sent += 1;
+                count(STAT_CALL_FRAMES, 1);
                 Status::Ok
             }
             Some(r) => Status::from_u64(r[0]),
@@ -1884,6 +2103,15 @@ impl Net {
     fn serve(&mut self, badge: u64, m: [u64; 4], lent: bool) -> ([u64; 4], bool) {
         let status = |s: Status| ([s as u64, 0, 0, 0], false);
         match m[0] {
+            net::LINK_STATS if m[1] == net::VERSION => (
+                [
+                    Status::Ok as u64,
+                    counted(STAT_RING_FRAMES),
+                    counted(STAT_CALL_FRAMES),
+                    counted(STAT_RINGS),
+                ],
+                false,
+            ),
             net::STATS if m[1] == net::VERSION => (
                 [
                     Status::Ok as u64,
@@ -2113,6 +2341,7 @@ fn start(n: &mut Net) -> Result<(), (&'static str, u64)> {
         *b = (info[1] >> (40 - 8 * i)) as u8;
     }
     n.attach();
+    n.ring_setup();
     syscall(Syscall::TimerSignal, TIMER_CAP, [PERIOD, 0, 0, 0]);
     let m = n.mac;
     say!(
@@ -2156,13 +2385,23 @@ pub extern "C" fn _start(arg: u64) -> ! {
         accept: Some(LENT as u16),
     };
     loop {
+        // With a ring, received frames are taken here, whatever woke the
+        // server, and never by a call.
+        n.before_sleep();
+        n.run_loopback();
         let r = syscall_x(Syscall::Recv, SERVICE, [0; 4], accept);
+        if n.ring_up {
+            hdr(ring::CALLER_SLEEPS).store(0, Ordering::SeqCst);
+        }
         if r.status == Error::Notified.code() {
-            if r.badge & TIMER != 0 {
+            let timer = r.badge & TIMER != 0;
+            if timer {
                 syscall(Syscall::TimerSignal, TIMER_CAP, [PERIOD, 0, 0, 0]);
                 n.tick();
             }
-            n.drain();
+            if timer || !n.ring_up {
+                n.drain();
+            }
             n.run_loopback();
             continue;
         }

@@ -429,6 +429,19 @@ holds the rest):
     bound to its thread, so one `Recv` waits for calls and frames; when frames arrive
     it signals the notification its caller attached. A restarted driver has lost it,
     and says so in every `RECV` reply.
+  - Frame rings between the two (`nic::ring`): 13 pages the manifest shares
+    (`shared`, kept by the manager, so a restart of either side leaves the other's
+    mapped) hold a receive ring of 16 frames and a transmit ring of 8. The driver
+    puts received frames in one as its interrupt brings them and sends what the
+    server puts in the other, so under load no frame takes a call, and neither side
+    signals the other unless the other said it sleeps. Nothing in the shared pages
+    is trusted: indices and lengths are bounded, a received frame is copied out
+    before it is parsed, and the device never sees the pages. A full transmit ring
+    makes the server wait for the driver rather than drop the frame; frames stuck
+    behind a full device are the one time the driver asks for transmit interrupts.
+    While there is no ring (just after the driver restarted, or none in the
+    manifest) each frame takes a call as before, and the server's timer call finds
+    a restarted driver and sets the ring up again.
   - The server speaks IPv4 over Ethernet: ARP (answering for itself, resolving next
     hops, holding frames that wait for an answer and asking again), ICMP echo (it
     answers pings) and UDP, with checksums, and IPv4 fragments: a datagram of up to
@@ -635,8 +648,8 @@ these buses have none); more than one command per queue in the NVMe driver,
 more than two commands in flight per disk in the AHCI driver, ATAPI
 and port multipliers; in the xHCI driver isochronous and bulk endpoints, USB 3 streams,
 hubs and more than one interrupter, and HID devices other than boot keyboards; in the network server
-IPv6 routes beyond one router and stateful DHCPv6, DNS records other than A, AAAA and CNAME (and DNS over TCP), routes beyond one gateway, and rings in place of a
-call per frame; buses behind bridges; the async executor, buffer pools and
+IPv6 routes beyond one router and stateful DHCPv6, DNS records other than A, AAAA and CNAME (and DNS over TCP), routes beyond one gateway, and rings between
+clients and the server (frames between the server and the driver go through rings; a client's datagram still takes a call); buses behind bridges; the async executor, buffer pools and
 power callbacks of the SDK; an IDL compiler for the interfaces; escalating a component
 given up on to a supervisor above it (today the
 manager is the only one), memory budgets from a policy service, giving the Memory Server all spare

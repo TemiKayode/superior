@@ -3474,6 +3474,16 @@ fn net_client() -> ! {
     dns_checks(&mut t);
     tcp_under_faults(&mut t, Dest::V4(gw | TCP_ECHO_PORT as u64));
     ipv6_checks(&mut t);
+    // Frames go between the server and the driver through their rings;
+    // only around a restart of either does one take a call.
+    let s = syscall(Syscall::Call, NET, [net::LINK_STATS, net::VERSION, 0, 0]).msg;
+    t.check(
+        s[0] == OK && s[3] > 0 && s[1] > 20 * s[2],
+        format_args!(
+            "{} frames through the rings with the driver, {} by a call each; rings set up {} times",
+            s[1], s[2], s[3]
+        ),
+    );
     syscall(Syscall::Call, NET_CONTROL, [OP_SHUTDOWN, t.0, 0, 0]);
     superior_sys::park()
 }

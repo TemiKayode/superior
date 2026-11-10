@@ -70,6 +70,15 @@ impl Queue {
         dma_barrier();
     }
 
+    /// Asks the device to interrupt (or not) when it finishes a chain: a
+    /// hint (`VIRTQ_AVAIL_F_NO_INTERRUPT`), so look at the ring again
+    /// after asking for interrupts.
+    pub fn interrupts(&mut self, on: bool) {
+        // SAFETY: the flags word starts the driver ring, in the queue page.
+        unsafe { self.at::<u16>(AVAIL).write_volatile(!on as u16) };
+        dma_barrier();
+    }
+
     /// Whether the device has finished a chain not yet taken.
     pub fn has_used(&self) -> bool {
         dma_barrier();

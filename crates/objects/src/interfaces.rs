@@ -173,13 +173,102 @@ pub mod nic {
     /// it: `RECV` says so, and the caller attaches again.
     pub const ATTACH: u64 = 2;
     /// `[RECV]` with a frame lent: the oldest received frame, copied into
-    /// it. Reply `[status, length, attached, 0]`: `Empty` if none is
-    /// waiting; `attached` is 0 if no notification is attached.
+    /// it. Reply `[status, length, attached, ring]`: `Empty` if none is
+    /// waiting (always, while a ring is started: frames go there);
+    /// `attached` is 0 if no notification is attached, `ring` 0 if no
+    /// ring is started. A restarted driver has neither.
     pub const RECV: u64 = 3;
     /// `[SEND, length]` with a frame lent: queues the frame at its start
     /// for transmission. Reply `[status]`: `NoSpace` if the transmit
     /// queue is full.
     pub const SEND: u64 = 4;
+    /// `[RING_ATTACH, page]` with page `page` of the caller's ring
+    /// granted (pages 0 to [`ring::PAGES`] - 1, in order; page 0 drops a
+    /// ring the driver had). The pages should be ones the manager keeps
+    /// across restarts (`shared`), so neither side's restart unmaps the
+    /// other's.
+    pub const RING_ATTACH: u64 = 5;
+    /// `[RING_START]` once every page is attached: the driver clears the
+    /// ring's header and from then on puts received frames in the ring
+    /// and sends what the caller puts there. The reply grants the
+    /// doorbell (Write). It belongs to the driver: a restart destroys it.
+    pub const RING_START: u64 = 6;
+
+    /// Frame rings (spec section 3, tier 2): received frames one way and
+    /// frames to send the other, in pages shared by the driver and its
+    /// caller, each ring with one producer and one consumer. Under load
+    /// neither side makes a system call per frame: a side signals the
+    /// other only when the other has said it is going to sleep.
+    ///
+    /// Slot `i % SLOTS` of a ring holds frame `i`: its bytes in the data
+    /// pages, its length in the header page. The producer fills the slot,
+    /// then moves the tail; the consumer copies the frame out (the
+    /// producer could change it at any time: nothing in these pages is to
+    /// be trusted or parsed in place), then moves the head. Neither side
+    /// believes the other's index further than the ring's size, or a
+    /// length beyond `MAX_FRAME`.
+    ///
+    /// Before it sleeps a side sets its flag and looks at its ring once
+    /// more; the other side, after moving a tail, clears the flag and
+    /// signals if it was set: the caller the doorbell, the driver the
+    /// notification from `ATTACH`. A driver that finds the receive ring
+    /// full keeps the frames in the device's buffers and says so
+    /// (`RX_STALLED`, then one more look); the caller, after taking
+    /// frames, clears that and rings the doorbell if it was set.
+    pub mod ring {
+        /// Bytes for each frame slot.
+        pub const SLOT: u64 = 2048;
+        pub const RX_SLOTS: u32 = 16;
+        pub const TX_SLOTS: u32 = 8;
+        /// The header page, then the receive slots, then the transmit
+        /// slots.
+        pub const RX_PAGE: u64 = 1;
+        pub const TX_PAGE: u64 = RX_PAGE + RX_SLOTS as u64 * SLOT / 4096;
+        pub const PAGES: u64 = TX_PAGE + TX_SLOTS as u64 * SLOT / 4096;
+
+        // Header words (u32), a cache line apart.
+        /// Next received frame the caller takes (caller writes).
+        pub const RX_HEAD: usize = 0;
+        /// Next free receive slot (driver writes).
+        pub const RX_TAIL: usize = 64;
+        /// Next frame the driver sends (driver writes).
+        pub const TX_HEAD: usize = 128;
+        /// Next free transmit slot (caller writes).
+        pub const TX_TAIL: usize = 192;
+        /// 1 while the driver sleeps: signal the doorbell.
+        pub const DRIVER_SLEEPS: usize = 256;
+        /// 1 while the caller sleeps: signal its notification.
+        pub const CALLER_SLEEPS: usize = 320;
+        /// 1 while the driver holds received frames back because the
+        /// receive ring was full (driver writes; the caller clears it).
+        pub const RX_STALLED: usize = 384;
+        /// Lengths of the frames in the receive slots (u32 each).
+        pub const RX_LEN: usize = 1024;
+        /// Lengths of the frames in the transmit slots.
+        pub const TX_LEN: usize = 2048;
+
+        /// How many frames wait between `head` and `tail`, whatever the
+        /// other side wrote: never more than the ring holds.
+        pub const fn waiting(head: u32, tail: u32, slots: u32) -> u32 {
+            let n = tail.wrapping_sub(head);
+            if n > slots { slots } else { n }
+        }
+
+        #[cfg(test)]
+        #[test]
+        fn layout() {
+            assert_eq!(PAGES, 13);
+            assert!(super::MAX_FRAME <= SLOT);
+            assert!(RX_SLOTS.is_power_of_two() && TX_SLOTS.is_power_of_two());
+            assert!(RX_LEN + 4 * RX_SLOTS as usize <= TX_LEN);
+            assert!(TX_LEN + 4 * TX_SLOTS as usize <= 4096);
+            assert_eq!(waiting(5, 9, 16), 4);
+            assert_eq!(waiting(u32::MAX, 1, 16), 2);
+            // A tail behind the head, or too far ahead, is not believed.
+            assert_eq!(waiting(9, 5, 16), 16);
+            assert_eq!(waiting(0, 1000, 8), 8);
+        }
+    }
 }
 
 /// The network: what the network server serves. IPv4 and IPv6 with ICMP
@@ -331,6 +420,11 @@ pub mod net {
     /// received, which the server keeps until the next `RECV` or `RECV6`.
     /// Reply `[status, bytes]`; `Empty` if there are none.
     pub const RECV_PART: u64 = 21;
+
+    /// `[LINK_STATS, VERSION]`: reply `[status, frames that went to or
+    /// came from the driver through the frame rings, frames that took a
+    /// call each, times the rings were set up]`, counted across restarts.
+    pub const LINK_STATS: u64 = 22;
 
     /// TCP states, as `TCP_STATE` gives them (RFC 9293's names).
     pub const TCP_CLOSED: u64 = 0;
