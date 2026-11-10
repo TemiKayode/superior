@@ -190,7 +190,8 @@ pub mod net {
     pub const MAX_PAYLOAD: u64 = 1472;
 
     /// `[INFO, VERSION]`: reply `[status, this host's address (IPv4, as
-    /// in addr), its MAC address, the gateway's address]`.
+    /// in addr), its MAC address, the gateway's address]`; `Unreachable`
+    /// while the server has no address yet (DHCP has not answered).
     pub const INFO: u64 = 1;
     /// `[UDP_BIND, port]`: a UDP socket on `port` (0: any free one). Reply
     /// `[status, handle, port]` and the socket's notification; `InUse` if
@@ -213,6 +214,10 @@ pub mod net {
     pub const RECV: u64 = 5;
     /// `[CLOSE, handle]`: closes the socket; its notification is deleted.
     pub const CLOSE: u64 = 6;
+    /// `[LEASE, VERSION]`: reply `[status, the netmask (IPv4, as a 32-bit
+    /// number), the DNS server's address (as in addr), seconds left on the
+    /// DHCP lease]`; `Unreachable` while there is none.
+    pub const LEASE: u64 = 7;
 
     /// The word for IPv4 address `ip` and `port`.
     pub const fn addr(ip: [u8; 4], port: u16) -> u64 {

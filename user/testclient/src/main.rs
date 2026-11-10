@@ -1541,11 +1541,12 @@ const NET_MEMORY: u64 = 2;
 const NET_NTFN: u64 = 3;
 const NET_PAGE: u64 = 4;
 const NET_PAGE_VA: u64 = USER_BASE + 0x4000_0000;
-/// QEMU's user-mode network: the gateway is the host, and UDP to it
-/// reaches the host's loopback, where `cargo xtask net-test` echoes on
-/// this port.
-const GATEWAY: [u8; 4] = [10, 0, 2, 2];
+/// QEMU's user-mode network: the gateway (from DHCP) is the host, and UDP
+/// to it reaches the host's loopback, where `cargo xtask net-test` echoes
+/// on this port.
 const ECHO_PORT: u16 = 47001;
+/// Ticks to wait for the server's first DHCP lease.
+const LEASE_TICKS: u64 = 1000;
 /// At least this many pings and echoes, and for at least this many ticks
 /// each, so the injector's kills land throughout.
 const PINGS: u64 = 20;
@@ -1555,6 +1556,16 @@ const ECHO_TICKS: u64 = 500;
 /// Ticks to wait for an answer before sending again.
 const NET_TIMEOUT: u64 = 30;
 const NET_TRIES: u32 = 50;
+
+/// An address word (as in `net::addr`), printed as its dotted IPv4 address.
+struct Dotted(u64);
+
+impl core::fmt::Display for Dotted {
+    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+        let b = ((self.0 >> 16) as u32).to_be_bytes();
+        write!(f, "{}.{}.{}.{}", b[0], b[1], b[2], b[3])
+    }
+}
 
 fn net_page() -> &'static mut [u8] {
     // SAFETY: the page is mapped at NET_PAGE_VA for good.
@@ -1719,17 +1730,38 @@ fn net_client() -> ! {
         made.status == 0 && mapped.status == 0,
         format_args!("a page of its own"),
     );
-    let info = (0..200)
-        .find_map(|_| {
-            let r = syscall(Syscall::Call, NET, [net::INFO, net::VERSION, 0, 0]);
+    // The server has no address until DHCP answers: ask until it has.
+    let ask = |op: u64| {
+        let start = ticks();
+        loop {
+            let r = syscall(Syscall::Call, NET, [op, net::VERSION, 0, 0]);
+            if r.status == 0 && r.msg[0] == OK {
+                return Some(r.msg);
+            }
+            if ticks() > start + LEASE_TICKS {
+                return None;
+            }
             syscall(Syscall::Yield, 0, [0; 4]);
-            (r.status == 0 && r.msg[0] == OK).then_some(r.msg)
-        })
-        .unwrap_or([u64::MAX; 4]);
+        }
+    };
+    let info = ask(net::INFO).unwrap_or([0; 4]);
+    let lease = ask(net::LEASE).unwrap_or([0; 4]);
+    let (host, gateway) = (Dotted(info[1]), Dotted(info[3]));
+    let same_net = |a: u64| (a >> 16) as u32 & lease[1] as u32;
     t.check(
-        info[1] == net::addr([10, 0, 2, 15], 0) && info[3] == net::addr(GATEWAY, 0),
-        format_args!("this host is 10.0.2.15, the gateway 10.0.2.2"),
+        info[1] != 0 && info[3] != 0 && lease[1] != 0 && same_net(info[1]) == same_net(info[3]),
+        format_args!("this host is {host}, the gateway {gateway}"),
     );
+    t.check(
+        lease[2] != 0 && lease[3] > 0,
+        format_args!(
+            "netmask /{}, DNS server {}, {} s left on the lease",
+            (lease[1] as u32).count_ones(),
+            Dotted(lease[2]),
+            lease[3]
+        ),
+    );
+    let gw = info[3];
 
     // Pings to the gateway, under fault injection.
     let (mut answered, mut pings) = (0, 0);
@@ -1739,7 +1771,7 @@ fn net_client() -> ! {
         while pings < PINGS || ticks() < start + PING_TICKS {
             let seq = pings;
             pings += 1;
-            let to = net::addr(GATEWAY, seq as u16);
+            let to = gw | seq as u64;
             let ok = s.exchange(
                 to,
                 56,
@@ -1763,7 +1795,7 @@ fn net_client() -> ! {
     t.check(
         answered == pings && pings >= PINGS,
         format_args!(
-            "{answered} of {pings} pings to 10.0.2.2 answered, every byte right ({} sent again, {} sockets bound again after a restart)",
+            "{answered} of {pings} pings to {gateway} answered, every byte right ({} sent again, {} sockets bound again after a restart)",
             stats.0, stats.1
         ),
     );
@@ -1772,7 +1804,7 @@ fn net_client() -> ! {
     let (mut echoed, mut echoes) = (0, 0);
     let mut stats = (0, 0);
     if let Some(mut s) = Sock::new(true) {
-        let to = net::addr(GATEWAY, ECHO_PORT);
+        let to = gw | ECHO_PORT as u64;
         let start = ticks();
         while echoes < ECHOES || ticks() < start + ECHO_TICKS {
             let k = echoes;

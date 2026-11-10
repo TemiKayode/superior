@@ -6,7 +6,9 @@
 //! an ARP answer and the sockets with their queued datagrams; a restart
 //! loses all of it, which the interface allows: datagrams are unreliable,
 //! and each socket's notification belongs to this server, so its deletion
-//! wakes a waiting client to bind again.
+//! wakes a waiting client to bind again. The one thing kept is the DHCP
+//! lease, in the component's state page: a restarted server goes on with
+//! the address it had, until the lease runs out.
 //!
 //! One thread serves everything. Its notification is bound to it, so one
 //! `Recv` waits for client calls, for the driver's "frames are waiting"
@@ -16,11 +18,15 @@
 //! restarted (a restarted driver has lost the notification and says so),
 //! and resends ARP requests that got no answer.
 //!
-//! The address is fixed for now: 10.0.2.15/24 with the gateway at
-//! 10.0.2.2, QEMU's user-mode network.
+//! The address, netmask, gateway and DNS server come from DHCP (RFC
+//! 2131): DISCOVER, OFFER, REQUEST, ACK, sent again every second until
+//! answered. The lease is renewed halfway through (or every `arg` ticks,
+//! when the manifest gives one, for tests), and dropped, with DISCOVER
+//! again, if it runs out or the server refuses it. Until there is a lease
+//! the server has no address: `INFO` and `SEND` answer `Unreachable`.
 //!
 //! Slots: 0 the `nic` endpoint, 1 the `net` endpoint (receive), 2 untyped
-//! memory (64 KiB).
+//! memory (64 KiB), 17 the state page.
 
 #![no_std]
 #![no_main]
@@ -46,10 +52,13 @@ const TX_FRAME: u64 = 7;
 const LENT: u64 = 8;
 /// Socket `i`'s notification.
 const SOCK_NTFN: u64 = 9;
+/// The state page, which outlives instances: the DHCP lease.
+const STATE: u64 = 17;
 
 const RX_VA: u64 = USER_BASE + 0x4000_0000;
 const TX_VA: u64 = RX_VA + 0x1000;
 const LENT_VA: u64 = RX_VA + 0x2000;
+const STATE_VA: u64 = RX_VA + 0x3000;
 
 /// Badges on this thread's notification.
 const RX: u64 = 1;
@@ -63,9 +72,22 @@ const ARP_TRIES: u8 = 10;
 const READ: u64 = 1;
 const WRITE: u64 = 2;
 
-const IP: [u8; 4] = [10, 0, 2, 15];
-const GATEWAY: [u8; 4] = [10, 0, 2, 2];
-const NETMASK: u32 = 0xffff_ff00;
+/// Ticks a second.
+const SECOND: u64 = 100;
+const BROADCAST: u32 = 0xffff_ffff;
+const DHCP_SERVER_PORT: u16 = 67;
+const DHCP_CLIENT_PORT: u16 = 68;
+const DHCP_COOKIE: u32 = 0x6382_5363;
+const DHCP_DISCOVER: u8 = 1;
+const DHCP_OFFER: u8 = 2;
+const DHCP_REQUEST: u8 = 3;
+const DHCP_ACK: u8 = 5;
+const DHCP_NAK: u8 = 6;
+/// REQUESTs sent for an offer before starting over with DISCOVER.
+const REQUEST_TRIES: u8 = 4;
+/// The state page's words: `LEASE_MAGIC` (written last, so a lease half
+/// written by an instance that died is not taken), then the lease.
+const LEASE_MAGIC: u64 = 0x4448_4350_6c65_6173;
 
 const SOCKETS: usize = 8;
 /// Datagrams a socket keeps until they are received.
@@ -122,8 +144,50 @@ struct Waiting {
     frame: [u8; MAX_FRAME],
 }
 
+/// A DHCP lease (in the kernel's ticks since boot).
+#[derive(Clone, Copy)]
+struct Lease {
+    ip: u32,
+    mask: u32,
+    gateway: u32,
+    dns: u32,
+    server: u32,
+    /// When it runs out, and when to renew it.
+    expires: u64,
+    renew: u64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    /// DISCOVER sent: waiting for an offer.
+    Selecting,
+    /// REQUEST sent for an offer.
+    Requesting { offered: u32, server: u32, tries: u8 },
+    Bound,
+    /// REQUEST sent to keep the lease.
+    Renewing,
+}
+
+/// An IPv4 address, printed dotted.
+struct Ip(u32);
+
+impl core::fmt::Display for Ip {
+    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+        let b = self.0.to_be_bytes();
+        write!(f, "{}.{}.{}.{}", b[0], b[1], b[2], b[3])
+    }
+}
+
 struct Net {
     mac: [u8; 6],
+    lease: Option<Lease>,
+    phase: Phase,
+    /// The current DHCP transaction.
+    xid: u32,
+    /// When to send the current DHCP message again.
+    resend: u64,
+    /// Ticks between renewals (0: halfway through the lease).
+    renew_every: u64,
     arp: [Option<(u32, [u8; 6])>; ARP_CACHE],
     arp_next: usize,
     waiting: [Option<Waiting>; WAITING],
@@ -144,6 +208,11 @@ const EMPTY: Datagram = Datagram {
 
 static mut NET: Net = Net {
     mac: [0; 6],
+    lease: None,
+    phase: Phase::Selecting,
+    xid: 0,
+    resend: 0,
+    renew_every: 0,
     arp: [None; ARP_CACHE],
     arp_next: 0,
     waiting: [None; WAITING],
@@ -155,8 +224,12 @@ static mut NET: Net = Net {
     sent: 0,
 };
 
-fn ip_u32(ip: [u8; 4]) -> u32 {
-    u32::from_be_bytes(ip)
+fn ticks() -> u64 {
+    syscall(Syscall::Ticks, 0, [0; 4]).msg[0]
+}
+
+fn state() -> *mut u64 {
+    STATE_VA as *mut u64
 }
 
 fn page(va: u64) -> &'static mut [u8] {
@@ -225,6 +298,240 @@ fn nic_call(m: [u64; 4], frame: u64) -> Option<[u64; 4]> {
 }
 
 impl Net {
+    /// This host's address: 0 without a lease.
+    fn addr(&self) -> u32 {
+        self.lease.map_or(0, |l| l.ip)
+    }
+
+    /// Writes the lease (or its absence) to the state page.
+    fn save(&self) {
+        let s = state();
+        // SAFETY: the state page is mapped at STATE_VA for good.
+        unsafe {
+            s.write_volatile(0);
+            if let Some(l) = self.lease {
+                let words = [l.ip, l.mask, l.gateway, l.dns, l.server].map(u64::from);
+                for (i, w) in words.iter().chain(&[l.expires, l.renew]).enumerate() {
+                    s.add(1 + i).write_volatile(*w);
+                }
+                s.write_volatile(LEASE_MAGIC);
+            }
+        }
+    }
+
+    /// Takes the lease a previous instance left, if it has not run out.
+    fn load(&mut self) -> bool {
+        let s = state();
+        // SAFETY: as in `save`.
+        let w = |i: usize| unsafe { s.add(i).read_volatile() };
+        if w(0) != LEASE_MAGIC || ticks() >= w(6) {
+            return false;
+        }
+        self.lease = Some(Lease {
+            ip: w(1) as u32,
+            mask: w(2) as u32,
+            gateway: w(3) as u32,
+            dns: w(4) as u32,
+            server: w(5) as u32,
+            expires: w(6),
+            renew: w(7),
+        });
+        self.phase = Phase::Bound;
+        true
+    }
+
+    /// A new DHCP transaction number.
+    fn next_xid(&mut self) {
+        self.xid = self.xid.wrapping_mul(1_103_515_245).wrapping_add(12_345) ^ ticks() as u32;
+    }
+
+    /// Sends a DHCP message of `kind` for the current phase, broadcast.
+    fn dhcp_send(&mut self, kind: u8) {
+        let (ciaddr, requested, server) = match self.phase {
+            Phase::Requesting { offered, server, .. } => (0, offered, server),
+            Phase::Renewing => (self.addr(), 0, 0),
+            _ => (0, 0, 0),
+        };
+        const LEN: usize = 300;
+        let tx = page(TX_VA);
+        let d = &mut tx[42..42 + LEN];
+        d.fill(0);
+        d[0] = 1; // a request
+        d[1] = 1; // Ethernet
+        d[2] = 6;
+        put32(d, 4, self.xid);
+        // Without an address, ask for the answer to be broadcast.
+        put16(d, 10, if ciaddr == 0 { 0x8000 } else { 0 });
+        put32(d, 12, ciaddr);
+        d[28..34].copy_from_slice(&self.mac);
+        put32(d, 236, DHCP_COOKIE);
+        let mut at = 240;
+        let mut option = |d: &mut [u8], code: u8, v: &[u8]| {
+            d[at] = code;
+            d[at + 1] = v.len() as u8;
+            d[at + 2..at + 2 + v.len()].copy_from_slice(v);
+            at += 2 + v.len();
+        };
+        option(d, 53, &[kind]);
+        if requested != 0 {
+            option(d, 50, &requested.to_be_bytes());
+        }
+        if server != 0 {
+            option(d, 54, &server.to_be_bytes());
+        }
+        // Netmask, router, DNS server, lease time.
+        option(d, 55, &[1, 3, 6, 51]);
+        d[at] = 255;
+        let u = &mut tx[34..42 + LEN];
+        put16(u, 0, DHCP_CLIENT_PORT);
+        put16(u, 2, DHCP_SERVER_PORT);
+        put16(u, 4, (8 + LEN) as u16);
+        put16(u, 6, 0);
+        let c = fold(sum(pseudo(ciaddr, BROADCAST, PROTO_UDP, 8 + LEN), u));
+        put16(u, 6, if c == 0 { 0xffff } else { c });
+        self.ip_header(ciaddr, BROADCAST, PROTO_UDP, 8 + LEN);
+        self.ether([0xff; 6], ETH_IP);
+        self.transmit(14 + 20 + 8 + LEN);
+        self.resend = ticks() + SECOND;
+    }
+
+    /// Drops any lease and starts over with DISCOVER.
+    fn rediscover(&mut self) {
+        self.lease = None;
+        self.save();
+        self.phase = Phase::Selecting;
+        self.next_xid();
+        self.dhcp_send(DHCP_DISCOVER);
+    }
+
+    /// A DHCP message to this host (the UDP payload).
+    fn dhcp(&mut self, d: &[u8]) {
+        if d.len() < 240
+            || d[0] != 2
+            || be32(d, 4) != self.xid
+            || d[28..34] != self.mac
+            || be32(d, 236) != DHCP_COOKIE
+        {
+            return;
+        }
+        let (mut kind, mut mask, mut gateway, mut dns, mut secs, mut server) = (0, 0, 0, 0, 0, 0);
+        let mut at = 240;
+        while at + 1 < d.len() && d[at] != 255 {
+            if d[at] == 0 {
+                at += 1;
+                continue;
+            }
+            let n = d[at + 1] as usize;
+            let Some(v) = d.get(at + 2..at + 2 + n) else {
+                break;
+            };
+            let word = if n >= 4 { be32(v, 0) } else { 0 };
+            match d[at] {
+                53 if n >= 1 => kind = v[0],
+                1 => mask = word,
+                3 => gateway = word,
+                6 => dns = word,
+                51 => secs = word,
+                54 => server = word,
+                _ => {}
+            }
+            at += 2 + n;
+        }
+        let yiaddr = be32(d, 16);
+        match (self.phase, kind) {
+            (Phase::Selecting, DHCP_OFFER) if yiaddr != 0 && server != 0 => {
+                self.phase = Phase::Requesting {
+                    offered: yiaddr,
+                    server,
+                    tries: 1,
+                };
+                self.dhcp_send(DHCP_REQUEST);
+            }
+            (Phase::Requesting { .. } | Phase::Renewing, DHCP_ACK) if yiaddr != 0 => {
+                let renewing = self.phase == Phase::Renewing;
+                let now = ticks();
+                // An infinite lease (all ones) is kept for good.
+                let length = if secs == u32::MAX {
+                    u64::MAX / 4
+                } else {
+                    (secs as u64).max(10) * SECOND
+                };
+                let renew = match self.renew_every {
+                    0 => length / 2,
+                    t => t.min(length / 2),
+                };
+                let old = self.lease;
+                let l = Lease {
+                    ip: yiaddr,
+                    mask: if mask == 0 { 0xffff_ff00 } else { mask },
+                    gateway: if gateway != 0 { gateway } else { old.map_or(0, |l| l.gateway) },
+                    dns: if dns != 0 { dns } else { old.map_or(0, |l| l.dns) },
+                    server: if server != 0 { server } else { old.map_or(0, |l| l.server) },
+                    expires: now + length,
+                    renew: now + renew,
+                };
+                self.lease = Some(l);
+                self.phase = Phase::Bound;
+                self.save();
+                if renewing {
+                    say!("lease renewed: {} for {secs} s", Ip(l.ip));
+                } else {
+                    say!(
+                        "leased {}/{} from {} via {}, DNS {}, for {secs} s",
+                        Ip(l.ip),
+                        l.mask.count_ones(),
+                        Ip(l.server),
+                        Ip(l.gateway),
+                        Ip(l.dns)
+                    );
+                }
+            }
+            (Phase::Requesting { .. } | Phase::Renewing, DHCP_NAK) => {
+                say!("lease refused; asking again");
+                self.rediscover();
+            }
+            _ => {}
+        }
+    }
+
+    /// The timer, for DHCP: messages sent again, renewal, expiry.
+    fn dhcp_tick(&mut self) {
+        let now = ticks();
+        match self.phase {
+            Phase::Selecting if now >= self.resend => self.dhcp_send(DHCP_DISCOVER),
+            Phase::Requesting {
+                offered,
+                server,
+                tries,
+            } if now >= self.resend => {
+                if tries >= REQUEST_TRIES {
+                    self.rediscover();
+                } else {
+                    self.phase = Phase::Requesting {
+                        offered,
+                        server,
+                        tries: tries + 1,
+                    };
+                    self.dhcp_send(DHCP_REQUEST);
+                }
+            }
+            Phase::Bound if self.lease.is_some_and(|l| now >= l.renew) => {
+                self.phase = Phase::Renewing;
+                self.next_xid();
+                self.dhcp_send(DHCP_REQUEST);
+            }
+            Phase::Renewing => {
+                if self.lease.is_none_or(|l| now >= l.expires) {
+                    say!("lease ran out; asking again");
+                    self.rediscover();
+                } else if now >= self.resend {
+                    self.dhcp_send(DHCP_REQUEST);
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Gives the driver a copy of this thread's notification, badged RX.
     fn attach(&mut self) {
         syscall(Syscall::CapDelete, MINT, [0; 4]);
@@ -331,7 +638,7 @@ impl Net {
         a[5] = 4;
         put16(a, 6, op);
         a[8..14].copy_from_slice(&self.mac);
-        put32(a, 14, ip_u32(IP));
+        put32(a, 14, self.addr());
         a[18..24].copy_from_slice(&target_mac);
         put32(a, 24, target_ip);
         self.transmit(60);
@@ -341,23 +648,15 @@ impl Net {
     /// transmit page after the two headers; fills them in. A packet whose
     /// next hop is not yet known waits for the ARP answer.
     fn ip_send(&mut self, dst: u32, proto: u8, len: usize) -> Status {
+        let Some(lease) = self.lease else {
+            return Status::Unreachable;
+        };
         let total = 20 + len;
-        let tx = page(TX_VA);
-        let h = &mut tx[14..34];
-        h.fill(0);
-        h[0] = 0x45;
-        put16(h, 2, total as u16);
-        put16(h, 4, self.sent as u16); // identification
-        h[8] = 64; // TTL
-        h[9] = proto;
-        put32(h, 12, ip_u32(IP));
-        put32(h, 16, dst);
-        let c = fold(sum(0, h));
-        put16(h, 10, c);
-        let hop = if dst & NETMASK == ip_u32(IP) & NETMASK {
+        self.ip_header(lease.ip, dst, proto, len);
+        let hop = if dst & lease.mask == lease.ip & lease.mask {
             dst
         } else {
-            ip_u32(GATEWAY)
+            lease.gateway
         };
         let frame = (14 + total).max(60);
         if let Some(mac) = self.lookup(hop) {
@@ -381,8 +680,26 @@ impl Net {
         Status::Ok
     }
 
-    /// The timer: ARP requests again for frames still waiting.
+    /// Fills in the IPv4 header on the transmit page for a payload of
+    /// `len` bytes.
+    fn ip_header(&self, src: u32, dst: u32, proto: u8, len: usize) {
+        let tx = page(TX_VA);
+        let h = &mut tx[14..34];
+        h.fill(0);
+        h[0] = 0x45;
+        put16(h, 2, (20 + len) as u16);
+        put16(h, 4, self.sent as u16); // identification
+        h[8] = 64; // TTL
+        h[9] = proto;
+        put32(h, 12, src);
+        put32(h, 16, dst);
+        let c = fold(sum(0, h));
+        put16(h, 10, c);
+    }
+
+    /// The timer: DHCP, and ARP requests again for frames still waiting.
     fn tick(&mut self) {
+        self.dhcp_tick();
         for w in 0..WAITING {
             let Some(mut f) = self.waiting[w] else {
                 continue;
@@ -405,7 +722,7 @@ impl Net {
         let to_us = f[0..6] == self.mac || f[0..6] == [0xff; 6];
         match be16(f, 12) {
             ETH_ARP if f.len() >= 42 => self.arp(&f[14..42]),
-            ETH_IP if to_us => self.ip(&f[14..]),
+            ETH_IP if to_us => self.ipv4(&f[14..]),
             _ => {}
         }
     }
@@ -418,7 +735,7 @@ impl Net {
         let mut sha = [0u8; 6];
         sha.copy_from_slice(&a[8..14]);
         let (spa, tpa) = (be32(a, 14), be32(a, 24));
-        let for_us = tpa == ip_u32(IP);
+        let for_us = tpa != 0 && tpa == self.addr();
         if for_us || self.lookup(spa).is_some() {
             self.learn(spa, sha);
         }
@@ -427,7 +744,7 @@ impl Net {
         }
     }
 
-    fn ip(&mut self, p: &[u8]) {
+    fn ipv4(&mut self, p: &[u8]) {
         if p.len() < 20 || p[0] >> 4 != 4 {
             return;
         }
@@ -441,13 +758,13 @@ impl Net {
             return;
         }
         let (src, dst) = (be32(p, 12), be32(p, 16));
-        if dst != ip_u32(IP) {
-            return;
-        }
+        // DHCP answers may come before this host has an address, or
+        // broadcast: UDP sorts them out.
+        let ours = dst != 0 && dst == self.addr();
         let body = &p[ihl..total];
         match p[9] {
-            PROTO_ICMP => self.icmp(src, body),
-            PROTO_UDP => self.udp(src, dst, body),
+            PROTO_ICMP if ours => self.icmp(src, body),
+            PROTO_UDP => self.udp(src, dst, body, ours),
             _ => {}
         }
     }
@@ -476,7 +793,7 @@ impl Net {
         }
     }
 
-    fn udp(&mut self, src: u32, dst: u32, u: &[u8]) {
+    fn udp(&mut self, src: u32, dst: u32, u: &[u8], ours: bool) {
         if u.len() < 8 {
             return;
         }
@@ -488,7 +805,11 @@ impl Net {
         if be16(u, 6) != 0 && fold(sum(pseudo(src, dst, PROTO_UDP, len), u)) != 0 {
             return;
         }
-        self.deliver(Kind::Udp(be16(u, 2)), src, be16(u, 0), &u[8..]);
+        if be16(u, 2) == DHCP_CLIENT_PORT && be16(u, 0) == DHCP_SERVER_PORT {
+            self.dhcp(&u[8..]);
+        } else if ours {
+            self.deliver(Kind::Udp(be16(u, 2)), src, be16(u, 0), &u[8..]);
+        }
     }
 
     /// Queues a payload on the socket of `kind` and signals it.
@@ -562,6 +883,9 @@ impl Net {
 
     /// Sends `len` bytes of the client's page from socket `i` to `to`.
     fn send(&mut self, i: usize, to: u64, len: usize) -> Status {
+        if self.lease.is_none() {
+            return Status::Unreachable;
+        }
         if len > MAX_PAYLOAD || syscall(Syscall::FrameMap, LENT, [LENT_VA, 0, 0, 0]).status != 0 {
             return Status::Invalid;
         }
@@ -576,7 +900,7 @@ impl Net {
                 put16(u, 4, (8 + len) as u16);
                 put16(u, 6, 0);
                 u[8..].copy_from_slice(data);
-                let c = fold(sum(pseudo(ip_u32(IP), dst, PROTO_UDP, 8 + len), u));
+                let c = fold(sum(pseudo(self.addr(), dst, PROTO_UDP, 8 + len), u));
                 put16(u, 6, if c == 0 { 0xffff } else { c });
                 self.ip_send(dst, PROTO_UDP, 8 + len)
             }
@@ -619,17 +943,17 @@ impl Net {
     fn serve(&mut self, badge: u64, m: [u64; 4], lent: bool) -> ([u64; 4], bool) {
         let status = |s: Status| ([s as u64, 0, 0, 0], false);
         match m[0] {
-            net::INFO if m[1] == net::VERSION => {
+            net::INFO | net::LEASE if m[1] == net::VERSION => {
+                let Some(l) = self.lease else {
+                    return status(Status::Unreachable);
+                };
+                let word = |ip: u32| (ip as u64) << 16;
+                if m[0] == net::LEASE {
+                    let left = l.expires.saturating_sub(ticks()) / SECOND;
+                    return ([Status::Ok as u64, l.mask as u64, word(l.dns), left], false);
+                }
                 let mac = self.mac.iter().fold(0, |a, &b| a << 8 | b as u64);
-                (
-                    [
-                        Status::Ok as u64,
-                        net::addr(IP, 0),
-                        mac,
-                        net::addr(GATEWAY, 0),
-                    ],
-                    false,
-                )
+                ([Status::Ok as u64, word(l.ip), mac, word(l.gateway)], false)
             }
             net::UDP_BIND => {
                 let port = match m[1] as u16 {
@@ -698,7 +1022,10 @@ fn start(n: &mut Net) -> Result<(), (&'static str, u64)> {
     for i in 0..SOCKETS as u64 {
         retype(ObjectType::Notification, SOCK_NTFN + i)?;
     }
-    n.epoch = syscall(Syscall::Ticks, 0, [0; 4]).msg[0] & 0xffff;
+    if syscall(Syscall::FrameMap, STATE, [STATE_VA, 1, 0, 0]).status != 0 {
+        return Err(("mapping the state page", STATE));
+    }
+    n.epoch = ticks() & 0xffff;
     let info = (0..100).find_map(|_| {
         let r = syscall(Syscall::Call, NIC, [nic::INFO, nic::VERSION, 0, 0]);
         if r.status == 0 && r.msg[0] == Status::Ok as u64 {
@@ -715,15 +1042,7 @@ fn start(n: &mut Net) -> Result<(), (&'static str, u64)> {
     syscall(Syscall::TimerSignal, TIMER_CAP, [PERIOD, 0, 0, 0]);
     let m = n.mac;
     say!(
-        "ready: {}.{}.{}.{}/24 via {}.{}.{}.{}, MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-        IP[0],
-        IP[1],
-        IP[2],
-        IP[3],
-        GATEWAY[0],
-        GATEWAY[1],
-        GATEWAY[2],
-        GATEWAY[3],
+        "ready: MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
         m[0],
         m[1],
         m[2],
@@ -731,13 +1050,27 @@ fn start(n: &mut Net) -> Result<(), (&'static str, u64)> {
         m[4],
         m[5]
     );
+    n.xid = u32::from_be_bytes([m[2], m[3], m[4], m[5]]);
+    if n.load() {
+        let l = n.lease.unwrap();
+        say!(
+            "lease kept: {}/{} via {} ({} s left)",
+            Ip(l.ip),
+            l.mask.count_ones(),
+            Ip(l.gateway),
+            l.expires.saturating_sub(ticks()) / SECOND
+        );
+    } else {
+        n.rediscover();
+    }
     Ok(())
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn _start(_: u64) -> ! {
+pub extern "C" fn _start(arg: u64) -> ! {
     // SAFETY: the one thread is the only user of NET.
     let n = unsafe { &mut *(&raw mut NET) };
+    n.renew_every = arg;
     if let Err((what, code)) = start(n) {
         say!("[fail] {what} ({code})");
         loop {

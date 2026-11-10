@@ -369,10 +369,21 @@ holds the rest):
     and a server restart deletes it, which wakes the client to bind again. The server's
     own notification, bound to its thread, carries the driver's signal and a 100 ms
     timer; on the timer it drains the driver and attaches again if the driver
-    restarted, and resends ARP requests. Fixed address for now: 10.0.2.15/24 via
-    10.0.2.2.
-  `cargo xtask net-test` boots `boot/net.manifest` on QEMU's user-mode network while
-  xtask echoes UDP on the host. For at least 2 s the client pings the gateway, then for
+    restarted, and resends ARP requests.
+  - Its address, netmask, gateway and DNS server come from DHCP: DISCOVER, OFFER,
+    REQUEST, ACK, each sent again every second until answered. Until it has a lease
+    the server has no address (`INFO` and `SEND` answer `Unreachable`); `LEASE`
+    gives the netmask, DNS server and seconds left. The lease is renewed halfway
+    through (or every `arg` ticks from the manifest), and dropped, with DISCOVER
+    again, if it runs out or the DHCP server refuses it. Everything else the server
+    holds is lost on a restart, but the lease is kept in its `state` page, so a
+    restarted server goes on with the same address at once.
+  `cargo xtask net-test` boots `boot/net.manifest` on QEMU's user-mode network, set
+  to 10.0.3.0/24 rather than QEMU's default so nothing can assume an address, while
+  xtask echoes UDP on the host. The server must lease 10.0.3.30/24 via 10.0.3.2
+  with DNS server 10.0.3.3 exactly once, keep it across every one of its restarts,
+  and renew it at least twice (every 2 s here); the client must see that address,
+  gateway, netmask and DNS server. For at least 2 s the client pings the gateway, then for
   at least 5 s it sends UDP datagrams of 1 to 1,400 bytes that the host echoes back;
   meanwhile the injector kills the server and the driver every 30 to 150 ms. Every
   ping and every datagram must come back with every byte right (the client sends
@@ -444,7 +455,7 @@ these buses have none); more than one command per queue in the NVMe driver,
 more than two commands in flight per disk in the AHCI driver, ATAPI
 and port multipliers; in the xHCI driver isochronous and bulk endpoints, USB 3 streams,
 hubs and more than one interrupter, and HID devices other than boot keyboards; in the network server
-DHCP, TCP, IPv6, fragments, DNS, routes beyond one gateway, and rings in place of a
+TCP, IPv6, fragments, DNS, routes beyond one gateway, and rings in place of a
 call per frame; buses behind bridges; the async executor, buffer pools and
 power callbacks of the SDK; an IDL compiler for the interfaces; escalating a component
 given up on to a supervisor above it (today the

@@ -643,11 +643,13 @@ fn qemu_command(img: &Image) -> Command {
             ]);
     }
     if img.net {
-        // User-mode networking: the guest is 10.0.2.15, the gateway (the
-        // host) 10.0.2.2. Modern virtio only, its DMA through the IOMMU.
+        // User-mode networking, on a network other than QEMU's default
+        // so no address can be assumed: DHCP gives the guest 10.0.3.30,
+        // the gateway (the host) is 10.0.3.2 and the DNS server 10.0.3.3.
+        // Modern virtio only, its DMA through the IOMMU.
         q.args([
             "-netdev",
-            "user,id=n0",
+            "user,id=n0,net=10.0.3.0/24,dhcpstart=10.0.3.30",
             "-device",
             "virtio-net-pci,netdev=n0,disable-legacy=on,iommu_platform=on",
         ]);
@@ -1114,16 +1116,19 @@ fn net_test(arch: Arch) -> Result<(), String> {
     let out = out?;
     let steps = [
         "virtio-net: ready:",
-        "net: ready: 10.0.2.15/24 via 10.0.2.2",
+        "net: ready: MAC",
+        "net: leased 10.0.3.30/24 from 10.0.3.2 via 10.0.3.2, DNS 10.0.3.3, for 86400 s",
         "[pass] net: a page of its own",
-        "[pass] net: this host is 10.0.2.15, the gateway 10.0.2.2",
+        "[pass] net: this host is 10.0.3.30, the gateway 10.0.3.2",
+        "[pass] net: netmask /24, DNS server 10.0.3.3,",
         "[cm] fault injection: killing",
-        "pings to 10.0.2.2 answered, every byte right",
+        "net: lease kept: 10.0.3.30/24 via 10.0.3.2",
+        "pings to 10.0.3.2 answered, every byte right",
         "UDP datagrams of 1 to 1400 bytes echoed by the host, every byte right",
         "[cm] client asked to shut down (pass)",
     ];
     check_log("network test", &out, &steps)?;
-    if !out.contains("net: 10.0.2.2 is at") {
+    if !out.contains("net: 10.0.3.2 is at") {
         return Err("network test: the gateway's MAC address was never learned".into());
     }
     let kills = |what: &str| {
@@ -1140,7 +1145,16 @@ fn net_test(arch: Arch) -> Result<(), String> {
             out[..i].matches("[cm] fault injection: killing").count()
         })
     };
-    let (by_pings, by_echoes) = (during("pings to 10.0.2.2"), during("echoed by the host"));
+    let (by_pings, by_echoes) = (during("pings to 10.0.3.2"), during("echoed by the host"));
+    // A restarted server keeps its lease: it asks DHCP only once.
+    let discovered = out.matches("net: leased ").count();
+    let kept = out.matches("net: lease kept").count();
+    let renewed = out.matches("net: lease renewed").count();
+    if discovered != 1 || kept < 10 || renewed < 2 {
+        return Err(format!(
+            "network test: {discovered} leases from DISCOVER, {kept} kept across restarts, {renewed} renewals; want 1, 10 and 2"
+        ));
+    }
     if server < 10 || driver < 10 || by_pings < 5 || by_echoes < by_pings + 20 {
         return Err(format!(
             "network test: the server was killed {server} times and the driver {driver}, {by_pings} kills by the end of the pings and {by_echoes} by the end of the echoes; want 10, 10, 5 and 20 more"
