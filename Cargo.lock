@@ -457,6 +457,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "superior-inet"
+version = "0.1.0"
+
+[[package]]
 name = "superior-kernel"
 version = "0.1.0"
 dependencies = [
@@ -479,6 +483,7 @@ dependencies = [
 name = "superior-net"
 version = "0.1.0"
 dependencies = [
+ "superior-inet",
  "superior-objects",
  "superior-sys",
 ]

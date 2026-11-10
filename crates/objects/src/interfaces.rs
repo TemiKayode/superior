@@ -186,8 +186,11 @@ pub mod nic {
 /// reliable: one may be lost at any time, and the client resends.
 pub mod net {
     pub const VERSION: u64 = 1;
-    /// The largest payload: an unfragmented 1500-byte IPv4 packet.
+    /// The largest UDP payload in one unfragmented 1500-byte IPv4 packet.
     pub const MAX_PAYLOAD: u64 = 1472;
+    /// The largest payload a socket sends or receives: bigger than
+    /// `MAX_PAYLOAD`, it goes (and arrives) in IPv4 fragments.
+    pub const MAX_DATAGRAM: u64 = 4000;
 
     /// `[INFO, VERSION]`: reply `[status, this host's address (IPv4, as
     /// in addr), its MAC address, the gateway's address]`; `Unreachable`
@@ -204,8 +207,10 @@ pub mod net {
     /// `[SEND, handle, address, length]` with a frame lent: sends a UDP
     /// datagram from the socket to `address`, or an ICMP echo request
     /// with the sequence number in its low 16 bits; the payload is the
-    /// first `length` bytes of the frame. Reply `[status]`: `Unreachable`
-    /// if the next hop did not answer ARP (the datagram is dropped).
+    /// first `length` bytes of the frame, at most `MAX_DATAGRAM`. Reply
+    /// `[status]`: `Unreachable` if the next hop did not answer ARP (the
+    /// datagram is dropped), or for a datagram sent in fragments, whose
+    /// next hop's address is not yet known (it is asked for).
     pub const SEND: u64 = 4;
     /// `[RECV, handle]` with a frame lent: the oldest datagram (or echo
     /// reply payload) that arrived on the socket, copied into the frame.
@@ -218,6 +223,10 @@ pub mod net {
     /// number), the DNS server's address (as in addr), seconds left on the
     /// DHCP lease]`; `Unreachable` while there is none.
     pub const LEASE: u64 = 7;
+    /// `[STATS, VERSION]`: reply `[status, datagrams reassembled from
+    /// fragments, datagrams sent in fragments, datagrams dropped half
+    /// reassembled]`, counted across the server's restarts.
+    pub const STATS: u64 = 8;
 
     /// The word for IPv4 address `ip` and `port`.
     pub const fn addr(ip: [u8; 4], port: u16) -> u64 {

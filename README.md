@@ -362,9 +362,14 @@ holds the rest):
     and says so in every `RECV` reply.
   - The server speaks IPv4 over Ethernet: ARP (answering for itself, resolving next
     hops, holding frames that wait for an answer and asking again), ICMP echo (it
-    answers pings) and UDP, with checksums; it serves the `net` interface: UDP and
-    ICMP-echo sockets, each owned by the client that bound it, send and receive with
-    a lent page. Each socket comes with a notification of the server's, signalled when
+    answers pings) and UDP, with checksums, and IPv4 fragments: a datagram of up to
+    4,000 bytes too big for one frame goes in 1,480-byte pieces, and fragments that
+    arrive are put back together (`crates/inet`, up to four datagrams at once, each
+    dropped if not whole within 5 s; malformed, overlapping past the end and
+    oversized fragments are refused, which host unit tests check). It serves the `net`
+    interface: UDP and ICMP-echo sockets, each owned by the client that bound it, send
+    and receive with a lent page; `STATS` counts datagrams reassembled, sent in
+    fragments and dropped half reassembled, kept across restarts in the state page. Each socket comes with a notification of the server's, signalled when
     something arrives: a client waits on it, with a `TimerSignal` on it for a timeout,
     and a server restart deletes it, which wakes the client to bind again. The server's
     own notification, bound to its thread, carries the driver's signal and a 100 ms
@@ -394,7 +399,9 @@ holds the rest):
   with DNS server 10.0.3.3 exactly once, keep it across every one of its restarts,
   and renew it at least twice (every 2 s here); the client must see that address,
   gateway, netmask and DNS server. For at least 2 s the client pings the gateway, then for
-  at least 5 s it sends UDP datagrams of 1 to 1,400 bytes that the host echoes back;
+  at least 5 s it sends UDP datagrams of 1 to 4,000 bytes that the host echoes back
+  (those over 1,472 bytes go out in fragments, which QEMU puts back together, and
+  come back in fragments, which the server must; it must have done both);
   meanwhile the injector kills the driver, the server and the resolver in turn
   every 30 to 150 ms. Every ping and every datagram must come back with every byte
   right (the client sends again after 300 ms, or binds again when its socket is
@@ -428,10 +435,12 @@ holds the rest):
   `cargo xtask keyboard-test` boots `boot/keyboard.manifest` with QEMU's xHCI
   controller and a USB keyboard, and xtask types "superior" followed by a space, over
   and over, through QEMU's monitor. Meanwhile the injector kills the xHCI and HID
-  drivers every 30 to 150 ms. The client must see 10 words come through whole, and
-  never a key that was not typed (a word cut by a restart counts as broken, not
-  wrong); each driver must have been killed at least 10 times, 20 of them while words
-  came through. A run sees 80 to 260 kills of each.
+  drivers every 30 to 150 ms, pausing 0.5 s after every eighth kill (a word takes
+  about 0.2 s to type, longer than most gaps, and without the pauses AArch64 runs
+  sometimes saw fewer than 10 whole words in 90 s). The client must see 10 words
+  come through whole, and never a key that was not typed (a word cut by a restart
+  counts as broken, not wrong); each driver must have been killed at least 10 times,
+  20 of them while words came through. A run sees about 45 kills of each.
 - Interrupt and exception entries clear the direction flag. User code may be
   interrupted mid-way through a backward copy, with the flag set; the kernel's own
   copies need it clear, and without the `cld` they ran backwards, wrecking saved
@@ -472,7 +481,7 @@ these buses have none); more than one command per queue in the NVMe driver,
 more than two commands in flight per disk in the AHCI driver, ATAPI
 and port multipliers; in the xHCI driver isochronous and bulk endpoints, USB 3 streams,
 hubs and more than one interrupter, and HID devices other than boot keyboards; in the network server
-TCP, IPv6, fragments, DNS records other than A and CNAME (and DNS over TCP), routes beyond one gateway, and rings in place of a
+TCP, IPv6, datagrams over 4,000 bytes, DNS records other than A and CNAME (and DNS over TCP), routes beyond one gateway, and rings in place of a
 call per frame; buses behind bridges; the async executor, buffer pools and
 power callbacks of the SDK; an IDL compiler for the interfaces; escalating a component
 given up on to a supervisor above it (today the
@@ -493,6 +502,7 @@ https://claude.ai/artifact/QKJS8qH5Dfbjzn58RStq1j
 | `kernel/` | The microkernel (`no_std`, targets `x86_64-unknown-none` and `aarch64-unknown-none-softfloat`) |
 | `kernel/src/arch/` | Per-ISA code: boot, exceptions and system call entry, page tables, interrupts, timer, console (`x86_64/`, `aarch64/`) |
 | `crates/sys/` | User-side system call wrappers for both ISAs (one ABI by register position), and the seL4 runtime (`src/sel4.rs`) |
+| `crates/inet/` | Protocol pieces of the network server, unit-tested on the host: IPv4 fragment reassembly |
 | `crates/objects/` | Pure kernel logic, unit-tested on the host: capabilities and CNodes, untyped memory, the IPC and scheduling state machine, the syscall ABI, an ELF reader, the boot bundle and manifest formats |
 | `user/pingpong/` | Boot self-test program (IPC server, client and spinner) |
 | `user/cm/` | The Component Manager: the root task, which starts every component from the boot manifest |

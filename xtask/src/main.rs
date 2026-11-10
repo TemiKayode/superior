@@ -213,7 +213,7 @@ fn run(cmd: &mut Command) -> Result<(), String> {
 
 fn host_tests() -> Result<(), String> {
     println!("== host unit tests");
-    run(cargo().args(["test", "--quiet", "-p", "superior-objects"]))?;
+    run(cargo().args(["test", "--quiet", "-p", "superior-objects", "-p", "superior-inet"]))?;
     println!("== model check and long simulation (release)");
     run(cargo().args([
         "test",
@@ -1181,7 +1181,7 @@ fn net_test(arch: Arch) -> Result<(), String> {
     let echo = {
         let (stop, echoed) = (stop.clone(), echoed.clone());
         std::thread::spawn(move || {
-            let mut buf = [0u8; 2048];
+            let mut buf = [0u8; 8192];
             while !stop.load(Ordering::Relaxed) {
                 if let Ok((n, from)) = socket.recv_from(&mut buf) {
                     if socket.send_to(&buf[..n], from).is_ok() {
@@ -1228,7 +1228,8 @@ fn net_test(arch: Arch) -> Result<(), String> {
         "[cm] fault injection: killing",
         "net: lease kept: 10.0.3.30/24 via 10.0.3.2",
         "pings to 10.0.3.2 answered, every byte right",
-        "UDP datagrams of 1 to 1400 bytes echoed by the host, every byte right",
+        "UDP datagrams of 1 to 4000 bytes echoed by the host, every byte right",
+        "datagrams reassembled from fragments,",
         "[pass] net: www.superior.test is 192.0.2.10",
         "[pass] net: alias.superior.test, a CNAME for www, is 192.0.2.10",
         "[pass] net: nowhere.superior.test does not exist, and no..dots is no name",

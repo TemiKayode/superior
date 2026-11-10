@@ -1508,8 +1508,9 @@ fn fs_other() -> ! {
     }
 }
 
-/// Kills `targets` (component numbers) in turn, at pseudo-random moments.
-fn injector(targets: &[u64]) -> ! {
+/// Kills `targets` (component numbers) in turn, at pseudo-random moments
+/// 30 to 150 ms apart; with `pauses`, every eighth gap is 0.5 s longer.
+fn injector(targets: &[u64], pauses: bool) -> ! {
     // A fixed seed: the moments vary with timing, not between runs.
     let mut seed = 0x2545_f491_4f6c_dd1du64;
     // Let the client get going first.
@@ -1522,7 +1523,7 @@ fn injector(targets: &[u64]) -> ! {
         seed ^= seed << 13;
         seed ^= seed >> 7;
         seed ^= seed << 17;
-        let wait = 3 + seed % 12;
+        let wait = 3 + seed % 12 + if pauses && n % 8 == 7 { 50 } else { 0 };
         let start = ticks();
         while ticks() < start + wait {
             syscall(Syscall::Yield, 0, [0; 4]);
@@ -1821,7 +1822,7 @@ fn dns_checks(t: &mut Checks) {
 
 /// Echo `k`'s length and byte `j`.
 fn echo_len(k: u64) -> u64 {
-    1 + k * 97 % 1400
+    1 + k * 97 % 4000
 }
 
 fn echo_byte(k: u64, j: u64) -> u8 {
@@ -1919,7 +1920,8 @@ fn net_client() -> ! {
         ),
     );
 
-    // UDP datagrams of 1 to 1400 bytes, echoed by the host.
+    // UDP datagrams of 1 to 4000 bytes, echoed by the host: those over
+    // 1472 bytes go out in fragments, and come back in them.
     let (mut echoed, mut echoes) = (0, 0);
     let mut stats = (0, 0);
     if let Some(mut s) = Sock::new(true) {
@@ -1952,8 +1954,16 @@ fn net_client() -> ! {
     t.check(
         echoed == echoes && echoes >= ECHOES,
         format_args!(
-            "{echoed} of {echoes} UDP datagrams of 1 to 1400 bytes echoed by the host, every byte right ({} sent again, {} sockets bound again after a restart)",
+            "{echoed} of {echoes} UDP datagrams of 1 to 4000 bytes echoed by the host, every byte right ({} sent again, {} sockets bound again after a restart)",
             stats.0, stats.1
+        ),
+    );
+    let s = syscall(Syscall::Call, NET, [net::STATS, net::VERSION, 0, 0]).msg;
+    t.check(
+        s[0] == OK && s[1] > 0 && s[2] > 0,
+        format_args!(
+            "{} datagrams reassembled from fragments, {} sent in fragments, {} dropped half reassembled",
+            s[1], s[2], s[3]
         ),
     );
     dns_checks(&mut t);
@@ -2094,9 +2104,12 @@ pub extern "C" fn _start(role: u64) -> ! {
         7 => fs_client(),
         8 => fs_verify(),
         9 => fs_other(),
-        10 => injector(&[FS_INDEX, DRIVER_INDEX]),
+        10 => injector(&[FS_INDEX, DRIVER_INDEX], false),
+        // The keyboard test: a word takes some 0.2 s to type, longer than
+        // most gaps between kills, so it gets pauses to come through in.
+        17 => injector(&[DRIVER_INDEX, FS_INDEX], true),
         // The network test: the driver, the network server, the resolver.
-        16 => injector(&[1, 2, 3]),
+        16 => injector(&[1, 2, 3], false),
         _ => probe(),
     }
 }

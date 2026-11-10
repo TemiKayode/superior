@@ -26,12 +26,19 @@
 //! the server has no address: `INFO` and `SEND` answer `Unreachable`.
 //!
 //! Slots: 0 the `nic` endpoint, 1 the `net` endpoint (receive), 2 untyped
-//! memory (64 KiB), 17 the state page.
+//! memory (256 KiB), 17 the state page.
+//!
+//! Datagrams up to `net::MAX_DATAGRAM` bytes go and come in IPv4
+//! fragments: a datagram too big for one frame is sent in 1480-byte
+//! pieces, and fragments that arrive are put back together
+//! (`superior_inet::Reassembler`), up to four datagrams at once, each
+//! given 5 s; one that does not complete in time is dropped.
 
 #![no_std]
 #![no_main]
 
 use superior_objects::abi::{CapTransfer, Error, ObjectType, Syscall};
+use superior_inet::{Key, MAX_REASSEMBLED, Outcome, Reassembler};
 use superior_objects::interfaces::{Status, net, nic};
 use superior_sys::{USER_BASE, print_line, syscall, syscall_x};
 
@@ -54,11 +61,14 @@ const LENT: u64 = 8;
 const SOCK_NTFN: u64 = 9;
 /// The state page, which outlives instances: the DHCP lease.
 const STATE: u64 = 17;
+/// The sockets' queue pages, SOCKETS * QUEUE of them.
+const QUEUE_PAGES: u64 = 18;
 
 const RX_VA: u64 = USER_BASE + 0x4000_0000;
 const TX_VA: u64 = RX_VA + 0x1000;
 const LENT_VA: u64 = RX_VA + 0x2000;
 const STATE_VA: u64 = RX_VA + 0x3000;
+const QUEUE_VA: u64 = RX_VA + 0x10_0000;
 
 /// Badges on this thread's notification.
 const RX: u64 = 1;
@@ -88,6 +98,17 @@ const REQUEST_TRIES: u8 = 4;
 /// The state page's words: `LEASE_MAGIC` (written last, so a lease half
 /// written by an instance that died is not taken), then the lease.
 const LEASE_MAGIC: u64 = 0x4448_4350_6c65_6173;
+/// Words of the state page after the lease: counts kept across restarts
+/// of datagrams reassembled, sent in fragments, and dropped half
+/// reassembled.
+const STAT_REASSEMBLED: usize = 8;
+const STAT_FRAGMENTED: usize = 9;
+const STAT_DROPPED: usize = 10;
+/// Datagrams reassembled at once, and how long one may take (5 s).
+const REASSEMBLING: usize = 4;
+const REASSEMBLY_TICKS: u64 = 500;
+/// The most IP payload in one 1500-byte frame, a multiple of 8.
+const FRAGMENT: usize = 1480;
 
 const SOCKETS: usize = 8;
 /// Datagrams a socket keeps until they are received.
@@ -95,7 +116,7 @@ const QUEUE: usize = 4;
 const ARP_CACHE: usize = 8;
 const WAITING: usize = 4;
 const MAX_FRAME: usize = nic::MAX_FRAME as usize;
-const MAX_PAYLOAD: usize = net::MAX_PAYLOAD as usize;
+const MAX_DATAGRAM: usize = net::MAX_DATAGRAM as usize;
 
 const ETH_ARP: u16 = 0x0806;
 const ETH_IP: u16 = 0x0800;
@@ -117,11 +138,11 @@ enum Kind {
     Icmp(u16),
 }
 
+/// A queued datagram; its bytes are in its queue page (`queue_page`).
 #[derive(Clone, Copy)]
 struct Datagram {
     len: u16,
     from: u64,
-    data: [u8; MAX_PAYLOAD],
 }
 
 struct Socket {
@@ -188,6 +209,9 @@ struct Net {
     resend: u64,
     /// Ticks between renewals (0: halfway through the lease).
     renew_every: u64,
+    reassembly: Reassembler<REASSEMBLING>,
+    /// The last IPv4 identification used.
+    ip_id: u16,
     arp: [Option<(u32, [u8; 6])>; ARP_CACHE],
     arp_next: usize,
     waiting: [Option<Waiting>; WAITING],
@@ -200,11 +224,18 @@ struct Net {
     sent: u64,
 }
 
-const EMPTY: Datagram = Datagram {
-    len: 0,
-    from: 0,
-    data: [0; MAX_PAYLOAD],
-};
+const EMPTY: Datagram = Datagram { len: 0, from: 0 };
+
+/// The page holding the bytes of socket `i`'s queue entry `j`: one page
+/// each, made at start, so the image stays small.
+fn queue_page(i: usize, j: usize) -> &'static mut [u8] {
+    page(QUEUE_VA + 0x1000 * (i * QUEUE + j) as u64)
+}
+
+/// A reassembled datagram, while it is handled.
+static mut WHOLE: [u8; MAX_REASSEMBLED] = [0; MAX_REASSEMBLED];
+/// A datagram's payload, while it is sent in fragments.
+static mut PIECES: [u8; MAX_REASSEMBLED] = [0; MAX_REASSEMBLED];
 
 static mut NET: Net = Net {
     mac: [0; 6],
@@ -213,6 +244,8 @@ static mut NET: Net = Net {
     xid: 0,
     resend: 0,
     renew_every: 0,
+    reassembly: Reassembler::new(),
+    ip_id: 0,
     arp: [None; ARP_CACHE],
     arp_next: 0,
     waiting: [None; WAITING],
@@ -230,6 +263,20 @@ fn ticks() -> u64 {
 
 fn state() -> *mut u64 {
     STATE_VA as *mut u64
+}
+
+/// Adds `n` to the state page's count `word`.
+fn count(word: usize, n: u64) {
+    // SAFETY: the state page is mapped at STATE_VA for good.
+    unsafe {
+        let w = state().add(word);
+        w.write_volatile(w.read_volatile() + n);
+    }
+}
+
+fn counted(word: usize) -> u64 {
+    // SAFETY: as in `count`.
+    unsafe { state().add(word).read_volatile() }
 }
 
 fn page(va: u64) -> &'static mut [u8] {
@@ -389,7 +436,7 @@ impl Net {
         put16(u, 6, 0);
         let c = fold(sum(pseudo(ciaddr, BROADCAST, PROTO_UDP, 8 + LEN), u));
         put16(u, 6, if c == 0 { 0xffff } else { c });
-        self.ip_header(ciaddr, BROADCAST, PROTO_UDP, 8 + LEN);
+        self.ip_header(ciaddr, BROADCAST, PROTO_UDP, 8 + LEN, 0);
         self.ether([0xff; 6], ETH_IP);
         self.transmit(14 + 20 + 8 + LEN);
         self.resend = ticks() + SECOND;
@@ -646,18 +693,23 @@ impl Net {
 
     /// Sends the IPv4 packet whose payload (`len` bytes) is already on the
     /// transmit page after the two headers; fills them in. A packet whose
-    /// next hop is not yet known waits for the ARP answer.
+    /// next hop is not yet known waits for the ARP answer. One too big for
+    /// a frame goes in fragments, of [`FRAGMENT`] bytes but the last (it is
+    /// not held for ARP: it answers `Unreachable` and asks).
     fn ip_send(&mut self, dst: u32, proto: u8, len: usize) -> Status {
         let Some(lease) = self.lease else {
             return Status::Unreachable;
         };
-        let total = 20 + len;
-        self.ip_header(lease.ip, dst, proto, len);
         let hop = if dst & lease.mask == lease.ip & lease.mask {
             dst
         } else {
             lease.gateway
         };
+        if len > FRAGMENT {
+            return self.fragments(lease.ip, dst, proto, len, hop);
+        }
+        let total = 20 + len;
+        self.ip_header(lease.ip, dst, proto, len, 0);
         let frame = (14 + total).max(60);
         if let Some(mac) = self.lookup(hop) {
             self.ether(mac, ETH_IP);
@@ -680,15 +732,53 @@ impl Net {
         Status::Ok
     }
 
+    /// Sends the `len`-byte payload on the transmit page in fragments.
+    fn fragments(&mut self, src: u32, dst: u32, proto: u8, len: usize, hop: u32) -> Status {
+        let Some(mac) = self.lookup(hop) else {
+            self.arp_send(1, [0; 6], hop);
+            return Status::Unreachable;
+        };
+        // SAFETY: one thread; PIECES is used only here.
+        let pieces = unsafe { &mut *(&raw mut PIECES) };
+        pieces[..len].copy_from_slice(&page(TX_VA)[34..34 + len]);
+        self.ip_id = self.ip_id.wrapping_add(1);
+        let id = self.ip_id;
+        let mut at = 0;
+        while at < len {
+            let n = (len - at).min(FRAGMENT);
+            let more = at + n < len;
+            page(TX_VA)[34..34 + n].copy_from_slice(&pieces[at..at + n]);
+            // The same identification on every fragment: only the offset
+            // (in 8-byte units) and "more fragments" differ.
+            self.ip_header_as(src, dst, proto, n, id, (more as u16) << 13 | (at / 8) as u16);
+            self.ether(mac, ETH_IP);
+            let s = self.transmit((14 + 20 + n).max(60));
+            if s != Status::Ok {
+                return s;
+            }
+            at += n;
+        }
+        count(STAT_FRAGMENTED, 1);
+        Status::Ok
+    }
+
     /// Fills in the IPv4 header on the transmit page for a payload of
-    /// `len` bytes.
-    fn ip_header(&self, src: u32, dst: u32, proto: u8, len: usize) {
+    /// `len` bytes, with a new identification.
+    fn ip_header(&mut self, src: u32, dst: u32, proto: u8, len: usize, frag: u16) {
+        self.ip_id = self.ip_id.wrapping_add(1);
+        self.ip_header_as(src, dst, proto, len, self.ip_id, frag);
+    }
+
+    /// The same, with identification `id` and the flags and fragment
+    /// offset word `frag`.
+    fn ip_header_as(&self, src: u32, dst: u32, proto: u8, len: usize, id: u16, frag: u16) {
         let tx = page(TX_VA);
         let h = &mut tx[14..34];
         h.fill(0);
         h[0] = 0x45;
         put16(h, 2, (20 + len) as u16);
-        put16(h, 4, self.sent as u16); // identification
+        put16(h, 4, id);
+        put16(h, 6, frag);
         h[8] = 64; // TTL
         h[9] = proto;
         put32(h, 12, src);
@@ -700,6 +790,8 @@ impl Net {
     /// The timer: DHCP, and ARP requests again for frames still waiting.
     fn tick(&mut self) {
         self.dhcp_tick();
+        let expired = self.reassembly.expire(ticks(), REASSEMBLY_TICKS);
+        count(STAT_DROPPED, expired as u64);
         for w in 0..WAITING {
             let Some(mut f) = self.waiting[w] else {
                 continue;
@@ -753,15 +845,36 @@ impl Net {
         if ihl < 20 || total < ihl || total > p.len() || fold(sum(0, &p[..ihl])) != 0 {
             return;
         }
-        // Fragments are not reassembled.
-        if be16(p, 6) & 0x3fff != 0 {
-            return;
-        }
         let (src, dst) = (be32(p, 12), be32(p, 16));
         // DHCP answers may come before this host has an address, or
         // broadcast: UDP sorts them out.
         let ours = dst != 0 && dst == self.addr();
-        let body = &p[ihl..total];
+        let frag = be16(p, 6);
+        let (more, offset) = (frag & 0x2000 != 0, (frag & 0x1fff) as usize * 8);
+        let body = if more || offset != 0 {
+            let key = Key {
+                src,
+                dst,
+                proto: p[9],
+                id: be16(p, 4),
+            };
+            // SAFETY: one thread; WHOLE holds this datagram until it has
+            // been handled, and nothing else uses it.
+            let whole = unsafe { &mut *(&raw mut WHOLE) };
+            match self.reassembly.add(ticks(), key, offset, more, &p[ihl..total], whole) {
+                Outcome::Complete(n) => {
+                    count(STAT_REASSEMBLED, 1);
+                    &whole[..n]
+                }
+                Outcome::Dropped => {
+                    count(STAT_DROPPED, 1);
+                    return;
+                }
+                Outcome::Pending => return,
+            }
+        } else {
+            &p[ihl..total]
+        };
         match p[9] {
             PROTO_ICMP if ours => self.icmp(src, body),
             PROTO_UDP => self.udp(src, dst, body, ours),
@@ -777,7 +890,7 @@ impl Net {
         match m[0] {
             ICMP_ECHO => {
                 // Answer with the same identifier, sequence and data.
-                let len = m.len().min(MAX_PAYLOAD + 8);
+                let len = m.len().min(MAX_DATAGRAM + 8);
                 let tx = page(TX_VA);
                 let r = &mut tx[34..34 + len];
                 r.copy_from_slice(&m[..len]);
@@ -823,11 +936,13 @@ impl Net {
             s.dropped += 1;
             return;
         }
-        let d = &mut s.queue[(s.head + s.count) % QUEUE];
-        let n = data.len().min(MAX_PAYLOAD);
-        d.len = n as u16;
-        d.from = (src as u64) << 16 | port as u64;
-        d.data[..n].copy_from_slice(&data[..n]);
+        let j = (s.head + s.count) % QUEUE;
+        let n = data.len().min(MAX_DATAGRAM);
+        s.queue[j] = Datagram {
+            len: n as u16,
+            from: (src as u64) << 16 | port as u64,
+        };
+        queue_page(i, j)[..n].copy_from_slice(&data[..n]);
         s.count += 1;
         syscall(Syscall::Signal, SOCK_NTFN + i as u64, [0; 4]);
     }
@@ -886,7 +1001,7 @@ impl Net {
         if self.lease.is_none() {
             return Status::Unreachable;
         }
-        if len > MAX_PAYLOAD || syscall(Syscall::FrameMap, LENT, [LENT_VA, 0, 0, 0]).status != 0 {
+        if len > MAX_DATAGRAM || syscall(Syscall::FrameMap, LENT, [LENT_VA, 0, 0, 0]).status != 0 {
             return Status::Invalid;
         }
         let data = &page(LENT_VA)[..len];
@@ -929,9 +1044,9 @@ impl Net {
         if syscall(Syscall::FrameMap, LENT, [LENT_VA, 1, 0, 0]).status != 0 {
             return [Status::Invalid as u64, 0, 0, 0];
         }
-        let d = &s.queue[s.head];
+        let d = s.queue[s.head];
         let n = d.len as usize;
-        page(LENT_VA)[..n].copy_from_slice(&d.data[..n]);
+        page(LENT_VA)[..n].copy_from_slice(&queue_page(i, s.head)[..n]);
         syscall(Syscall::FrameUnmap, LENT, [0; 4]);
         let from = d.from;
         s.head = (s.head + 1) % QUEUE;
@@ -943,6 +1058,15 @@ impl Net {
     fn serve(&mut self, badge: u64, m: [u64; 4], lent: bool) -> ([u64; 4], bool) {
         let status = |s: Status| ([s as u64, 0, 0, 0], false);
         match m[0] {
+            net::STATS if m[1] == net::VERSION => (
+                [
+                    Status::Ok as u64,
+                    counted(STAT_REASSEMBLED),
+                    counted(STAT_FRAGMENTED),
+                    counted(STAT_DROPPED),
+                ],
+                false,
+            ),
             net::INFO | net::LEASE if m[1] == net::VERSION => {
                 let Some(l) = self.lease else {
                     return status(Status::Unreachable);
@@ -1021,6 +1145,12 @@ fn start(n: &mut Net) -> Result<(), (&'static str, u64)> {
     }
     for i in 0..SOCKETS as u64 {
         retype(ObjectType::Notification, SOCK_NTFN + i)?;
+    }
+    for k in 0..(SOCKETS * QUEUE) as u64 {
+        retype(ObjectType::Frame, QUEUE_PAGES + k)?;
+        if syscall(Syscall::FrameMap, QUEUE_PAGES + k, [QUEUE_VA + 0x1000 * k, 1, 0, 0]).status != 0 {
+            return Err(("mapping a queue page", k));
+        }
     }
     if syscall(Syscall::FrameMap, STATE, [STATE_VA, 1, 0, 0]).status != 0 {
         return Err(("mapping the state page", STATE));

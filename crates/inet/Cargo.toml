@@ -1,0 +1,10 @@
+[package]
+name = "superior-inet"
+description = "Internet protocol pieces for Superior's network server that host tests can check: IPv4 fragment reassembly."
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+edition = "2024"
+publish = false
+
+[dependencies]
