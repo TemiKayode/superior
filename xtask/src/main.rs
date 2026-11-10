@@ -540,13 +540,14 @@ fn qemu_command(img: &Image) -> Command {
             }
             if img.disk.is_some() && img.driver == "ahci" {
                 // The boot disk would be q35's AHCI port 0, the first disk the
-                // driver finds: put it on port 1, the test disk on port 0.
+                // driver finds: put it on port 2, after the test disks on
+                // ports 0 and 1 (so it is unit 2).
                 q.arg("-drive")
                     .arg(format!(
                         "if=none,id=boot,format=raw,file={}",
                         img.path.display()
                     ))
-                    .args(["-device", "ide-hd,drive=boot,bus=ide.1,bootindex=0"]);
+                    .args(["-device", "ide-hd,drive=boot,bus=ide.2,bootindex=0"]);
             } else {
                 q.arg("-drive")
                     .arg(format!("format=raw,file={}", img.path.display()));
@@ -612,18 +613,20 @@ fn qemu_command(img: &Image) -> Command {
             ]);
     } else if let (Some(disk), "ahci") = (&img.disk, img.driver) {
         // q35 has an AHCI controller (ICH9, 00:1f.2); virt needs one added.
-        // Its DMA goes through the IOMMU.
-        q.arg("-drive").arg(drive("sata0", disk));
-        if img.arch == Arch::X86_64 {
-            q.args(["-device", "ide-hd,drive=sata0,bus=ide.0"]);
+        // Its DMA goes through the IOMMU. Two disks: the test disk on port
+        // 0, and the small disk of its own pattern on port 1.
+        q.arg("-drive")
+            .arg(drive("sata0", disk))
+            .arg("-drive")
+            .arg(drive("sata1", &second_namespace()));
+        let bus = if img.arch == Arch::X86_64 {
+            "ide"
         } else {
-            q.args([
-                "-device",
-                "ahci,id=ahci",
-                "-device",
-                "ide-hd,drive=sata0,bus=ahci.0",
-            ]);
-        }
+            q.args(["-device", "ahci,id=ahci"]);
+            "ahci"
+        };
+        q.args(["-device", &format!("ide-hd,drive=sata0,bus={bus}.0")])
+            .args(["-device", &format!("ide-hd,drive=sata1,bus={bus}.1")]);
     } else if let Some(disk) = &img.disk {
         // Modern only (virtio 1.x): no legacy I/O BAR. iommu_platform:
         // the device's DMA goes through the IOMMU (QEMU's virtio devices
@@ -804,7 +807,7 @@ fn supervise_test(img: &Image) -> Result<(), String> {
     Ok(())
 }
 
-/// The NVMe tests' second namespace: 64 sectors, word `k` of sector `s`
+/// The NVMe tests' second namespace (and the AHCI tests' second disk): 64 sectors, word `k` of sector `s`
 /// being `0x4e32 << 48 | s << 16 | k`. Written afresh each time (it is
 /// small).
 fn second_namespace() -> PathBuf {
@@ -871,9 +874,25 @@ fn drivers_test(img: &Image) -> Result<(), String> {
     );
     let forged: &str = if d == "virtio-blk" { &forged } else { "" };
     // NVMe: two I/O queues, each with its own thread, and the second
-    // namespace a unit of its own.
+    // namespace a unit of its own. AHCI: two command slots, each with its
+    // own thread, queued (NCQ), and the disk on port 1 a unit of its own
+    // (on x86 the boot disk, on port 2, is a third).
     let nvme = d == "nvme";
+    let ahci = d == "ahci";
     let pick = |s: &'static str| if nvme { s } else { "" };
+    let sata = |s: &'static str| if ahci { s } else { "" };
+    let units = if ahci && img.arch == Arch::X86_64 { 3 } else { 2 };
+    let unit1 = if nvme || ahci {
+        format!("[pass] block: unit 1 of {units}: 64 sectors of 512 bytes")
+    } else {
+        String::new()
+    };
+    let no_unit = if nvme || ahci {
+        format!("[pass] block: unit 1 ends at its own size, and there is no unit {units}")
+    } else {
+        String::new()
+    };
+    let both = |s: &'static str| if nvme || ahci { s } else { "" };
     let steps: &[&str] = &[
         remap,
         remap_at,
@@ -882,7 +901,13 @@ fn drivers_test(img: &Image) -> Result<(), String> {
         device,
         "given to client 2 (reset:",
         "new, empty IOMMU domain",
+        // AHCI names its disks before it is ready, NVMe after.
+        sata("ahci: unit 0: port 0 "),
+        sata("128 sectors, write cache, NCQ"),
+        sata("ahci: unit 1: port 1 "),
+        sata("64 sectors, write cache, NCQ"),
         &ready,
+        sata(" disks, 2 command slots, interrupts on MSI"),
         pick("2 I/O queues, interrupts on MSI-X vectors 0-1"),
         pick("nvme: unit 0: namespace 1, 128 blocks of 512 bytes"),
         pick("nvme: unit 1: namespace 2, 64 blocks of 512 bytes"),
@@ -890,12 +915,12 @@ fn drivers_test(img: &Image) -> Result<(), String> {
         "[pass] block: read 8 sectors from 0 by DMA into its page: every word right",
         "[pass] block: read 8 sectors from 100 by DMA into its page: every word right",
         "[pass] block: read 1 sectors from 127 by DMA into its page: every word right",
-        pick("[pass] block: unit 1 of 2: 64 sectors of 512 bytes"),
-        pick("[pass] block: read 8 sectors from 0 of unit 1: its own data, every word right"),
-        pick("[pass] block: read 4 sectors from 60 of unit 1: its own data, every word right"),
-        pick("[pass] block: unit 1 ends at its own size, and there is no unit 2"),
+        &unit1,
+        both("[pass] block: read 8 sectors from 0 of unit 1: its own data, every word right"),
+        both("[pass] block: read 4 sectors from 60 of unit 1: its own data, every word right"),
+        &no_unit,
         "[pass] block: two threads read 40 times each at once: every word right",
-        pick("[pass] block: the driver used all 2 of its I/O queues, with up to 2 commands in flight at once"),
+        both("[pass] block: the driver used all 2 of its queues, with up to 2 commands in flight at once"),
         "may not have",
         "[pass] block: the bus server will not give it the driver's device",
         "[pass] block: nor any BAR page",

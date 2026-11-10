@@ -23,10 +23,11 @@ component virtio-blk
   uses pci 0
   provides block 1
   notification 2
-  # 64 KiB: enough for any disk driver (cargo xtask nvme-test and
+  # 128 KiB: enough for any disk driver (cargo xtask nvme-test and
   # ahci-test boot this manifest with nvme or ahci in its place; NVMe
-  # makes a thread, stack and queue pair per I/O queue).
-  untyped 16 3
+  # makes a thread, stack and queue pair per I/O queue, AHCI a thread
+  # and stack per command slot and command pages per port).
+  untyped 17 3
 
 component fs
   image fs

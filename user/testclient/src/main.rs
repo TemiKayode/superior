@@ -434,7 +434,7 @@ fn block_client(open: [u64; 4]) -> ! {
             ),
         );
     }
-    // A second unit (NVMe's second namespace) is a disk of its own: its
+    // A second unit (NVMe's second namespace, AHCI's second port) is a disk of its own: its
     // own size, its own data, its own bounds.
     if units > 1 {
         let r = syscall(Syscall::Call, BLOCK, [block::INFO, block::VERSION, 1, 0]);
@@ -464,7 +464,8 @@ fn block_client(open: [u64; 4]) -> ! {
         );
     }
     // Two threads reading at once; the NVMe driver serves them on two
-    // queues, each with its own thread and vector.
+    // queues, each with its own thread and vector, the AHCI driver on two
+    // command slots (NCQ tags), each with its own thread.
     let helper = start_helper();
     let mut failed = 0;
     if helper.is_ok() {
@@ -492,7 +493,7 @@ fn block_client(open: [u64; 4]) -> ! {
         t.check(
             queues >= 2 && used == (1 << queues) - 1 && peak >= 2,
             format_args!(
-                "the driver used all {queues} of its I/O queues, with up to {peak} commands in flight at once"
+                "the driver used all {queues} of its queues, with up to {peak} commands in flight at once"
             ),
         );
     }

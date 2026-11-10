@@ -235,10 +235,18 @@ holds the rest):
   - An AHCI (SATA) driver (`user/ahci/`), opening the first function of class
     01:06:01. The bus server cannot reset such a controller (no Function Level
     Reset), so the driver resets the whole controller itself on every start, then
-    brings up each port with a link until one reports an ATA disk (its signature
-    arrives only once the port receives FISes), identifies it (48-bit size, write
-    cache), and serves `block` with READ DMA EXT, WRITE DMA EXT and FLUSH CACHE EXT
-    in command slot 0, one PRD entry each, interrupts on plain MSI.
+    brings up every port with a link and serves each one that reports an ATA disk
+    (its signature arrives only once the port receives FISes) as a unit of `block`,
+    in port order, with a command list, received-FIS area and command tables of its
+    own. It identifies each disk (48-bit size, write cache, native command queuing).
+    Two serving threads, each with a command slot of its own on every port, receive
+    on the one endpoint; where the controller and disk do NCQ, reads and writes are
+    READ/WRITE FPDMA QUEUED with the slot as the tag, so the disk holds both at once
+    (otherwise READ/WRITE DMA EXT, one at a time per port). FLUSH CACHE EXT takes
+    the port for itself. With one plain MSI for the whole controller, the main
+    thread takes the interrupt, works out from each port's SACT and CI which slots
+    finished (a task-file error restarts the port and fails what was on it) and
+    wakes their threads; every command also waits on a timer.
   `cargo xtask drivers-test` boots `boot/drivers.manifest` with a test disk:
   - the client reads it and checks every word;
   - the bus server refuses the client the driver's device and its BARs;
@@ -253,13 +261,15 @@ holds the rest):
   - the driver is crashed, restarted, its device reset and reopened, and reads work
     again;
   - two client threads read 40 times each at once, every word right; NVMe must
-    report using both of its I/O queues with two commands in flight at once.
-  With NVMe the controller has a second namespace, a small disk of its own
-  pattern: the client must see it as unit 1, of its own size, read its own data
-  from it, and be refused past its end and for a unit 2.
+    report using both of its I/O queues, and AHCI both of its command slots (NCQ
+    tags), with two commands in flight at once.
+  With NVMe the controller has a second namespace, and with AHCI port 1 a second
+  disk, a small disk of its own pattern: the client must see it as unit 1, of its
+  own size, read its own data from it, and be refused past its end and for the
+  unit after the last (on x86-64 the boot disk, on AHCI port 2, is unit 2).
   `cargo xtask nvme-test` and `cargo xtask ahci-test` run that test and the
   filesystem test with the disk on QEMU's NVMe controller or on an AHCI port (q35's
-  own ICH9 controller on x86-64, with the boot disk moved to port 1; one added on
+  own ICH9 controller on x86-64, with the boot disk moved to port 2; one added on
   AArch64), the manifests' `virtio-blk` swapped for the driver; `cargo xtask test`
   runs all three drivers on both ISAs. Through the IOMMU the stray read leaves the
   page untouched (both QEMU controllers then report the command a success); the
@@ -431,7 +441,7 @@ Not yet: an interrupt for IOMMU faults (they are collected on
 the timer tick), buses behind bridges in the IOMMU (requester IDs on bus 0 only); Function
 Level Reset is exercised only by the NVMe controller (QEMU's virtio devices on
 these buses have none); more than one command per queue in the NVMe driver,
-several commands (NCQ) and ports in the AHCI driver, ATAPI
+more than two commands in flight per disk in the AHCI driver, ATAPI
 and port multipliers; in the xHCI driver isochronous and bulk endpoints, USB 3 streams,
 hubs and more than one interrupter, and HID devices other than boot keyboards; in the network server
 DHCP, TCP, IPv6, fragments, DNS, routes beyond one gateway, and rings in place of a
