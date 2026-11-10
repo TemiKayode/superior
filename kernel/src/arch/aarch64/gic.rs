@@ -1,7 +1,8 @@
 //! The GICv3 interrupt controller on QEMU's `virt` machine
-//! (`gic-version=3`): a distributor for shared interrupts, CPU 0's
-//! redistributor for its private ones and for LPIs, the system-register
-//! CPU interface, and an ITS that turns device MSIs into LPIs.
+//! (`gic-version=3`): a distributor for shared interrupts (all routed to
+//! CPU 0), each CPU's redistributor for its private ones (CPU 0's for
+//! LPIs too), the system-register CPU interface, and an ITS that turns
+//! device MSIs into LPIs. CPUs interrupt each other with SGIs.
 //!
 //! The ITS is what makes MSIs safe to hand to user-space drivers. A
 //! device raises an MSI by writing an event ID to the ITS's translation
@@ -18,9 +19,22 @@ use spin::Mutex;
 
 const GICD: u64 = 0x0800_0000;
 const GITS: u64 = 0x0808_0000;
-/// CPU 0's redistributor: its control frame, then its SGI/PPI frame.
+/// CPU 0's redistributor: its control frame, then its SGI/PPI frame. The
+/// next CPU's follows ([`REDIST_STRIDE`] on).
 const GICR: u64 = 0x080a_0000;
-const SGI: u64 = GICR + 0x1_0000;
+const REDIST_STRIDE: u64 = 0x2_0000;
+/// The SGIs CPUs send each other: a kick, and a shootdown request.
+pub const KICK_SGI: u32 = 1;
+pub const SHOOTDOWN_SGI: u32 = 2;
+
+/// CPU `cpu`'s redistributor control frame and SGI/PPI frame.
+fn gicr(cpu: usize) -> u64 {
+    GICR + cpu as u64 * REDIST_STRIDE
+}
+
+fn sgi(cpu: usize) -> u64 {
+    gicr(cpu) + 0x1_0000
+}
 
 const GICD_CTLR: u64 = 0x000;
 const GICD_IGROUPR: u64 = 0x080;
@@ -163,18 +177,25 @@ pub fn init() {
     }
     write32(GICD + GICD_CTLR, GICD_CTLR_ARE | GICD_CTLR_GRP1);
     wait_rwp(GICD + GICD_CTLR);
+    init_cpu(0);
+    init_its();
+}
 
-    // Redistributor: awake, private interrupts group 1 and disabled.
-    write32(GICR + GICR_WAKER, read32(GICR + GICR_WAKER) & !WAKER_SLEEP);
-    while read32(GICR + GICR_WAKER) & WAKER_ASLEEP != 0 {
+/// This CPU's redistributor and CPU interface: private interrupts group 1
+/// and disabled but for the SGIs from other CPUs.
+pub fn init_cpu(cpu: usize) {
+    let (rd, sgi) = (gicr(cpu), sgi(cpu));
+    write32(rd + GICR_WAKER, read32(rd + GICR_WAKER) & !WAKER_SLEEP);
+    while read32(rd + GICR_WAKER) & WAKER_ASLEEP != 0 {
         core::hint::spin_loop();
     }
-    write32(SGI + GICD_ICENABLER, !0);
-    write32(SGI + GICD_IGROUPR, !0);
+    write32(sgi + GICD_ICENABLER, !0);
+    write32(sgi + GICD_IGROUPR, !0);
     for id in 0..32 {
-        write8(SGI + GICD_IPRIORITYR + id, 0x80);
+        write8(sgi + GICD_IPRIORITYR + id, 0x80);
     }
-    while read32(GICR + GICR_CTLR) & GICR_RWP != 0 {
+    write32(sgi + GICD_ISENABLER, 1 << KICK_SGI | 1 << SHOOTDOWN_SGI);
+    while read32(rd + GICR_CTLR) & GICR_RWP != 0 {
         core::hint::spin_loop();
     }
 
@@ -196,7 +217,15 @@ pub fn init() {
             options(nostack)
         )
     };
-    init_its();
+}
+
+/// Sends SGI `id` to CPU `cpu` (affinity 0 = `cpu`, the rest 0).
+pub fn send_sgi(cpu: usize, id: u32) {
+    let v = (id as u64) << 24 | 1 << cpu;
+    // SAFETY: writing ICC_SGI1R_EL1 raises the SGI at the target.
+    unsafe {
+        core::arch::asm!("dsb ish", "msr S3_0_C12_C11_5, {}", "isb", in(reg) v, options(nostack))
+    };
 }
 
 /// LPIs and the ITS, if the machine has one; without, MSI lines raise
@@ -379,7 +408,7 @@ pub fn line_of(id: u32) -> u32 {
 
 pub fn unmask(line: u32) {
     match line {
-        0..32 => write32(SGI + GICD_ISENABLER, 1 << line),
+        0..32 => write32(sgi(super::cpu_id()) + GICD_ISENABLER, 1 << line),
         l if is_msi(l) => {} // LPIs stay enabled
         l if l < MAX_SPI => write32(GICD + GICD_ISENABLER + 4 * (l / 32) as u64, 1 << (l % 32)),
         _ => {}
@@ -388,7 +417,7 @@ pub fn unmask(line: u32) {
 
 pub fn mask(line: u32) {
     match line {
-        0..32 => write32(SGI + GICD_ICENABLER, 1 << line),
+        0..32 => write32(sgi(super::cpu_id()) + GICD_ICENABLER, 1 << line),
         l if is_msi(l) => {}
         l if l < MAX_SPI => write32(GICD + GICD_ICENABLER + 4 * (l / 32) as u64, 1 << (l % 32)),
         _ => {}

@@ -1824,7 +1824,7 @@ fn start(n: &mut Net) -> Result<(), (&'static str, u64)> {
         if r.status == 0 && r.msg[0] == Status::Ok as u64 {
             return Some(r.msg);
         }
-        syscall(Syscall::Yield, 0, [0; 4]);
+        superior_sys::sleep(1);
         None
     });
     let info = info.ok_or(("the NIC driver does not answer", 0))?;
@@ -1868,9 +1868,7 @@ pub extern "C" fn _start(arg: u64) -> ! {
     n.drop_one_in = arg >> 32;
     if let Err((what, code)) = start(n) {
         say!("[fail] {what} ({code})");
-        loop {
-            syscall(Syscall::Yield, 0, [0; 4]);
-        }
+        superior_sys::park()
     }
     let accept = CapTransfer {
         grant: None,
@@ -1910,7 +1908,5 @@ pub extern "C" fn _start(arg: u64) -> ! {
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
     say!("panic: {info}");
-    loop {
-        syscall(Syscall::Yield, 0, [0; 4]);
-    }
+    superior_sys::park()
 }

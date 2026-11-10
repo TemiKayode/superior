@@ -516,6 +516,15 @@ fn sel4_image() -> Result<Image, String> {
     })
 }
 
+/// CPUs the test machines have: `SUPERIOR_CPUS`, else 2.
+fn cpus() -> usize {
+    env::var("SUPERIOR_CPUS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&n| (1..=4).contains(&n))
+        .unwrap_or(2)
+}
+
 fn qemu(arch: Arch) -> PathBuf {
     let (var, exe) = match arch {
         Arch::X86_64 => ("QEMU", "qemu-system-x86_64"),
@@ -585,6 +594,10 @@ fn qemu_command(img: &Image) -> Command {
     }
     if img.arch == Arch::X86_64 {
         q.args(["-m", "512M"]);
+    }
+    // Several CPUs, except for seL4's images (built for one).
+    if !img.sel4 {
+        q.args(["-smp", &cpus().to_string()]);
     }
     // QEMU's IDE disks cannot be read-only; the drivers test's disk is
     // made afresh for every run anyway.
@@ -727,19 +740,13 @@ fn cm_test(img: &Image) -> Result<(), String> {
         "[pass] client: call 1: sent 100, got 101".to_string(),
         "[pass] client: call 2: sent 200, got 201".to_string(),
         "[pass] client: call 3: sent 300, got 301".to_string(),
+        "[pass] client: slept 20 ticks".to_string(),
         "[cm] client asked to shut down (pass)".to_string(),
         "[cm] never started: spare (nothing used it)".to_string(),
     ];
-    let mut at = 0;
-    for step in &steps {
-        match out[at..].find(step.as_str()) {
-            Some(i) => at += i + step.len(),
-            None => {
-                return Err(format!(
-                    "Component Manager test: missing (in order) {step:?}"
-                ));
-            }
-        }
+    let steps: Vec<&str> = steps.iter().map(String::as_str).collect();
+    if let Err(step) = find_in_order(&out, &steps) {
+        return Err(format!("Component Manager test: missing (in order) {step:?}"));
     }
     // An interrupt that lands while user code has the direction flag set
     // must not run the kernel with it set (x86-64 only).
@@ -784,12 +791,8 @@ fn supervise_test(img: &Image) -> Result<(), String> {
         "[pass] supervise: after was restarted with base: call 1 of a new instance",
         "[cm] client asked to shut down (pass)",
     ];
-    let mut at = 0;
-    for step in steps {
-        match out[at..].find(step) {
-            Some(i) => at += i + step.len(),
-            None => return Err(format!("supervision test: missing (in order) {step:?}")),
-        }
+    if let Err(step) = find_in_order(&out, &steps) {
+        return Err(format!("supervision test: missing (in order) {step:?}"));
     }
     // The new counter and the client are ready together after the
     // restart, at one priority: either may print first.
@@ -940,8 +943,6 @@ fn drivers_test(img: &Image) -> Result<(), String> {
         &restarting,
         "reopened by client 2 (reset:",
         "new, empty IOMMU domain",
-        // The client's verdict may come before or after the driver is up.
-        "[pass] block: DMA aimed outside the device's IOMMU domain did not land and was reported",
         "[pass] block: read 8 sectors from 32 after the driver restarted on a fresh domain: every word right",
         &crashing,
         &restarting,
@@ -951,16 +952,14 @@ fn drivers_test(img: &Image) -> Result<(), String> {
         "[pass] block: read 8 sectors from 64 after the restart: every word right",
         "[cm] client asked to shut down (pass)",
     ];
-    let mut at = 0;
-    for step in steps {
-        match out[at..].find(step) {
-            Some(i) => at += i + step.len(),
-            None => {
-                return Err(format!(
-                    "driver framework test: missing (in order) {step:?}"
-                ));
-            }
-        }
+    if let Err(step) = find_in_order(&out, steps) {
+        return Err(format!("driver framework test: missing (in order) {step:?}"));
+    }
+    // The client's verdict on the stray DMA, which (on several CPUs) may
+    // come before or after the driver crashes and is restarted.
+    let verdict = "[pass] block: DMA aimed outside the device's IOMMU domain did not land and was reported";
+    if !out.contains(verdict) {
+        return Err(format!("driver framework test: missing {verdict:?}"));
     }
     for bad in ["[fail]", "could not", "panic"] {
         if out.contains(bad) {
@@ -1074,14 +1073,50 @@ fn fs_test(arch: Arch, driver: &'static str) -> Result<(), String> {
     Ok(())
 }
 
+/// Finds `steps` in `out` in order, as far as order means anything: each
+/// thread's lines (tagged `[tN]`; the kernel's own are untagged) come in
+/// the order it printed them, but on several CPUs lines of different
+/// threads interleave as they run. So each step must come after the
+/// previous step of the same thread. Empty steps are skipped. Returns the
+/// first step not found.
+fn find_in_order<'a>(out: &str, steps: &[&'a str]) -> Result<(), &'a str> {
+    // The thread tag of the line holding byte `i`.
+    let tag = |i: usize| -> &str {
+        let start = out[..i].rfind('\n').map_or(0, |n| n + 1);
+        let line = &out[start..];
+        match line.strip_prefix("[t") {
+            Some(rest) => match rest.find(']') {
+                Some(e) if e > 0 && rest[..e].bytes().all(|b| b.is_ascii_digit()) => {
+                    &line[..e + 3]
+                }
+                _ => "",
+            },
+            None => "",
+        }
+    };
+    let mut cursors: std::collections::HashMap<&str, usize> = Default::default();
+    for &step in steps {
+        if step.is_empty() {
+            continue;
+        }
+        let found = out.match_indices(step).find(|&(i, _)| {
+            let t = tag(i);
+            i >= cursors.get(t).copied().unwrap_or(0)
+        });
+        match found {
+            Some((i, _)) => {
+                cursors.insert(tag(i), i + step.len());
+            }
+            None => return Err(step),
+        }
+    }
+    Ok(())
+}
+
 /// Checks `steps` appear in `out` in order, and no failure markers.
 fn check_log(what: &str, out: &str, steps: &[&str]) -> Result<(), String> {
-    let mut at = 0;
-    for step in steps {
-        match out[at..].find(step) {
-            Some(i) => at += i + step.len(),
-            None => return Err(format!("{what}: missing (in order) {step:?}")),
-        }
+    if let Err(step) = find_in_order(out, steps) {
+        return Err(format!("{what}: missing (in order) {step:?}"));
     }
     for bad in ["[fail]", "could not", "panic", "check FAILED"] {
         if out.contains(bad) {
@@ -1639,12 +1674,8 @@ fn memory_test(img: &Image) -> Result<(), String> {
         "[pass] memory: a component may not release another's pages",
         "[cm] client asked to shut down (pass)",
     ];
-    let mut at = 0;
-    for step in steps {
-        match out[at..].find(step) {
-            Some(i) => at += i + step.len(),
-            None => return Err(format!("Memory Server test: missing (in order) {step:?}")),
-        }
+    if let Err(step) = find_in_order(&out, &steps) {
+        return Err(format!("Memory Server test: missing (in order) {step:?}"));
     }
     for bad in ["[fail]", "could not", "panic"] {
         if out.contains(bad) {

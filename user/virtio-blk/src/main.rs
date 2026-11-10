@@ -521,9 +521,7 @@ fn crash() -> ! {
     // SAFETY: deliberately not: nothing is mapped here, so this faults.
     let v = unsafe { ((USER_BASE + 0x6000_0000) as *const u64).read_volatile() };
     say!("[fail] read {v:#x} from a hole");
-    loop {
-        syscall(Syscall::Yield, 0, [0; 4]);
-    }
+    superior_sys::park()
 }
 
 #[unsafe(no_mangle)]
@@ -532,9 +530,7 @@ pub extern "C" fn _start(arg: u64) -> ! {
         Ok(d) => d,
         Err((what, code)) => {
             say!("[fail] {what} ({code})");
-            loop {
-                syscall(Syscall::Yield, 0, [0; 4]);
-            }
+            superior_sys::park()
         }
     };
     let accept = CapTransfer {
@@ -561,7 +557,5 @@ pub extern "C" fn _start(arg: u64) -> ! {
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
     say!("panic: {info}");
-    loop {
-        syscall(Syscall::Yield, 0, [0; 4]);
-    }
+    superior_sys::park()
 }

@@ -372,16 +372,14 @@ pub extern "C" fn _start(_: u64) -> ! {
     let h = unsafe { &mut *(&raw mut HID) };
     if let Err((what, code)) = start() {
         say!("[fail] {what} ({code})");
-        loop {
-            syscall(Syscall::Yield, 0, [0; 4]);
-        }
+        superior_sys::park()
     }
     // The host controller driver may still be finding its devices.
     for _ in 0..200 {
         if h.setup().is_ok() {
             break;
         }
-        syscall(Syscall::Yield, 0, [0; 4]);
+        superior_sys::sleep(1);
     }
     if h.keyboard.is_none() {
         say!("no keyboard yet (status {})", h.setup().err().map_or(0, |s| s as u64));
@@ -420,7 +418,5 @@ pub extern "C" fn _start(_: u64) -> ! {
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
     say!("panic: {info}");
-    loop {
-        syscall(Syscall::Yield, 0, [0; 4]);
-    }
+    superior_sys::park()
 }

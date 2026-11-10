@@ -400,9 +400,7 @@ pub extern "C" fn _start(_: u64) -> ! {
         Ok(n) => n,
         Err((what, code)) => {
             say!("[fail] {what} ({code:#x})");
-            loop {
-                syscall(Syscall::Yield, 0, [0; 4]);
-            }
+            superior_sys::park()
         }
     };
     // The interrupt wakes the same `Recv` that waits for calls.
@@ -452,7 +450,5 @@ pub extern "C" fn _start(_: u64) -> ! {
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
     say!("panic: {info}");
-    loop {
-        syscall(Syscall::Yield, 0, [0; 4]);
-    }
+    superior_sys::park()
 }

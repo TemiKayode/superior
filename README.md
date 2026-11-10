@@ -30,8 +30,31 @@ holds the rest):
   0x20 with every line masked until a driver claims one.
 - All usable physical memory handed to the root CNode as untyped capabilities; every
   page table and user page is retyped from them. There is no kernel heap.
-- `syscall`/`sysret` entry on a single kernel stack, with the seL4 model of saving user
-  registers in the thread's TCB. System calls and interrupts share one register frame;
+- Several CPUs (SMP; QEMU runs every test with 2, `SUPERIOR_CPUS` sets up to 4): the
+  other CPUs start through an INIT/start-up trampoline that climbs from real mode to long
+  mode (x86-64) or PSCI `CPU_ON` (AArch64), each with its own kernel stack, GDT and TSS or
+  redistributor, and timer. One kernel lock covers all kernel work, taken in turn (a
+  ticket lock, so no CPU waits behind the others for ever); the IPC engine keeps
+  a current thread per CPU and a shared set of ready queues, so any CPU runs the
+  highest-priority thread it can. A thread another CPU stops (suspended, destroyed, its
+  scheduling context gone) stays with its own CPU until that CPU next enters the kernel
+  and saves its registers, and nobody else may run it before then; a system call it was
+  making is made again, and every tick, interrupt signal or reschedule on a CPU lets go
+  of such a thread first (an interrupt in the idle loop can hand a CPU a thread that
+  another stops before the CPU runs it). A thread that crashes owing a reply fails its
+  caller with `PeerRestarted` whichever CPU stops or destroys it first. CPUs kick each other with an interrupt when one's work leaves
+  another something better to run, and only CPU 0's timer keeps the system's time
+  (ticks, budget refills, sleeps). An unmapped page or a destroyed address space is
+  flushed or unloaded on every CPU that has the space loaded before the kernel goes on:
+  the CPU doing it asks each one by interrupt and waits, and a CPU waiting for the
+  kernel lock answers such requests while it waits, so the wait cannot deadlock. Device
+  interrupts go to CPU 0; code a CPU loads is made visible to every CPU's instruction
+  cache. The boot self-test checks that every CPU ran user threads; the engine's
+  simulation runs every seed on 2, 3 and 4 CPUs too, including interrupts that reach an
+  idle CPU; and every QEMU test passes with 1, 2 and 4 CPUs. Test logs are checked in
+  order per thread, since threads on different CPUs print in either order.
+- `syscall`/`sysret` entry on each CPU's kernel stack (found through `swapgs`), with the
+  seL4 model of saving user registers in the thread's TCB. System calls and interrupts share one register frame;
   threads that entered by system call leave by `sysret`, preempted threads by `iretq`.
 - Local APIC timer, calibrated against the PIT, at 100 Hz; round-robin time slices within
   a priority level, never handing the CPU to a lower priority.
@@ -68,8 +91,8 @@ holds the rest):
   sporadic); a thread that runs dry is throttled until the refill. A passive server
   (`SchedPassive`) runs only on its caller's context, lent on `Call` and returned on
   reply, so serving a client is charged to that client.
-- Idle: with every thread blocked the kernel halts the CPU until an interrupt makes one
-  runnable. The timer signals a notification each tick, so threads sleep by waiting on it.
+- Idle: a CPU with no thread it can run halts until an interrupt (or a kick from another
+  CPU) gives it one. The timer signals a notification each tick, so threads sleep by waiting on it.
 - IPC engine: `Send`, `Call`, `Recv`, `Reply`, `ReplyRecv`, `Signal`, `Wait`, `Yield`;
   direct switch on call/reply (fast path); 64 fixed priorities.
 - Bound notifications (as in seL4): `NotificationBind` ties a notification to the
@@ -79,7 +102,11 @@ holds the rest):
 - Timers: `TimerSignal` signals a notification once, a number of ticks from now, with
   the capability's badge (a new deadline replaces the old; 0 cancels; 64 pending
   across the system, cleared when the notification is destroyed). A thread waits
-  with a timeout by waiting on a notification it also set a timer on.
+  with a timeout by waiting on a notification it also set a timer on. `Sleep` blocks
+  the caller for a number of ticks on a notification of its own that only the kernel
+  signals, so no capability is needed; no program polls the clock in a loop (that
+  costs a whole CPU on a multiprocessor), and one with nothing left to do parks on a
+  sleep instead of yielding for ever.
 - Rights-checked capability lookup on every system call; badges delivered to servers.
 - Capability transfer in IPC: a sender grants a slot, the receiver names an accept slot,
   and the receiver gets a copy derived from the sender's. Every CSpace is a window onto
@@ -562,7 +589,9 @@ reboot instead, not built yet), copy-on-write address-space cloning for `fork` i
 Memory Server, memory budgets from a policy service, giving the Memory Server all spare
 RAM (today it gets a fixed pool from its manifest), page tables for boot processes paid for from user memory,
 multi-level CSpaces, the first call's capability forwarded by a lazy-start watcher, scheduling-context capabilities (budgets are set at boot), sporadic refills,
-timeout faults, SMP, an IPC benchmark on bare metal.
+timeout faults, per-CPU ready queues and thread affinity (one lock and shared queues
+today), device interrupts spread over CPUs, more than four CPUs, an IPC benchmark on bare
+metal.
 
 The architectural specification lives in the Superior OS Architectural Specification doc:
 https://claude.ai/artifact/QKJS8qH5Dfbjzn58RStq1j
@@ -572,7 +601,8 @@ https://claude.ai/artifact/QKJS8qH5Dfbjzn58RStq1j
 | Path | What it is |
 | --- | --- |
 | `kernel/` | The microkernel (`no_std`, targets `x86_64-unknown-none` and `aarch64-unknown-none-softfloat`) |
-| `kernel/src/arch/` | Per-ISA code: boot, exceptions and system call entry, page tables, interrupts, timer, console (`x86_64/`, `aarch64/`) |
+| `kernel/src/arch/` | Per-ISA code: boot, starting the other CPUs, exceptions and system call entry, page tables, interrupts, timer, console (`x86_64/`, `aarch64/`) |
+| `kernel/src/smp.rs` | What CPUs share outside the kernel lock: kicks and address-space shootdowns |
 | `crates/sys/` | User-side system call wrappers for both ISAs (one ABI by register position), and the seL4 runtime (`src/sel4.rs`) |
 | `crates/inet/` | Protocol pieces of the network server, unit-tested on the host: IP fragment reassembly, checksums over both families, and TCP |
 | `crates/objects/` | Pure kernel logic, unit-tested on the host: capabilities and CNodes, untyped memory, the IPC and scheduling state machine, the syscall ABI, an ELF reader, the boot bundle and manifest formats |

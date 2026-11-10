@@ -26,7 +26,5 @@ pub extern "C" fn _start(_: u64) -> ! {
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
-    loop {
-        syscall(Syscall::Yield, 0, [0; 4]);
-    }
+    superior_sys::park()
 }

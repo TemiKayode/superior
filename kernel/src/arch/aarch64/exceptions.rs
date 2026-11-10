@@ -99,6 +99,12 @@ impl UserFrame {
         self.elr
     }
 
+    /// Points back at the `svc` that entered the kernel, so the system
+    /// call is made again.
+    pub fn rewind_syscall(&mut self) {
+        self.elr -= 4;
+    }
+
     /// Resumes at `pc` with `value` in `x0`.
     pub fn resume_at(&mut self, pc: u64, value: u64) {
         self.elr = pc;
@@ -127,7 +133,7 @@ pub fn init() {
 /// Enters user mode for the first time with `frame`'s registers, from the
 /// top of the kernel stack.
 pub fn enter_user(frame: UserFrame) -> ! {
-    let at = super::stack_top() - FRAME_SIZE as u64;
+    let at = super::stack_top(super::cpu_id()) - FRAME_SIZE as u64;
     // SAFETY: nothing on the kernel stack is needed any more; the frame is
     // written at its top and popped by the common exit.
     unsafe {
@@ -318,6 +324,12 @@ extern "C" fn irq(frame: &mut UserFrame, _kind: u64) {
         super::timer::rearm();
         super::gic::end_of_interrupt(id);
         crate::task::handle_timer(frame);
+    } else if id == super::gic::KICK_SGI {
+        super::gic::end_of_interrupt(id);
+        crate::task::handle_kick(frame);
+    } else if id == super::gic::SHOOTDOWN_SGI {
+        crate::smp::service();
+        super::gic::end_of_interrupt(id);
     } else {
         // Masked until the driver acknowledges, so a level that stays
         // raised cannot storm the kernel (MSIs, being messages, are not).

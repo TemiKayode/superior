@@ -38,7 +38,7 @@
 #![no_std]
 #![no_main]
 
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use superior_driver::{DmaPage, Failure, Mmio, Pci, dma_address, dma_barrier, io_map};
 use superior_objects::abi::{CapTransfer, ObjectType, Syscall};
 use superior_objects::interfaces::{Status, block};
@@ -209,10 +209,14 @@ fn shared() -> &'static Shared {
     unsafe { &*(&raw const SHARED) }
 }
 
-/// Per disk: the slots with a command in flight (set by the thread that
-/// issued it, cleared by the main thread when it ends), and a count of
-/// queued commands with `EXCLUSIVE` set while one thread has the port.
+/// Per disk: the slots with a command the controller has been given (set
+/// by the issuing thread once it has written `P_CI`, never before: until
+/// then the slot is idle in the hardware and would look finished), cleared
+/// by whichever thread claims the ending; a count of queued commands with
+/// `EXCLUSIVE` set while one thread has the port; and how many times the
+/// port was restarted after an error, which drops every command on it.
 static IN_FLIGHT: [AtomicU32; MAX_DISKS] = [const { AtomicU32::new(0) }; MAX_DISKS];
+static RESTARTS: [AtomicU32; MAX_DISKS] = [const { AtomicU32::new(0) }; MAX_DISKS];
 static USERS: [AtomicU32; MAX_DISKS] = [const { AtomicU32::new(0) }; MAX_DISKS];
 const EXCLUSIVE: u32 = 1 << 31;
 /// Per slot: how its last command ended (`PENDING` until it does).
@@ -221,6 +225,12 @@ const PENDING: u32 = u32::MAX;
 const FAILED_BIT: u32 = 1 << 30;
 /// Commands in flight across the slots now, the most ever, and how many
 /// each slot has run.
+/// Set (fault injection) once a serving thread has answered the stray-DMA
+/// request and is about to crash: a request any other serving thread then
+/// receives crashes it too, unserved, so the client's next request reaches
+/// the restarted driver (or fails with `PeerRestarted` and is retried),
+/// however the CPUs interleave the threads.
+static CRASHING: AtomicBool = AtomicBool::new(false);
 static NOW: AtomicU64 = AtomicU64::new(0);
 static PEAK: AtomicU64 = AtomicU64::new(0);
 static RUN: [AtomicU64; TAGS] = [const { AtomicU64::new(0) }; TAGS];
@@ -531,6 +541,7 @@ fn dispatch() -> ! {
                 // Every command on the port is lost with the restart.
                 say!("port {}: task file error {:#x}; port restarted", d.n, d.port.read32(P_TFD));
                 failed = IN_FLIGHT[i].load(Ordering::SeqCst);
+                RESTARTS[i].fetch_add(1, Ordering::SeqCst);
                 restart_port(d);
             }
             let busy = d.port.read32(P_SACT) | d.port.read32(P_CI);
@@ -541,7 +552,10 @@ fn dispatch() -> ! {
                 if flight & bit == 0 || (busy & bit != 0 && failed & bit == 0) {
                     continue;
                 }
-                IN_FLIGHT[i].fetch_and(!bit, Ordering::SeqCst);
+                // The issuing thread may have claimed it first.
+                if IN_FLIGHT[i].fetch_and(!bit, Ordering::SeqCst) & bit == 0 {
+                    continue;
+                }
                 let result = if failed & bit != 0 || tfd & TFD_ERR != 0 {
                     FAILED_BIT | tfd
                 } else {
@@ -568,6 +582,9 @@ extern "C" fn serving_thread(t: u64) -> ! {
     let faults = shared().faults;
     let mut r = syscall_x(Syscall::Recv, SERVICE, [0; 4], accept);
     loop {
+        if CRASHING.load(Ordering::Acquire) {
+            crash("crashing (fault injection)");
+        }
         let lent = r.cap == Some(BUFFER as u16);
         let reply = w.serve(r.msg, lent, faults);
         if lent {
@@ -576,6 +593,7 @@ extern "C" fn serving_thread(t: u64) -> ! {
             syscall(Syscall::CapDelete, BUFFER, [0; 4]);
         }
         if faults && r.msg[0] == OP_STRAY {
+            CRASHING.store(true, Ordering::Release);
             syscall(Syscall::Reply, 0, reply);
             crash("crashing (fault injection)");
         }
@@ -641,14 +659,27 @@ impl Worker {
         PEAK.fetch_max(now, Ordering::SeqCst);
         RUN[self.tag].fetch_add(1, Ordering::SeqCst);
         RESULT[self.tag].store(PENDING, Ordering::SeqCst);
+        let restarts = RESTARTS[i].load(Ordering::SeqCst);
         if interrupts {
-            IN_FLIGHT[i].fetch_or(bit, Ordering::SeqCst);
             syscall(Syscall::TimerSignal, NOTIFY, [COMMAND_TICKS, 0, 0, 0]);
         }
         if queued {
             d.port.write32(P_SACT, bit);
         }
         d.port.write32(P_CI, bit);
+        if interrupts {
+            // Only now may the main thread end it (see IN_FLIGHT). If it
+            // ended already, its interrupt found nothing to end: claim it
+            // here. A port restart since it was issued dropped it.
+            IN_FLIGHT[i].fetch_or(bit, Ordering::SeqCst);
+            let busy = (d.port.read32(P_SACT) | d.port.read32(P_CI)) & bit != 0;
+            if !busy && IN_FLIGHT[i].fetch_and(!bit, Ordering::SeqCst) & bit != 0 {
+                let tfd = d.port.read32(P_TFD);
+                let lost = RESTARTS[i].load(Ordering::SeqCst) != restarts;
+                let failed = tfd & TFD_ERR != 0 || lost;
+                RESULT[self.tag].store(if failed { FAILED_BIT | tfd } else { 0 }, Ordering::SeqCst);
+            }
+        }
         let start = ticks();
         let outcome = loop {
             if interrupts {
@@ -786,18 +817,14 @@ fn crash(why: &str) -> ! {
     // SAFETY: deliberately not: nothing is mapped here, so this faults.
     let v = unsafe { ((USER_BASE + 0x6000_0000) as *const u64).read_volatile() };
     say!("[fail] read {v:#x} from a hole");
-    loop {
-        syscall(Syscall::Yield, 0, [0; 4]);
-    }
+    superior_sys::park()
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(arg: u64) -> ! {
     if let Err((what, code)) = start(arg == 1) {
         say!("[fail] {what} ({code:#x})");
-        loop {
-            syscall(Syscall::Yield, 0, [0; 4]);
-        }
+        superior_sys::park()
     }
     dispatch()
 }
@@ -805,7 +832,5 @@ pub extern "C" fn _start(arg: u64) -> ! {
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
     say!("panic: {info}");
-    loop {
-        syscall(Syscall::Yield, 0, [0; 4]);
-    }
+    superior_sys::park()
 }

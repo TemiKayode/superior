@@ -1,12 +1,14 @@
-//! The local APIC timer: the kernel's only interrupt source.
+//! The local APIC: each CPU's timer, and interrupts between CPUs.
 //!
 //! The timer runs in periodic mode at [`TICK_HZ`] on vector
 //! [`TIMER_VECTOR`]. Its input clock (bus or crystal) differs between
 //! machines, so it is calibrated once at boot against the legacy PIT,
-//! whose 1.193182 MHz rate is fixed.
+//! whose 1.193182 MHz rate is fixed; the other CPUs reuse the result.
 //!
-//! Device interrupts are not routed here: in Superior they reach user-space
-//! drivers as notifications, which needs the IOAPIC and comes later.
+//! CPUs interrupt each other through the interrupt command register: a
+//! kick ([`KICK_VECTOR`]), a shootdown request ([`SHOOTDOWN_VECTOR`]), and
+//! INIT and start-up messages to start a CPU. A CPU's number is its APIC
+//! ID.
 
 use super::vm;
 use x86_64::instructions::port::Port;
@@ -14,6 +16,8 @@ use x86_64::registers::model_specific::Msr;
 use x86_64::PhysAddr;
 
 pub const TIMER_VECTOR: u8 = 0x30;
+pub const KICK_VECTOR: u8 = 0x50;
+pub const SHOOTDOWN_VECTOR: u8 = 0x51;
 pub const SPURIOUS_VECTOR: u8 = 0xff;
 pub const TICK_HZ: u32 = 100;
 
@@ -21,7 +25,13 @@ const IA32_APIC_BASE: u32 = 0x1b;
 const APIC_GLOBAL_ENABLE: u64 = 1 << 11;
 
 // Register offsets.
+const ID: usize = 0x20;
 const EOI: usize = 0xb0;
+const ICR_LOW: usize = 0x300;
+const ICR_HIGH: usize = 0x310;
+const ICR_PENDING: u32 = 1 << 12;
+const ICR_INIT: u32 = 0b101 << 8 | 1 << 14;
+const ICR_STARTUP: u32 = 0b110 << 8 | 1 << 14;
 const SPURIOUS: usize = 0xf0;
 const LVT_TIMER: usize = 0x320;
 const INITIAL_COUNT: usize = 0x380;
@@ -37,6 +47,8 @@ const PIT_HZ: u32 = 1_193_182;
 const CALIBRATION_MS: u32 = 10;
 
 static mut BASE: usize = 0;
+/// Timer counts per tick, from the calibration.
+static mut PER_TICK: u32 = 0;
 
 fn read(reg: usize) -> u32 {
     // SAFETY: BASE maps the local APIC's register page (set in init).
@@ -73,9 +85,87 @@ pub fn init() -> u64 {
     let hz = per_calibration as u64 * 1000 / CALIBRATION_MS as u64;
     let per_tick = (hz / TICK_HZ as u64).max(1) as u32;
 
+    // SAFETY: written once at boot, before any other CPU starts.
+    unsafe { (&raw mut PER_TICK).write(per_tick) };
     write(LVT_TIMER, LVT_PERIODIC | TIMER_VECTOR as u32);
     write(INITIAL_COUNT, per_tick);
     hz
+}
+
+/// Enables another CPU's APIC and starts its timer, at CPU 0's rate.
+pub fn init_ap() {
+    let mut msr = Msr::new(IA32_APIC_BASE);
+    // SAFETY: as in `init`.
+    let base = unsafe { msr.read() };
+    if base & APIC_GLOBAL_ENABLE == 0 {
+        // SAFETY: as in `init`.
+        unsafe { msr.write(base | APIC_GLOBAL_ENABLE) };
+    }
+    write(SPURIOUS, SOFTWARE_ENABLE | SPURIOUS_VECTOR as u32);
+    write(DIVIDE, DIVIDE_BY_16);
+    // SAFETY: written before any other CPU started.
+    let per_tick = unsafe { (&raw const PER_TICK).read() };
+    write(LVT_TIMER, LVT_PERIODIC | TIMER_VECTOR as u32);
+    write(INITIAL_COUNT, per_tick);
+}
+
+/// This CPU's APIC ID (0 before the APIC is mapped: only CPU 0 runs then).
+pub fn id() -> usize {
+    // SAFETY: BASE is written once at boot.
+    if unsafe { (&raw const BASE).read() } == 0 {
+        return 0;
+    }
+    (read(ID) >> 24) as usize
+}
+
+fn command(apic: usize, low: u32) {
+    while read(ICR_LOW) & ICR_PENDING != 0 {
+        core::hint::spin_loop();
+    }
+    write(ICR_HIGH, (apic as u32) << 24);
+    write(ICR_LOW, low);
+}
+
+/// Sends `vector` to the CPU with APIC ID `apic` (fixed, physical, edge).
+pub fn send_ipi(apic: usize, vector: u8) {
+    command(apic, vector as u32);
+}
+
+/// Starts the CPU with APIC ID `apic` at physical page `page` (below
+/// 1 MiB), in real mode: INIT, then start-up twice, as Intel prescribes.
+pub fn start_cpu(apic: usize, page: u64) {
+    command(apic, ICR_INIT);
+    delay_us(10_000);
+    for _ in 0..2 {
+        command(apic, ICR_STARTUP | (page >> 12) as u32);
+        delay_us(200);
+    }
+}
+
+/// Waits `us` microseconds by the PIT (channel 2, polled).
+pub fn delay_us(us: u64) {
+    let mut gate = Port::<u8>::new(0x61);
+    let mut command = Port::<u8>::new(0x43);
+    let mut channel2 = Port::<u8>::new(0x42);
+    let mut left = us * PIT_HZ as u64 / 1_000_000;
+    while left > 0 {
+        let count = left.min(0xffff) as u16;
+        left -= count as u64;
+        // SAFETY: as in `calibrate`.
+        unsafe {
+            let g = gate.read();
+            gate.write((g & !0x02) | 0x01);
+            command.write(0b1011_0000);
+            channel2.write(count as u8);
+            channel2.write((count >> 8) as u8);
+            let g = gate.read();
+            gate.write(g & !0x01);
+            gate.write(g | 0x01);
+            while gate.read() & 0x20 == 0 {
+                core::hint::spin_loop();
+            }
+        }
+    }
 }
 
 /// Counts APIC timer decrements during [`CALIBRATION_MS`] of PIT time,

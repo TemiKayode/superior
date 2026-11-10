@@ -34,6 +34,43 @@ pub fn init() -> u64 {
     freq
 }
 
+/// Starts this CPU's tick (another CPU's: [`init`] ran first).
+pub fn init_cpu() {
+    // SAFETY: INTERVAL is only written in init, before any CPU starts.
+    let interval = unsafe { (&raw const INTERVAL).read() };
+    // SAFETY: as in `init`.
+    unsafe {
+        core::arch::asm!(
+            "mrs {t}, cntkctl_el1",
+            "orr {t}, {t}, #2",
+            "msr cntkctl_el1, {t}",
+            "msr cntv_tval_el0, {iv}",
+            "mov {t}, #1",
+            "msr cntv_ctl_el0, {t}",
+            "isb",
+            t = out(reg) _,
+            iv = in(reg) interval,
+            options(nostack)
+        )
+    };
+}
+
+/// The virtual counter.
+pub fn counter() -> u64 {
+    let v: u64;
+    // SAFETY: reading the counter has no side effect.
+    unsafe { core::arch::asm!("isb", "mrs {}, cntvct_el0", out(reg) v, options(nostack)) };
+    v
+}
+
+/// The counter's frequency, in Hz.
+pub fn frequency() -> u64 {
+    let f: u64;
+    // SAFETY: reading the frequency has no side effect.
+    unsafe { core::arch::asm!("mrs {}, cntfrq_el0", out(reg) f, options(nostack, nomem)) };
+    f
+}
+
 /// Schedules the next tick, which also clears this one.
 pub fn rearm() {
     // SAFETY: INTERVAL is only written in init.

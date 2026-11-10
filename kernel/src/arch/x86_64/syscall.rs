@@ -13,12 +13,19 @@
 //!   every register must come back exactly.
 //!
 //! Interrupts stay disabled for the whole kernel entry; the kernel is
-//! single-core and non-preemptible, and only user mode is interruptible.
+//! non-preemptible, and only user mode (and the idle halt) is
+//! interruptible.
+//!
+//! Each CPU has its own kernel stack. Interrupts find it through the CPU's
+//! TSS; `syscall`, which switches no stack, through the CPU's [`PerCpu`]
+//! block, whose address is in `IA32_KERNEL_GS_BASE`: the entry swaps it in
+//! with `swapgs` just long enough to switch stacks.
 
 use super::gdt;
+use crate::smp::MAX_CPUS;
 use core::arch::naked_asm;
 use superior_objects::abi::FaultKind;
-use x86_64::registers::model_specific::{Efer, EferFlags, LStar, SFMask, Star};
+use x86_64::registers::model_specific::{Efer, EferFlags, KernelGsBase, LStar, SFMask, Star};
 use x86_64::registers::rflags::RFlags;
 use x86_64::VirtAddr;
 
@@ -122,6 +129,13 @@ impl UserFrame {
         self.rip
     }
 
+    /// Points back at the `syscall` that entered the kernel (two bytes),
+    /// so the system call is made again. Its `rcx` and `r11` were already
+    /// lost to the ABI.
+    pub fn rewind_syscall(&mut self) {
+        self.rip -= 2;
+    }
+
     /// Resumes at `pc` with `value` in the first result register (`rax`).
     pub fn resume_at(&mut self, pc: u64, value: u64) {
         self.rip = pc;
@@ -151,14 +165,31 @@ pub enum Exit {
     Iret = 1,
 }
 
-static mut USER_RSP_SCRATCH: u64 = 0;
-static mut KERNEL_STACK_TOP: u64 = 0;
-/// Frame used for the very first entry to user mode.
-static mut FIRST_FRAME: UserFrame = UserFrame::ZERO;
+/// What the `syscall` entry needs of its CPU: somewhere to keep the user
+/// stack pointer, and the CPU's kernel stack.
+#[repr(C)]
+pub struct PerCpu {
+    scratch: u64,
+    kernel_stack: u64,
+}
 
-pub fn init() {
-    // SAFETY: single-threaded boot; written once before any syscall.
-    unsafe { (&raw mut KERNEL_STACK_TOP).write(gdt::kernel_stack_top()) };
+static mut PER_CPU: [PerCpu; MAX_CPUS] = [const {
+    PerCpu {
+        scratch: 0,
+        kernel_stack: 0,
+    }
+}; MAX_CPUS];
+
+/// Sets up `syscall` on CPU `cpu` (its GDT is loaded).
+pub fn init(cpu: usize) {
+    // SAFETY: each CPU writes its own block, once, before its first
+    // system call.
+    let block = unsafe {
+        let b = &raw mut PER_CPU[cpu];
+        (&raw mut (*b).kernel_stack).write(gdt::kernel_stack_top(cpu));
+        b
+    };
+    KernelGsBase::write(VirtAddr::from_ptr(block));
     let s = gdt::selectors();
     assert_eq!(
         s.user_data.0 as u64, USER_SS,
@@ -183,13 +214,17 @@ pub fn init() {
     };
 }
 
-/// Enters user mode for the first time with `frame`'s registers.
+/// Enters user mode for the first time on this CPU with `frame`'s
+/// registers, from the top of its kernel stack (where every later entry
+/// from user mode starts).
 pub fn enter_user(frame: UserFrame) -> ! {
-    // SAFETY: FIRST_FRAME is only touched here, with interrupts disabled,
-    // and is fully consumed by return_to_user before anything else runs.
+    let at = (gdt::kernel_stack_top(super::cpu_id()) - core::mem::size_of::<UserFrame>() as u64)
+        as *mut UserFrame;
+    // SAFETY: the top of this CPU's stack is free (boot ran below it), and
+    // the frame is consumed by return_to_user before anything else runs.
     unsafe {
-        (&raw mut FIRST_FRAME).write(frame);
-        enter_user_asm(&raw const FIRST_FRAME)
+        at.write(frame);
+        enter_user_asm(at)
     }
 }
 
@@ -209,11 +244,15 @@ unsafe extern "C" fn enter_user_asm(_frame: *const UserFrame) -> ! {
 #[unsafe(naked)]
 unsafe extern "C" fn syscall_entry() {
     naked_asm!(
-        "mov [rip + {scratch}], rsp",
-        "mov rsp, [rip + {kstack}]",
+        // This CPU's block, briefly: the user stack pointer kept in it,
+        // the kernel stack from it.
+        "swapgs",
+        "mov gs:[0], rsp",
+        "mov rsp, gs:[8]",
         // The interrupt-return frame, built by hand.
         "push {ss}",
-        "push qword ptr [rip + {scratch}]",
+        "push qword ptr gs:[0]",
+        "swapgs",
         "push r11", // rflags
         "push {cs}",
         "push rcx", // rip
@@ -237,8 +276,6 @@ unsafe extern "C" fn syscall_entry() {
         "mov rdi, rsp",
         "call {handler}",
         "jmp {ret}",
-        scratch = sym USER_RSP_SCRATCH,
-        kstack = sym KERNEL_STACK_TOP,
         ss = const USER_SS,
         cs = const USER_CS,
         handler = sym syscall_handler,
@@ -271,6 +308,34 @@ pub unsafe extern "C" fn timer_entry() {
         "call {handler}",
         "jmp {ret}",
         handler = sym timer_handler,
+        ret = sym return_to_user,
+    )
+}
+
+/// Entry for a kick from another CPU: reschedule.
+#[unsafe(naked)]
+pub unsafe extern "C" fn kick_entry() {
+    naked_asm!(
+        "push r11",
+        "push rcx",
+        "push rax",
+        "push rbx",
+        "push rdx",
+        "push rsi",
+        "push rdi",
+        "push rbp",
+        "push r8",
+        "push r9",
+        "push r10",
+        "push r12",
+        "push r13",
+        "push r14",
+        "push r15",
+        "cld", // the ABI wants DF clear; user code may have set it
+        "mov rdi, rsp",
+        "call {handler}",
+        "jmp {ret}",
+        handler = sym kick_handler,
         ret = sym return_to_user,
     )
 }
@@ -560,6 +625,11 @@ msi_entries!(
 fn msi_handler(frame: &mut UserFrame, n: u8) -> Exit {
     super::apic::end_of_interrupt();
     crate::task::handle_irq(frame, super::interrupts::MSI_LINE_BASE + n)
+}
+
+extern "C" fn kick_handler(frame: &mut UserFrame) -> Exit {
+    super::apic::end_of_interrupt();
+    crate::task::handle_kick(frame)
 }
 
 extern "C" fn timer_handler(frame: &mut UserFrame) -> Exit {

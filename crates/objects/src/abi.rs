@@ -218,6 +218,11 @@ pub enum Syscall {
     /// (VT-d only: the ITS drops them without a report). Without this, a
     /// device aimed outside its domain fails without anyone hearing of it.
     IoFaults = 42,
+    /// Blocks the caller for `rdi` ticks ([`TICK_HZ`] a second), on a
+    /// notification of its own that only the kernel signals: no
+    /// capability, and no CPU spent waiting. Returns early with
+    /// `Interrupted` if the thread is stopped meanwhile. 0 returns at once.
+    Sleep = 43,
     /// Maps the frame in slot `rdi` at page-aligned `rsi` in the address
     /// space in slot `r8` (Write right). `rdx` = [`MAP_WRITE`] and/or
     /// [`MAP_EXEC`], never both. Needs the frame's Map right, plus Write
@@ -285,6 +290,7 @@ impl Syscall {
             39 => Syscall::IoUnmap,
             40 => Syscall::NotificationBind,
             41 => Syscall::TimerSignal,
+            43 => Syscall::Sleep,
             42 => Syscall::IoFaults,
             0x100 => Syscall::DebugPutStr,
             0x101 => Syscall::DebugSelftestDone,

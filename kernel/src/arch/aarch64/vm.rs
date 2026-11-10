@@ -102,6 +102,28 @@ fn dsb() {
     unsafe { core::arch::asm!("dsb ish", options(nostack)) };
 }
 
+/// The top-level table this CPU has loaded.
+pub fn current_root() -> u64 {
+    let v: u64;
+    // SAFETY: reading TTBR0 has no side effect.
+    unsafe { core::arch::asm!("mrs {}, ttbr0_el1", out(reg) v, options(nostack, nomem)) };
+    v
+}
+
+/// Loads the kernel's own tables (no user window), dropping what the TLB
+/// held of the previous ones.
+pub fn load_kernel_root() {
+    let l0 = core::ptr::addr_of!(KERNEL_L0) as u64;
+    // SAFETY: the kernel's tables map the kernel as every space does.
+    unsafe { core::arch::asm!("msr ttbr0_el1, {}", "isb", in(reg) l0, options(nostack)) };
+    flush_tlb();
+}
+
+/// Drops this CPU's TLB entries.
+pub fn flush_local() {
+    flush_tlb();
+}
+
 fn flush_tlb() {
     // SAFETY: invalidating the TLB only forces fresh table walks.
     unsafe {
@@ -350,6 +372,11 @@ impl AddressSpace {
         Ok(())
     }
 
+    /// The physical address of the top-level table.
+    pub fn root_pa(&self) -> u64 {
+        self.0
+    }
+
     pub fn activate(&self) {
         let cur: u64;
         // SAFETY: reading TTBR0 has no side effect.
@@ -413,6 +440,8 @@ fn sync_icache(pa: u64) {
         // SAFETY: cleaning a cache line changes no memory contents.
         unsafe { core::arch::asm!("dc cvau, {}", in(reg) a, options(nostack)) };
     }
+    // Every CPU's instruction cache (inner shareable): another CPU may
+    // run the code next.
     // SAFETY: invalidating the instruction cache only forces refetches.
-    unsafe { core::arch::asm!("dsb ish", "ic iallu", "dsb ish", "isb", options(nostack)) };
+    unsafe { core::arch::asm!("dsb ish", "ic ialluis", "dsb ish", "isb", options(nostack)) };
 }

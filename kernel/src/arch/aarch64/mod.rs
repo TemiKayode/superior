@@ -2,6 +2,9 @@
 //! the link address, with the device tree at the start of RAM. The kernel
 //! runs at EL1 and user threads at EL0. Devices: a PL011 UART, a GICv3
 //! interrupt controller with an ITS, and the architected generic timer.
+//! The other CPUs are started through PSCI (`CPU_ON`, by `hvc`, which QEMU
+//! answers itself) at [`ap_start`], each with its own stack, redistributor
+//! and timer; CPU `n` is the one whose MPIDR affinity 0 is `n`.
 //!
 //! One translation table base (`TTBR0_EL1`) serves both: every address
 //! space shares the kernel's first top-level entry, an identity map of
@@ -24,6 +27,7 @@ pub use timer::TICK_HZ;
 
 use crate::kprintln;
 use crate::memory::{add_region, Summary};
+use crate::smp::{self, MAX_CPUS};
 use superior_objects::cap::{Capability, Object, Rights};
 
 pub const NAME: &str = "aarch64";
@@ -34,6 +38,8 @@ const UART_IRQ: u8 = 33;
 /// Where QEMU puts the device tree for a bare-metal image.
 const DTB_DEFAULT: u64 = 0x4000_0000;
 const BOOT_STACK_SIZE: usize = 128 * 1024;
+/// PSCI 0.2's `CPU_ON`, 64-bit.
+const PSCI_CPU_ON: u64 = 0xc400_0003;
 /// The device tree in use, for drivers that look themselves up later.
 static DTB: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
@@ -45,12 +51,91 @@ pub fn iommu_init() -> Option<&'static str> {
 #[repr(C, align(16))]
 struct Stack([u8; BOOT_STACK_SIZE]);
 
-/// The kernel's only stack: boot, system calls, faults and interrupts.
+/// Each CPU's only stack: boot, system calls, faults and interrupts.
 #[no_mangle]
-static mut BOOT_STACK: Stack = Stack([0; BOOT_STACK_SIZE]);
+static mut BOOT_STACKS: [Stack; MAX_CPUS] = [const { Stack([0; BOOT_STACK_SIZE]) }; MAX_CPUS];
 
-fn stack_top() -> u64 {
-    core::ptr::addr_of!(BOOT_STACK) as u64 + BOOT_STACK_SIZE as u64
+fn stack_top(cpu: usize) -> u64 {
+    core::ptr::addr_of!(BOOT_STACKS) as u64 + ((cpu + 1) * BOOT_STACK_SIZE) as u64
+}
+
+/// This CPU's number: its MPIDR affinity 0.
+pub fn cpu_id() -> usize {
+    let mpidr: u64;
+    // SAFETY: reading MPIDR_EL1 has no side effect.
+    unsafe { core::arch::asm!("mrs {}, mpidr_el1", out(reg) mpidr, options(nostack, nomem)) };
+    (mpidr & 0xff) as usize
+}
+
+/// Interrupts between CPUs.
+#[derive(Clone, Copy)]
+pub enum Ipi {
+    /// Enter the kernel and reschedule.
+    Kick,
+    /// Carry out a shootdown request (`crate::smp`).
+    Shootdown,
+}
+
+pub fn send_ipi(cpu: usize, ipi: Ipi) {
+    gic::send_sgi(
+        cpu,
+        match ipi {
+            Ipi::Kick => gic::KICK_SGI,
+            Ipi::Shootdown => gic::SHOOTDOWN_SGI,
+        },
+    )
+}
+
+/// Starts the other CPUs, one at a time, until PSCI says there are no
+/// more (or [`MAX_CPUS`]). Returns how many CPUs are online.
+pub fn start_secondaries() -> usize {
+    for cpu in 1..MAX_CPUS {
+        let r: i64;
+        // SAFETY: a PSCI call; the new CPU starts at `ap_start` with the
+        // MMU off and builds nothing this CPU uses.
+        unsafe {
+            core::arch::asm!(
+                "hvc #0",
+                inout("x0") PSCI_CPU_ON => r,
+                inout("x1") cpu as u64 => _,
+                inout("x2") ap_start as *const () as u64 => _,
+                inout("x3") cpu as u64 => _,
+                out("x4") _, out("x5") _, out("x6") _, out("x7") _,
+                out("x8") _, out("x9") _, out("x10") _, out("x11") _,
+                out("x12") _, out("x13") _, out("x14") _, out("x15") _,
+                out("x16") _, out("x17") _,
+                options(nostack)
+            )
+        };
+        if r != 0 {
+            break;
+        }
+        // A second at most to come up.
+        let deadline = timer::counter() + timer::frequency();
+        while smp::online() <= cpu {
+            if timer::counter() > deadline {
+                panic!("CPU {cpu} did not come up");
+            }
+            core::hint::spin_loop();
+        }
+    }
+    smp::online()
+}
+
+extern "C" {
+    fn ap_start();
+}
+
+/// A started CPU, on its own stack with the MMU on: its exception vectors,
+/// redistributor and CPU interface, and timer; then it schedules.
+#[no_mangle]
+extern "C" fn ap_main(cpu: u64) -> ! {
+    exceptions::init();
+    gic::init_cpu(cpu as usize);
+    timer::init_cpu();
+    gic::unmask(timer::INTID);
+    smp::ONLINE.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+    crate::task::start()
 }
 
 extern "C" {
@@ -115,7 +200,35 @@ core::arch::global_asm!(
     "    mov x0, x19",
     "    bl {main}",
     "    b 1b",
-    stack = sym BOOT_STACK,
+    // A CPU started by PSCI, with its number in x0: its own stack (below
+    // a page kept free for the first entry to user mode), the kernel's
+    // tables (already built), the MMU on.
+    ".global ap_start",
+    "ap_start:",
+    "    adrp x1, {stack}",
+    "    add x1, x1, :lo12:{stack}",
+    "    mov x2, #{stack_size}",
+    "    add x3, x0, #1",
+    "    mul x3, x3, x2",
+    "    add x1, x1, x3",
+    "    sub sp, x1, #4096",
+    "    ldr x3, ={mair}",
+    "    msr mair_el1, x3",
+    "    ldr x3, ={tcr}",
+    "    msr tcr_el1, x3",
+    "    adrp x1, {l0}",
+    "    add x1, x1, :lo12:{l0}",
+    "    msr ttbr0_el1, x1",
+    "    isb",
+    "    tlbi vmalle1",
+    "    dsb ish",
+    "    isb",
+    "    ldr x3, ={sctlr}",
+    "    msr sctlr_el1, x3",
+    "    isb",
+    "    bl {ap_main}",
+    "    b 1b",
+    stack = sym BOOT_STACKS,
     stack_size = const BOOT_STACK_SIZE,
     l0 = sym vm::KERNEL_L0,
     l1 = sym vm::KERNEL_L1,
@@ -125,6 +238,7 @@ core::arch::global_asm!(
     tcr = const vm::TCR,
     sctlr = const vm::SCTLR,
     main = sym kernel_main,
+    ap_main = sym ap_main,
 );
 
 #[no_mangle]

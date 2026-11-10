@@ -39,6 +39,12 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
         idt[apic::TIMER_VECTOR]
             .set_handler_addr(VirtAddr::new(syscall::timer_entry as *const () as u64));
     }
+    // SAFETY: kick_entry is a naked interrupt entry like timer_entry.
+    unsafe {
+        idt[apic::KICK_VECTOR]
+            .set_handler_addr(VirtAddr::new(syscall::kick_entry as *const () as u64));
+    }
+    idt[apic::SHOOTDOWN_VECTOR].set_handler_fn(shootdown);
     // SAFETY: com1_entry is a naked interrupt entry like timer_entry.
     unsafe {
         idt[PIC_BASE + COM1_IRQ]
@@ -133,6 +139,11 @@ pub fn init() {
     IDT.load();
 }
 
+/// Loads the IDT on another CPU.
+pub fn load() {
+    IDT.load();
+}
+
 /// The 8259 PIC powers up delivering IRQ 0-7 on vectors 8-15, which
 /// collide with CPU exceptions (IRQ 0, the timer, would arrive as a
 /// "double fault"). Remap it to vectors 0x20-0x2f and mask every line; a
@@ -164,6 +175,13 @@ extern "x86-interrupt" fn breakpoint(frame: InterruptStackFrame) {
         "[trap] breakpoint at {:#x}",
         frame.instruction_pointer.as_u64()
     );
+}
+
+/// Another CPU asks this one to flush or unload an address space; it
+/// takes no lock, so it can arrive in user mode or while idle.
+extern "x86-interrupt" fn shootdown(_frame: InterruptStackFrame) {
+    crate::smp::service();
+    apic::end_of_interrupt();
 }
 
 /// A spurious APIC interrupt needs no EOI and no action.

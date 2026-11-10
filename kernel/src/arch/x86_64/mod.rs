@@ -9,6 +9,7 @@ pub mod interrupts;
 pub mod iommu;
 pub mod qemu;
 pub mod serial;
+mod smp;
 pub mod syscall;
 pub mod vm;
 
@@ -41,13 +42,17 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     serial::init();
     crate::banner();
 
-    gdt::init();
+    gdt::init(0);
     kprintln!("[ok] gdt + tss loaded");
     interrupts::init();
     kprintln!("[ok] idt loaded");
-    syscall::init();
+    syscall::init(0);
     kprintln!("[ok] syscall/sysret enabled");
+    smp::note_boot_cpu();
 
+    if let Some(page) = boot_memory::startup_page(&boot_info.memory_regions) {
+        smp::STARTUP_PAGE.store(page, core::sync::atomic::Ordering::Relaxed);
+    }
     let mem = boot_memory::init(&boot_info.memory_regions);
     crate::report_memory(&mem);
     let offset = boot_info
@@ -63,6 +68,35 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         apic::TICK_HZ
     );
     crate::kernel_start(mem.untyped_caps)
+}
+
+/// This CPU's number: its APIC ID.
+pub fn cpu_id() -> usize {
+    apic::id()
+}
+
+/// Interrupts between CPUs.
+#[derive(Clone, Copy)]
+pub enum Ipi {
+    /// Enter the kernel and reschedule.
+    Kick,
+    /// Carry out a shootdown request (`crate::smp`).
+    Shootdown,
+}
+
+pub fn send_ipi(cpu: usize, ipi: Ipi) {
+    apic::send_ipi(
+        cpu,
+        match ipi {
+            Ipi::Kick => apic::KICK_VECTOR,
+            Ipi::Shootdown => apic::SHOOTDOWN_VECTOR,
+        },
+    )
+}
+
+/// Starts the other CPUs; returns how many are online.
+pub fn start_secondaries() -> usize {
+    smp::start_secondaries()
 }
 
 /// The shell's console: COM1's eight I/O ports and its interrupt line.

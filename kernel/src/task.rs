@@ -39,12 +39,24 @@
 //! interrupts enabled, the one place the kernel ever enables them, until
 //! an interrupt makes a thread runnable. The timer signals notification
 //! [`TIMER_NTFN`] on every tick, so a thread can sleep by waiting on it.
+//!
+//! Several CPUs share the kernel under one lock ([`lock_kernel`]); the IPC
+//! engine keeps each CPU's current thread. A CPU entering the kernel saves
+//! the registers of the thread it ran ([`save_running`]); if another CPU
+//! stopped that thread meanwhile, the engine lets it go then, and a system
+//! call it was making is made again when it next runs. After its work a
+//! CPU kicks any other that now has something better to run (see
+//! `crate::smp`).
 
 use crate::arch::vm::{self, AddressSpace, USER_BASE, USER_END};
 use crate::arch::{self, Args, Exit, UserFrame, iommu};
 use crate::iommu::IoFault;
 use crate::memory::{MapError, TablePool};
+use crate::smp::{self, MAX_CPUS};
 use crate::{kprint, kprintln};
+use core::mem::ManuallyDrop;
+use core::ops::{Deref, DerefMut};
+use core::sync::atomic::{AtomicU32, Ordering};
 use spin::{Mutex, MutexGuard};
 use superior_objects::abi::{
     CNODE_SLOT_BITS, CapTransfer, Error, FaultKind, FaultReply, MAP_EXEC, MAP_WRITE, ObjectType,
@@ -116,6 +128,8 @@ struct Stats {
     /// no I/O address space (or lost to a full fault log).
     io_faults: u64,
     io_faults_unowned: u64,
+    /// Returns to user mode, by CPU.
+    resumes: [u64; MAX_CPUS],
 }
 
 /// An address space and where its page tables come from.
@@ -150,7 +164,9 @@ impl IoDomain {
 }
 
 struct Kernel {
-    ipc: Ipc<MAX_THREADS, MAX_ENDPOINTS, MAX_NOTIFICATIONS>,
+    /// Notifications: the ones objects name (`MAX_NOTIFICATIONS`), then
+    /// one per thread for [`sleep`], which only the kernel signals.
+    ipc: Ipc<MAX_THREADS, MAX_ENDPOINTS, { MAX_NOTIFICATIONS + MAX_THREADS }>,
     frames: [UserFrame; MAX_THREADS],
     /// Address spaces by id.
     vspaces: [Option<VSpace>; MAX_SPACES],
@@ -173,6 +189,8 @@ struct Kernel {
     ntfn_used: [bool; MAX_NOTIFICATIONS],
     /// Pending `TimerSignal`s: (deadline in ticks, notification, bits).
     timers: [Option<(u64, u16, u64)>; MAX_TIMERS],
+    /// When each sleeping thread wakes (`Sleep`).
+    sleep_until: [Option<u64>; MAX_THREADS],
     /// Where the frame capability in each capability-table slot is mapped:
     /// (address space, user address).
     mapped: [Option<(u16, u64)>; CAP_TABLE_SLOTS],
@@ -197,6 +215,10 @@ struct Kernel {
     /// Last left user mode by interrupt: its frame is complete and must be
     /// resumed untouched, including `rcx` and `r11`.
     preempted: [bool; MAX_THREADS],
+    /// The thread whose registers each CPU holds (it last resumed it), if
+    /// they are still wanted: saved into `frames` when that CPU next
+    /// enters the kernel.
+    running: [Option<Tid>; MAX_CPUS],
     stats: Stats,
 }
 
@@ -218,6 +240,7 @@ static KERNEL: Mutex<Kernel> = Mutex::new(Kernel {
     cnodes: [None; CNODE_CHUNKS],
     irq_ntfn: [None; MAX_IRQS],
     timers: [None; MAX_TIMERS],
+    sleep_until: [None; MAX_THREADS],
     reply_grant: [false; MAX_THREADS],
     ep_used: [false; MAX_ENDPOINTS],
     mapped: [None; CAP_TABLE_SLOTS],
@@ -236,6 +259,7 @@ static KERNEL: Mutex<Kernel> = Mutex::new(Kernel {
     },
     fresh: [false; MAX_THREADS],
     preempted: [false; MAX_THREADS],
+    running: [None; MAX_CPUS],
     stats: Stats {
         ticks: 0,
         preemptions: 0,
@@ -244,6 +268,7 @@ static KERNEL: Mutex<Kernel> = Mutex::new(Kernel {
         faults_unhandled: 0,
         io_faults: 0,
         io_faults_unowned: 0,
+        resumes: [0; MAX_CPUS],
     },
 });
 
@@ -387,26 +412,106 @@ const fn window(t: usize) -> (u16, u16) {
     ((t * CSPACE_SLOTS) as u16, CSPACE_SLOTS as u16)
 }
 
-/// Runs the highest-priority thread. Never returns: from here on the
+/// Runs the highest-priority thread this CPU can, idling until there is
+/// one. Every CPU ends its boot here. Never returns: from here on the
 /// kernel is entered only through system calls and traps.
 pub fn start() -> ! {
-    let frame = {
-        let mut k = KERNEL.lock();
-        k.ipc.schedule();
-        let t = k.ipc.current().expect("no runnable thread at start") as usize;
-        k.fresh[t] = false;
-        space_of(&k, t as Tid).unwrap().activate();
-        k.frames[t]
-    };
+    let mut frame = UserFrame::ZERO;
+    let guard = lock_kernel();
+    resume(guard, &mut frame);
     arch::enter_user(frame)
 }
 
+/// The kernel lock is fair: CPUs get it in the order they asked for it
+/// (a ticket each), so none can be kept waiting behind the others for
+/// ever, which strict priorities across CPUs would otherwise allow.
+static TICKET_NEXT: AtomicU32 = AtomicU32::new(0);
+static TICKET_SERVING: AtomicU32 = AtomicU32::new(0);
+
+/// The kernel, locked by one CPU; dropping it passes the lock on to the
+/// next ticket.
+struct KernelGuard(ManuallyDrop<MutexGuard<'static, Kernel>>);
+
+impl Deref for KernelGuard {
+    type Target = Kernel;
+    fn deref(&self) -> &Kernel {
+        &self.0
+    }
+}
+
+impl DerefMut for KernelGuard {
+    fn deref_mut(&mut self) -> &mut Kernel {
+        &mut self.0
+    }
+}
+
+impl Drop for KernelGuard {
+    fn drop(&mut self) {
+        // SAFETY: dropped once, here; the next ticket finds it unlocked.
+        unsafe { ManuallyDrop::drop(&mut self.0) };
+        TICKET_SERVING.fetch_add(1, Ordering::Release);
+    }
+}
+
+/// Takes the kernel lock for this CPU, in turn, carrying out shootdown
+/// requests while it waits (the CPU holding the lock may be waiting for
+/// them).
+fn lock_kernel() -> KernelGuard {
+    let ticket = TICKET_NEXT.fetch_add(1, Ordering::Relaxed);
+    while TICKET_SERVING.load(Ordering::Acquire) != ticket {
+        smp::service();
+        core::hint::spin_loop();
+    }
+    // This CPU's turn: the lock is free, or about to be (its holder has
+    // passed the turn on and is releasing it).
+    loop {
+        if let Some(mut k) = KERNEL.try_lock() {
+            k.ipc.set_cpu(arch::cpu_id());
+            smp::kicked();
+            return KernelGuard(ManuallyDrop::new(k));
+        }
+        smp::service();
+        core::hint::spin_loop();
+    }
+}
+
+/// Saves the registers of the thread this CPU ran, which entered the
+/// kernel with `frame` (by system call if `syscall`). Returns it if it is
+/// still this CPU's to run; `None` if another CPU stopped it meanwhile
+/// (then a system call it made is made again when it next runs).
+fn save_running(k: &mut Kernel, frame: &UserFrame, syscall: bool) -> Option<Tid> {
+    let me = arch::cpu_id();
+    let t = k.running[me].take();
+    if let Some(t) = t {
+        k.frames[t as usize] = *frame;
+        k.preempted[t as usize] = !syscall;
+    }
+    if let Some(gone) = k.ipc.settle() {
+        if Some(gone) == t && syscall {
+            k.frames[gone as usize].rewind_syscall();
+            k.preempted[gone as usize] = true;
+        }
+        return None;
+    }
+    t
+}
+
+/// The registers in `frames[t]` are being replaced: whatever CPU still
+/// holds `t`'s old ones must not save them over the new.
+fn disown(k: &mut Kernel, t: Tid) {
+    for r in k.running.iter_mut() {
+        if *r == Some(t) {
+            *r = None;
+        }
+    }
+}
+
 pub fn handle_syscall(frame: &mut UserFrame) -> Exit {
-    let mut guard = KERNEL.lock();
+    let mut guard = lock_kernel();
     let k = &mut *guard;
-    let cur = k.ipc.current().expect("system call with no current thread");
-    k.frames[cur as usize] = *frame;
-    k.preempted[cur as usize] = false;
+    let Some(cur) = save_running(k, frame, true) else {
+        return resume(guard, frame);
+    };
 
     let a = frame.args();
     let msg = [a.a1, a.a2, a.a3, a.a4];
@@ -430,6 +535,7 @@ pub fn handle_syscall(frame: &mut UserFrame) -> Exit {
         Some(Syscall::IoUnmap) => io_unmap(k, cur, a.a0),
         Some(Syscall::NotificationBind) => notification_bind(k, cur, a.a0),
         Some(Syscall::TimerSignal) => timer_signal(k, cur, a.a0, a.a1),
+        Some(Syscall::Sleep) => sleep(k, cur, a.a0),
         Some(Syscall::IoFaults) => io_faults(k, cur, a.a0),
         Some(Syscall::ThreadSetVSpace) => thread_set_vspace(k, cur, &a),
         Some(Syscall::ThreadSetFaultHandler) => thread_set_fault_handler(k, cur, &a),
@@ -465,17 +571,23 @@ pub fn handle_syscall(frame: &mut UserFrame) -> Exit {
     // thread that has since taken the CPU.
     k.ipc.set_status_of(cur, result.err().unwrap_or(0));
     complete_transfers(k);
-    resume(guard, cur, frame)
+    resume(guard, frame)
 }
 
 /// The timer fired, either in user mode or while the kernel idled.
+/// Every CPU has its own timer; CPU 0's keeps the system's time (ticks,
+/// budget refills, the timer notification and `TimerSignal`s), the others'
+/// only charge and slice their own threads.
 pub fn handle_timer(frame: &mut UserFrame) -> Exit {
-    let mut guard = KERNEL.lock();
+    let mut guard = lock_kernel();
     let k = &mut *guard;
-    k.stats.ticks += 1;
-    collect_io_faults(k);
+    let global = arch::cpu_id() == 0;
+    if global {
+        k.stats.ticks += 1;
+        collect_io_faults(k);
+    }
     #[cfg(feature = "selftest")]
-    if k.stats.ticks > SELFTEST_TIMEOUT_SECS * arch::TICK_HZ as u64 {
+    if global && k.stats.ticks > SELFTEST_TIMEOUT_SECS * arch::TICK_HZ as u64 {
         // Say where every thread is stuck before giving up.
         for t in 0..MAX_THREADS as Tid {
             let tcb = k.ipc.thread(t);
@@ -492,7 +604,7 @@ pub fn handle_timer(frame: &mut UserFrame) -> Exit {
         }
         kprintln!(
             "[state] current {:?}, user mode {}",
-            k.ipc.current(),
+            core::array::from_fn::<Option<Tid>, MAX_CPUS, _>(|c| k.ipc.current_on(c)),
             frame.is_user_mode()
         );
         drop(guard);
@@ -503,23 +615,32 @@ pub fn handle_timer(frame: &mut UserFrame) -> Exit {
         // The only kernel code that runs with interrupts enabled is the
         // idle halt in `resume`. Advance time (refilling budgets), wake any
         // sleeper, and return to it; the idle loop decides who runs.
-        k.ipc.tick();
-        let _ = k.ipc.signal_irq(TIMER_NTFN, 1);
-        fire_timers(k);
+        k.ipc.tick_cpu(global);
+        if global {
+            let _ = k.ipc.signal_irq(TIMER_NTFN, 1);
+            fire_timers(k);
+        }
         return Exit::Iret;
     }
-    let cur = k
-        .ipc
-        .current()
-        .expect("timer interrupt with no current thread");
-    k.frames[cur as usize] = *frame;
-    k.preempted[cur as usize] = true;
-    if k.ipc.tick() {
+    save_running(k, frame, false);
+    if k.ipc.tick_cpu(global) {
         k.stats.preemptions += 1;
     }
-    let _ = k.ipc.signal_irq(TIMER_NTFN, 1);
-    fire_timers(k);
-    resume(guard, cur, frame)
+    if global {
+        let _ = k.ipc.signal_irq(TIMER_NTFN, 1);
+        fire_timers(k);
+    }
+    resume(guard, frame)
+}
+
+/// Another CPU kicked this one: reschedule. While idle, the idle loop does.
+pub fn handle_kick(frame: &mut UserFrame) -> Exit {
+    if !frame.is_user_mode() {
+        return Exit::Iret;
+    }
+    let mut guard = lock_kernel();
+    save_running(&mut guard, frame, false);
+    resume(guard, frame)
 }
 
 /// A CPU exception. From user mode it becomes a `Call` from the faulting
@@ -532,12 +653,13 @@ pub fn handle_fault(frame: &mut UserFrame, kind: FaultKind, code: u64, addr: u64
             frame.pc()
         );
     }
-    let mut guard = KERNEL.lock();
+    let mut guard = lock_kernel();
     let k = &mut *guard;
-    let cur = k.ipc.current().expect("user fault with no current thread");
-    k.frames[cur as usize] = *frame;
-    // Resume (if ever) with every register exactly as it was.
-    k.preempted[cur as usize] = true;
+    // Resume (if ever) with every register exactly as it was: if another
+    // CPU stopped the thread meanwhile, it faults again when it next runs.
+    let Some(cur) = save_running(k, frame, false) else {
+        return resume(guard, frame);
+    };
     match k.fault_ep[cur as usize] {
         Some((ep, badge)) => {
             k.stats.faults_handled += 1;
@@ -551,14 +673,14 @@ pub fn handle_fault(frame: &mut UserFrame, kind: FaultKind, code: u64, addr: u64
         }
         None => stop_thread(k, cur, kind, addr, frame.pc()),
     }
-    resume(guard, cur, frame)
+    resume(guard, frame)
 }
 
 /// A device interrupt (already masked and acknowledged at the PIC): signal
 /// the notification bound to its line. Like the timer, it can arrive in
 /// user mode or while the kernel idles.
 pub fn handle_irq(frame: &mut UserFrame, line: u8) -> Exit {
-    let mut guard = KERNEL.lock();
+    let mut guard = lock_kernel();
     let k = &mut *guard;
     let bound = k.irq_ntfn.get(line as usize).copied().flatten();
     if !frame.is_user_mode() {
@@ -567,13 +689,11 @@ pub fn handle_irq(frame: &mut UserFrame, line: u8) -> Exit {
         }
         return Exit::Iret;
     }
-    let cur = k.ipc.current().expect("interrupt with no current thread");
-    k.frames[cur as usize] = *frame;
-    k.preempted[cur as usize] = true;
+    save_running(k, frame, false);
     if let Some((ntfn, badge)) = bound {
         let _ = k.ipc.signal_irq(ntfn, badge);
     }
-    resume(guard, cur, frame)
+    resume(guard, frame)
 }
 
 /// The interrupt line an IRQ capability in the caller's slot names.
@@ -697,8 +817,32 @@ fn timer_signal(k: &mut Kernel, cur: Tid, slot: u64, ticks: u64) -> Result<(), u
 }
 
 /// Signals every notification whose `TimerSignal` deadline has come.
+/// Thread `t`'s own notification, on which it sleeps.
+fn sleep_ntfn(t: Tid) -> u16 {
+    (MAX_NOTIFICATIONS + t as usize) as u16
+}
+
+/// `Sleep`: rdi = ticks. Waits on the caller's own notification until the
+/// kernel signals it then. Bits left from an earlier sleep cut short are
+/// forgotten first, so they cannot end this one early.
+fn sleep(k: &mut Kernel, cur: Tid, ticks: u64) -> Result<(), u64> {
+    if ticks == 0 {
+        return Ok(());
+    }
+    let n = sleep_ntfn(cur);
+    let _ = k.ipc.clear_notification(n);
+    k.sleep_until[cur as usize] = Some(k.stats.ticks.saturating_add(ticks));
+    k.ipc.wait(n).map_err(|e| e.status())
+}
+
 fn fire_timers(k: &mut Kernel) {
     let now = k.stats.ticks;
+    for t in 0..MAX_THREADS {
+        if k.sleep_until[t].is_some_and(|w| w <= now) {
+            k.sleep_until[t] = None;
+            let _ = k.ipc.signal_irq(sleep_ntfn(t as Tid), 1);
+        }
+    }
     for i in 0..MAX_TIMERS {
         if let Some((deadline, n, bits)) = k.timers[i] {
             if deadline <= now {
@@ -821,7 +965,7 @@ fn io_port_out(k: &mut Kernel, cur: Tid, f: &Args) -> Result<(), u64> {
 fn stop_thread(k: &mut Kernel, t: Tid, kind: FaultKind, addr: u64, pc: u64) {
     kprintln!("[fault] thread {t}: unhandled {kind:?} at pc {pc:#x}, address {addr:#x}; stopped");
     k.stats.faults_unhandled += 1;
-    k.ipc.suspend_current();
+    k.ipc.crash_current();
 }
 
 /// Applies a fault handler's reply to thread `t`. Returns false if the
@@ -880,18 +1024,29 @@ fn space_of(k: &Kernel, t: Tid) -> Option<AddressSpace> {
     k.vspaces[id as usize].map(|v| v.root)
 }
 
+/// Kicks every other CPU that now has something better to run.
+fn kick_others(k: &Kernel) {
+    let me = arch::cpu_id();
+    for x in 0..smp::online() {
+        if x != me && k.ipc.needs_kick(x) {
+            smp::kick(x);
+        }
+    }
+}
+
 /// Loads the registers of the thread the IPC engine chose into `frame`,
 /// switches address space if needed, and says how to return to it. If no
 /// thread can run, halts until an interrupt makes one runnable.
-fn resume(mut guard: MutexGuard<'_, Kernel>, cur: Tid, frame: &mut UserFrame) -> Exit {
+fn resume(mut guard: KernelGuard, frame: &mut UserFrame) -> Exit {
     let next = loop {
-        guard.ipc.schedule();
+        guard.ipc.reschedule();
+        kick_others(&guard);
         if let Some(next) = guard.ipc.current() {
             let k = &mut *guard;
             if core::mem::take(&mut k.in_fault[next as usize]) && !apply_fault_reply(k, next) {
                 kprintln!("[fault] thread {next}: handler said stop (or failed); stopped");
                 k.stats.faults_unhandled += 1;
-                k.ipc.suspend_current();
+                k.ipc.crash_current();
                 continue;
             }
             break next;
@@ -902,7 +1057,7 @@ fn resume(mut guard: MutexGuard<'_, Kernel>, cur: Tid, frame: &mut UserFrame) ->
         // past and leave the CPU halted with work to do. The interrupt
         // handler runs on this stack and returns here.
         arch::idle_wait();
-        guard = KERNEL.lock();
+        guard = lock_kernel();
     };
     let k = &mut *guard;
     let n = next as usize;
@@ -922,11 +1077,24 @@ fn resume(mut guard: MutexGuard<'_, Kernel>, cur: Tid, frame: &mut UserFrame) ->
         );
         Exit::Sysret
     };
-    if next != cur {
-        space_of(k, next)
-            .expect("running thread has no address space")
-            .activate();
-    }
+    let Some(space) = space_of(k, next) else {
+        panic!(
+            "thread {next} (on CPU {}) has no address space: {:?} prio {} used {} configured {:?} sc {:?} pc {:#x}, running {:?}, current {:?}",
+            arch::cpu_id(),
+            k.ipc.thread(next).state,
+            k.ipc.thread(next).prio,
+            k.thread_used[next as usize],
+            k.configured[next as usize],
+            k.ipc.sched_context(next),
+            k.frames[next as usize].pc(),
+            k.running,
+            core::array::from_fn::<Option<Tid>, MAX_CPUS, _>(|c| k.ipc.current_on(c)),
+        )
+    };
+    space.activate();
+    smp::note_loaded(space.root_pa());
+    k.running[arch::cpu_id()] = Some(next);
+    k.stats.resumes[arch::cpu_id()] += 1;
     *frame = out;
     exit
 }
@@ -987,6 +1155,7 @@ fn unmap_slot(k: &mut Kernel, s: usize) {
     if let Some((id, va)) = k.mapped[s].take() {
         if let Some(v) = k.vspaces[id as usize] {
             v.root.unmap(va);
+            smp::shootdown(v.root.root_pa(), false);
         }
     }
     if let Some((id, iova)) = k.io_mapped[s].take() {
@@ -1215,7 +1384,10 @@ fn destroy_vspace(k: &mut Kernel, id: u16) {
             k.spaces[t] = None;
         }
     }
-    k.vspaces[id as usize] = None;
+    // No CPU may keep its tables loaded once their memory can be reused.
+    if let Some(v) = k.vspaces[id as usize].take() {
+        smp::shootdown(v.root.root_pa(), true);
+    }
 }
 
 /// `FrameUnmap`: rdi = frame slot.
@@ -1371,6 +1543,8 @@ fn destroy_thread(k: &mut Kernel, t: Tid) {
     k.spaces[i] = None;
     k.fault_ep[i] = None;
     k.in_fault[i] = false;
+    k.sleep_until[i] = None;
+    let _ = k.ipc.clear_notification(sleep_ntfn(t));
     let _ = k.ipc.reset_thread(t);
 }
 
@@ -1416,6 +1590,7 @@ fn thread_configure(k: &mut Kernel, cur: Tid, f: &Args) -> Result<(), u64> {
     if k.caps.get(VSPACE_SLOTS + i).is_none() {
         k.spaces[i] = k.spaces[cur as usize];
     }
+    disown(k, t);
     k.frames[i] = UserFrame::new_thread(entry, stack_top, f.a3);
     k.fresh[i] = true;
     k.preempted[i] = false;
@@ -1642,7 +1817,9 @@ fn retype(k: &mut Kernel, cur: Tid, f: &Args) -> Result<(), u64> {
             Capability::new(Object::Notification { id: id as u32 }, ipc_rights)
         }
         (ObjectType::Thread, Some(t)) => {
-            let _ = k.ipc.reset_thread(t as Tid);
+            // Its previous thread was destroyed (so is inactive).
+            let reset = k.ipc.reset_thread(t as Tid);
+            debug_assert!(reset.is_ok(), "retyping active thread {t}");
             k.thread_used[t] = true;
             k.thread_object[t] = true;
             k.cspace[t] = window(t);
@@ -1918,6 +2095,16 @@ fn selftest_done(cur: Tid, code: u64, stats: Stats) -> ! {
     } else {
         kprintln!("[pass] idle: halted {idle_halts} times with every thread blocked");
         code
+    };
+    // Every CPU online ran user threads.
+    let cpus = smp::online();
+    let r = &stats.resumes[..cpus];
+    let code = if r.iter().all(|&n| n > 0) {
+        kprintln!("[pass] SMP: {cpus} CPUs ran user threads, resuming them {r:?} times");
+        code
+    } else {
+        kprintln!("[fail] SMP: of {cpus} CPUs, some never ran a user thread: {r:?}");
+        code.max(1)
     };
     #[cfg(not(feature = "selftest"))]
     let _ = code;

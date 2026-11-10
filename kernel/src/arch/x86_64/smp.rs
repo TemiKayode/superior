@@ -1,0 +1,225 @@
+//! Starting the other CPUs.
+//!
+//! A CPU starts in real mode at a page below 1 MiB (the start-up message
+//! names it). The trampoline below is copied there; it loads a small GDT
+//! of its own, turns on protected mode, then long mode with paging on the
+//! kernel's own tables (in which the page is identity-mapped for the
+//! switch), and jumps to [`ap_main`] on the CPU's own kernel stack. CPU 0
+//! fills in the trampoline's data (tables, stack, number, entry) before
+//! each start and waits for the CPU to come up before the next.
+
+use super::{apic, gdt, interrupts, syscall, vm};
+use crate::smp::{self, MAX_CPUS};
+use core::sync::atomic::{AtomicU64, Ordering};
+
+/// The start-up page, if the memory map had one.
+pub static STARTUP_PAGE: AtomicU64 = AtomicU64::new(0);
+/// CPU 0's CR0 and CR4 (and XCR0 if it uses XSAVE), which every CPU
+/// copies.
+static CR0: AtomicU64 = AtomicU64::new(0);
+static CR4: AtomicU64 = AtomicU64::new(0);
+static XCR0: AtomicU64 = AtomicU64::new(0);
+const CR4_PAE: u64 = 1 << 5;
+const CR4_OSXSAVE: u64 = 1 << 18;
+
+core::arch::global_asm!(
+    ".pushsection .rodata.ap_trampoline, \"a\"",
+    ".balign 16",
+    ".global sup_ap_start",
+    "sup_ap_start:",
+    ".code16",
+    "    cli",
+    "    cld",
+    "    mov %cs, %ax",
+    "    mov %ax, %ds",
+    // %esi: the page's address, kept through every mode.
+    "    movzwl %ax, %esi",
+    "    shll $4, %esi",
+    "    lgdtl sup_ap_gdtr - sup_ap_start",
+    "    movl %cr0, %eax",
+    "    orl $1, %eax",
+    "    movl %eax, %cr0",
+    "    ljmpl *(sup_ap_far32 - sup_ap_start)",
+    ".code32",
+    "sup_ap_pm32:",
+    "    movw $0x10, %ax",
+    "    movw %ax, %ds",
+    "    movw %ax, %es",
+    "    movw %ax, %ss",
+    "    movl $0x20, %eax",
+    "    movl %eax, %cr4",
+    "    movl (sup_ap_cr3 - sup_ap_start)(%esi), %eax",
+    "    movl %eax, %cr3",
+    // EFER: syscall, long mode, no-execute.
+    "    movl $0xc0000080, %ecx",
+    "    rdmsr",
+    "    orl $0x901, %eax",
+    "    wrmsr",
+    "    movl (sup_ap_cr0 - sup_ap_start)(%esi), %eax",
+    "    movl %eax, %cr0",
+    "    ljmpl *(sup_ap_far64 - sup_ap_start)(%esi)",
+    ".code64",
+    "sup_ap_lm64:",
+    "    movl %esi, %esi",
+    "    movq (sup_ap_stack - sup_ap_start)(%rsi), %rsp",
+    "    movq (sup_ap_cpu - sup_ap_start)(%rsi), %rdi",
+    "    movq (sup_ap_entry - sup_ap_start)(%rsi), %rax",
+    "    jmpq *%rax",
+    ".balign 8",
+    "sup_ap_gdt:",
+    "    .quad 0",
+    "    .quad 0x00cf9a000000ffff", // 0x08: 32-bit code
+    "    .quad 0x00cf92000000ffff", // 0x10: data
+    "    .quad 0x00af9a000000ffff", // 0x18: 64-bit code
+    ".global sup_ap_gdtr",
+    "sup_ap_gdtr:",
+    "    .word 31",
+    "    .long 0",
+    ".balign 8",
+    ".global sup_ap_far32",
+    "sup_ap_far32:",
+    "    .long 0",
+    "    .word 0x08",
+    ".balign 8",
+    ".global sup_ap_far64",
+    "sup_ap_far64:",
+    "    .long 0",
+    "    .word 0x18",
+    ".balign 8",
+    ".global sup_ap_cr3",
+    "sup_ap_cr3: .quad 0",
+    ".global sup_ap_cr0",
+    "sup_ap_cr0: .quad 0",
+    ".global sup_ap_stack",
+    "sup_ap_stack: .quad 0",
+    ".global sup_ap_cpu",
+    "sup_ap_cpu: .quad 0",
+    ".global sup_ap_entry",
+    "sup_ap_entry: .quad 0",
+    ".global sup_ap_pm32_at",
+    "sup_ap_pm32_at: .quad sup_ap_pm32 - sup_ap_start",
+    ".global sup_ap_lm64_at",
+    "sup_ap_lm64_at: .quad sup_ap_lm64 - sup_ap_start",
+    ".global sup_ap_gdt_at",
+    "sup_ap_gdt_at: .quad sup_ap_gdt - sup_ap_start",
+    ".global sup_ap_end",
+    "sup_ap_end:",
+    ".popsection",
+    options(att_syntax)
+);
+
+extern "C" {
+    static sup_ap_start: u8;
+    static sup_ap_end: u8;
+    static sup_ap_gdtr: u8;
+    static sup_ap_far32: u8;
+    static sup_ap_far64: u8;
+    static sup_ap_cr3: u8;
+    static sup_ap_cr0: u8;
+    static sup_ap_stack: u8;
+    static sup_ap_cpu: u8;
+    static sup_ap_entry: u8;
+    static sup_ap_pm32_at: u64;
+    static sup_ap_lm64_at: u64;
+    static sup_ap_gdt_at: u64;
+}
+
+/// Where `sym` lands in the copy at `page`.
+fn at(page: u64, sym: *const u8) -> *mut u8 {
+    let off = sym as u64 - (&raw const sup_ap_start) as u64;
+    vm::phys_ptr(page + off)
+}
+
+/// Notes CPU 0's control registers, for the others to copy.
+pub fn note_boot_cpu() {
+    use x86_64::registers::control::{Cr0, Cr4};
+    CR0.store(Cr0::read_raw(), Ordering::Relaxed);
+    let cr4 = Cr4::read_raw();
+    CR4.store(cr4, Ordering::Relaxed);
+    if cr4 & CR4_OSXSAVE != 0 {
+        let xcr0 = x86_64::registers::xcontrol::XCr0::read_raw();
+        XCR0.store(xcr0, Ordering::Relaxed);
+    }
+}
+
+/// Starts CPUs with APIC IDs 1, 2, ... until one does not come up (or
+/// [`MAX_CPUS`]). Returns how many CPUs are online.
+pub fn start_secondaries() -> usize {
+    let page = STARTUP_PAGE.load(Ordering::Relaxed);
+    let root = vm::kernel_root();
+    if page == 0 || root >= 1 << 32 {
+        return smp::online();
+    }
+    if vm::identity_map(page, true).is_err() {
+        return smp::online();
+    }
+    // SAFETY: the trampoline's bytes, and the start-up page, which nothing
+    // else uses; the patched fields are inside the copy.
+    unsafe {
+        let len = (&raw const sup_ap_end) as usize - (&raw const sup_ap_start) as usize;
+        core::ptr::copy_nonoverlapping(&raw const sup_ap_start, vm::phys_ptr(page), len);
+        let gdt = page + (&raw const sup_ap_gdt_at).read();
+        (at(page, &raw const sup_ap_gdtr).add(2) as *mut u32).write_unaligned(gdt as u32);
+        let pm32 = page + (&raw const sup_ap_pm32_at).read();
+        (at(page, &raw const sup_ap_far32) as *mut u32).write_unaligned(pm32 as u32);
+        let lm64 = page + (&raw const sup_ap_lm64_at).read();
+        (at(page, &raw const sup_ap_far64) as *mut u32).write_unaligned(lm64 as u32);
+        (at(page, &raw const sup_ap_cr3) as *mut u64).write_unaligned(root);
+        // Paging, protection, and CPU 0's other bits, but caching on.
+        let cr0 = CR0.load(Ordering::Relaxed) | 1 << 31 | 1;
+        (at(page, &raw const sup_ap_cr0) as *mut u64).write_unaligned(cr0);
+        (at(page, &raw const sup_ap_entry) as *mut u64)
+            .write_unaligned(ap_main as *const () as u64);
+    }
+    for cpu in 1..MAX_CPUS {
+        // SAFETY: as above; the previous CPU is past the trampoline (it
+        // came up), so these fields are free to change.
+        unsafe {
+            // Below a page kept free for the first entry to user mode.
+            let stack = gdt::kernel_stack_top(cpu) - 4096;
+            (at(page, &raw const sup_ap_stack) as *mut u64).write_unaligned(stack);
+            (at(page, &raw const sup_ap_cpu) as *mut u64).write_unaligned(cpu as u64);
+        }
+        apic::start_cpu(cpu, page);
+        // Up to 200 ms to come up; QEMU starts nothing for an ID it does
+        // not have.
+        let mut waited = 0;
+        while smp::online() <= cpu && waited < 200 {
+            apic::delay_us(1000);
+            waited += 1;
+        }
+        if smp::online() <= cpu {
+            break;
+        }
+    }
+    let _ = vm::identity_map(page, false);
+    smp::online()
+}
+
+/// A started CPU in long mode on its own stack: CPU 0's control
+/// registers, its own GDT, TSS and `syscall` set-up, the IDT, its APIC and
+/// timer; then it schedules.
+extern "C" fn ap_main(cpu: u64) -> ! {
+    let cpu = cpu as usize;
+    // SAFETY: the same settings CPU 0 runs with.
+    unsafe {
+        let cr4 = CR4.load(Ordering::Relaxed) | CR4_PAE;
+        x86_64::registers::control::Cr4::write_raw(cr4);
+        if cr4 & CR4_OSXSAVE != 0 {
+            core::arch::asm!(
+                "xsetbv",
+                in("ecx") 0,
+                in("eax") XCR0.load(Ordering::Relaxed) as u32,
+                in("edx") (XCR0.load(Ordering::Relaxed) >> 32) as u32,
+                options(nostack)
+            );
+        }
+    }
+    gdt::init(cpu);
+    interrupts::load();
+    syscall::init(cpu);
+    apic::init_ap();
+    debug_assert_eq!(apic::id(), cpu);
+    smp::ONLINE.fetch_add(1, Ordering::AcqRel);
+    crate::task::start()
+}

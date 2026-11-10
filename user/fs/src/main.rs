@@ -158,9 +158,7 @@ fn crash(why: &str) -> ! {
     say!("cannot go on: {why}; crashing so a new instance recovers");
     // SAFETY: deliberately not: nothing is mapped here, so this faults.
     unsafe { ((USER_BASE + 0x6000_0000) as *const u64).read_volatile() };
-    loop {
-        syscall(Syscall::Yield, 0, [0; 4]);
-    }
+    superior_sys::park()
 }
 
 fn buf(slot: u64) -> &'static mut [u8] {

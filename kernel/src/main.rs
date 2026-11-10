@@ -25,6 +25,7 @@ mod arch;
 
 mod iommu;
 mod memory;
+mod smp;
 mod task;
 
 pub use arch::serial;
@@ -94,6 +95,10 @@ fn kernel_start(untyped_caps: usize) -> ! {
     if let Err(e) = started {
         panic!("starting user programs: {e}");
     }
+    // The other CPUs, once the boot threads exist: each idles until there
+    // is work for it.
+    let cpus = arch::start_secondaries();
+    kprintln!("[ok] {cpus} CPU{} online", if cpus == 1 { "" } else { "s" });
     task::start()
 }
 

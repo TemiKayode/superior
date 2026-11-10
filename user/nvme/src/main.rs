@@ -32,7 +32,7 @@
 #![no_std]
 #![no_main]
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use superior_driver::{DmaPage, Failure, Mmio, Pci, dma_address, dma_barrier, io_map};
 use superior_objects::abi::{CapTransfer, ObjectType, Syscall};
 use superior_objects::interfaces::{Status, block};
@@ -321,6 +321,12 @@ static mut IO: [Option<Queue>; QUEUES] = [const { None }; QUEUES];
 
 /// Commands in flight across the queues now, the most ever, and how many
 /// each queue has run.
+/// Set (fault injection) once a serving thread has answered the stray-DMA
+/// request and is about to crash: a request any other serving thread then
+/// receives crashes it too, unserved, so the client's next request reaches
+/// the restarted driver (or fails with `PeerRestarted` and is retried),
+/// however the CPUs interleave the threads.
+static CRASHING: AtomicBool = AtomicBool::new(false);
 static IN_FLIGHT: AtomicU64 = AtomicU64::new(0);
 static PEAK: AtomicU64 = AtomicU64::new(0);
 static RUN: [AtomicU64; QUEUES] = [const { AtomicU64::new(0) }; QUEUES];
@@ -620,6 +626,9 @@ fn serve_forever(q: usize) -> ! {
     let faults = shared().faults;
     let mut r = syscall_x(Syscall::Recv, SERVICE, [0; 4], accept);
     loop {
+        if CRASHING.load(Ordering::Acquire) {
+            crash();
+        }
         let lent = r.cap == Some(BUFFER as u16);
         let reply = w.serve(r.msg, lent, faults);
         if lent {
@@ -628,6 +637,7 @@ fn serve_forever(q: usize) -> ! {
             syscall(Syscall::CapDelete, BUFFER, [0; 4]);
         }
         if faults && r.msg[0] == OP_STRAY {
+            CRASHING.store(true, Ordering::Release);
             syscall(Syscall::Reply, 0, reply);
             crash();
         }
@@ -776,18 +786,14 @@ fn crash() -> ! {
     // SAFETY: deliberately not: nothing is mapped here, so this faults.
     let v = unsafe { ((USER_BASE + 0x6000_0000) as *const u64).read_volatile() };
     say!("[fail] read {v:#x} from a hole");
-    loop {
-        syscall(Syscall::Yield, 0, [0; 4]);
-    }
+    superior_sys::park()
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(arg: u64) -> ! {
     if let Err((what, code)) = start(arg == 1) {
         say!("[fail] {what} ({code:#x})");
-        loop {
-            syscall(Syscall::Yield, 0, [0; 4]);
-        }
+        superior_sys::park()
     }
     serve_forever(0)
 }
@@ -795,7 +801,5 @@ pub extern "C" fn _start(arg: u64) -> ! {
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
     say!("panic: {info}");
-    loop {
-        syscall(Syscall::Yield, 0, [0; 4]);
-    }
+    superior_sys::park()
 }

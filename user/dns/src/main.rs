@@ -392,10 +392,7 @@ impl Resolver {
     }
 
     fn pause(&self, t: u64) {
-        let end = ticks() + t;
-        while ticks() < end {
-            syscall(Syscall::Yield, 0, [0; 4]);
-        }
+        superior_sys::sleep(t);
     }
 
     fn resolve(&mut self, m: [u64; 4], lent: bool) -> [u64; 4] {
@@ -439,9 +436,7 @@ pub extern "C" fn _start(arg: u64) -> ! {
     let made = syscall(Syscall::Retype, UNTYPED, [ObjectType::Frame as u64, 0, PAGE, 0]);
     if made.status != 0 || syscall(Syscall::FrameMap, PAGE, [PAGE_VA, 1, 0, 0]).status != 0 {
         say!("[fail] no page of its own");
-        loop {
-            syscall(Syscall::Yield, 0, [0; 4]);
-        }
+        superior_sys::park()
     }
     let mut r = Resolver {
         handle: 0,
@@ -472,7 +467,5 @@ pub extern "C" fn _start(arg: u64) -> ! {
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
     say!("panic: {info}");
-    loop {
-        syscall(Syscall::Yield, 0, [0; 4]);
-    }
+    superior_sys::park()
 }

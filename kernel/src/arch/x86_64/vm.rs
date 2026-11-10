@@ -283,6 +283,11 @@ impl AddressSpace {
         Ok(())
     }
 
+    /// The physical address of the PML4.
+    pub fn root_pa(&self) -> u64 {
+        self.0.start_address().as_u64()
+    }
+
     pub fn activate(&self) {
         let (current, flags) = Cr3::read();
         if current != self.0 {
@@ -290,6 +295,62 @@ impl AddressSpace {
             unsafe { Cr3::write(self.0, flags) };
         }
     }
+}
+
+/// The PML4 this CPU has loaded.
+pub fn current_root() -> u64 {
+    Cr3::read().0.start_address().as_u64()
+}
+
+/// Loads the kernel's own PML4 (no user window).
+pub fn load_kernel_root() {
+    let (_, flags) = Cr3::read();
+    // SAFETY: the kernel's tables map the kernel as every space does.
+    unsafe { Cr3::write(kernel_pml4(), flags) };
+}
+
+/// Drops this CPU's (non-global) TLB entries, by reloading CR3.
+pub fn flush_local() {
+    let (current, flags) = Cr3::read();
+    // SAFETY: reloading the same tables only drops cached translations.
+    unsafe { Cr3::write(current, flags) };
+}
+
+/// The kernel's PML4's physical address.
+pub fn kernel_root() -> u64 {
+    kernel_pml4().start_address().as_u64()
+}
+
+/// Maps the page at physical `pa` (below 4 GiB) at the same address in the
+/// kernel's tables, executable, for a CPU switching paging on; or, with
+/// `map` false, removes that mapping again.
+pub fn identity_map(pa: u64, map: bool) -> Result<(), &'static str> {
+    let mut mapper =
+        // SAFETY: the kernel's PML4, with physical memory mapped at PHYS_OFFSET.
+        unsafe { OffsetPageTable::new(table(kernel_pml4()), VirtAddr::new(phys_offset())) };
+    let page = Page::<Size4KiB>::containing_address(VirtAddr::new(pa));
+    if !map {
+        if let Ok((_, flush)) = mapper.unmap(page) {
+            flush.flush();
+        }
+        return Ok(());
+    }
+    let frame = PhysFrame::containing_address(PhysAddr::new(pa));
+    // SAFETY: low memory the kernel hands to no one; only a starting CPU
+    // runs there.
+    unsafe {
+        mapper
+            .map_to_with_table_flags(
+                page,
+                frame,
+                F::PRESENT | F::WRITABLE,
+                F::PRESENT | F::WRITABLE,
+                &mut UntypedFrames,
+            )
+            .map_err(|_| "identity-mapping the start-up page failed")?
+            .flush();
+    }
+    Ok(())
 }
 
 /// Zeroes the 4 KiB frame at `pa`, so memory handed to a new owner never

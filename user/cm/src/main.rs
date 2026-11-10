@@ -609,9 +609,7 @@ extern "C" fn watcher(s: u64) -> ! {
         syscall(Syscall::Reply, 0, reply);
     }
     syscall(Syscall::ThreadSuspend, WATCHER_TCB + s, [0; 4]);
-    loop {
-        syscall(Syscall::Yield, 0, [0; 4]);
-    }
+    superior_sys::park()
 }
 
 fn start_watcher(s: u64) -> Result<(), u64> {
@@ -691,9 +689,7 @@ fn shutdown(pass: bool) -> ! {
     // QEMU's isa-debug-exit: (value << 1) | 1; 0x10 is the pass code.
     let value = if pass { 0x10 } else { 0x11 };
     syscall(Syscall::IoPortOut, root::EXIT_PORT, [0xf4, 4, value, 0]);
-    loop {
-        syscall(Syscall::Yield, 0, [0; 4]);
-    }
+    superior_sys::park()
 }
 
 #[unsafe(no_mangle)]

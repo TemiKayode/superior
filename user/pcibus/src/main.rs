@@ -356,7 +356,7 @@ impl Bus {
             if ticks() > start + 100 {
                 return "Function Level Reset (did not come back)";
             }
-            syscall(Syscall::Yield, 0, [0; 4]);
+            superior_sys::sleep(1);
         }
         "Function Level Reset"
     }
@@ -662,7 +662,5 @@ pub extern "C" fn _start(_: u64) -> ! {
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
     say!("panic: {info}");
-    loop {
-        syscall(Syscall::Yield, 0, [0; 4]);
-    }
+    superior_sys::park()
 }

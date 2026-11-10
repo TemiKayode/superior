@@ -881,9 +881,7 @@ pub extern "C" fn _start(_: u64) -> ! {
         Ok(h) => h,
         Err((what, code)) => {
             say!("[fail] {what} ({code:#x})");
-            loop {
-                syscall(Syscall::Yield, 0, [0; 4]);
-            }
+            superior_sys::park()
         }
     };
     if syscall(Syscall::NotificationBind, NOTIFY, [0; 4]).status != 0 {
@@ -919,7 +917,5 @@ pub extern "C" fn _start(_: u64) -> ! {
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
     say!("panic: {info}");
-    loop {
-        syscall(Syscall::Yield, 0, [0; 4]);
-    }
+    superior_sys::park()
 }

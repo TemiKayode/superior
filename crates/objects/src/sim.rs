@@ -18,6 +18,10 @@
 //!   a message whose sender was suspended before delivery is never
 //!   received.
 //!
+//! Runs on several CPUs ([`run_on`]) pick a CPU for each step, settle it
+//! as the kernel does on entry (a thread another CPU stopped leaves it),
+//! make the step that CPU's, and reschedule it after.
+//!
 //! The trace of every step (operation, result, who runs next) is hashed,
 //! and every seed is run twice: the two hashes must match, so a failing
 //! seed always replays exactly. A failure reports the seed, the step and
@@ -101,6 +105,9 @@ enum Op {
         t: Tid,
         prio: u8,
     },
+    /// Destroy a thread and leave its entry empty, as when its component
+    /// is killed (a new thread may be made in it later).
+    Destroy(Tid),
     Budget {
         t: Tid,
         budget: u32,
@@ -116,6 +123,8 @@ const REPLY_TAG: u64 = 2 << 40;
 
 struct Sim {
     k: Engine,
+    /// CPUs the steps are spread over.
+    cpus: usize,
     rng: Rng,
     step: u64,
     /// Messages sent (or queued) and not yet received: id -> (endpoint, badge).
@@ -130,9 +139,10 @@ struct Sim {
 }
 
 impl Sim {
-    fn new(seed: u64) -> Sim {
+    fn new(seed: u64, cpus: usize) -> Sim {
         let mut sim = Sim {
             k: Engine::new(),
+            cpus,
             rng: Rng(seed),
             step: 0,
             in_flight: HashMap::new(),
@@ -190,6 +200,7 @@ impl Sim {
                 t,
                 prio: 1 + r.below(3) as u8,
             },
+            89 if r.chance(50) => Op::Destroy(t),
             89..=92 => Op::Spawn {
                 t,
                 prio: 1 + r.below(3) as u8,
@@ -238,7 +249,26 @@ impl Sim {
     /// One step. Returns an error describing the first violation.
     fn step(&mut self, seed: u64) -> Result<(), String> {
         self.step += 1;
+        // The CPU making this step enters the kernel: if another CPU
+        // stopped its thread, it lets it go.
+        let cpu = if self.cpus > 1 {
+            self.rng.below(self.cpus as u64) as usize
+        } else {
+            0
+        };
         let op = self.pick();
+        // An interrupt can also reach a CPU in the kernel's idle loop,
+        // whose handler acts on the engine as it stands, settling nothing.
+        let idle = self.cpus > 1
+            && matches!(op, Op::Tick | Op::Irq { .. })
+            && self.rng.chance(50);
+        if self.cpus > 1 {
+            self.k.set_cpu(cpu);
+            if !idle {
+                self.k.settle();
+                self.k.reschedule();
+            }
+        }
         let before: [State; THREADS] = core::array::from_fn(|t| self.k.thread(t as Tid).state);
         let cur = self.k.current();
         let id = self.step;
@@ -250,7 +280,7 @@ impl Sim {
         let msg = |tag: u64| [tag | id, 0, 0, 0];
         // A blocked sender stopped by this step: its message is cancelled.
         let stopped = match op {
-            Op::Suspend(t) | Op::Recreate { t, .. } => Some(t),
+            Op::Suspend(t) | Op::Recreate { t, .. } | Op::Destroy(t) => Some(t),
             _ => None,
         };
         if let Some(t) = stopped
@@ -286,7 +316,7 @@ impl Sim {
             Op::Yield => self.k.yield_now(),
             Op::Passive => self.k.make_passive(),
             Op::Tick => {
-                self.k.tick();
+                self.k.tick_cpu(cpu == 0);
                 Ok(())
             }
             Op::Irq { ntfn, bits } => self.k.signal_irq(ntfn, bits),
@@ -298,15 +328,27 @@ impl Sim {
                 self.k.spawn(t, prio)
             }
             Op::Spawn { t, prio } => self.k.spawn(t, prio),
+            Op::Destroy(t) => {
+                let _ = self.k.destroy(t);
+                self.k.reset_thread(t).unwrap();
+                Ok(())
+            }
             Op::Budget { t, budget, period } => self.k.configure_sc(t, budget, period),
             Op::DestroyEp(ep) => self.k.destroy_endpoint(ep),
             Op::DestroyNtfn(n) => self.k.destroy_notification(n),
         };
         let _ = self.k.take_transfers();
-        self.k.schedule();
+        if idle {
+            // Back to the idle loop, which reschedules.
+            self.k.reschedule();
+        } else if self.cpus > 1 {
+            self.k.reschedule();
+        } else {
+            self.k.schedule();
+        }
 
         let now = self.k.current();
-        let line = format!("{op:?} by {cur:?} -> {result:?}, then {now:?} runs");
+        let line = format!("CPU {cpu}: {op:?} by {cur:?} -> {result:?}, then {now:?} runs");
         self.recent.push_back(line);
         if self.recent.len() > 12 {
             self.recent.pop_front();
@@ -416,7 +458,13 @@ impl Sim {
 
 /// Runs `steps` steps from `seed`; returns the trace hash.
 pub fn run(seed: u64, steps: u64) -> Result<u64, String> {
-    let mut sim = Sim::new(seed);
+    run_on(1, seed, steps)
+}
+
+/// Runs `steps` steps from `seed` spread over `cpus` CPUs; returns the
+/// trace hash.
+pub fn run_on(cpus: usize, seed: u64, steps: u64) -> Result<u64, String> {
+    let mut sim = Sim::new(seed, cpus);
     for _ in 0..steps {
         sim.step(seed)?;
     }
@@ -427,7 +475,7 @@ pub fn run(seed: u64, steps: u64) -> Result<u64, String> {
 pub fn coverage(seeds: u64, steps: u64) -> HashMap<&'static str, u64> {
     let mut c = HashMap::new();
     for seed in 0..seeds {
-        let mut sim = Sim::new(seed);
+        let mut sim = Sim::new(seed, 1);
         for _ in 0..steps {
             sim.step(seed).unwrap();
             let k = &sim.k;
@@ -512,6 +560,17 @@ mod tests {
             "messages received",
         ] {
             assert!(c.get(key).copied().unwrap_or(0) > 0, "never reached: {key}");
+        }
+    }
+
+    #[test]
+    fn simulated_runs_on_several_cpus_keep_every_invariant() {
+        for cpus in 2..=crate::ipc::MAX_CPUS {
+            for seed in 0..SEEDS {
+                let a = run_on(cpus, seed, STEPS).unwrap_or_else(|e| panic!("{cpus} CPUs: {e}"));
+                let b = run_on(cpus, seed, STEPS).unwrap();
+                assert_eq!(a, b, "{cpus} CPUs, seed {seed} did not replay identically");
+            }
         }
     }
 

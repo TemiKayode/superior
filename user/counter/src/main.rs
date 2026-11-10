@@ -65,9 +65,7 @@ fn crash() -> ! {
     // SAFETY: deliberately not: this faults, and the manager restarts us.
     let v = unsafe { core::ptr::read_volatile(HOLE as *const u64) };
     print_line(format_args!("[fail] counter: read {v:#x} from a hole"));
-    loop {
-        syscall(Syscall::Yield, 0, [0; 4]);
-    }
+    superior_sys::park()
 }
 
 #[unsafe(no_mangle)]
@@ -117,7 +115,5 @@ pub extern "C" fn _start(_: u64) -> ! {
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
-    loop {
-        syscall(Syscall::Yield, 0, [0; 4]);
-    }
+    superior_sys::park()
 }

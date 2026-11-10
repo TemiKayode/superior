@@ -91,10 +91,21 @@ fn client() -> ! {
         );
         failures += !ok as u64;
     }
+    // Sleep: blocks for the ticks asked (the timer may land up to one
+    // tick late), on a notification of the thread's own.
+    let before = superior_sys::ticks();
+    let r = syscall(Syscall::Sleep, 20, [0; 4]);
+    let slept = superior_sys::ticks() - before;
+    let zero = syscall(Syscall::Sleep, 0, [0; 4]).status;
+    let ok = r.status == 0 && (20..=22).contains(&slept) && zero == 0;
+    say!(
+        "[{}] client: slept 20 ticks: woke after {slept} (status {}; 0 ticks: status {zero})",
+        if ok { "pass" } else { "fail" },
+        r.status
+    );
+    failures += !ok as u64;
     syscall(Syscall::Call, CONTROL, [OP_SHUTDOWN, failures, 0, 0]);
-    loop {
-        syscall(Syscall::Yield, 0, [0; 4]);
-    }
+    superior_sys::park()
 }
 
 /// Spins with the direction flag set (as user code does mid-way through a
@@ -153,9 +164,7 @@ fn df_spinner() -> ! {
             if ok { "pass" } else { "fail" }
         );
     }
-    loop {
-        syscall(Syscall::Yield, 0, [0; 4]);
-    }
+    superior_sys::park()
 }
 
 fn probe() -> ! {
@@ -164,9 +173,7 @@ fn probe() -> ! {
     // SAFETY: deliberately not: this must fault.
     let v = unsafe { core::ptr::read_volatile(va as *const u64) };
     say!("[fail] probe: read {v:#x} from the manager's memory");
-    loop {
-        syscall(Syscall::Yield, 0, [0; 4]);
-    }
+    superior_sys::park()
 }
 
 // The supervision client's slots, and the counter's operations.
@@ -272,9 +279,7 @@ fn supervise() -> ! {
     );
 
     syscall(Syscall::Call, SUPERVISE_CONTROL, [OP_SHUTDOWN, t.0, 0, 0]);
-    loop {
-        syscall(Syscall::Yield, 0, [0; 4]);
-    }
+    superior_sys::park()
 }
 
 // The block client's slots.
@@ -366,9 +371,7 @@ extern "C" fn block_helper(_: u64) -> ! {
     syscall(Syscall::Signal, H_DONE, [0; 4]);
     // Not waiting on H_DONE: that could take the signal back before the
     // main thread sees it. The main thread suspends this one.
-    loop {
-        syscall(Syscall::Yield, 0, [0; 4]);
-    }
+    superior_sys::park()
 }
 
 /// Starts the helper thread: Ok, or what failed.
@@ -537,7 +540,7 @@ fn block_client(open: [u64; 4]) -> ! {
     let r = syscall(Syscall::Call, BLOCK, [0xdead, 0, 0, 0]);
     t.check(
         r.status == Error::PeerRestarted.code(),
-        format_args!("the driver crashed under a call (PeerRestarted)"),
+        format_args!("the driver crashed under a call (PeerRestarted; status {})", r.status),
     );
     let r = read_and_check(64, 8);
     t.check(
@@ -548,9 +551,7 @@ fn block_client(open: [u64; 4]) -> ! {
         ),
     );
     syscall(Syscall::Call, BLOCK_CONTROL, [OP_SHUTDOWN, t.0, 0, 0]);
-    loop {
-        syscall(Syscall::Yield, 0, [0; 4]);
-    }
+    superior_sys::park()
 }
 
 // The memory tests' slots and layout.
@@ -595,10 +596,7 @@ fn touch(p: u64) -> bool {
 fn memory_client() -> ! {
     let mut t = Checks(0, "memory");
     // Let the hog (higher priority) run its course first.
-    let start = ticks();
-    while ticks() < start + 50 {
-        syscall(Syscall::Yield, 0, [0; 4]);
-    }
+    superior_sys::sleep(50);
     let r = info();
     t.check(
         r[0] == 0 && r[1] == CLIENT_QUOTA && r[2] == 0,
@@ -683,9 +681,7 @@ fn memory_client() -> ! {
         format_args!("a component may not release another's pages"),
     );
     syscall(Syscall::Call, MEM_CONTROL, [OP_SHUTDOWN, t.0, 0, 0]);
-    loop {
-        syscall(Syscall::Yield, 0, [0; 4]);
-    }
+    superior_sys::park()
 }
 
 fn hog() -> ! {
@@ -855,22 +851,44 @@ fn append(h: u64, k: u64) -> (bool, u64) {
     (r[0] == OK, tries)
 }
 
+/// The first record that did not read back right, and how.
+enum Wrong {
+    /// The read failed with this status (`u64::MAX`: retries ran out).
+    Read(u64, u64),
+    /// Record, word, what was there.
+    Word(u64, u64, u64),
+}
+
+impl core::fmt::Display for Wrong {
+    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+        match *self {
+            Wrong::Read(k, s) => write!(f, "{k}: the read failed, status {s:#x}"),
+            Wrong::Word(k, j, w) => write!(
+                f,
+                "{k}: word {j} is {w:#x}, not {:#x}",
+                record_word(k, j)
+            ),
+        }
+    }
+}
+
 /// Checks records `0..n` of the file read back right. Returns the first
 /// wrong one.
-fn check_records(h: u64, n: u64) -> Result<(), u64> {
+fn check_records(h: u64, n: u64) -> Result<(), Wrong> {
     let per_block = fs::BLOCK / RECORD;
     let mut k = 0;
     while k < n {
         let (r, _) = fs_call([fs::READ, h, k * RECORD, fs::BLOCK], true);
         if r[0] != OK {
-            return Err(k);
+            return Err(Wrong::Read(k, r[0]));
         }
         let b = fs_buffer();
         for i in 0..per_block.min(n - k) {
             let rec = k + i;
             for j in 0..RECORD / 8 {
-                if b[(i * RECORD / 8 + j) as usize] != record_word(rec, j) {
-                    return Err(rec);
+                let w = b[(i * RECORD / 8 + j) as usize];
+                if w != record_word(rec, j) {
+                    return Err(Wrong::Word(rec, j, w));
                 }
             }
         }
@@ -1087,14 +1105,10 @@ fn fs_client() -> ! {
             "{acked} records written under fault injection ({retried} calls cut off by a restart and retried)"
         ),
     );
-    let c = check_records(h, acked);
-    t.check(
-        c.is_ok(),
-        format_args!(
-            "every acknowledged record reads back (first wrong: {})",
-            c.err().map_or(-1, |k| k as i64)
-        ),
-    );
+    match check_records(h, acked) {
+        Ok(()) => t.check(true, format_args!("every acknowledged record reads back")),
+        Err(w) => t.check(false, format_args!("every acknowledged record reads back (first wrong: {w})")),
+    }
     let (r, _) = fs_call([fs::STAT, h, 0, 0], false);
     t.check(
         r[1] == acked * RECORD,
@@ -1230,9 +1244,7 @@ fn fs_client() -> ! {
         format_args!("record {RECORDS} and a rename of a/g to g2 acknowledged; cutting the power"),
     );
     syscall(Syscall::Call, FS_CONTROL, [OP_SHUTDOWN, t.0, 0, 0]);
-    loop {
-        syscall(Syscall::Yield, 0, [0; 4]);
-    }
+    superior_sys::park()
 }
 
 // ---- the ring client (`fs::ring`) ----
@@ -1535,8 +1547,12 @@ fn ring_steady(t: &mut Checks, h: u64) {
         },
     );
     let calls = r.doorbells + r.waits;
+    // Each sleep asks to be woken with half of the queue done, so on one
+    // CPU a quarter as many calls as reads. On several the server runs
+    // beside the client and, out of work, wakes it early to refill: a few
+    // more. Calls one by one would be one per read.
     t.check(
-        right == n && calls * 4 <= n,
+        right == n && calls * 3 <= n,
         format_args!(
             "ring, no faults: {n} reads with {calls} system calls ({} doorbells, {} sleeps)",
             r.doorbells, r.waits
@@ -1557,14 +1573,10 @@ fn fs_verify() -> ! {
         r[0] == OK && r[2] == n * RECORD,
         format_args!("after the power cut logs/app.log is {} bytes", r[2]),
     );
-    let c = check_records(r[1], n);
-    t.check(
-        c.is_ok(),
-        format_args!(
-            "all {n} acknowledged records survived (first wrong: {})",
-            c.err().map_or(-1, |k| k as i64)
-        ),
-    );
+    match check_records(r[1], n) {
+        Ok(()) => t.check(true, format_args!("all {n} acknowledged records survived")),
+        Err(w) => t.check(false, format_args!("all {n} acknowledged records survived (first wrong: {w})")),
+    }
     let g2 = fs_open("g2", 0);
     let ag = fs_open("a/g", 0)[0];
     let root = fs_open("/", fs::DIRECTORY);
@@ -1615,9 +1627,7 @@ fn fs_verify() -> ! {
         format_args!("data/big survived: {} bytes", big[2]),
     );
     syscall(Syscall::Call, FS_CONTROL, [OP_SHUTDOWN, t.0, 0, 0]);
-    loop {
-        syscall(Syscall::Yield, 0, [0; 4]);
-    }
+    superior_sys::park()
 }
 
 /// Another component (`arg 9`): its own container.
@@ -1651,20 +1661,14 @@ fn injector(targets: &[u64], pauses: bool) -> ! {
     // A fixed seed: the moments vary with timing, not between runs.
     let mut seed = 0x2545_f491_4f6c_dd1du64;
     // Let the client get going first.
-    let start = ticks();
-    while ticks() < start + 10 {
-        syscall(Syscall::Yield, 0, [0; 4]);
-    }
+    superior_sys::sleep(10);
     // Until the client cuts the power: through every phase of its test.
     for n in 0.. {
         seed ^= seed << 13;
         seed ^= seed >> 7;
         seed ^= seed << 17;
         let wait = 3 + seed % 12 + if pauses && n % 8 == 7 { 50 } else { 0 };
-        let start = ticks();
-        while ticks() < start + wait {
-            syscall(Syscall::Yield, 0, [0; 4]);
-        }
+        superior_sys::sleep(wait);
         let target = targets[n % targets.len()];
         syscall(Syscall::Call, 0, [OP_KILL, target, 0, 0]);
     }
@@ -1762,7 +1766,7 @@ impl Sock {
                 self.port = r.msg[2] as u16;
                 return true;
             }
-            syscall(Syscall::Yield, 0, [0; 4]);
+            superior_sys::sleep(1);
         }
         false
     }
@@ -2429,7 +2433,7 @@ fn tcp_client() -> ! {
         if (r.status == 0 && r.msg[0] == OK) || ticks() > start + LEASE_TICKS {
             break r.msg;
         }
-        syscall(Syscall::Yield, 0, [0; 4]);
+        superior_sys::sleep(1);
     };
     t.check(
         made.status == 0 && mapped.status == 0 && info[0] == OK,
@@ -2631,9 +2635,7 @@ fn tcp_client() -> ! {
         ),
     );
     syscall(Syscall::Call, NET_CONTROL, [OP_SHUTDOWN, t.0, 0, 0]);
-    loop {
-        syscall(Syscall::Yield, 0, [0; 4]);
-    }
+    superior_sys::park()
 }
 
 /// The resolver (`boot/net.manifest`), whose host-side server
@@ -2680,16 +2682,13 @@ fn resolve(args: core::fmt::Arguments) -> ([u64; 4], u32) {
             return (r.msg, again);
         }
         again += 1;
-        syscall(Syscall::Yield, 0, [0; 4]);
+        superior_sys::sleep(1);
     }
     ([Status::Unreachable as u64, 0, 0, 0], again)
 }
 
 fn pause(t: u64) {
-    let end = ticks() + t;
-    while ticks() < end {
-        syscall(Syscall::Yield, 0, [0; 4]);
-    }
+    superior_sys::sleep(t);
 }
 
 fn dns_checks(t: &mut Checks) {
@@ -2795,7 +2794,7 @@ fn net_client() -> ! {
             if ticks() > start + LEASE_TICKS {
                 return None;
             }
-            syscall(Syscall::Yield, 0, [0; 4]);
+            superior_sys::sleep(1);
         }
     };
     let info = ask(net::INFO).unwrap_or([0; 4]);
@@ -2904,9 +2903,7 @@ fn net_client() -> ! {
     tcp_under_faults(&mut t, Dest::V4(gw | TCP_ECHO_PORT as u64));
     ipv6_checks(&mut t);
     syscall(Syscall::Call, NET_CONTROL, [OP_SHUTDOWN, t.0, 0, 0]);
-    loop {
-        syscall(Syscall::Yield, 0, [0; 4]);
-    }
+    superior_sys::park()
 }
 
 const INPUT: u64 = 0;
@@ -2931,7 +2928,7 @@ fn subscribe() -> bool {
         if r.status == 0 && r.msg[0] == OK && r.cap == Some(INPUT_NTFN as u16) {
             return true;
         }
-        syscall(Syscall::Yield, 0, [0; 4]);
+        superior_sys::sleep(1);
     }
     false
 }
@@ -3004,9 +3001,7 @@ fn keyboard_client() -> ! {
         ),
     );
     syscall(Syscall::Call, INPUT_CONTROL, [OP_SHUTDOWN, t.0, 0, 0]);
-    loop {
-        syscall(Syscall::Yield, 0, [0; 4]);
-    }
+    superior_sys::park()
 }
 
 fn ticks() -> u64 {
@@ -3018,9 +3013,7 @@ fn crasher() -> ! {
     // SAFETY: deliberately not: this must fault.
     let v = unsafe { core::ptr::read_volatile((USER_BASE + root::BUNDLE_OFFSET) as *const u64) };
     say!("[fail] crasher: read {v:#x}");
-    loop {
-        syscall(Syscall::Yield, 0, [0; 4]);
-    }
+    superior_sys::park()
 }
 
 #[unsafe(no_mangle)]
@@ -3053,7 +3046,5 @@ pub extern "C" fn _start(role: u64) -> ! {
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
-    loop {
-        syscall(Syscall::Yield, 0, [0; 4]);
-    }
+    superior_sys::park()
 }

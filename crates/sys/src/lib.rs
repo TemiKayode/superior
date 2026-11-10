@@ -87,6 +87,35 @@ pub fn syscall_x(nr: Syscall, a0: u64, m: [u64; MSG_WORDS], x: CapTransfer) -> R
     }
 }
 
+/// Ticks since boot ([`superior_objects::abi::TICK_HZ`] a second).
+pub fn ticks() -> u64 {
+    syscall(Syscall::Ticks, 0, [0; MSG_WORDS]).msg[0]
+}
+
+/// Blocks for `n` ticks without spending a CPU on it (`Sleep`). Where
+/// there is no `Sleep` (on seL4), yields until the time has passed.
+pub fn sleep(n: u64) {
+    if n == 0 {
+        return;
+    }
+    let r = syscall(Syscall::Sleep, n, [0; MSG_WORDS]);
+    if r.status == 0 || r.status == Error::Interrupted.code() {
+        return;
+    }
+    let end = ticks().saturating_add(n);
+    while ticks() < end {
+        syscall(Syscall::Yield, 0, [0; MSG_WORDS]);
+    }
+}
+
+/// Stops here for good without spending a CPU: for a thread with nothing
+/// left to do (or that cannot go on, and has said why).
+pub fn park() -> ! {
+    loop {
+        sleep(u64::MAX / 2);
+    }
+}
+
 /// A cycle-ish counter for timing: the time-stamp counter on x86-64, the
 /// virtual counter (`CNTVCT_EL0`, which the kernel lets user mode read) on
 /// AArch64. Neither counts core cycles exactly; under emulation neither
