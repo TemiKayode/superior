@@ -45,6 +45,11 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
             .set_handler_addr(VirtAddr::new(syscall::kick_entry as *const () as u64));
     }
     idt[apic::SHOOTDOWN_VECTOR].set_handler_fn(shootdown);
+    // SAFETY: iommu_entry is a naked interrupt entry like timer_entry.
+    unsafe {
+        idt[apic::IOMMU_VECTOR]
+            .set_handler_addr(VirtAddr::new(syscall::iommu_entry as *const () as u64));
+    }
     // SAFETY: com1_entry is a naked interrupt entry like timer_entry.
     unsafe {
         idt[PIC_BASE + COM1_IRQ]

@@ -18,6 +18,8 @@ use x86_64::PhysAddr;
 pub const TIMER_VECTOR: u8 = 0x30;
 pub const KICK_VECTOR: u8 = 0x50;
 pub const SHOOTDOWN_VECTOR: u8 = 0x51;
+/// The IOMMU's fault event interrupt.
+pub const IOMMU_VECTOR: u8 = 0x52;
 pub const SPURIOUS_VECTOR: u8 = 0xff;
 pub const TICK_HZ: u32 = 100;
 

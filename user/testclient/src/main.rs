@@ -269,6 +269,12 @@ fn supervise() -> ! {
         r.status == peer_restarted,
         format_args!("base crashed under a call"),
     );
+    // The kernel fails the call at the fault, before the manager has
+    // handled it, and until then the old `after` may still answer. The
+    // manager stops the whole group before starting any of it, so once
+    // base's new instance answers, `after`'s old one is gone (calls to it
+    // wait for the new one).
+    answered(call_retry(BASE, [GET, 0, 0, 0], TRIES));
     let r = answered(call_retry(AFTER, [7, 0, 0, 0], TRIES));
     t.check(
         r[0] == 8 && r[2] == 1,
@@ -3002,6 +3008,51 @@ fn resolve(args: core::fmt::Arguments) -> ([u64; 4], u32) {
     ([Status::Unreachable as u64, 0, 0, 0], again)
 }
 
+/// Resolves the name `args` gives to an IPv6 address, asking again while
+/// the resolver or the network is restarting: the status, the address,
+/// and whether it came from the cache.
+fn resolve6(args: core::fmt::Arguments) -> (u64, [u8; 16], bool) {
+    let x = CapTransfer {
+        grant: Some(NET_PAGE as u16),
+        accept: None,
+    };
+    for _ in 0..DNS_TRIES {
+        let len = put_text(args);
+        let r = syscall_x(Syscall::Call, DNS, [dns::RESOLVE6, dns::VERSION, len, 0], x);
+        if r.status == 0 && r.msg[0] != Status::Unreachable as u64 {
+            let mut a = [0; 16];
+            if r.msg[0] == OK {
+                a.copy_from_slice(&net_page()[..16]);
+            }
+            return (r.msg[0], a, r.msg[2] == 1);
+        }
+        superior_sys::sleep(1);
+    }
+    (Status::Unreachable as u64, [0; 16], false)
+}
+
+/// An IPv6 address in the 2001:db8:: form the DNS test's names use: its
+/// groups, with the zeros between the first two and the last left out.
+struct Colons([u8; 16]);
+
+impl core::fmt::Display for Colons {
+    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+        let g = |i: usize| u16::from_be_bytes([self.0[2 * i], self.0[2 * i + 1]]);
+        let first = (0..8).find(|&i| g(i) == 0).unwrap_or(8);
+        let last = (first..8).find(|&i| g(i) != 0).unwrap_or(8);
+        for i in 0..first {
+            write!(f, "{}{:x}", if i > 0 { ":" } else { "" }, g(i))?;
+        }
+        if first < 8 {
+            write!(f, "::")?;
+            for i in last..8 {
+                write!(f, "{}{:x}", if i > last { ":" } else { "" }, g(i))?;
+            }
+        }
+        Ok(())
+    }
+}
+
 fn pause(t: u64) {
     superior_sys::sleep(t);
 }
@@ -3017,6 +3068,37 @@ fn dns_checks(t: &mut Checks) {
     t.check(
         r[0] == OK && r[1] == a([192, 0, 2, 10]),
         format_args!("alias.superior.test, a CNAME for www, is {}", Dotted(r[1])),
+    );
+    // IPv6 addresses (AAAA records), through a CNAME too; a name with only
+    // an IPv4 address has none, and one with only IPv6 none of IPv4.
+    let v6 = |last: u8| {
+        let mut a = [0; 16];
+        a[..4].copy_from_slice(&[0x20, 0x01, 0x0d, 0xb8]);
+        a[15] = last;
+        a
+    };
+    let (s, www6, _) = resolve6(format_args!("www.superior.test"));
+    let (s2, alias6, _) = resolve6(format_args!("alias.superior.test"));
+    let (_, again6, from_cache) = resolve6(format_args!("www.superior.test"));
+    t.check(
+        s == OK && www6 == v6(0x10) && s2 == OK && alias6 == v6(0x10) && again6 == www6 && from_cache,
+        format_args!(
+            "www.superior.test's IPv6 address is {}, alias's too, and the second answer was cached",
+            Colons(www6)
+        ),
+    );
+    let (none6, _, _) = resolve6(format_args!("cached.superior.test"));
+    let (only6, addr6, _) = resolve6(format_args!("v6only.superior.test"));
+    let (none4, _) = resolve(format_args!("v6only.superior.test"));
+    t.check(
+        none6 == Status::NotFound as u64
+            && only6 == OK
+            && addr6 == v6(0x66)
+            && none4[0] == Status::NotFound as u64,
+        format_args!(
+            "cached.superior.test has no IPv6 address; v6only.superior.test has {} and no IPv4 one",
+            Colons(addr6)
+        ),
     );
     let (r, _) = resolve(format_args!("nowhere.superior.test"));
     let (bad, _) = resolve(format_args!("no..dots"));

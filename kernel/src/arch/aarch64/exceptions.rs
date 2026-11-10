@@ -330,6 +330,9 @@ extern "C" fn irq(frame: &mut UserFrame, _kind: u64) {
     } else if id == super::gic::SHOOTDOWN_SGI {
         crate::smp::service();
         super::gic::end_of_interrupt(id);
+    } else if Some(id) == super::iommu::fault_irq() {
+        super::gic::end_of_interrupt(id);
+        crate::task::handle_io_fault_irq(frame);
     } else {
         // Masked until the driver acknowledges, so a level that stays
         // raised cannot storm the kernel (MSIs, being messages, are not).

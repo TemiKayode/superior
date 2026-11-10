@@ -7,13 +7,14 @@
 //! granule tables (39-bit I/O addresses).
 //!
 //! Once the SMMU is on, a stream whose entry is not valid can reach no
-//! memory at all. Faults go to the event queue, which the kernel drains on
-//! every timer tick ([`take_faults`]); its interrupt stays off.
+//! memory at all. Faults go to the event queue, whose interrupt (the
+//! wired SPI the device tree names first) has the kernel drain it at once
+//! ([`take_faults`]); the timer tick drains it too, in case one is missed.
 
 use super::{fdt, gic, vm};
 use crate::iommu::IoFault;
 use crate::{kprintln, memory};
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 const IDR0: u64 = 0x00;
 const CR0: u64 = 0x20;
@@ -25,6 +26,9 @@ const CMDQ_BASE: u64 = 0x90;
 const CMDQ_PROD: u64 = 0x98;
 const CMDQ_CONS: u64 = 0x9c;
 const EVTQ_BASE: u64 = 0xa0;
+const IRQ_CTRL: u64 = 0x50;
+const IRQ_CTRLACK: u64 = 0x54;
+const IRQ_EVTQ: u32 = 1 << 2;
 /// The event queue's indices live in the second register page.
 const EVTQ_PROD: u64 = 0x1_00a8;
 const EVTQ_CONS: u64 = 0x1_00ac;
@@ -54,6 +58,13 @@ static REGS: AtomicU64 = AtomicU64::new(0);
 static STRTAB: AtomicU64 = AtomicU64::new(0);
 static CMDQ: AtomicU64 = AtomicU64::new(0);
 static EVTQ: AtomicU64 = AtomicU64::new(0);
+/// The event queue's interrupt ID, or 0 if it has none.
+static IRQ: AtomicU32 = AtomicU32::new(0);
+
+/// The interrupt ID of the event queue's interrupt, if it is on.
+pub fn fault_irq() -> Option<u32> {
+    Some(IRQ.load(Ordering::Relaxed)).filter(|&id| id != 0)
+}
 
 fn r32(off: u64) -> u32 {
     // SAFETY: the SMMU's registers lie in the kernel's device identity map.
@@ -111,7 +122,7 @@ fn sync() {
 
 /// Finds and turns on the SMMU, with no stream able to reach anything.
 pub fn init(dtb: u64) -> Option<&'static str> {
-    let base = fdt::find_compatible(dtb, b"arm,smmu-v3")?;
+    let (base, irq) = fdt::find_device(dtb, b"arm,smmu-v3")?;
     REGS.store(base, Ordering::Relaxed);
     let idr0 = r32(IDR0);
     // Stage 1, AArch64 tables.
@@ -144,6 +155,14 @@ pub fn init(dtb: u64) -> Option<&'static str> {
     command(CMD_TLBI_NSNH_ALL, 0);
     sync();
     set_cr0(CR0_CMDQEN | CR0_EVTQEN | CR0_SMMUEN);
+    if let Some(id) = irq {
+        w32(IRQ_CTRL, IRQ_EVTQ);
+        while r32(IRQ_CTRLACK) != IRQ_EVTQ {
+            core::hint::spin_loop();
+        }
+        gic::enable_edge_spi(id);
+        IRQ.store(id, Ordering::Relaxed);
+    }
     Some("Arm SMMUv3")
 }
 

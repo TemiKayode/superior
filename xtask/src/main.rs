@@ -972,6 +972,18 @@ fn drivers_test(img: &Image) -> Result<(), String> {
     if !out.contains(verdict) {
         return Err(format!("driver framework test: missing {verdict:?}"));
     }
+    // The IOMMU raised its fault interrupt (the kernel drains faults then,
+    // not at the next tick), and virtio-blk's driver, which bound a
+    // notification to its domain's faults, was signalled.
+    let mut wanted = vec!["[iommu] fault interrupt 1"];
+    if d == "virtio-blk" {
+        wanted.push("the IOMMU reported a blocked write to it; the driver was signalled");
+    }
+    for line in wanted {
+        if !out.contains(line) {
+            return Err(format!("driver framework test: missing {line:?}"));
+        }
+    }
     for bad in ["[fail]", "could not", "panic"] {
         if out.contains(bad) {
             return Err(format!("driver framework test: log contains {bad:?}"));
@@ -1154,16 +1166,25 @@ const ECHO_PORT: u16 = 47001;
 const DNS_PORT: u16 = 47053;
 
 /// The network test's DNS answer to a query for `name` (lower case, no
-/// final dot): records `(owner, type, TTL, data)` (A or CNAME), or none
-/// for a name that does not exist.
+/// final dot): records `(owner, type, TTL, data)` (A, AAAA or CNAME), or
+/// none for a name that does not exist.
 fn dns_records(name: &str) -> Option<Vec<(String, u16, u32, Vec<u8>)>> {
     let a = |owner: &str, ttl: u32, ip: [u8; 4]| (owner.to_string(), 1u16, ttl, ip.to_vec());
+    // 2001:db8::`last`.
+    let aaaa = |owner: &str, last: u8| {
+        let mut ip = vec![0x20, 0x01, 0x0d, 0xb8];
+        ip.resize(16, 0);
+        ip[15] = last;
+        (owner.to_string(), 28u16, 60, ip)
+    };
     Some(match name {
-        "www.superior.test" => vec![a(name, 60, [192, 0, 2, 10])],
+        "www.superior.test" => vec![a(name, 60, [192, 0, 2, 10]), aaaa(name, 0x10)],
         "alias.superior.test" => vec![
             (name.to_string(), 5, 60, dns_name("www.superior.test")),
             a("www.superior.test", 60, [192, 0, 2, 10]),
+            aaaa("www.superior.test", 0x10),
         ],
+        "v6only.superior.test" => vec![aaaa(name, 0x66)],
         "cached.superior.test" => vec![a(name, 300, [192, 0, 2, 20])],
         "short.superior.test" => vec![a(name, 1, [192, 0, 2, 30])],
         _ => {
@@ -1203,7 +1224,8 @@ fn dns_answer(q: &[u8]) -> Option<(Vec<u8>, String)> {
     let answers: Vec<_> = records
         .iter()
         .flatten()
-        .filter(|r| qtype == 1 || r.1 == qtype)
+        // The type asked for, and the CNAMEs leading to it.
+        .filter(|r| r.1 == qtype || r.1 == 5)
         .collect();
     let mut r = Vec::new();
     r.extend_from_slice(&q[0..2]);
@@ -1459,6 +1481,8 @@ fn net_test(arch: Arch) -> Result<(), String> {
         "datagrams reassembled from fragments,",
         "[pass] net: www.superior.test is 192.0.2.10",
         "[pass] net: alias.superior.test, a CNAME for www, is 192.0.2.10",
+        "[pass] net: www.superior.test's IPv6 address is 2001:db8::10, alias's too, and the second answer was cached",
+        "[pass] net: cached.superior.test has no IPv6 address; v6only.superior.test has 2001:db8::66 and no IPv4 one",
         "[pass] net: nowhere.superior.test does not exist, and no..dots is no name",
         "[pass] net: cached.superior.test resolved 20 times,",
         "[pass] net: short.superior.test (TTL 1 s) asked of the server again after 1.5 s",

@@ -16,9 +16,11 @@
 //! goes through the invalidation queue, since the interrupt entry cache
 //! has no register to flush it.
 //!
-//! Blocked requests are logged in the unit's fault recording registers;
-//! the kernel drains them on every timer tick ([`take_faults`]), with the
-//! fault event interrupt left masked.
+//! Blocked requests are logged in the unit's fault recording registers,
+//! and the unit's fault event interrupt (a message to CPU 0's local APIC on
+//! [`super::apic::IOMMU_VECTOR`], never itself remapped) has the kernel
+//! drain them at once ([`take_faults`]); the timer tick drains them too.
+//! A record freed while others are pending raises the event again.
 
 use super::vm;
 use crate::iommu::IoFault;
@@ -36,6 +38,9 @@ const RTADDR: u64 = 0x20;
 const CCMD: u64 = 0x28;
 const FSTS: u64 = 0x34;
 const FECTL: u64 = 0x38;
+const FEDATA: u64 = 0x3c;
+const FEADDR: u64 = 0x40;
+const FEUADDR: u64 = 0x44;
 const IQH: u64 = 0x80;
 const IQT: u64 = 0x88;
 const IQA: u64 = 0x90;
@@ -75,8 +80,6 @@ const SAGAW_39: u64 = 1 << 9;
 const AW_39: u64 = 1;
 /// FSTS: primary fault overflow (write 1 to clear).
 const FSTS_PFO: u32 = 1;
-/// FECTL: fault event interrupt masked.
-const FECTL_IM: u32 = 1 << 31;
 /// A fault recording register's high half: valid (write 1 to clear), and
 /// the request was a read.
 const FRCD_F: u64 = 1 << 63;
@@ -155,7 +158,12 @@ pub fn init() -> Option<&'static str> {
     }
     flush_context();
     flush();
-    w32(FECTL, FECTL_IM);
+    // Fault events: a fixed-delivery message to CPU 0 (physical
+    // destination), then unmasked.
+    w32(FEDATA, super::apic::IOMMU_VECTOR as u32);
+    w32(FEADDR, 0xfee0_0000 | (super::apic::id() as u32) << 12);
+    w32(FEUADDR, 0);
+    w32(FECTL, 0);
     let remapping = ecap & ECAP_QI != 0 && ecap & ECAP_IR != 0;
     if remapping {
         // Every entry starts not present: no device raises anything until

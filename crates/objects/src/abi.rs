@@ -230,6 +230,13 @@ pub enum Syscall {
     /// The state store ([`root::STATE_STORE`]) keeps its contents. Also
     /// what happens when the root task faults.
     Reboot = 44,
+    /// Has the notification in slot `rsi` (Write right) signalled, with its
+    /// badge (bit 0 if unbadged), whenever the IOMMU blocks a request from
+    /// the device of the I/O address space in slot `rdi` (Read right): the
+    /// IOMMU's fault interrupt has the kernel collect it at once, so the
+    /// holder hears of it without asking (`IoFaults` then says what it
+    /// was). Slot `rsi` = `u64::MAX` unbinds it.
+    IoFaultNotify = 45,
     /// Maps the frame in slot `rdi` at page-aligned `rsi` in the address
     /// space in slot `r8` (Write right). `rdx` = [`MAP_WRITE`] and/or
     /// [`MAP_EXEC`], never both. Needs the frame's Map right, plus Write
@@ -299,6 +306,7 @@ impl Syscall {
             41 => Syscall::TimerSignal,
             43 => Syscall::Sleep,
             44 => Syscall::Reboot,
+            45 => Syscall::IoFaultNotify,
             42 => Syscall::IoFaults,
             0x100 => Syscall::DebugPutStr,
             0x101 => Syscall::DebugSelftestDone,

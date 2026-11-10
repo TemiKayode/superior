@@ -348,6 +348,12 @@ pub mod dns {
     /// not exist or has no IPv4 address, `Unreachable` if no DNS server
     /// answered, `Invalid` if the name is malformed.
     pub const RESOLVE: u64 = 1;
+    /// `[RESOLVE6, VERSION, length]`, the same with an IPv6 address (an
+    /// AAAA record): the frame lent (writable) gets the 16-byte address
+    /// in its first 16 bytes; reply `[status, seconds the answer stays
+    /// good, 1 if it came from the cache]`. `NotFound` if the name does
+    /// not exist or has no IPv6 address.
+    pub const RESOLVE6: u64 = 2;
 }
 
 /// USB: what a host controller driver serves to class drivers.

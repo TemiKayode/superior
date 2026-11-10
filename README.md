@@ -222,9 +222,12 @@ holds the rest):
     page of RAM (never device memory) into it, and deleting or revoking that frame
     capability takes it out again. Destroying the space unbinds the function first,
     so its DMA stops before anything else happens. Blocked requests are reported:
-    on every timer tick the kernel drains VT-d's fault recording registers or the
-    SMMU's event queue and credits each fault to the space bound to its requester
-    ID; `IoFaults` tells the space's holder how many there were since it last
+    the IOMMU's fault interrupt (VT-d's fault event message, or the SMMU's event
+    queue interrupt, the wired SPI its device-tree node names) has the kernel drain
+    VT-d's fault recording registers or the SMMU's event queue at once (the timer
+    tick drains them too), credit each fault to the space bound to its requester
+    ID, and signal the notification the space's holder bound with `IoFaultNotify`;
+    `IoFaults` tells the space's holder how many there were since it last
     asked, the first one's page and whether it was a write, and how many
     interrupt messages VT-d blocked (the ITS drops them without a report).
   - The root task gets PCI configuration space (ports 0xcf8-0xcff, or ECAM), a BAR
@@ -284,7 +287,8 @@ holds the rest):
   - the driver points its device at a page of its own outside the domain, and the
     page must stay untouched (it does on both ISAs; with QEMU's virtio IOMMU
     bypass left on, the same test fails), and the IOMMU must report a blocked
-    write to exactly that page;
+    write to exactly that page, through its fault interrupt; virtio-blk's driver
+    binds a notification to its domain's faults first and must be signalled;
   - the driver is crashed, restarted, its device reset and reopened, and reads work
     again;
   - two client threads read 40 times each at once, every word right; NVMe must
@@ -449,9 +453,10 @@ holds the rest):
     holds is lost on a restart, but the lease is kept in its `state` page, so a
     restarted server goes on with the same address at once.
   - A DNS resolver (`user/dns/`), a component of its own, serves the `dns`
-    interface: a client lends a page holding a name and gets its IPv4 address. It
-    answers from its cache while an answer's TTL lasts; otherwise it sends a
-    recursive query for an A record to the DNS server the network server got from
+    interface: a client lends a page holding a name and gets its IPv4 address
+    (`RESOLVE`, an A record) or its IPv6 address (`RESOLVE6`, an AAAA record,
+    written into the page). It answers from its cache while an answer's TTL lasts;
+    otherwise it sends a recursive query for that record type to the DNS server the network server got from
     DHCP, through a UDP socket of the network server's, again every second for up
     to four tries, follows CNAMEs in the answer (with compression pointers) to the
     address, and caches what it learns, names that do not exist included (for
@@ -523,7 +528,9 @@ holds the rest):
   gone), and the components must have been killed at least 10 times, among the pings
   and among the echoes. Then the client resolves names through the resolver, which
   asks a DNS server xtask runs on the host (at the gateway's port 47053, as QEMU's
-  own DNS server would ask the real internet): an A record, a CNAME, a name that
+  own DNS server would ask the real internet): an A record, a CNAME, AAAA records
+  (directly, through the CNAME and from the cache), a name with only an IPv4
+  address asked for IPv6 and one with only IPv6 asked for IPv4, a name that
   does not exist and a malformed one; a name with a 300 s TTL 20 times, at least
   15 from the cache (the host must be asked at most 5 times); a name with a 1 s TTL
   twice, 1.5 s apart, the second asked of the host again; and for at least 3 s a
@@ -613,14 +620,13 @@ holds the rest):
   notifications, a 256-slot CNode pool) so filling them stays quick; normal kernels have
   32 of each, 32 address spaces and a 4096-slot pool.
 
-Not yet: an interrupt for IOMMU faults (they are collected on
-the timer tick), buses behind bridges in the IOMMU (requester IDs on bus 0 only); Function
+Not yet: buses behind bridges in the IOMMU (requester IDs on bus 0 only); Function
 Level Reset is exercised only by the NVMe controller (QEMU's virtio devices on
 these buses have none); more than one command per queue in the NVMe driver,
 more than two commands in flight per disk in the AHCI driver, ATAPI
 and port multipliers; in the xHCI driver isochronous and bulk endpoints, USB 3 streams,
 hubs and more than one interrupter, and HID devices other than boot keyboards; in the network server
-IPv6 routes beyond one router and stateful DHCPv6, datagrams over 4,000 bytes, DNS records other than A and CNAME (and DNS over TCP), routes beyond one gateway, and rings in place of a
+IPv6 routes beyond one router and stateful DHCPv6, datagrams over 4,000 bytes, DNS records other than A, AAAA and CNAME (and DNS over TCP), routes beyond one gateway, and rings in place of a
 call per frame; buses behind bridges; the async executor, buffer pools and
 power callbacks of the SDK; an IDL compiler for the interfaces; escalating a component
 given up on to a supervisor above it (today the
@@ -660,7 +666,7 @@ https://claude.ai/artifact/QKJS8qH5Dfbjzn58RStq1j
 | `user/xhci/` | The xHCI (USB) host controller driver |
 | `user/hid/` | The USB HID keyboard driver |
 | `user/echo/`, `user/counter/`, `user/testclient/` | Test components for the Component Manager, supervision and drivers |
-| `boot/` | Component manifests: `shell.manifest` (normal boot), `test.manifest` (`cm-test`), `supervise.manifest` (`supervise-test`) , `drivers.manifest` (`drivers-test`) , `memory.manifest` (`memory-test`), `fs.manifest` and `fs-verify.manifest` (`fs-test`), `net.manifest` (`net-test`), `tcp.manifest` (`tcp-test`), `keyboard.manifest` (`keyboard-test`) |
+| `boot/` | Component manifests: `shell.manifest` (normal boot), `test.manifest` (`cm-test`), `supervise.manifest` (`supervise-test`) , `drivers.manifest` (`drivers-test`) , `memory.manifest` (`memory-test`), `reboot.manifest` (`reboot-test`), `fs.manifest` and `fs-verify.manifest` (`fs-test`), `net.manifest` (`net-test`), `tcp.manifest` (`tcp-test`), `keyboard.manifest` (`keyboard-test`) |
 | `sel4/` | Docker build of seL4 and rust-sel4's kernel loader, for running the shell on seL4 |
 | `xtask/` | Build driver: user program, kernel, disk image, QEMU boot |
 

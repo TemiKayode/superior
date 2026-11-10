@@ -41,6 +41,7 @@ const GICD_IGROUPR: u64 = 0x080;
 const GICD_ISENABLER: u64 = 0x100;
 const GICD_ICENABLER: u64 = 0x180;
 const GICD_IPRIORITYR: u64 = 0x400;
+const GICD_ICFGR: u64 = 0xc00;
 const GICD_IROUTER: u64 = 0x6000;
 /// Single security state (the machine has none): affinity routing,
 /// group 0 and group 1 enabled; and the register-write-pending bit.
@@ -404,6 +405,17 @@ pub fn line_of(id: u32) -> u32 {
     } else {
         id
     }
+}
+
+/// Turns on shared interrupt `id` (an SPI) for the kernel itself, edge
+/// triggered: one a device pulses rather than holds (the SMMU's).
+pub fn enable_edge_spi(id: u32) {
+    if !(32..MAX_SPI).contains(&id) {
+        return;
+    }
+    let reg = GICD + GICD_ICFGR + 4 * (id / 16) as u64;
+    write32(reg, read32(reg) | 2 << (2 * (id % 16)));
+    write32(GICD + GICD_ISENABLER + 4 * (id / 32) as u64, 1 << (id % 32));
 }
 
 pub fn unmask(line: u32) {

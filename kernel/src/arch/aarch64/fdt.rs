@@ -129,8 +129,9 @@ pub fn memory(dtb: u64, out: &mut [(u64, u64); MAX_RANGES]) -> Option<usize> {
 }
 
 /// The base address (first `reg` entry) of the first top-level node whose
-/// `compatible` list includes `want`, if any.
-pub fn find_compatible(dtb: u64, want: &[u8]) -> Option<u64> {
+/// `compatible` list includes `want`, and the GIC interrupt ID of its first
+/// `interrupts` entry (three cells: SPI or PPI, number, flags), if any.
+pub fn find_device(dtb: u64, want: &[u8]) -> Option<(u64, Option<u32>)> {
     if !valid(dtb) {
         return None;
     }
@@ -169,7 +170,7 @@ pub fn find_compatible(dtb: u64, want: &[u8]) -> Option<u64> {
     };
     let mut addr_cells = 2u32;
     let mut depth = 0u32;
-    let (mut matched, mut reg) = (false, None);
+    let (mut matched, mut reg, mut irq) = (false, None, None);
     let mut p = structs;
     while p + 4 <= end {
         let token = be32(p);
@@ -182,13 +183,13 @@ pub fn find_compatible(dtb: u64, want: &[u8]) -> Option<u64> {
                 }
                 p = (p + 1 + 3) & !3;
                 if depth == 2 {
-                    (matched, reg) = (false, None);
+                    (matched, reg, irq) = (false, None, None);
                 }
             }
             END_NODE => {
                 if depth == 2 && matched {
                     if let Some(r) = reg {
-                        return Some(r);
+                        return Some((r, irq));
                     }
                 }
                 depth = depth.saturating_sub(1);
@@ -213,6 +214,10 @@ pub fn find_compatible(dtb: u64, want: &[u8]) -> Option<u64> {
                     && len >= 4 * addr_cells as u64
                 {
                     reg = Some(cells(value, addr_cells));
+                } else if depth == 2 && name_is(name, b"interrupts") && len >= 12 {
+                    // SPIs are numbered from ID 32, PPIs from 16.
+                    let base = if be32(value) == 0 { 32 } else { 16 };
+                    irq = Some(base + be32(value + 4));
                 }
                 p = (value + len + 3) & !3;
             }

@@ -340,6 +340,39 @@ pub unsafe extern "C" fn kick_entry() {
     )
 }
 
+/// Entry for the IOMMU's fault event: drain its fault records.
+#[unsafe(naked)]
+pub unsafe extern "C" fn iommu_entry() {
+    naked_asm!(
+        "push r11",
+        "push rcx",
+        "push rax",
+        "push rbx",
+        "push rdx",
+        "push rsi",
+        "push rdi",
+        "push rbp",
+        "push r8",
+        "push r9",
+        "push r10",
+        "push r12",
+        "push r13",
+        "push r14",
+        "push r15",
+        "cld", // the ABI wants DF clear; user code may have set it
+        "mov rdi, rsp",
+        "call {handler}",
+        "jmp {ret}",
+        handler = sym iommu_handler,
+        ret = sym return_to_user,
+    )
+}
+
+extern "C" fn iommu_handler(frame: &mut UserFrame) -> Exit {
+    super::apic::end_of_interrupt();
+    crate::task::handle_io_fault_irq(frame)
+}
+
 /// Entry for COM1's interrupt (legacy PIC line 4), delivered to the
 /// serial driver as a notification.
 #[unsafe(naked)]

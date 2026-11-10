@@ -47,8 +47,11 @@ const CANARY: u64 = BUFFER + 1;
 const FORGED_IRQ: u64 = CANARY + 1;
 const FORGED_NTFN: u64 = CANARY + 2;
 const TIMEOUT_NTFN: u64 = CANARY + 3;
+/// And a copy badged for the IOMMU's report of a blocked request.
+const FAULT_NTFN: u64 = CANARY + 4;
 const FORGED_BIT: u64 = 2;
 const TIMEOUT_BIT: u64 = 4;
+const FAULT_BIT: u64 = 8;
 
 const BAR_VA: u64 = USER_BASE + 0x4000_0000;
 const QUEUE_VA: u64 = USER_BASE + 0x5000_0000;
@@ -276,7 +279,7 @@ fn start(faults: bool) -> Result<Device, Failure> {
 fn forge_vector(pci: &Pci) -> Result<(u64, u64), Failure> {
     pci.take_msi_vector(1, FORGED_IRQ)?;
     let m = superior_driver::msi_message(FORGED_IRQ, None)?;
-    for (slot, badge) in [(FORGED_NTFN, FORGED_BIT), (TIMEOUT_NTFN, TIMEOUT_BIT)] {
+    for (slot, badge) in [(FORGED_NTFN, FORGED_BIT), (TIMEOUT_NTFN, TIMEOUT_BIT), (FAULT_NTFN, FAULT_BIT)] {
         if syscall(Syscall::CapMint, NOTIFY, [slot, 0xff, badge, 0]).status != 0 {
             return Err(("minting a copy of the notification", badge));
         }
@@ -398,7 +401,9 @@ impl Device {
     /// Aims a read at a page of the driver's own that is not in the
     /// device's domain. Returns (page untouched, request completed, its
     /// status byte).
-    fn stray(&mut self) -> Result<(bool, bool, u8, u64), Failure> {
+    /// Also returns whether the IOMMU's report reached the driver as a
+    /// signal, without it asking.
+    fn stray(&mut self) -> Result<(bool, bool, u8, u64, bool), Failure> {
         let made = syscall(
             Syscall::Retype,
             UNTYPED,
@@ -418,6 +423,7 @@ impl Device {
         page.fill(CANARY_WORD);
         dma_barrier();
         let pa = dma_address(CANARY)?;
+        superior_driver::io_fault_notify(DOMAIN, Some(FAULT_NTFN))?;
         self.submit(0, 8, pa);
         // The device either fails the request or never finishes it; give
         // it a second either way.
@@ -432,13 +438,21 @@ impl Device {
         }
         dma_barrier();
         let untouched = page.iter().all(|&w| w == CANARY_WORD);
-        Ok((untouched, done, self.request_status(), pa))
+        // The signal came at the fault (an interrupt) or will at the next
+        // tick at the latest: see which bits a short wait collects.
+        syscall(Syscall::TimerSignal, TIMEOUT_NTFN, [10, 0, 0, 0]);
+        let mut bits = 0;
+        while bits & TIMEOUT_BIT == 0 {
+            bits |= syscall(Syscall::Wait, NOTIFY, [0; 4]).badge;
+        }
+        superior_driver::io_fault_notify(DOMAIN, None)?;
+        Ok((untouched, done, self.request_status(), pa, bits & FAULT_BIT != 0))
     }
 
     /// The forged interrupt, then the stray DMA. Returns whether the
     /// interrupt was held back (and, where the IOMMU reports interrupts,
     /// reported), and the stray DMA's result.
-    fn forge_then_stray(&mut self) -> Result<(bool, (bool, bool, u8, u64)), Failure> {
+    fn forge_then_stray(&mut self) -> Result<(bool, (bool, bool, u8, u64, bool)), Failure> {
         let message = self.forged.ok_or(("no second vector", 0))?;
         let (raised, done, blocked) = self.forge(message)?;
         // VT-d records blocked interrupts; the ITS drops them silently.
@@ -492,14 +506,15 @@ impl Device {
             }
             OP_CRASH if faults => crash(),
             OP_STRAY if faults => match self.forge_then_stray() {
-                Ok((held, (untouched, done, st, page))) => {
+                Ok((held, (untouched, done, st, page, signalled))) => {
                     let (reported, report) = superior_driver::stray_reported(DOMAIN, page);
                     say!(
-                        "stray DMA: page {}, request {} (status {st:#x}); {report}",
+                        "stray DMA: page {}, request {} (status {st:#x}); {report}; {}",
                         if untouched { "untouched" } else { "WRITTEN" },
-                        if done { "completed" } else { "never completed" }
+                        if done { "completed" } else { "never completed" },
+                        if signalled { "the driver was signalled" } else { "the driver was NOT signalled" }
                     );
-                    let ok = held && untouched && reported;
+                    let ok = held && untouched && reported && signalled;
                     [Status::Ok as u64, ok as u64, done as u64, st as u64]
                 }
                 Err((what, code)) => {

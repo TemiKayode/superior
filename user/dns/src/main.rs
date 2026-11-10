@@ -1,11 +1,11 @@
 //! The DNS resolver: serves the `dns` interface
 //! (`superior_objects::interfaces::dns`), turning names into IPv4
-//! addresses by asking a DNS server (RFC 1035) over the network server's
-//! UDP.
+//! addresses (A records) and IPv6 addresses (AAAA, RFC 3596) by asking a
+//! DNS server (RFC 1035) over the network server's UDP.
 //!
 //! A client lends a page holding the name. The resolver answers from its
 //! cache while the answer's time to live lasts; otherwise it sends a
-//! recursive query (an A record) to the DNS server the network server got
+//! recursive query (for an A or AAAA record) to the DNS server the network server got
 //! from DHCP, sends it again every second for up to [`TRIES`] tries,
 //! follows CNAME records in the answer to the address, and caches what it
 //! learns, names that do not exist included (for [`NEGATIVE_TTL`]).
@@ -53,6 +53,7 @@ const MAX_NAME: usize = dns::MAX_NAME as usize;
 
 const TYPE_A: u16 = 1;
 const TYPE_CNAME: u16 = 5;
+const TYPE_AAAA: u16 = 28;
 const CLASS_IN: u16 = 1;
 const RCODE_NXDOMAIN: u16 = 3;
 
@@ -165,14 +166,17 @@ impl Name {
 #[derive(Clone, Copy)]
 struct Entry {
     name: Name,
-    /// The address, or none: the name does not exist (or has no address).
-    addr: Option<u32>,
+    /// The record type asked for (A or AAAA).
+    kind: u16,
+    /// The address (an IPv4 one in the first 4 bytes), or none: the name
+    /// does not exist (or has no address of this kind).
+    addr: Option<[u8; 16]>,
     expires: u64,
 }
 
 /// How a query ended.
 enum Answer {
-    Address(u32, u64),
+    Address([u8; 16], u64),
     NoSuchName,
     NoAnswer,
 }
@@ -226,23 +230,25 @@ impl Resolver {
         })
     }
 
-    fn cached(&mut self, name: &Name) -> Option<Entry> {
+    fn cached(&mut self, name: &Name, kind: u16) -> Option<Entry> {
         let now = ticks();
         self.cache
             .iter()
             .flatten()
-            .find(|e| e.expires > now && e.name.as_bytes() == name.as_bytes())
+            .find(|e| e.expires > now && e.kind == kind && e.name.as_bytes() == name.as_bytes())
             .copied()
     }
 
-    fn remember(&mut self, name: &Name, addr: Option<u32>, ttl: u64) {
+    fn remember(&mut self, name: &Name, kind: u16, addr: Option<[u8; 16]>, ttl: u64) {
         if ttl == 0 {
             return;
         }
         let now = ticks();
         let slot = (0..CACHE)
             .find(|&i| {
-                self.cache[i].is_none_or(|e| e.expires <= now || e.name.as_bytes() == name.as_bytes())
+                self.cache[i].is_none_or(|e| {
+                    e.expires <= now || (e.kind == kind && e.name.as_bytes() == name.as_bytes())
+                })
             })
             .unwrap_or_else(|| {
                 self.next = (self.next + 1) % CACHE;
@@ -250,13 +256,14 @@ impl Resolver {
             });
         self.cache[slot] = Some(Entry {
             name: *name,
+            kind,
             addr,
             expires: now + ttl.min(MAX_TTL) * SECOND,
         });
     }
 
-    /// Asks the DNS server for `name`'s address.
-    fn query(&mut self, name: &Name) -> Option<Answer> {
+    /// Asks the DNS server for `name`'s address (`kind`: A or AAAA).
+    fn query(&mut self, name: &Name, kind: u16) -> Option<Answer> {
         for _ in 0..TRIES {
             let Some(server) = self.server() else {
                 // No lease yet, or the network server is restarting.
@@ -274,7 +281,8 @@ impl Resolver {
             m[2] = 0x01; // recursion desired
             m[5] = 1; // one question
             let end = name.write(m, 12);
-            m[end..end + 4].copy_from_slice(&[0, TYPE_A as u8, 0, CLASS_IN as u8]);
+            m[end..end + 2].copy_from_slice(&kind.to_be_bytes());
+            m[end + 2..end + 4].copy_from_slice(&CLASS_IN.to_be_bytes());
             let len = end + 4;
             match net_call([net::SEND, self.handle, server, len as u64]) {
                 Some(r) if r[0] == Status::Ok as u64 => {}
@@ -289,7 +297,7 @@ impl Resolver {
                     continue;
                 }
             }
-            if let Some(a) = self.wait(server, name, ticks() + SECOND) {
+            if let Some(a) = self.wait(server, name, kind, ticks() + SECOND) {
                 return Some(a);
             }
         }
@@ -297,7 +305,7 @@ impl Resolver {
     }
 
     /// Waits until `deadline` for the answer to the query just sent.
-    fn wait(&mut self, server: u64, name: &Name, deadline: u64) -> Option<Answer> {
+    fn wait(&mut self, server: u64, name: &Name, kind: u16, deadline: u64) -> Option<Answer> {
         loop {
             loop {
                 match net_call([net::RECV, self.handle, 0, 0]) {
@@ -306,7 +314,7 @@ impl Resolver {
                             continue;
                         }
                         let len = (r[1] as usize).min(4096);
-                        if let Some(a) = self.answer(&page(PAGE_VA)[..len], name) {
+                        if let Some(a) = self.answer(&page(PAGE_VA)[..len], name, kind) {
                             return Some(a);
                         }
                     }
@@ -331,12 +339,16 @@ impl Resolver {
     }
 
     /// Reads a response: `None` if it is not the answer to this query.
-    fn answer(&self, m: &[u8], name: &Name) -> Option<Answer> {
+    fn answer(&self, m: &[u8], name: &Name, want_kind: u16) -> Option<Answer> {
         if m.len() < 12 || be16(m, 0) != self.id || m[2] & 0x80 == 0 || be16(m, 4) != 1 {
             return None;
         }
         let (q, mut at) = Name::read(m, 12)?;
-        if q.as_bytes() != name.as_bytes() || be16(m, at) != TYPE_A || be16(m, at + 2) != CLASS_IN {
+        if at + 4 > m.len()
+            || q.as_bytes() != name.as_bytes()
+            || be16(m, at) != want_kind
+            || be16(m, at + 2) != CLASS_IN
+        {
             return None;
         }
         at += 4;
@@ -377,14 +389,20 @@ impl Resolver {
                     continue;
                 }
                 match *kind {
-                    TYPE_A if *len == 4 => {
-                        return Some(Answer::Address(be32(m, *data), ttl.min(*t) as u64));
+                    k if k == want_kind && *len == if k == TYPE_A { 4 } else { 16 } => {
+                        let mut a = [0; 16];
+                        a[..*len].copy_from_slice(&m[*data..*data + *len]);
+                        return Some(Answer::Address(a, ttl.min(*t) as u64));
                     }
                     TYPE_CNAME => next = Name::read(m, *data).map(|(n, _)| (n, *t)),
                     _ => {}
                 }
             }
-            let (n, t) = next?;
+            // No record of the type asked for, nor a CNAME on: the name
+            // exists without one (NODATA).
+            let Some((n, t)) = next else {
+                return Some(Answer::NoAnswer);
+            };
             want = n;
             ttl = ttl.min(t);
         }
@@ -395,37 +413,71 @@ impl Resolver {
         superior_sys::sleep(t);
     }
 
-    fn resolve(&mut self, m: [u64; 4], lent: bool) -> [u64; 4] {
+    /// `RESOLVE` (`kind` A) or `RESOLVE6` (AAAA, the address written
+    /// into the lent page).
+    fn resolve(&mut self, m: [u64; 4], lent: bool, kind: u16) -> [u64; 4] {
         let status = |s: Status| [s as u64, 0, 0, 0];
         let len = m[2] as usize;
         if !lent || m[1] != dns::VERSION || len == 0 || len > MAX_NAME + 1 {
             return status(Status::Invalid);
         }
-        if syscall(Syscall::FrameMap, LENT, [LENT_VA, 0, 0, 0]).status != 0 {
+        let v6 = kind == TYPE_AAAA;
+        if syscall(Syscall::FrameMap, LENT, [LENT_VA, v6 as u64, 0, 0]).status != 0 {
             return status(Status::Invalid);
         }
-        let name = Name::parse(&page(LENT_VA)[..len]);
-        syscall(Syscall::FrameUnmap, LENT, [0; 4]);
-        let Some(name) = name else {
-            return status(Status::Invalid);
+        let reply = match Name::parse(&page(LENT_VA)[..len]) {
+            None => status(Status::Invalid),
+            Some(name) => self.lookup(&name, kind),
         };
-        if let Some(e) = self.cached(&name) {
+        let out = match (reply[0] == Status::Ok as u64, v6) {
+            (true, true) => {
+                // The address goes in the page; the reply moves up.
+                let a = [reply[1], reply[2]];
+                page(LENT_VA)[..8].copy_from_slice(&a[0].to_be_bytes());
+                page(LENT_VA)[8..16].copy_from_slice(&a[1].to_be_bytes());
+                [reply[0], reply[3] & !(1 << 63), reply[3] >> 63, 0]
+            }
+            _ => reply,
+        };
+        syscall(Syscall::FrameUnmap, LENT, [0; 4]);
+        out
+    }
+
+    /// The reply to `RESOLVE` for an A record; for AAAA, `[status, first
+    /// 8 address bytes, last 8, TTL | cached << 63]`.
+    fn lookup(&mut self, name: &Name, kind: u16) -> [u64; 4] {
+        let status = |s: Status| [s as u64, 0, 0, 0];
+        let found = |a: [u8; 16], ttl: u64, cached: u64| {
+            if kind == TYPE_A {
+                let v4 = u32::from_be_bytes([a[0], a[1], a[2], a[3]]);
+                [Status::Ok as u64, (v4 as u64) << 16, ttl, cached]
+            } else {
+                let hi = u64::from_be_bytes(a[..8].try_into().unwrap_or([0; 8]));
+                let lo = u64::from_be_bytes(a[8..].try_into().unwrap_or([0; 8]));
+                [Status::Ok as u64, hi, lo, ttl | cached << 63]
+            }
+        };
+        if let Some(e) = self.cached(name, kind) {
             let left = (e.expires - ticks()) / SECOND;
             return match e.addr {
-                Some(a) => [Status::Ok as u64, (a as u64) << 16, left, 1],
+                Some(a) => found(a, left, 1),
                 None => status(Status::NotFound),
             };
         }
-        match self.query(&name) {
+        match self.query(name, kind) {
             Some(Answer::Address(a, ttl)) => {
-                self.remember(&name, Some(a), ttl);
-                [Status::Ok as u64, (a as u64) << 16, ttl.min(MAX_TTL), 0]
+                self.remember(name, kind, Some(a), ttl);
+                found(a, ttl.min(MAX_TTL), 0)
             }
             Some(Answer::NoSuchName) => {
-                self.remember(&name, None, NEGATIVE_TTL);
+                self.remember(name, kind, None, NEGATIVE_TTL);
                 status(Status::NotFound)
             }
-            Some(Answer::NoAnswer) => status(Status::NotFound),
+            Some(Answer::NoAnswer) => {
+                // Remembered like a name that does not exist (RFC 2308).
+                self.remember(name, kind, None, NEGATIVE_TTL);
+                status(Status::NotFound)
+            }
             None => status(Status::Unreachable),
         }
     }
@@ -454,7 +506,8 @@ pub extern "C" fn _start(arg: u64) -> ! {
     loop {
         let lent = call.cap == Some(LENT as u16);
         let reply = match call.msg[0] {
-            dns::RESOLVE if call.status == 0 => r.resolve(call.msg, lent),
+            dns::RESOLVE if call.status == 0 => r.resolve(call.msg, lent, TYPE_A),
+            dns::RESOLVE6 if call.status == 0 => r.resolve(call.msg, lent, TYPE_AAAA),
             _ => [Status::Invalid as u64, 0, 0, 0],
         };
         if lent {

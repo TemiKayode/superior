@@ -306,6 +306,14 @@ pub fn io_faults(domain: u64) -> Result<IoFaults, Failure> {
         .map_err(|e| ("reading IOMMU faults", e))
 }
 
+/// Has the notification in `ntfn` signalled whenever the IOMMU blocks a
+/// request from the function bound to `domain` (`None`: no longer).
+pub fn io_fault_notify(domain: u64, ntfn: Option<u64>) -> Result<(), Failure> {
+    sys(Syscall::IoFaultNotify, domain, [ntfn.unwrap_or(u64::MAX), 0, 0, 0])
+        .map(|_| ())
+        .map_err(|e| ("binding the IOMMU's fault notification", e))
+}
+
 /// How a test describes the IOMMU's report of a stray DMA write aimed at
 /// `page`: whether it was reported, and a phrase saying so.
 pub fn stray_reported(domain: u64, page: u64) -> (bool, &'static str) {

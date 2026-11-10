@@ -134,6 +134,8 @@ struct Stats {
     /// no I/O address space (or lost to a full fault log).
     io_faults: u64,
     io_faults_unowned: u64,
+    /// IOMMU fault interrupts taken.
+    io_fault_irqs: u64,
     /// Returns to user mode, by CPU.
     resumes: [u64; MAX_CPUS],
 }
@@ -161,6 +163,9 @@ struct IoDomain {
     faults: u64,
     first_fault: (u64, bool),
     irq_faults: u64,
+    /// Signalled (notification id, badge) when the IOMMU blocks one of
+    /// its device's requests (`IoFaultNotify`).
+    notify: Option<(u16, u64)>,
 }
 
 impl IoDomain {
@@ -278,6 +283,7 @@ static KERNEL: Mutex<Kernel> = Mutex::new(Kernel {
         faults_unhandled: 0,
         io_faults: 0,
         io_faults_unowned: 0,
+        io_fault_irqs: 0,
         resumes: [0; MAX_CPUS],
     },
 });
@@ -560,6 +566,7 @@ pub fn handle_syscall(frame: &mut UserFrame) -> Exit {
         Some(Syscall::TimerSignal) => timer_signal(k, cur, a.a0, a.a1),
         Some(Syscall::Sleep) => sleep(k, cur, a.a0),
         Some(Syscall::IoFaults) => io_faults(k, cur, a.a0),
+        Some(Syscall::IoFaultNotify) => io_fault_notify(k, cur, a.a0, a.a1),
         Some(Syscall::ThreadSetVSpace) => thread_set_vspace(k, cur, &a),
         Some(Syscall::ThreadSetFaultHandler) => thread_set_fault_handler(k, cur, &a),
         Some(Syscall::SetFaultHandler) => set_fault_handler(k, cur, a.a0),
@@ -976,13 +983,19 @@ fn fire_timers(k: &mut Kernel) {
 }
 
 /// Credits each DMA request the IOMMU blocked to the I/O address space of
-/// the function that made it.
+/// the function that made it, and signals the notification each space
+/// that got one has bound (`IoFaultNotify`).
 fn collect_io_faults(k: &mut Kernel) {
     let (spaces, stats) = (&mut k.io_spaces, &mut k.stats);
+    let mut hit = [false; MAX_IO_SPACES];
     let lost = iommu::take_faults(|sid, fault| {
         stats.io_faults += 1;
-        let Some(d) = spaces.iter_mut().flatten().find(|d| d.sid == Some(sid)) else {
+        let Some(i) = spaces.iter().position(|d| d.is_some_and(|d| d.sid == Some(sid))) else {
             stats.io_faults_unowned += 1;
+            return;
+        };
+        hit[i] = true;
+        let Some(d) = spaces[i].as_mut() else {
             return;
         };
         let (page, write) = match fault {
@@ -1001,6 +1014,59 @@ fn collect_io_faults(k: &mut Kernel) {
     if lost {
         stats.io_faults_unowned += 1;
     }
+    for (i, d) in k.io_spaces.iter().enumerate() {
+        if let (true, Some((n, badge))) = (hit[i], d.as_ref().and_then(|d| d.notify)) {
+            let _ = k.ipc.signal_irq(n, badge);
+        }
+    }
+}
+
+/// The IOMMU's fault interrupt: its faults are collected (and their
+/// spaces' holders signalled) now rather than at the next tick.
+pub fn handle_io_fault_irq(frame: &mut UserFrame) -> Exit {
+    let mut guard = lock_kernel();
+    let k = &mut *guard;
+    k.stats.io_fault_irqs += 1;
+    if k.stats.io_fault_irqs <= 3 {
+        kprintln!("[iommu] fault interrupt {}", k.stats.io_fault_irqs);
+    }
+    collect_io_faults(k);
+    if !frame.is_user_mode() {
+        return Exit::Iret;
+    }
+    save_running(k, frame, false);
+    resume(guard, frame)
+}
+
+/// `IoFaultNotify`: rdi = I/O address space (Read), rsi = notification
+/// (Write), or `u64::MAX` to unbind.
+fn io_fault_notify(k: &mut Kernel, cur: Tid, space: u64, ntfn: u64) -> Result<(), u64> {
+    let s = own_slot(k, cur, space).ok_or(Error::InvalidCapability.code())?;
+    let cap = *k.caps.get(s).ok_or(Error::InvalidCapability.code())?;
+    let Object::IoSpace { id } = cap.object else {
+        return Err(Error::InvalidCapability.code());
+    };
+    if !cap.rights.contains(Rights::READ) {
+        return Err(Error::InsufficientRights.code());
+    }
+    let notify = if ntfn == u64::MAX {
+        None
+    } else {
+        let n = own_slot(k, cur, ntfn).ok_or(Error::InvalidCapability.code())?;
+        let ncap = *k.caps.get(n).ok_or(Error::InvalidCapability.code())?;
+        let Object::Notification { id } = ncap.object else {
+            return Err(Error::InvalidCapability.code());
+        };
+        if !ncap.rights.contains(Rights::WRITE) {
+            return Err(Error::InsufficientRights.code());
+        }
+        Some((id as u16, if ncap.badge == 0 { 1 } else { ncap.badge }))
+    };
+    let d = k.io_spaces[id as usize]
+        .as_mut()
+        .ok_or(Error::InvalidCapability.code())?;
+    d.notify = notify;
+    Ok(())
 }
 
 /// `IoFaults`: rdi = I/O address space (Read). Returns the requests the
@@ -1591,6 +1657,12 @@ fn reap(k: &mut Kernel) {
                         k.irq_ntfn[line] = None;
                     }
                 }
+                // Nor an I/O space's fault notification.
+                for d in k.io_spaces.iter_mut().flatten() {
+                    if matches!(d.notify, Some((n, _)) if n as usize == id) {
+                        d.notify = None;
+                    }
+                }
                 // Nor may a pending timer.
                 for t in k.timers.iter_mut() {
                     if matches!(t, Some((_, n, _)) if *n as usize == id) {
@@ -1991,6 +2063,7 @@ fn retype(k: &mut Kernel, cur: Tid, f: &Args) -> Result<(), u64> {
                 faults: 0,
                 first_fault: (0, false),
                 irq_faults: 0,
+                notify: None,
             };
             iommu::init_space(base, d.root(), id as u16 + 1);
             for &pa in iommu::fixed_pages() {
