@@ -182,8 +182,8 @@ pub mod nic {
     pub const SEND: u64 = 4;
 }
 
-/// The network: what the network server serves. IPv4 with ICMP echo, UDP
-/// and TCP; each socket belongs to the client that bound it.
+/// The network: what the network server serves. IPv4 and IPv6 with ICMP
+/// echo, UDP and TCP; each socket belongs to the client that bound it.
 ///
 /// An address and port travel in one word, [`net::addr`]: the IPv4
 /// address (its first byte the most significant) shifted up 16 bits, and
@@ -283,6 +283,34 @@ pub mod net {
     /// segments dropped on purpose (a test setting), segments kept that
     /// arrived out of order]`, counted across restarts.
     pub const TCP_STATS: u64 = 14;
+
+    /// IPv6. Addresses are 16 bytes, most significant first, at the start
+    /// of the lent page; an IPv4 address in its mapped form
+    /// (`::ffff:a.b.c.d`) works too. Sockets and connections serve both
+    /// families.
+    ///
+    /// `[SEND6, handle, port, length]` with a frame lent: as `SEND`, to
+    /// the address in the page's first 16 bytes, the payload after it
+    /// (for ICMP echo, `port` is the sequence number).
+    pub const SEND6: u64 = 15;
+    /// `[RECV6, handle]` with a frame lent: as `RECV`, the sender's
+    /// address in the first 16 bytes and the payload after it. Reply
+    /// `[status, length, port, family (4 or 6)]`. (`RECV` gives an IPv6
+    /// sender's address word as 0, and the family in its last word.)
+    pub const RECV6: u64 = 16;
+    /// `[TCP_CONNECT6, port]` with a frame lent holding the address: as
+    /// `TCP_CONNECT`.
+    pub const TCP_CONNECT6: u64 = 17;
+    /// `[TCP_PEER, handle]` with a frame lent: the peer's address, written
+    /// to the page's first 16 bytes. Reply `[status, port, family]`.
+    /// (`TCP_ACCEPT` and `RECV` give an IPv6 peer's address word as 0.)
+    pub const TCP_PEER: u64 = 18;
+    /// `[INFO6, VERSION]` with a frame lent: this host's link-local and
+    /// global addresses, the router's and the DNS server's (from router
+    /// advertisements), 16 bytes each in that order. Reply `[status,
+    /// prefix length, seconds the address has left, seconds the router
+    /// has left]`; `Unreachable` until there is a global address.
+    pub const INFO6: u64 = 19;
 
     /// TCP states, as `TCP_STATE` gives them (RFC 9293's names).
     pub const TCP_CLOSED: u64 = 0;

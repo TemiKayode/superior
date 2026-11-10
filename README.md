@@ -361,7 +361,7 @@ holds the rest):
     mount's check must pass. With no faults, 300 reads through a ring cost about
     40 system calls (a handful of doorbells, the rest sleeps), where calls cost at
     least one each.
-- The network server, v2 (`user/net/`), and a virtio-net driver (`user/virtio-net/`).
+- The network server, v3 (`user/net/`), and a virtio-net driver (`user/virtio-net/`).
   - The driver serves the versioned `nic` interface: whole Ethernet frames copied
     between its own receive and transmit buffers (the only memory the device reaches,
     through the IOMMU) and a page the caller lends with each call. Its interrupt is
@@ -420,7 +420,27 @@ holds the rest):
     The server is crash-only here too: a restart forgets every connection (the
     peer is reset when it next sends; ports and initial sequence numbers differ
     per instance), and the client connects again. Packets to the server's own
-    address go round a loopback queue.
+    address go round a loopback queue. A port that closing connections still
+    use can be listened on again (only another listener stands in the way).
+  - IPv6 too, alongside IPv4 (`user/net/src/ip6.rs`; addresses are 128 bits
+    throughout the server and `crates/inet`, IPv4 ones held as IPv4-mapped).
+    The link-local address comes from the MAC (modified EUI-64) and must pass
+    duplicate address detection (a neighbour solicitation from the unspecified
+    address, then 1 s with no answer); router solicitations every 4 s until an
+    advertisement gives the router and a /64 prefix with the autonomous flag
+    (SLAAC), whose address is tried the same way. The DNS server comes from the
+    advertisement's RDNSS option or, when it carries none (as QEMU's does not),
+    from stateless DHCPv6 (an Information-Request to ff02::1:2). Neighbours are
+    found with Neighbor Discovery (solicitations and advertisements, answered
+    for its own addresses, on 33:33 multicast MACs), the address lives as long
+    as the prefix's valid lifetime, and everything learned, detection's progress
+    included, is kept in the state page so a restarted server goes on at once.
+    ICMPv6 echo both ways, "unreachable" ending a connection attempt, UDP and
+    TCP (MSS 1,440) over IPv6, extension headers skipped, and fragments both
+    ways (1,448-byte pieces up to 4,000 bytes, put back together with the IPv4
+    reassembler). The `net` interface's `SEND6`, `RECV6`, `TCP_CONNECT6`,
+    `TCP_PEER` and `INFO6` take and give 16-byte addresses in the lent page;
+    the IPv4 calls go on unchanged.
   `cargo xtask net-test` boots `boot/net.manifest` on QEMU's user-mode network, set
   to 10.0.3.0/24 rather than QEMU's default so nothing can assume an address, while
   xtask echoes UDP on the host. The server must lease 10.0.3.30/24 via 10.0.3.2
@@ -447,7 +467,13 @@ holds the rest):
   the injector must have killed components at least 10 times meanwhile. A run
   does about 1,000 to 3,000 pings, 2,000 to 3,800 echoes, 1,500 to 2,000 names and
   some 300 TCP connections (about 1.3 MB, some 20 of them cut) through some 30 to
-  60 kills of each.
+  60 kills of each. Then IPv6, under the same faults: the server must have its
+  link-local address, fd00:3::5054:ff:fe12:3456/64 via the router and DNS
+  server fd00:3::3, each address passing detection once and kept across every
+  restart; pings to the host (fd00:3::2) for at least 2 s; UDP datagrams of 1 to
+  1,452 bytes echoed by the host (on ::1); datagrams of 1,453 to 4,000 bytes sent
+  to the client's own socket in fragments and put back together; and TCP echoes
+  for at least 5 s, every byte right.
   `cargo xtask tcp-test` boots `boot/tcp.manifest`, where the server drops one TCP
   segment in 20 at random each way (a test setting in its `arg`): a connection to
   a closed port of its own is refused (round the loopback: QEMU's user network
@@ -456,8 +482,11 @@ holds the rest):
   port through QEMU's forwarding, each sending 30,000 bytes (more than the
   window, which the client lets fill before reading) that the client checks and
   sends back; and two sockets of the client's own exchange 20,000 bytes each way
-  through the loopback. Segments must have been sent again, dropped and kept out
-  of order.
+  through the loopback. Then over IPv6: a closed port of its own refused,
+  50,000 bytes echoed by the host, and a pair of its own sockets exchanging
+  20,000 bytes each way, the accepted end giving its peer's IPv6 address. (QEMU
+  forwards only IPv4 connections in from the host.) Segments must have been sent
+  again, dropped and kept out of order.
 - USB: an xHCI host controller driver (`user/xhci/`) and a HID keyboard driver
   (`user/hid/`).
   - The xHCI driver opens the first function of class 0c:03:30, resets the controller,
@@ -524,7 +553,7 @@ these buses have none); more than one command per queue in the NVMe driver,
 more than two commands in flight per disk in the AHCI driver, ATAPI
 and port multipliers; in the xHCI driver isochronous and bulk endpoints, USB 3 streams,
 hubs and more than one interrupter, and HID devices other than boot keyboards; in the network server
-TCP window scaling, timestamps and SACK, more than six TCP connections, IPv6, datagrams over 4,000 bytes, DNS records other than A and CNAME (and DNS over TCP), routes beyond one gateway, and rings in place of a
+TCP window scaling, timestamps and SACK, more than six TCP connections, IPv6 routes beyond one router and stateful DHCPv6, datagrams over 4,000 bytes, DNS records other than A and CNAME (and DNS over TCP), routes beyond one gateway, and rings in place of a
 call per frame; buses behind bridges; the async executor, buffer pools and
 power callbacks of the SDK; an IDL compiler for the interfaces; escalating a component
 given up on to a supervisor above it (today the
@@ -545,7 +574,7 @@ https://claude.ai/artifact/QKJS8qH5Dfbjzn58RStq1j
 | `kernel/` | The microkernel (`no_std`, targets `x86_64-unknown-none` and `aarch64-unknown-none-softfloat`) |
 | `kernel/src/arch/` | Per-ISA code: boot, exceptions and system call entry, page tables, interrupts, timer, console (`x86_64/`, `aarch64/`) |
 | `crates/sys/` | User-side system call wrappers for both ISAs (one ABI by register position), and the seL4 runtime (`src/sel4.rs`) |
-| `crates/inet/` | Protocol pieces of the network server, unit-tested on the host: IPv4 fragment reassembly and TCP |
+| `crates/inet/` | Protocol pieces of the network server, unit-tested on the host: IP fragment reassembly, checksums over both families, and TCP |
 | `crates/objects/` | Pure kernel logic, unit-tested on the host: capabilities and CNodes, untyped memory, the IPC and scheduling state machine, the syscall ABI, an ELF reader, the boot bundle and manifest formats |
 | `user/pingpong/` | Boot self-test program (IPC server, client and spinner) |
 | `user/cm/` | The Component Manager: the root task, which starts every component from the boot manifest |

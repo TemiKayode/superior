@@ -1724,6 +1724,8 @@ fn net_call(m: [u64; 4]) -> Option<[u64; 4]> {
 struct Sock {
     udp: bool,
     handle: u64,
+    /// Its port (UDP) or echo identifier.
+    port: u16,
     /// Bound again after the server lost the socket (it was restarted).
     rebinds: u64,
     /// Requests sent again after no answer came in time.
@@ -1735,6 +1737,7 @@ impl Sock {
         let mut s = Sock {
             udp,
             handle: 0,
+            port: 0,
             rebinds: 0,
             resent: 0,
         };
@@ -1756,6 +1759,7 @@ impl Sock {
             let r = syscall_x(Syscall::Call, NET, [op, 0, 0, 0], x);
             if r.status == 0 && r.msg[0] == OK && r.cap == Some(NET_NTFN as u16) {
                 self.handle = r.msg[1];
+                self.port = r.msg[2] as u16;
                 return true;
             }
             syscall(Syscall::Yield, 0, [0; 4]);
@@ -1825,6 +1829,71 @@ impl Sock {
         false
     }
 
+    /// As `exchange`, over IPv6 (`SEND6` and `RECV6`): to `to`:`port`
+    /// (for ICMP echo, `port` is the sequence number; with `to_self`, the
+    /// socket's own port, whatever it is after a rebind). `fill` writes
+    /// the payload, and `matches` gets an answer's length, payload,
+    /// sender and port.
+    fn exchange6(
+        &mut self,
+        to: u128,
+        port: u16,
+        to_self: bool,
+        len: u64,
+        fill: impl Fn(&mut [u8]),
+        matches: impl Fn(u64, &[u8], u128, u16) -> bool,
+    ) -> bool {
+        let mut tries = 0;
+        'send: while tries < NET_TRIES {
+            tries += 1;
+            if tries > 1 {
+                self.resent += 1;
+            }
+            let port = if to_self { self.port } else { port };
+            net_page()[..16].copy_from_slice(&to.to_be_bytes());
+            fill(&mut net_page()[16..]);
+            match net_call([net::SEND6, self.handle, port as u64, len]) {
+                Some(r) if r[0] == OK => {}
+                Some(r) if r[0] == Status::NotFound as u64 => {
+                    self.rebind();
+                    continue;
+                }
+                _ => {
+                    self.rebind_if_lost();
+                    continue;
+                }
+            }
+            let deadline = ticks() + NET_TIMEOUT;
+            loop {
+                loop {
+                    match net_call([net::RECV6, self.handle, 0, 0]) {
+                        Some(r) if r[0] == OK => {
+                            let p = net_page();
+                            if matches(r[1], &p[16..16 + r[1] as usize], page_addr(0), r[2] as u16) {
+                                return true;
+                            }
+                        }
+                        Some(r) if r[0] == Status::Empty as u64 => break,
+                        _ => {
+                            self.rebind_if_lost();
+                            continue 'send;
+                        }
+                    }
+                }
+                let now = ticks();
+                if now >= deadline {
+                    continue 'send;
+                }
+                syscall(Syscall::TimerSignal, NET_NTFN, [deadline - now, 0, 0, 0]);
+                if syscall(Syscall::Wait, NET_NTFN, [0; 4]).status != 0 {
+                    self.rebind();
+                    continue 'send;
+                }
+            }
+        }
+        false
+    }
+
     fn rebind(&mut self) {
         self.rebinds += 1;
         self.bind();
@@ -1862,6 +1931,89 @@ const TCP_TICKS: u64 = 500;
 const TCP_LIMIT: u64 = 4000;
 /// Ticks an echo may go without progress before it is given up as stuck.
 const TCP_STUCK: u64 = 3000;
+
+/// Where a connection goes: an address word (IPv4), or an IPv6 address
+/// and port.
+#[derive(Clone, Copy)]
+enum Dest {
+    V4(u64),
+    V6(u128, u16),
+}
+
+impl Dest {
+    fn port(self, port: u16) -> Dest {
+        match self {
+            Dest::V4(w) => Dest::V4(w & !0xffff | port as u64),
+            Dest::V6(a, _) => Dest::V6(a, port),
+        }
+    }
+}
+
+/// The 16-byte address at `at` in the page.
+fn page_addr(at: usize) -> u128 {
+    let mut b = [0u8; 16];
+    b.copy_from_slice(&net_page()[at..at + 16]);
+    u128::from_be_bytes(b)
+}
+
+/// QEMU's IPv6 network (xtask's `ipv6-net=fd00:3::/64`): the host is ::2
+/// on it and the DNS server ::3; this host makes its address from the
+/// prefix and its MAC (52:54:00:12:34:56) as a modified EUI-64.
+const GW6: u128 = 0xfd00_0003_0000_0000_0000_0000_0000_0002;
+const DNS6: u128 = 0xfd00_0003_0000_0000_0000_0000_0000_0003;
+const HOST6: u128 = 0xfd00_0003_0000_0000_5054_00ff_fe12_3456;
+const LINK_LOCAL6: u128 = 0xfe80_0000_0000_0000_5054_00ff_fe12_3456;
+
+/// An IPv6 address, in RFC 5952's short form.
+struct Six(u128);
+
+impl core::fmt::Display for Six {
+    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+        let g: [u16; 8] = core::array::from_fn(|i| (self.0 >> (112 - 16 * i)) as u16);
+        let (mut best, mut len) = (8, 1);
+        let mut i = 0;
+        while i < 8 {
+            let n = g[i..].iter().take_while(|&&x| x == 0).count();
+            if n > len {
+                (best, len) = (i, n);
+            }
+            i += n.max(1);
+        }
+        let mut i = 0;
+        while i < 8 {
+            if i == best {
+                f.write_str("::")?;
+                i += len;
+                continue;
+            }
+            if i > 0 && i != best + len {
+                f.write_str(":")?;
+            }
+            write!(f, "{:x}", g[i])?;
+            i += 1;
+        }
+        Ok(())
+    }
+}
+
+/// `INFO6`, asked until the server has a global address and a DNS
+/// server, or `wait` ticks
+/// pass: [link-local, global, router, DNS] and the reply.
+fn info6(wait: u64) -> Option<([u128; 4], [u64; 4])> {
+    let start = ticks();
+    loop {
+        if let Some(r) = net_call([net::INFO6, net::VERSION, 0, 0]) {
+            // With the DNS server too (it may come later, by DHCPv6).
+            if r[0] == OK && page_addr(48) != 0 {
+                return Some((core::array::from_fn(|k| page_addr(16 * k)), r));
+            }
+        }
+        if ticks() > start + wait {
+            return None;
+        }
+        pause(2);
+    }
+}
 
 /// Why a connection ended early.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1913,6 +2065,34 @@ impl Stream {
     fn connect(to: u64, ntfn: u64) -> Result<Stream, Cut> {
         let r = Stream::granting(net::TCP_CONNECT, to, ntfn)?;
         Ok(Stream { h: r[1], ntfn })
+    }
+
+    /// A connection to `d`, over either family.
+    fn connect_to(d: Dest, ntfn: u64) -> Result<Stream, Cut> {
+        let (a, port) = match d {
+            Dest::V4(w) => return Stream::connect(w, ntfn),
+            Dest::V6(a, port) => (a, port),
+        };
+        syscall(Syscall::CapDelete, ntfn, [0; 4]);
+        net_page()[..16].copy_from_slice(&a.to_be_bytes());
+        let x = CapTransfer {
+            grant: Some(NET_PAGE as u16),
+            accept: Some(ntfn as u16),
+        };
+        let r = syscall_x(Syscall::Call, NET, [net::TCP_CONNECT6, port as u64, 0, 0], x);
+        if r.status != 0 {
+            return Err(Cut::Lost);
+        }
+        if r.msg[0] != OK {
+            return Err(Cut::Status(r.msg[0]));
+        }
+        Ok(Stream { h: r.msg[1], ntfn })
+    }
+
+    /// The peer's address and family (`TCP_PEER`).
+    fn peer(&self) -> Option<(u128, u64)> {
+        let r = net_call([net::TCP_PEER, self.h, 0, 0])?;
+        (r[0] == OK).then(|| (page_addr(0), r[2]))
     }
 
     /// Waits for the notification, `ticks` at most.
@@ -2004,19 +2184,123 @@ impl Stream {
     }
 }
 
+/// IPv6 in the network test, under fault injection: the addresses from
+/// the router's advertisement, pings to the host, UDP echoes (up to what
+/// one frame holds: QEMU does not reassemble IPv6), datagrams of up to
+/// 4,000 bytes to the socket itself (in fragments, round the loopback),
+/// and TCP echoes.
+fn ipv6_checks(t: &mut Checks) {
+    let (a, r) = info6(3000).unwrap_or(([0; 4], [0; 4]));
+    t.check(
+        a[0] == LINK_LOCAL6 && a[1] == HOST6 && a[2] >> 112 == 0xfe80 && a[3] == DNS6 && r[1] == 64,
+        format_args!(
+            "IPv6: this host is {}/{}, the router {}, DNS {}, link-local {}",
+            Six(a[1]),
+            r[1],
+            Six(a[2]),
+            Six(a[3]),
+            Six(a[0])
+        ),
+    );
+    let (mut answered, mut pings, mut stats) = (0, 0, (0, 0));
+    if let Some(mut s) = Sock::new(false) {
+        let start = ticks();
+        while pings < PINGS || ticks() < start + PING_TICKS {
+            let seq = pings;
+            pings += 1;
+            let ok = s.exchange6(
+                GW6,
+                seq as u16,
+                false,
+                56,
+                |b| {
+                    for (j, x) in b[..56].iter_mut().enumerate() {
+                        *x = echo_byte(seq, j as u64);
+                    }
+                },
+                |len, b, from, port| {
+                    from == GW6
+                        && port == seq as u16
+                        && len == 56
+                        && b.iter().enumerate().all(|(j, &x)| x == echo_byte(seq, j as u64))
+                },
+            );
+            answered += ok as u64;
+        }
+        stats = (s.resent, s.rebinds);
+    }
+    t.check(
+        answered == pings && pings >= PINGS,
+        format_args!(
+            "{answered} of {pings} pings to {} over IPv6 answered, every byte right ({} sent again, {} sockets bound again)",
+            Six(GW6),
+            stats.0,
+            stats.1
+        ),
+    );
+    // UDP to the host's echo, and to the socket itself in fragments.
+    for (to_self, label) in [(false, 0), (true, 1)] {
+        let (mut ok, mut n, mut stats) = (0, 0, (0, 0));
+        let (want, lasting) = if to_self { (20, 0) } else { (ECHOES / 2, ECHO_TICKS / 2) };
+        if let Some(mut s) = Sock::new(true) {
+            let start = ticks();
+            while n < want || ticks() < start + lasting {
+                let k = n;
+                n += 1;
+                let len = if to_self { 1453 + k * 641 % 2548 } else { 1 + k * 97 % 1452 };
+                let to = if to_self { HOST6 } else { GW6 };
+                let got = s.exchange6(
+                    to,
+                    ECHO_PORT,
+                    to_self,
+                    len,
+                    |b| {
+                        for j in 0..len {
+                            b[j as usize] = echo_at(k, j);
+                        }
+                    },
+                    |m, b, from, _| {
+                        from == to && m == len && b.iter().enumerate().all(|(j, &x)| x == echo_at(k, j as u64))
+                    },
+                );
+                ok += got as u64;
+            }
+            stats = (s.resent, s.rebinds);
+        }
+        if label == 0 {
+            t.check(
+                ok == n && n >= want,
+                format_args!(
+                    "{ok} of {n} UDP datagrams of 1 to 1452 bytes over IPv6 echoed by the host, every byte right ({} sent again, {} sockets bound again)",
+                    stats.0, stats.1
+                ),
+            );
+        } else {
+            t.check(
+                ok == n && n >= want,
+                format_args!(
+                    "{ok} of {n} UDP datagrams of 1453 to 4000 bytes sent to itself over IPv6, in fragments, every byte right ({} sent again)",
+                    stats.0
+                ),
+            );
+        }
+    }
+    tcp_under_faults(t, Dest::V6(GW6, TCP_ECHO_PORT));
+}
+
 /// TCP connections to the host's echo while the injector kills the
 /// server and the driver: each sends up to 8,000 bytes and reads them
 /// back. A connection a restart cuts is made again; no byte may come back
 /// wrong.
-fn tcp_under_faults(t: &mut Checks, gw: u64) {
-    let to = gw | TCP_ECHO_PORT as u64;
+fn tcp_under_faults(t: &mut Checks, to: Dest) {
+    let six = matches!(to, Dest::V6(..));
     let (mut done, mut cut, mut wrong, mut k) = (0u64, 0u64, 0u64, 0u64);
     let mut bytes = 0;
     let start = ticks();
     while (done < TCP_ECHOES || ticks() < start + TCP_TICKS) && ticks() < start + TCP_LIMIT {
         k += 1;
         let len = 1 + k * 1777 % 8000;
-        match Stream::connect(to, NET_NTFN) {
+        match Stream::connect_to(to, NET_NTFN) {
             Ok(s) => {
                 let r = s.echo(k, len);
                 s.close();
@@ -2038,7 +2322,8 @@ fn tcp_under_faults(t: &mut Checks, gw: u64) {
     t.check(
         done >= TCP_ECHOES && wrong == 0,
         format_args!(
-            "{done} TCP connections echoed {bytes} bytes through the host under fault injection, every byte right ({cut} cut by a restart and made again, {wrong} wrong)"
+            "{done} TCP connections{} echoed {bytes} bytes through the host under fault injection, every byte right ({cut} cut by a restart and made again, {wrong} wrong)",
+            if six { " over IPv6" } else { "" }
         ),
     );
 }
@@ -2047,6 +2332,7 @@ fn tcp_under_faults(t: &mut Checks, gw: u64) {
 /// one TCP segment in 20 each way, so retransmission, fast retransmit
 /// and out-of-order arrival all happen.
 const TCP_BULK: u64 = 100_000;
+const TCP_BULK6: u64 = 50_000;
 /// Connections the host makes to the listening port, and the bytes each
 /// sends (more than the server's 8 KiB window, so it shuts).
 const TCP_INBOUND: u64 = 3;
@@ -2057,13 +2343,13 @@ const LOCAL_BYTES: u64 = 20_000;
 /// Both ends of a connection here, through the loopback: a listener on
 /// `TCP_LISTEN_PORT + 1`, a connection to it, and the accepted end; each
 /// sends `LOCAL_BYTES` (streams 7 and 8) and reads the other's.
-fn local_pair(me: u64) -> bool {
-    let port = TCP_LISTEN_PORT as u64 + 1;
-    let Ok(lr) = Stream::granting(net::TCP_LISTEN, port, LISTEN_NTFN) else {
+fn local_pair(me: Dest) -> bool {
+    let port = TCP_LISTEN_PORT + 1;
+    let Ok(lr) = Stream::granting(net::TCP_LISTEN, port as u64, LISTEN_NTFN) else {
         return false;
     };
     let l = Stream { h: lr[1], ntfn: LISTEN_NTFN };
-    let Ok(a) = Stream::connect(me | port, NET_NTFN) else {
+    let Ok(a) = Stream::connect_to(me.port(port), NET_NTFN) else {
         l.close();
         return false;
     };
@@ -2080,9 +2366,14 @@ fn local_pair(me: u64) -> bool {
         a.close();
         return false;
     };
+    // The accepted end knows its peer, in the right family.
+    let peer = b.peer();
+    let mut right = match me {
+        Dest::V4(_) => peer.is_some_and(|p| p.1 == 4),
+        Dest::V6(addr, _) => peer == Some((addr, 6)),
+    };
     // [sent, received, ended] for each end.
     let mut st = [[0u64; 3]; 2];
-    let mut right = true;
     let start = ticks();
     while ticks() < start + 2000 && !(st[0][2] == 1 && st[1][2] == 1) {
         let mut moved = false;
@@ -2298,7 +2589,39 @@ fn tcp_client() -> ! {
             "{served} connections from the host accepted, {total} bytes checked and echoed back, every byte right"
         ),
     );
-    t.check(local_pair(info[1]), format_args!("a connection between two sockets of this host's carried {LOCAL_BYTES} bytes each way, every byte right"));
+    t.check(local_pair(Dest::V4(info[1])), format_args!("a connection between two sockets of this host's carried {LOCAL_BYTES} bytes each way, every byte right"));
+    // IPv6: a closed port, a bulk echo through the lossy server, a local
+    // pair.
+    let have6 = info6(1000).is_some();
+    let refused6 = Stream::connect_to(Dest::V6(HOST6, TCP_CLOSED_PORT), NET_NTFN).and_then(|s| {
+        let mut r = Ok(None);
+        for _ in 0..50 {
+            r = s.recv();
+            if r != Ok(None) {
+                break;
+            }
+            let _ = s.wait(20);
+        }
+        s.close();
+        r
+    });
+    t.check(
+        have6 && refused6 == Err(Cut::Status(Status::Refused as u64)),
+        format_args!("over IPv6, a connection to a closed port of this host's is refused"),
+    );
+    let bulk6 = Stream::connect_to(Dest::V6(GW6, TCP_ECHO_PORT), NET_NTFN).and_then(|s| {
+        let r = s.echo(2, TCP_BULK6);
+        s.close();
+        r
+    });
+    t.check(
+        bulk6 == Ok(true),
+        format_args!("over IPv6, {TCP_BULK6} bytes echoed by the host with one segment in 20 dropped each way, every byte right"),
+    );
+    t.check(
+        local_pair(Dest::V6(HOST6, 0)),
+        format_args!("over IPv6, a connection between two sockets of this host's carried {LOCAL_BYTES} bytes each way, every byte right, the accepted end's peer {} over IPv6", Six(HOST6)),
+    );
     let s = syscall(Syscall::Call, NET, [net::TCP_STATS, net::VERSION, 0, 0]).msg;
     t.check(
         s[0] == OK && s[1] > 0 && s[2] > 0 && s[3] > 0,
@@ -2578,7 +2901,8 @@ fn net_client() -> ! {
         ),
     );
     dns_checks(&mut t);
-    tcp_under_faults(&mut t, gw);
+    tcp_under_faults(&mut t, Dest::V4(gw | TCP_ECHO_PORT as u64));
+    ipv6_checks(&mut t);
     syscall(Syscall::Call, NET_CONTROL, [OP_SHUTDOWN, t.0, 0, 0]);
     loop {
         syscall(Syscall::Yield, 0, [0; 4]);

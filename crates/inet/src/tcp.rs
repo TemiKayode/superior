@@ -24,9 +24,10 @@ pub const RST: u8 = 0x04;
 pub const PSH: u8 = 0x08;
 pub const ACK: u8 = 0x10;
 
-/// The largest segment sent: a 1500-byte IPv4 packet's payload less the
-/// headers.
+/// The largest segment sent over IPv4: a 1500-byte packet's payload less
+/// the headers; and over IPv6, whose header is 20 bytes longer.
 pub const MSS: u32 = 1460;
+pub const MSS6: u32 = 1440;
 /// The MSS assumed when the peer gives none (RFC 9293).
 const DEFAULT_MSS: u32 = 536;
 /// Retransmission timeouts: the first (1 s), the least and the most.
@@ -91,34 +92,12 @@ pub struct Header {
     pub mss: Option<u16>,
 }
 
-/// The Internet checksum's running sum of `b` (RFC 1071).
-fn sum(mut acc: u32, b: &[u8]) -> u32 {
-    for pair in b.chunks(2) {
-        acc += (pair[0] as u32) << 8 | pair.get(1).copied().unwrap_or(0) as u32;
-    }
-    acc
-}
-
-fn fold(mut acc: u32) -> u16 {
-    while acc >> 16 != 0 {
-        acc = (acc & 0xffff) + (acc >> 16);
-    }
-    !(acc as u16)
-}
-
-fn pseudo(src: u32, dst: u32, len: usize) -> u32 {
-    let mut b = [0u8; 12];
-    b[0..4].copy_from_slice(&src.to_be_bytes());
-    b[4..8].copy_from_slice(&dst.to_be_bytes());
-    b[9] = 6;
-    b[10..12].copy_from_slice(&(len as u16).to_be_bytes());
-    sum(0, &b)
-}
+use crate::{fold, pseudo, sum};
 
 /// The header and payload of segment `b`, which came from `src` to `dst`;
 /// `None` if it is malformed or its checksum is wrong.
-pub fn parse(b: &[u8], src: u32, dst: u32) -> Option<(Header, &[u8])> {
-    if b.len() < 20 || fold(sum(pseudo(src, dst, b.len()), b)) != 0 {
+pub fn parse(b: &[u8], src: u128, dst: u128) -> Option<(Header, &[u8])> {
+    if b.len() < 20 || fold(sum(pseudo(src, dst, 6, b.len()), b)) != 0 {
         return None;
     }
     let off = (b[12] >> 4) as usize * 4;
@@ -158,7 +137,7 @@ pub fn parse(b: &[u8], src: u32, dst: u32) -> Option<(Header, &[u8])> {
 
 /// Writes segment `h` with payload `a` then `b` into `out`, from `src` to
 /// `dst`, checksum and all; returns its length.
-pub fn encode(out: &mut [u8], src: u32, dst: u32, h: &Header, a: &[u8], b: &[u8]) -> usize {
+pub fn encode(out: &mut [u8], src: u128, dst: u128, h: &Header, a: &[u8], b: &[u8]) -> usize {
     let hl = if h.mss.is_some() { 24 } else { 20 };
     let len = hl + a.len() + b.len();
     let s = &mut out[..len];
@@ -177,7 +156,7 @@ pub fn encode(out: &mut [u8], src: u32, dst: u32, h: &Header, a: &[u8], b: &[u8]
     }
     s[hl..hl + a.len()].copy_from_slice(a);
     s[hl + a.len()..].copy_from_slice(b);
-    let c = fold(sum(pseudo(src, dst, len), s));
+    let c = fold(sum(pseudo(src, dst, 6, len), s));
     s[16..18].copy_from_slice(&c.to_be_bytes());
     len
 }
@@ -254,7 +233,8 @@ pub struct Tcb {
     pub state: State,
     pub error: Option<Error>,
     pub local_port: u16,
-    pub remote: u32,
+    /// The peer's address (an IPv4 one as in [`crate::mapped`]).
+    pub remote: u128,
     pub remote_port: u16,
     /// Something the owner may want to know happened: data or room
     /// arrived, the state changed. The caller clears it.
@@ -262,6 +242,8 @@ pub struct Tcb {
     pub stats: Stats,
     tx_size: u32,
     rx_size: u32,
+    /// The largest segment this side takes and sends.
+    max_seg: u32,
     iss: u32,
     snd_una: u32,
     snd_nxt: u32,
@@ -303,7 +285,7 @@ pub struct Tcb {
 }
 
 impl Tcb {
-    fn new(iss: u32, local_port: u16, remote: u32, remote_port: u16, tx_size: usize, rx_size: usize) -> Tcb {
+    fn new(iss: u32, local_port: u16, remote: u128, remote_port: u16, tx_size: usize, rx_size: usize) -> Tcb {
         assert!(tx_size.is_power_of_two() && rx_size.is_power_of_two() && rx_size <= 65536);
         Tcb {
             state: State::Closed,
@@ -315,6 +297,7 @@ impl Tcb {
             stats: Stats::default(),
             tx_size: tx_size as u32,
             rx_size: rx_size as u32,
+            max_seg: if crate::ipv4(remote).is_some() { MSS } else { MSS6 },
             iss,
             snd_una: iss,
             snd_nxt: iss,
@@ -349,8 +332,8 @@ impl Tcb {
     }
 
     /// An active open to `remote`:`remote_port`; the SYN goes with the
-    /// next [`Tcb::output`].
-    pub fn connect(iss: u32, local_port: u16, remote: u32, remote_port: u16, tx_size: usize, rx_size: usize) -> Tcb {
+    /// next [`Tcb::output`]. Segments are sized for `remote`'s family.
+    pub fn connect(iss: u32, local_port: u16, remote: u128, remote_port: u16, tx_size: usize, rx_size: usize) -> Tcb {
         let mut t = Tcb::new(iss, local_port, remote, remote_port, tx_size, rx_size);
         t.state = State::SynSent;
         t
@@ -358,7 +341,7 @@ impl Tcb {
 
     /// A passive open: the connection SYN `syn` from `remote` asks for, to
     /// a port listened on. The SYN-ACK goes with the next output.
-    pub fn accept(iss: u32, remote: u32, syn: &Header, tx_size: usize, rx_size: usize) -> Tcb {
+    pub fn accept(iss: u32, remote: u128, syn: &Header, tx_size: usize, rx_size: usize) -> Tcb {
         let mut t = Tcb::new(iss, syn.dst_port, remote, syn.src_port, tx_size, rx_size);
         t.state = State::SynReceived;
         t.synchronize(syn);
@@ -369,7 +352,7 @@ impl Tcb {
     fn synchronize(&mut self, syn: &Header) {
         self.rcv_nxt = syn.seq.wrapping_add(1);
         self.rcv_read = self.rcv_nxt;
-        self.mss = syn.mss.map_or(DEFAULT_MSS, |m| (m as u32).clamp(64, MSS));
+        self.mss = syn.mss.map_or(DEFAULT_MSS, |m| (m as u32).clamp(64, self.max_seg));
         self.cwnd = 4 * self.mss;
         self.snd_wnd = syn.window as u32;
         self.snd_wl1 = syn.seq;
@@ -895,7 +878,7 @@ impl Tcb {
                 if self.snd_nxt == self.iss || resend {
                     let flags = if self.state == State::SynSent { SYN } else { SYN | ACK };
                     let mut h = self.header(self.iss, flags);
-                    h.mss = Some(MSS as u16);
+                    h.mss = Some(self.max_seg as u16);
                     emit(&h, &[], &[]);
                     if self.snd_max == self.iss {
                         self.timing = Some((self.iss.wrapping_add(1), now));
@@ -998,8 +981,11 @@ mod tests {
     use std::vec;
     use std::vec::Vec;
 
-    const A: u32 = 0x0a00_0001;
-    const B: u32 = 0x0a00_0002;
+    const A: u128 = crate::mapped(0x0a00_0001);
+    const B: u128 = crate::mapped(0x0a00_0002);
+    /// Two IPv6 hosts, for the tests over IPv6.
+    const A6: u128 = 0xfd00_0003_0000_0000_0000_0000_0000_0001;
+    const B6: u128 = 0xfd00_0003_0000_0000_0000_0000_0000_0002;
 
     /// A tiny deterministic generator.
     struct Rng(u64);
@@ -1030,6 +1016,10 @@ mod tests {
         jitter: u64,
         q: Vec<Packet>,
         sent: u64,
+        /// A's address and B's.
+        addrs: (u128, u128),
+        /// The longest segment sent.
+        biggest: usize,
     }
 
     impl Link {
@@ -1041,15 +1031,19 @@ mod tests {
                 jitter,
                 q: Vec::new(),
                 sent: 0,
+                addrs: (A, B),
+                biggest: 0,
             }
         }
 
         fn send(&mut self, now: u64, to_b: bool, h: &Header, a: &[u8], c: &[u8]) {
-            let (src, dst) = if to_b { (A, B) } else { (B, A) };
+            let (x, y) = self.addrs;
+            let (src, dst) = if to_b { (x, y) } else { (y, x) };
             let mut buf = vec![0u8; 24 + a.len() + c.len()];
             let n = encode(&mut buf, src, dst, h, a, c);
             buf.truncate(n);
             self.sent += 1;
+            self.biggest = self.biggest.max(n);
             if self.rng.chance(self.loss) {
                 return;
             }
@@ -1133,7 +1127,8 @@ mod tests {
     fn run(a: &mut End, b: &mut End, link: &mut Link, limit: u64) -> u64 {
         for now in 0..limit {
             for p in link.due(now) {
-                let (dst, src, end) = if p.to_b { (B, A, &mut *b) } else { (A, B, &mut *a) };
+                let (x, y) = link.addrs;
+                let (dst, src, end) = if p.to_b { (y, x, &mut *b) } else { (x, y, &mut *a) };
                 let (h, data) = parse(&p.bytes, src, dst).expect("a good checksum");
                 let mut bufs = Bufs {
                     tx: &mut end.tx,
@@ -1229,6 +1224,29 @@ mod tests {
             let s = ta.stats;
             assert!(s.retransmitted > 0 && tb.stats.out_of_order > 0, "seed {seed}: {s:?}");
         }
+    }
+
+    #[test]
+    fn over_ipv6_with_its_smaller_segments() {
+        let size = 8192;
+        let mut a = End::new(size, pattern(60_000, 11));
+        let mut b = End::new(size, pattern(30_000, 12));
+        a.tcb = Some(Tcb::connect(77, 40000, B6, 80, size, size));
+        b.listening = Some(80);
+        let mut link = Link::new(21, 5, 2, 4);
+        link.addrs = (A6, B6);
+        let t = run(&mut a, &mut b, &mut link, 100_000);
+        assert!(t < 100_000);
+        assert!(b.got == a.out && a.got == b.out);
+        let ta = a.tcb.unwrap();
+        assert_eq!((ta.mss, ta.remote), (MSS6, B6));
+        // A checksum over IPv6's pseudo-header fails over IPv4's.
+        let h = Header { flags: ACK, ..Header::default() };
+        let mut buf = [0u8; 64];
+        let n = encode(&mut buf, A6, B6, &h, b"x", &[]);
+        assert!(parse(&buf[..n], A6, B6).is_some());
+        assert!(parse(&buf[..n], A, B).is_none());
+        assert_eq!(link.biggest, 20 + MSS6 as usize);
     }
 
     #[test]

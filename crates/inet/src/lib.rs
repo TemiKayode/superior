@@ -1,24 +1,74 @@
 //! Internet protocol pieces for the network server (`user/net`), kept
-//! apart so host tests can check them: IPv4 fragment reassembly and TCP
-//! ([`tcp`]).
+//! apart so host tests can check them: fragment reassembly (IPv4's and
+//! IPv6's), checksums, and TCP ([`tcp`]). Addresses are 128 bits, IPv4
+//! ones mapped into IPv6 ([`mapped`]).
 
 #![no_std]
 
 pub mod tcp;
+
+/// IPv4 address `ip` as the server keeps every address: an IPv4-mapped
+/// IPv6 address, `::ffff:a.b.c.d` (RFC 4291).
+pub const fn mapped(ip: u32) -> u128 {
+    0xffff_0000_0000 | ip as u128
+}
+
+/// The IPv4 address in `a`, if it is one (as in [`mapped`]).
+pub const fn ipv4(a: u128) -> Option<u32> {
+    if a >> 32 == 0xffff { Some(a as u32) } else { None }
+}
+
+/// The Internet checksum's running sum of `b` (RFC 1071); `b` must start
+/// at an even offset of what is summed.
+pub fn sum(mut acc: u32, b: &[u8]) -> u32 {
+    for pair in b.chunks(2) {
+        acc = acc.wrapping_add((pair[0] as u32) << 8 | pair.get(1).copied().unwrap_or(0) as u32);
+    }
+    acc
+}
+
+/// The checksum from a running sum: folded and complemented.
+pub fn fold(mut acc: u32) -> u16 {
+    while acc >> 16 != 0 {
+        acc = (acc & 0xffff) + (acc >> 16);
+    }
+    !(acc as u16)
+}
+
+/// The sum of the pseudo-header that UDP, TCP and ICMPv6 checksums cover:
+/// IPv4's (RFC 768) when both addresses are IPv4, else IPv6's (RFC 8200
+/// 8.1).
+pub fn pseudo(src: u128, dst: u128, proto: u8, len: usize) -> u32 {
+    if let (Some(s), Some(d)) = (ipv4(src), ipv4(dst)) {
+        let mut b = [0u8; 12];
+        b[0..4].copy_from_slice(&s.to_be_bytes());
+        b[4..8].copy_from_slice(&d.to_be_bytes());
+        b[9] = proto;
+        b[10..12].copy_from_slice(&(len as u16).to_be_bytes());
+        return sum(0, &b);
+    }
+    let mut b = [0u8; 40];
+    b[0..16].copy_from_slice(&src.to_be_bytes());
+    b[16..32].copy_from_slice(&dst.to_be_bytes());
+    b[32..36].copy_from_slice(&(len as u32).to_be_bytes());
+    b[39] = proto;
+    sum(0, &b)
+}
 
 /// The largest IP payload reassembled (a UDP datagram of up to 4000 bytes
 /// with its header, rounded up to whole 8-byte units).
 pub const MAX_REASSEMBLED: usize = 4008;
 const UNITS: usize = MAX_REASSEMBLED.div_ceil(8);
 
-/// What identifies one datagram's fragments (RFC 791): source,
-/// destination, protocol and identification.
+/// What identifies one datagram's fragments (RFC 791, RFC 8200): source,
+/// destination (as in [`mapped`] for IPv4), protocol and identification.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Key {
-    pub src: u32,
-    pub dst: u32,
+    pub src: u128,
+    pub dst: u128,
     pub proto: u8,
-    pub id: u16,
+    /// The identification: 16 bits in IPv4, 32 in IPv6's fragment header.
+    pub id: u32,
 }
 
 #[derive(Clone, Copy)]

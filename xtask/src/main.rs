@@ -652,8 +652,11 @@ fn qemu_command(img: &Image) -> Command {
         // Modern virtio only, its DMA through the IOMMU.
         q.args([
             "-netdev",
-            // The TCP test's host connects in through 47004.
-            "user,id=n0,net=10.0.3.0/24,dhcpstart=10.0.3.30,hostfwd=tcp:127.0.0.1:47004-:8080",
+            // IPv6 on fd00:3::/64 (the host fd00:3::2, DNS fd00:3::3; the
+            // guest makes fd00:3::5054:ff:fe12:3456 from its MAC). The TCP
+            // test's host connects in through 47004 (QEMU forwards IPv4
+            // only).
+            "user,id=n0,net=10.0.3.0/24,dhcpstart=10.0.3.30,ipv6-net=fd00:3::/64,hostfwd=tcp:127.0.0.1:47004-:8080",
             "-device",
             "virtio-net-pci,netdev=n0,disable-legacy=on,iommu_platform=on",
         ]);
@@ -1196,12 +1199,23 @@ fn tcp_echo_server(
     use std::io::Read;
     use std::net::{Shutdown, TcpListener};
     use std::sync::atomic::Ordering;
-    let l = TcpListener::bind(("127.0.0.1", TCP_ECHO_PORT))
-        .map_err(|e| format!("binding the TCP echo port {TCP_ECHO_PORT}: {e}"))?;
-    l.set_nonblocking(true).map_err(|e| e.to_string())?;
+    let mut ls = Vec::new();
+    for host in ["127.0.0.1", "::1"] {
+        let l = TcpListener::bind((host, TCP_ECHO_PORT))
+            .map_err(|e| format!("binding the TCP echo port {TCP_ECHO_PORT} on {host}: {e}"))?;
+        l.set_nonblocking(true).map_err(|e| e.to_string())?;
+        ls.push(l);
+    }
     Ok(std::thread::spawn(move || {
         while !stop.load(Ordering::Relaxed) {
-            match l.accept() {
+            let mut accepted = None;
+            for l in &ls {
+                if let Ok(a) = l.accept() {
+                    accepted = Some(a);
+                    break;
+                }
+            }
+            match accepted.ok_or(()) {
                 Ok((mut s, _)) => {
                     let echoed = echoed.clone();
                     std::thread::spawn(move || {
@@ -1232,7 +1246,8 @@ fn tcp_echo_server(
 }
 
 /// Connects `n` times, one after another, to the guest's listener through
-/// QEMU's forwarding: each sends `len` bytes of stream 1000 + its number,
+/// QEMU's forwarding: each sends `len` bytes of
+/// stream 1000 + its number,
 /// shuts down, and must get them all back. Connections QEMU accepted
 /// before the guest listened come to nothing, and are made again. Returns
 /// the connections echoed right.
@@ -1243,7 +1258,8 @@ fn tcp_inbound(n: u64, len: u64, stop: std::sync::Arc<std::sync::atomic::AtomicB
     let mut done = 0;
     while done < n && !stop.load(Ordering::Relaxed) {
         let k = 1000 + done;
-        let Ok(mut s) = TcpStream::connect(("127.0.0.1", TCP_FORWARD_PORT)) else {
+        let to = ("127.0.0.1", TCP_FORWARD_PORT);
+        let Ok(mut s) = TcpStream::connect(to) else {
             std::thread::sleep(Duration::from_millis(200));
             continue;
         };
@@ -1299,6 +1315,9 @@ fn tcp_test(arch: Arch) -> Result<(), String> {
         "[pass] tcp: listening on port 8080, which a second listener cannot take",
         "[pass] tcp: 3 connections from the host accepted, 90000 bytes checked and echoed back, every byte right",
         "[pass] tcp: a connection between two sockets of this host's carried 20000 bytes each way, every byte right",
+        "[pass] tcp: over IPv6, a connection to a closed port of this host's is refused",
+        "[pass] tcp: over IPv6, 50000 bytes echoed by the host with one segment in 20 dropped each way, every byte right",
+        "[pass] tcp: over IPv6, a connection between two sockets of this host's carried 20000 bytes each way, every byte right, the accepted end's peer",
         "segments sent again,",
         "[cm] client asked to shut down (pass)",
     ];
@@ -1320,16 +1339,19 @@ fn net_test(arch: Arch) -> Result<(), String> {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
     let img = image_with(false, arch, "net")?;
-    let socket = UdpSocket::bind(("127.0.0.1", ECHO_PORT))
-        .map_err(|e| format!("binding the echo port {ECHO_PORT}: {e}"))?;
-    socket
-        .set_read_timeout(Some(Duration::from_millis(200)))
-        .map_err(|e| e.to_string())?;
     let stop = Arc::new(AtomicBool::new(false));
     let echoed = Arc::new(AtomicU64::new(0));
-    let echo = {
+    // UDP echoes over IPv4 and IPv6 (QEMU sends the guest's datagrams to
+    // its gateway to the host's loopback, ::1 for IPv6).
+    let mut echoes = Vec::new();
+    for host in ["127.0.0.1", "::1"] {
+        let socket = UdpSocket::bind((host, ECHO_PORT))
+            .map_err(|e| format!("binding the echo port {ECHO_PORT} on {host}: {e}"))?;
+        socket
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .map_err(|e| e.to_string())?;
         let (stop, echoed) = (stop.clone(), echoed.clone());
-        std::thread::spawn(move || {
+        echoes.push(std::thread::spawn(move || {
             let mut buf = [0u8; 8192];
             while !stop.load(Ordering::Relaxed) {
                 if let Ok((n, from)) = socket.recv_from(&mut buf) {
@@ -1338,8 +1360,8 @@ fn net_test(arch: Arch) -> Result<(), String> {
                     }
                 }
             }
-        })
-    };
+        }));
+    }
     // A DNS server for the resolver, counting the queries for each name.
     let resolver = UdpSocket::bind(("127.0.0.1", DNS_PORT))
         .map_err(|e| format!("binding the DNS port {DNS_PORT}: {e}"))?;
@@ -1366,7 +1388,9 @@ fn net_test(arch: Arch) -> Result<(), String> {
     println!("== network test on {}", img.path.display());
     let out = run_to_exit(&img, Duration::from_secs(180));
     stop.store(true, Ordering::Relaxed);
-    let _ = echo.join();
+    for e in echoes {
+        let _ = e.join();
+    }
     let _ = tcp_echo.join();
     let _ = answering.join();
     let out = out?;
@@ -1390,11 +1414,28 @@ fn net_test(arch: Arch) -> Result<(), String> {
         "names resolved under fault injection, every address right",
         "TCP connections echoed",
         "bytes through the host under fault injection, every byte right",
+        "[pass] net: IPv6: this host is fd00:3::5054:ff:fe12:3456/64, the router fe80::",
+        "pings to fd00:3::2 over IPv6 answered, every byte right",
+        "UDP datagrams of 1 to 1452 bytes over IPv6 echoed by the host, every byte right",
+        "UDP datagrams of 1453 to 4000 bytes sent to itself over IPv6, in fragments, every byte right",
+        "TCP connections over IPv6 echoed",
         "[cm] client asked to shut down (pass)",
     ];
     check_log("network test", &out, &steps)?;
     if !out.contains("net: 10.0.3.2 is at") {
         return Err("network test: the gateway's MAC address was never learned".into());
+    }
+    // IPv6's addresses passed duplicate detection once each, in spite of
+    // the restarts, and were kept after.
+    for line in [
+        "net: IPv6 link-local fe80::5054:ff:fe12:3456",
+        "net: IPv6 address fd00:3::5054:ff:fe12:3456/64 via fe80::",
+        "net: IPv6 kept: fd00:3::5054:ff:fe12:3456/64 via fe80::",
+        "net: IPv6 DNS fd00:3::3 (DHCPv6)",
+    ] {
+        if !out.contains(line) {
+            return Err(format!("network test: missing {line:?}"));
+        }
     }
     let kills = |what: &str| {
         out.matches(&format!("[cm] fault injection: killing {what}\n"))

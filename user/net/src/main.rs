@@ -39,6 +39,9 @@
 //! Packets to this host's own address go round a loopback queue, so a
 //! client may talk to another on the same host.
 //!
+//! IPv6 (`ip6`) runs beside IPv4 on the same sockets and connections:
+//! addresses are 128 bits everywhere, IPv4 ones mapped (`::ffff:a.b.c.d`).
+//!
 //! Datagrams up to `net::MAX_DATAGRAM` bytes go and come in IPv4
 //! fragments: a datagram too big for one frame is sent in 1480-byte
 //! pieces, and fragments that arrive are put back together
@@ -50,7 +53,7 @@
 
 use superior_objects::abi::{CapTransfer, Error, ObjectType, Syscall};
 use superior_inet::tcp::{self, Bufs, Tcb};
-use superior_inet::{Key, MAX_REASSEMBLED, Outcome, Reassembler};
+use superior_inet::{Key, MAX_REASSEMBLED, Outcome, Reassembler, fold, ipv4, mapped, pseudo, sum};
 use superior_objects::interfaces::{Status, net, nic};
 use superior_sys::{USER_BASE, print_line, syscall, syscall_x};
 
@@ -145,7 +148,7 @@ const LINGER: u64 = 3000;
 const LOOPBACK: usize = 4;
 /// Datagrams a socket keeps until they are received.
 const QUEUE: usize = 4;
-const ARP_CACHE: usize = 8;
+const ARP_CACHE: usize = 12;
 const WAITING: usize = 4;
 const MAX_FRAME: usize = nic::MAX_FRAME as usize;
 const MAX_DATAGRAM: usize = net::MAX_DATAGRAM as usize;
@@ -164,6 +167,9 @@ const EPHEMERAL: u16 = 49152;
 macro_rules! say {
     ($($t:tt)*) => { print_line(format_args!("net: {}", format_args!($($t)*))) };
 }
+
+mod ip6;
+use ip6::{ETH_IPV6, Ip6, NH_ICMP6, V6};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
@@ -194,7 +200,8 @@ struct Conn {
 #[derive(Clone, Copy)]
 struct Datagram {
     len: u16,
-    from: u64,
+    from: u128,
+    port: u16,
 }
 
 struct Socket {
@@ -211,7 +218,7 @@ struct Socket {
 #[derive(Clone, Copy)]
 struct Waiting {
     /// The next hop whose MAC address the frame waits for.
-    hop: u32,
+    hop: u128,
     len: u16,
     tries: u8,
     frame: [u8; MAX_FRAME],
@@ -264,7 +271,9 @@ struct Net {
     reassembly: Reassembler<REASSEMBLING>,
     /// The last IPv4 identification used.
     ip_id: u16,
-    arp: [Option<(u32, [u8; 6])>; ARP_CACHE],
+    /// MAC addresses learned from ARP and Neighbor Discovery.
+    arp: [Option<(u128, [u8; 6])>; ARP_CACHE],
+    v6: V6,
     arp_next: usize,
     waiting: [Option<Waiting>; WAITING],
     sockets: [Option<Socket>; SOCKETS],
@@ -285,12 +294,22 @@ struct Net {
     sent: u64,
 }
 
-const EMPTY: Datagram = Datagram { len: 0, from: 0 };
+const EMPTY: Datagram = Datagram {
+    len: 0,
+    from: 0,
+    port: 0,
+};
 
 /// The page holding the bytes of socket `i`'s queue entry `j`: one page
 /// each, made at start, so the image stays small.
 fn queue_page(i: usize, j: usize) -> &'static mut [u8] {
     page(QUEUE_VA + 0x1000 * (i * QUEUE + j) as u64)
+}
+
+/// The address word (`net::addr`) for `a` and `port`: 0 for an IPv6
+/// address, which does not fit (the `*6` calls give those).
+fn word(a: u128, port: u16) -> u64 {
+    ipv4(a).map_or(0, |ip| (ip as u64) << 16 | port as u64)
 }
 
 /// Connection `c`'s rings.
@@ -347,6 +366,7 @@ static mut NET: Net = Net {
     reassembly: Reassembler::new(),
     ip_id: 0,
     arp: [None; ARP_CACHE],
+    v6: V6::new(),
     arp_next: 0,
     waiting: [None; WAITING],
     sockets: [const { None }; SOCKETS],
@@ -407,30 +427,6 @@ fn put32(b: &mut [u8], at: usize, v: u32) {
     b[at..at + 4].copy_from_slice(&v.to_be_bytes());
 }
 
-/// The Internet checksum's running sum of `b` (RFC 1071).
-fn sum(mut acc: u32, b: &[u8]) -> u32 {
-    for pair in b.chunks(2) {
-        acc += (pair[0] as u32) << 8 | pair.get(1).copied().unwrap_or(0) as u32;
-    }
-    acc
-}
-
-fn fold(mut acc: u32) -> u16 {
-    while acc >> 16 != 0 {
-        acc = (acc & 0xffff) + (acc >> 16);
-    }
-    !(acc as u16)
-}
-
-/// The UDP checksum's pseudo-header sum.
-fn pseudo(src: u32, dst: u32, proto: u8, len: usize) -> u32 {
-    let mut b = [0u8; 12];
-    put32(&mut b, 0, src);
-    put32(&mut b, 4, dst);
-    b[9] = proto;
-    put16(&mut b, 10, len as u16);
-    sum(0, &b)
-}
 
 /// Calls the driver, lending `frame`; tries again if it was restarted.
 fn nic_call(m: [u64; 4], frame: u64) -> Option<[u64; 4]> {
@@ -540,7 +536,7 @@ impl Net {
         put16(u, 2, DHCP_SERVER_PORT);
         put16(u, 4, (8 + LEN) as u16);
         put16(u, 6, 0);
-        let c = fold(sum(pseudo(ciaddr, BROADCAST, PROTO_UDP, 8 + LEN), u));
+        let c = fold(sum(pseudo(mapped(ciaddr), mapped(BROADCAST), PROTO_UDP, 8 + LEN), u));
         put16(u, 6, if c == 0 { 0xffff } else { c });
         self.ip_header(ciaddr, BROADCAST, PROTO_UDP, 8 + LEN, 0);
         self.ether([0xff; 6], ETH_IP);
@@ -734,24 +730,20 @@ impl Net {
         }
     }
 
-    fn lookup(&self, ip: u32) -> Option<[u8; 6]> {
+    fn lookup(&self, ip: u128) -> Option<[u8; 6]> {
         self.arp.iter().flatten().find(|e| e.0 == ip).map(|e| e.1)
     }
 
-    fn learn(&mut self, ip: u32, mac: [u8; 6]) {
+    fn learn(&mut self, ip: u128, mac: [u8; 6]) {
         if let Some(e) = self.arp.iter_mut().flatten().find(|e| e.0 == ip) {
             e.1 = mac;
             return;
         }
         self.arp[self.arp_next] = Some((ip, mac));
         self.arp_next = (self.arp_next + 1) % ARP_CACHE;
-        let i = ip.to_be_bytes();
         say!(
-            "{}.{}.{}.{} is at {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-            i[0],
-            i[1],
-            i[2],
-            i[3],
+            "{} is at {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+            Ip6(ip),
             mac[0],
             mac[1],
             mac[2],
@@ -802,7 +794,53 @@ impl Net {
     /// next hop is not yet known waits for the ARP answer. One too big for
     /// a frame goes in fragments, of [`FRAGMENT`] bytes but the last (it is
     /// not held for ARP: it answers `Unreachable` and asks).
-    fn ip_send(&mut self, dst: u32, proto: u8, len: usize) -> Status {
+    fn ip_send(&mut self, dst: u128, proto: u8, len: usize) -> Status {
+        match ipv4(dst) {
+            Some(d) => self.ip4_send(d, proto, len),
+            None => self.ip6_send(dst, proto, len),
+        }
+    }
+
+    /// The source address for a packet to `dst`, if this host has one in
+    /// its family.
+    fn source_for(&self, dst: u128) -> Option<u128> {
+        match ipv4(dst) {
+            Some(_) => self.lease.map(|l| mapped(l.ip)),
+            None => self.source6(dst),
+        }
+    }
+
+    /// Where a payload to `dst` starts on the transmit page: after the
+    /// Ethernet header and IPv4's or IPv6's.
+    fn payload_at(dst: u128) -> usize {
+        if ipv4(dst).is_some() { 34 } else { 54 }
+    }
+
+    /// Holds the frame on the transmit page (`frame` bytes) until `hop`'s
+    /// MAC address is known (dropping the oldest waiting frame if need be).
+    fn wait_for(&mut self, hop: u128, frame: usize) {
+        let slot = (0..WAITING)
+            .find(|&w| self.waiting[w].is_none())
+            .unwrap_or(0);
+        let mut w = Waiting {
+            hop,
+            len: frame as u16,
+            tries: 0,
+            frame: [0; MAX_FRAME],
+        };
+        w.frame[..frame].copy_from_slice(&page(TX_VA)[..frame]);
+        self.waiting[slot] = Some(w);
+    }
+
+    /// Asks for `hop`'s MAC address: ARP, or a neighbour solicitation.
+    fn solicit(&mut self, hop: u128) {
+        match ipv4(hop) {
+            Some(ip) => self.arp_send(1, [0; 6], ip),
+            None => self.ns(hop, false),
+        }
+    }
+
+    fn ip4_send(&mut self, dst: u32, proto: u8, len: usize) -> Status {
         let Some(lease) = self.lease else {
             return Status::Unreachable;
         };
@@ -820,23 +858,12 @@ impl Net {
         let total = 20 + len;
         self.ip_header(lease.ip, dst, proto, len, 0);
         let frame = (14 + total).max(60);
-        if let Some(mac) = self.lookup(hop) {
+        if let Some(mac) = self.lookup(mapped(hop)) {
             self.ether(mac, ETH_IP);
             return self.transmit(frame);
         }
-        // Wait for ARP (dropping the oldest waiting frame if need be).
-        let slot = (0..WAITING)
-            .find(|&w| self.waiting[w].is_none())
-            .unwrap_or(0);
-        let mut w = Waiting {
-            hop,
-            len: frame as u16,
-            tries: 0,
-            frame: [0; MAX_FRAME],
-        };
         self.ether([0; 6], ETH_IP);
-        w.frame[..frame].copy_from_slice(&page(TX_VA)[..frame]);
-        self.waiting[slot] = Some(w);
+        self.wait_for(mapped(hop), frame);
         self.arp_send(1, [0; 6], hop);
         Status::Ok
     }
@@ -851,10 +878,19 @@ impl Net {
             return Status::Ok;
         }
         self.ip_header(ip, ip, proto, len, 0);
+        self.loop_push(total);
+        Status::Ok
+    }
+
+    /// Queues the packet on the transmit page (`total` bytes after the
+    /// Ethernet header) on the loopback; dropped if the queue is full.
+    fn loop_push(&mut self, total: usize) {
+        if self.loop_count == LOOPBACK || total > 4096 {
+            return;
+        }
         let slot = (self.loop_head + self.loop_count) % LOOPBACK;
         page(LOOP_VA + 0x1000 * slot as u64)[..total].copy_from_slice(&page(TX_VA)[14..14 + total]);
         self.loop_count += 1;
-        Status::Ok
     }
 
     /// Handles the packets this host sent itself, and those their answers
@@ -867,8 +903,13 @@ impl Net {
             // The entry stays queued while it is handled, so what it sends
             // goes after it.
             let p = page(LOOP_VA + 0x1000 * self.loop_head as u64);
-            let total = (be16(p, 2) as usize).min(4096);
-            self.ipv4(&p[..total]);
+            if p[0] >> 4 == 6 {
+                let total = (40 + be16(p, 4) as usize).min(4096);
+                self.ipv6(&p[..total]);
+            } else {
+                let total = (be16(p, 2) as usize).min(4096);
+                self.ipv4(&p[..total]);
+            }
             self.loop_head = (self.loop_head + 1) % LOOPBACK;
             self.loop_count -= 1;
         }
@@ -876,7 +917,7 @@ impl Net {
 
     /// Sends the `len`-byte payload on the transmit page in fragments.
     fn fragments(&mut self, src: u32, dst: u32, proto: u8, len: usize, hop: u32) -> Status {
-        let Some(mac) = self.lookup(hop) else {
+        let Some(mac) = self.lookup(mapped(hop)) else {
             self.arp_send(1, [0; 6], hop);
             return Status::Unreachable;
         };
@@ -932,6 +973,7 @@ impl Net {
     /// The timer: DHCP, and ARP requests again for frames still waiting.
     fn tick(&mut self) {
         self.dhcp_tick();
+        self.tick6();
         let now = ticks();
         for c in 0..CONNS {
             let Some(k) = self.conns[c].as_mut() else {
@@ -955,7 +997,7 @@ impl Net {
                 continue;
             }
             self.waiting[w] = Some(f);
-            self.arp_send(1, [0; 6], f.hop);
+            self.solicit(f.hop);
         }
     }
 
@@ -964,10 +1006,12 @@ impl Net {
         if f.len() < 14 {
             return;
         }
-        let to_us = f[0..6] == self.mac || f[0..6] == [0xff; 6];
+        // This host's MAC, broadcast, or IPv6 multicast (33:33:...).
+        let to_us = f[0..6] == self.mac || f[0..6] == [0xff; 6] || f[0..2] == [0x33, 0x33];
         match be16(f, 12) {
             ETH_ARP if f.len() >= 42 => self.arp(&f[14..42]),
             ETH_IP if to_us => self.ipv4(&f[14..]),
+            ETH_IPV6 if to_us => self.ipv6(&f[14..]),
             _ => {}
         }
     }
@@ -981,8 +1025,8 @@ impl Net {
         sha.copy_from_slice(&a[8..14]);
         let (spa, tpa) = (be32(a, 14), be32(a, 24));
         let for_us = tpa != 0 && tpa == self.addr();
-        if for_us || self.lookup(spa).is_some() {
-            self.learn(spa, sha);
+        if for_us || self.lookup(mapped(spa)).is_some() {
+            self.learn(mapped(spa), sha);
         }
         if op == 1 && for_us {
             self.arp_send(2, sha, spa);
@@ -1006,10 +1050,10 @@ impl Net {
         let (more, offset) = (frag & 0x2000 != 0, (frag & 0x1fff) as usize * 8);
         let body = if more || offset != 0 {
             let key = Key {
-                src,
-                dst,
+                src: mapped(src),
+                dst: mapped(dst),
                 proto: p[9],
-                id: be16(p, 4),
+                id: be16(p, 4) as u32,
             };
             // SAFETY: one thread; WHOLE holds this datagram until it has
             // been handled, and nothing else uses it.
@@ -1030,8 +1074,8 @@ impl Net {
         };
         match p[9] {
             PROTO_ICMP if ours => self.icmp(src, body),
-            PROTO_UDP => self.udp(src, dst, body, ours),
-            PROTO_TCP if ours => self.tcp(src, dst, body),
+            PROTO_UDP => self.udp(mapped(src), mapped(dst), body, ours, false),
+            PROTO_TCP if ours => self.tcp(mapped(src), mapped(dst), body),
             _ => {}
         }
     }
@@ -1053,9 +1097,9 @@ impl Net {
                 r[3] = 0;
                 let c = fold(sum(0, r));
                 put16(r, 2, c);
-                self.ip_send(src, PROTO_ICMP, len);
+                self.ip_send(mapped(src), PROTO_ICMP, len);
             }
-            ICMP_ECHO_REPLY => self.deliver(Kind::Icmp(id), src, seq, &m[8..]),
+            ICMP_ECHO_REPLY => self.deliver(Kind::Icmp(id), mapped(src), seq, &m[8..]),
             ICMP_UNREACHABLE => self.unreachable(m[1], &m[8..]),
             _ => {}
         }
@@ -1074,19 +1118,26 @@ impl Net {
             return;
         };
         let (dst, sport, dport, seq) = (be32(q, 16), be16(t, 0), be16(t, 2), be32(t, 4));
+        // Port or protocol unreachable: nothing listens there.
+        self.tcp_unreachable(mapped(dst), sport, dport, seq, code == 2 || code == 3);
+    }
+
+    /// An ICMP or ICMPv6 "unreachable" about a TCP segment from `sport`
+    /// to `dst`:`dport` numbered `seq`.
+    fn tcp_unreachable(&mut self, dst: u128, sport: u16, dport: u16, seq: u32, refused: bool) {
         let found = (0..CONNS).find(|&c| {
             matches!(&self.conns[c], Some(k) if k.tcb.local_port == sport
                 && k.tcb.remote == dst
                 && k.tcb.remote_port == dport)
         });
         if let Some(c) = found {
-            // Port or protocol unreachable: nothing listens there.
-            self.conns[c].as_mut().unwrap().tcb.unreachable(code == 2 || code == 3, seq);
+            self.conns[c].as_mut().unwrap().tcb.unreachable(refused, seq);
             self.pump(c);
         }
     }
 
-    fn udp(&mut self, src: u32, dst: u32, u: &[u8], ours: bool) {
+    /// A UDP datagram; over IPv6 (`six`) its checksum is required.
+    fn udp(&mut self, src: u128, dst: u128, u: &[u8], ours: bool, six: bool) {
         if u.len() < 8 {
             return;
         }
@@ -1095,18 +1146,22 @@ impl Net {
             return;
         }
         let u = &u[..len];
-        if be16(u, 6) != 0 && fold(sum(pseudo(src, dst, PROTO_UDP, len), u)) != 0 {
+        if (six || be16(u, 6) != 0) && fold(sum(pseudo(src, dst, PROTO_UDP, len), u)) != 0 {
             return;
         }
-        if be16(u, 2) == DHCP_CLIENT_PORT && be16(u, 0) == DHCP_SERVER_PORT {
+        if !six && be16(u, 2) == DHCP_CLIENT_PORT && be16(u, 0) == DHCP_SERVER_PORT {
             self.dhcp(&u[8..]);
+        } else if six && be16(u, 2) == ip6::DHCP6_CLIENT_PORT {
+            // (Any source port: QEMU's replies come from 547 byte-swapped.
+            // The transaction must match.)
+            self.dhcp6(&u[8..]);
         } else if ours {
             self.deliver(Kind::Udp(be16(u, 2)), src, be16(u, 0), &u[8..]);
         }
     }
 
     /// Queues a payload on the socket of `kind` and signals it.
-    fn deliver(&mut self, kind: Kind, src: u32, port: u16, data: &[u8]) {
+    fn deliver(&mut self, kind: Kind, src: u128, port: u16, data: &[u8]) {
         let Some(i) = (0..SOCKETS).find(|&i| matches!(&self.sockets[i], Some(s) if s.kind == kind))
         else {
             return;
@@ -1120,7 +1175,8 @@ impl Net {
         let n = data.len().min(MAX_DATAGRAM);
         s.queue[j] = Datagram {
             len: n as u16,
-            from: (src as u64) << 16 | port as u64,
+            from: src,
+            port,
         };
         queue_page(i, j)[..n].copy_from_slice(&data[..n]);
         s.count += 1;
@@ -1143,11 +1199,15 @@ impl Net {
     }
 
     /// Sends a TCP segment to `dst`.
-    fn tcp_emit(&mut self, dst: u32, h: &tcp::Header, a: &[u8], b: &[u8]) {
+    fn tcp_emit(&mut self, dst: u128, h: &tcp::Header, a: &[u8], b: &[u8]) {
         if self.drop_this() {
             return;
         }
-        let len = tcp::encode(&mut page(TX_VA)[34..], self.addr(), dst, h, a, b);
+        let Some(src) = self.source_for(dst) else {
+            return;
+        };
+        let at = Net::payload_at(dst);
+        let len = tcp::encode(&mut page(TX_VA)[at..], src, dst, h, a, b);
         self.ip_send(dst, PROTO_TCP, len);
     }
 
@@ -1190,7 +1250,7 @@ impl Net {
     }
 
     /// A TCP segment to this host.
-    fn tcp(&mut self, src: u32, dst: u32, seg: &[u8]) {
+    fn tcp(&mut self, src: u128, dst: u128, seg: &[u8]) {
         let Some((h, data)) = tcp::parse(seg, src, dst) else {
             return;
         };
@@ -1253,8 +1313,15 @@ impl Net {
 
     /// Whether a TCP port is in use, by a listener or a connection.
     fn tcp_port_free(&self, port: u16) -> bool {
+        self.listen_port_free(port) && !self.conns.iter().flatten().any(|k| k.tcb.local_port == port)
+    }
+
+    /// Whether a TCP port can be listened on: no other listener has it.
+    /// Connections on it (those an earlier listener accepted, still
+    /// closing) do not stand in the way: segments find them first, by
+    /// both ends.
+    fn listen_port_free(&self, port: u16) -> bool {
         !self.sockets.iter().flatten().any(|s| s.kind == Kind::Listen(port))
-            && !self.conns.iter().flatten().any(|k| k.tcb.local_port == port)
     }
 
     /// A free ephemeral TCP port, starting somewhere each instance picks,
@@ -1272,8 +1339,8 @@ impl Net {
     }
 
     /// `TCP_CONNECT`: a connection, with its handle and port.
-    fn connect(&mut self, badge: u64, to: u64) -> Result<(u64, u16), Status> {
-        if self.lease.is_none() {
+    fn connect(&mut self, badge: u64, to: u128, to_port: u16) -> Result<(u64, u16), Status> {
+        if self.source_for(to).is_none() {
             return Err(Status::Unreachable);
         }
         let c = self.free_conn().ok_or(Status::NoSpace)?;
@@ -1281,7 +1348,7 @@ impl Net {
         let handle = self.bind(badge, Kind::Tcp(c))?;
         let iss = self.iss();
         self.conns[c] = Some(Conn {
-            tcb: Tcb::connect(iss, port, (to >> 16) as u32, to as u16, TCP_BUF, TCP_BUF),
+            tcb: Tcb::connect(iss, port, to, to_port, TCP_BUF, TCP_BUF),
             socket: Some((handle & 0xff) as usize),
             listener: None,
             closed_at: None,
@@ -1300,7 +1367,7 @@ impl Net {
         let k = self.conns[c].as_mut().unwrap();
         k.listener = None;
         k.socket = Some((handle & 0xff) as usize);
-        Ok((handle, (k.tcb.remote as u64) << 16 | k.tcb.remote_port as u64))
+        Ok((handle, word(k.tcb.remote, k.tcb.remote_port)))
     }
 
     /// `SEND` on connection `c`: bytes taken.
@@ -1330,7 +1397,7 @@ impl Net {
     /// `RECV` on connection `c`.
     fn tcp_recv(&mut self, c: usize) -> [u64; 4] {
         let t = self.conns[c].unwrap().tcb;
-        let peer = (t.remote as u64) << 16 | t.remote_port as u64;
+        let peer = word(t.remote, t.remote_port);
         if t.readable() == 0 {
             return if t.eof() {
                 [Status::Ok as u64, 0, peer, 0]
@@ -1433,48 +1500,65 @@ impl Net {
             .any(|s| s.kind == Kind::Udp(port))
     }
 
-    /// Sends `len` bytes of the client's page from socket `i` to `to`.
-    fn send(&mut self, i: usize, to: u64, len: usize) -> Status {
-        if self.lease.is_none() {
-            return Status::Unreachable;
-        }
+    /// Sends `len` bytes of the client's page from socket `i` to `to`
+    /// (`port` being the port, or an echo's sequence number); with no
+    /// `to` (`SEND6`), the page starts with the address and the payload
+    /// follows it.
+    fn send(&mut self, i: usize, to: Option<u128>, port: u16, len: usize) -> Status {
         if len > MAX_DATAGRAM || syscall(Syscall::FrameMap, LENT, [LENT_VA, 0, 0, 0]).status != 0 {
             return Status::Invalid;
         }
-        let data = &page(LENT_VA)[..len];
-        let dst = (to >> 16) as u32;
+        let lent = page(LENT_VA);
+        let (dst, at) = match to {
+            Some(d) => (d, 0),
+            None => {
+                let mut a = [0u8; 16];
+                a.copy_from_slice(&lent[..16]);
+                (u128::from_be_bytes(a), 16)
+            }
+        };
+        let data = &lent[at..at + len];
+        let off = Net::payload_at(dst);
         let tx = page(TX_VA);
-        let status = match self.sockets[i].as_ref().unwrap().kind {
-            Kind::Udp(port) => {
-                let u = &mut tx[34..42 + len];
-                put16(u, 0, port);
-                put16(u, 2, to as u16);
+        let status = match (self.source_for(dst), self.sockets[i].as_ref().unwrap().kind) {
+            (None, _) => Status::Unreachable,
+            (Some(src), Kind::Udp(local)) => {
+                let u = &mut tx[off..off + 8 + len];
+                put16(u, 0, local);
+                put16(u, 2, port);
                 put16(u, 4, (8 + len) as u16);
                 put16(u, 6, 0);
                 u[8..].copy_from_slice(data);
-                let c = fold(sum(pseudo(self.addr(), dst, PROTO_UDP, 8 + len), u));
+                let c = fold(sum(pseudo(src, dst, PROTO_UDP, 8 + len), u));
                 put16(u, 6, if c == 0 { 0xffff } else { c });
                 self.ip_send(dst, PROTO_UDP, 8 + len)
             }
-            Kind::Icmp(id) => {
-                let m = &mut tx[34..42 + len];
-                m[0] = ICMP_ECHO;
+            (Some(src), Kind::Icmp(id)) => {
+                let six = ipv4(dst).is_none();
+                let m = &mut tx[off..off + 8 + len];
+                m[0] = if six { 128 } else { ICMP_ECHO };
                 m[1] = 0;
                 put16(m, 2, 0);
                 put16(m, 4, id);
-                put16(m, 6, to as u16);
+                put16(m, 6, port);
                 m[8..].copy_from_slice(data);
-                let c = fold(sum(0, m));
+                let c = if six {
+                    fold(sum(pseudo(src, dst, NH_ICMP6, 8 + len), m))
+                } else {
+                    fold(sum(0, m))
+                };
                 put16(m, 2, c);
-                self.ip_send(dst, PROTO_ICMP, 8 + len)
+                self.ip_send(dst, if six { NH_ICMP6 } else { PROTO_ICMP }, 8 + len)
             }
-            Kind::Listen(_) | Kind::Tcp(_) => Status::Invalid,
+            (_, Kind::Listen(_) | Kind::Tcp(_)) => Status::Invalid,
         };
         syscall(Syscall::FrameUnmap, LENT, [0; 4]);
         status
     }
 
-    fn recv(&mut self, i: usize) -> [u64; 4] {
+    /// `RECV`, or with `six` `RECV6` (the sender's address first in the
+    /// page, then the payload).
+    fn recv(&mut self, i: usize, six: bool) -> [u64; 4] {
         let s = self.sockets[i].as_mut().unwrap();
         if s.count == 0 {
             return [Status::Empty as u64, 0, 0, 0];
@@ -1484,12 +1568,45 @@ impl Net {
         }
         let d = s.queue[s.head];
         let n = d.len as usize;
-        page(LENT_VA)[..n].copy_from_slice(&queue_page(i, s.head)[..n]);
+        let lent = page(LENT_VA);
+        let at = if six { 16 } else { 0 };
+        let n = n.min(4096 - at);
+        lent[at..at + n].copy_from_slice(&queue_page(i, s.head)[..n]);
+        if six {
+            lent[..16].copy_from_slice(&d.from.to_be_bytes());
+        }
         syscall(Syscall::FrameUnmap, LENT, [0; 4]);
-        let from = d.from;
         s.head = (s.head + 1) % QUEUE;
         s.count -= 1;
-        [Status::Ok as u64, n as u64, from, 0]
+        let family = if ipv4(d.from).is_some() { 4 } else { 6 };
+        if six {
+            [Status::Ok as u64, n as u64, d.port as u64, family]
+        } else {
+            [Status::Ok as u64, n as u64, word(d.from, d.port), family]
+        }
+    }
+
+    /// The address a client's page starts with (`TCP_CONNECT6`).
+    fn lent_addr(&self) -> Option<u128> {
+        if syscall(Syscall::FrameMap, LENT, [LENT_VA, 0, 0, 0]).status != 0 {
+            return None;
+        }
+        let mut a = [0u8; 16];
+        a.copy_from_slice(&page(LENT_VA)[..16]);
+        syscall(Syscall::FrameUnmap, LENT, [0; 4]);
+        Some(u128::from_be_bytes(a))
+    }
+
+    /// Writes `addrs` to the start of the client's page.
+    fn lend_addrs(&self, addrs: &[u128]) -> bool {
+        if syscall(Syscall::FrameMap, LENT, [LENT_VA, 1, 0, 0]).status != 0 {
+            return false;
+        }
+        for (k, a) in addrs.iter().enumerate() {
+            page(LENT_VA)[16 * k..16 * k + 16].copy_from_slice(&a.to_be_bytes());
+        }
+        syscall(Syscall::FrameUnmap, LENT, [0; 4]);
+        true
     }
 
     /// One client call: the reply, and whether MINT is granted with it.
@@ -1541,13 +1658,56 @@ impl Net {
             net::SEND if lent => match self.socket(badge, m[1]).map(|i| (i, self.kind(i))) {
                 Some((_, Kind::Tcp(c))) => (self.tcp_send(c, m[3] as usize), false),
                 Some((_, Kind::Listen(_))) => status(Status::Invalid),
-                Some((i, _)) => status(self.send(i, m[2], m[3] as usize)),
+                Some((i, _)) => status(self.send(i, Some(mapped((m[2] >> 16) as u32)), m[2] as u16, m[3] as usize)),
                 None => status(Status::NotFound),
             },
-            net::RECV if lent => match self.socket(badge, m[1]).map(|i| (i, self.kind(i))) {
-                Some((_, Kind::Tcp(c))) => (self.tcp_recv(c), false),
-                Some((_, Kind::Listen(_))) => status(Status::Invalid),
-                Some((i, _)) => (self.recv(i), false),
+            net::SEND6 if lent => match self.socket(badge, m[1]).map(|i| (i, self.kind(i))) {
+                Some((i, Kind::Udp(_) | Kind::Icmp(_))) => status(self.send(i, None, m[2] as u16, m[3] as usize)),
+                Some(_) => status(Status::Invalid),
+                None => status(Status::NotFound),
+            },
+            net::RECV | net::RECV6 if lent => match self.socket(badge, m[1]).map(|i| (i, self.kind(i))) {
+                Some((_, Kind::Tcp(c))) if m[0] == net::RECV => (self.tcp_recv(c), false),
+                Some((i, Kind::Udp(_) | Kind::Icmp(_))) => (self.recv(i, m[0] == net::RECV6), false),
+                Some(_) => status(Status::Invalid),
+                None => status(Status::NotFound),
+            },
+            net::INFO6 if lent && m[1] == net::VERSION => {
+                let v = self.v6;
+                if v.global == 0 {
+                    return status(Status::Unreachable);
+                }
+                if !self.lend_addrs(&[v.ll, v.global, v.router, v.dns]) {
+                    return status(Status::Invalid);
+                }
+                let now = ticks();
+                (
+                    [
+                        Status::Ok as u64,
+                        v.prefix_len as u64,
+                        v.valid_until.saturating_sub(now) / SECOND,
+                        v.router_until.saturating_sub(now) / SECOND,
+                    ],
+                    false,
+                )
+            }
+            net::TCP_CONNECT6 if lent => match self.lent_addr() {
+                Some(a) => match self.connect(badge, a, m[1] as u16) {
+                    Ok((h, port)) => ([Status::Ok as u64, h, port as u64, 0], true),
+                    Err(s) => status(s),
+                },
+                None => status(Status::Invalid),
+            },
+            net::TCP_PEER if lent => match self.socket(badge, m[1]).map(|i| self.kind(i)) {
+                Some(Kind::Tcp(c)) => {
+                    let t = self.conns[c].unwrap().tcb;
+                    if !self.lend_addrs(&[t.remote]) {
+                        return status(Status::Invalid);
+                    }
+                    let family = if ipv4(t.remote).is_some() { 4 } else { 6 };
+                    ([Status::Ok as u64, t.remote_port as u64, family, 0], false)
+                }
+                Some(_) => status(Status::Invalid),
                 None => status(Status::NotFound),
             },
             net::CLOSE => match self.socket(badge, m[1]) {
@@ -1557,7 +1717,7 @@ impl Net {
                 }
                 None => status(Status::NotFound),
             },
-            net::TCP_CONNECT => match self.connect(badge, m[1]) {
+            net::TCP_CONNECT => match self.connect(badge, mapped((m[1] >> 16) as u32), m[1] as u16) {
                 Ok((h, port)) => ([Status::Ok as u64, h, port as u64, 0], true),
                 Err(s) => status(s),
             },
@@ -1566,7 +1726,7 @@ impl Net {
                 if port == 0 || m[1] > u16::MAX as u64 {
                     return status(Status::Invalid);
                 }
-                if !self.tcp_port_free(port) {
+                if !self.listen_port_free(port) {
                     return status(Status::InUse);
                 }
                 match self.bind(badge, Kind::Listen(port)) {
@@ -1696,6 +1856,7 @@ fn start(n: &mut Net) -> Result<(), (&'static str, u64)> {
     } else {
         n.rediscover();
     }
+    n.start6();
     Ok(())
 }
 
