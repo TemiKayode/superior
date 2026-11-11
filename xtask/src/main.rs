@@ -117,7 +117,7 @@ struct Image {
 /// and the test client's role for it (which device it must be refused).
 const DISK_DRIVERS: [(&str, &str, u64); 3] = [
     ("virtio-blk", "1af4:1042 class 010000", 4),
-    ("nvme", "1b36:0010 class 010802", 11),
+    ("nvme", "pci: 01:00.0 1b36:0010 class 010802", 11),
     ("ahci", "8086:2922 class 010601", 12),
 ];
 
@@ -630,9 +630,20 @@ fn qemu_command(img: &Image) -> Command {
                 "if=none,id=nvm1,format=raw,readonly=on,file={}",
                 second_namespace().display()
             ))
+            // The controller sits behind a PCI Express root port, on a
+            // bus of its own, so the bus server must number that bus and
+            // open the port's memory window to reach it. A conventional
+            // bridge with a device behind it follows: found, but given no
+            // DMA, since it would share the bridge's requester ID.
             .args([
                 "-device",
-                "nvme,id=nvme0,serial=superior0",
+                "pcie-root-port,id=rp0,chassis=1",
+                "-device",
+                "nvme,id=nvme0,serial=superior0,bus=rp0",
+                "-device",
+                "pci-bridge,id=br0,chassis_nr=2",
+                "-device",
+                "virtio-rng-pci,bus=br0,addr=1,disable-legacy=on",
                 "-device",
                 "nvme-ns,drive=nvm0,bus=nvme0,nsid=1",
                 "-device",
@@ -922,6 +933,12 @@ fn drivers_test(img: &Image) -> Result<(), String> {
         "[cm] manifest: 3 components",
         "pci: BAR window at",
         device,
+        // The NVMe controller is behind a root port, on bus 1; a
+        // conventional bridge with a device behind it makes bus 2.
+        pick("bridges to bus 01 (to 01), 1 functions behind it, memory window"),
+        pick("pci: 02:01.0 1af4:1044"),
+        pick("bridges to bus 02 (to 02), 1 functions behind it, memory window"),
+        pick("a conventional bridge, so what is behind it shares its requester ID and gets no DMA"),
         "given to client 2 (reset:",
         "new, empty IOMMU domain",
         // AHCI names its disks before it is ready, NVMe after.
@@ -947,6 +964,8 @@ fn drivers_test(img: &Image) -> Result<(), String> {
         "may not have",
         "[pass] block: the bus server will not give it the driver's device",
         "[pass] block: nor any BAR page",
+        pick("behind a conventional bridge, so no bus mastering"),
+        pick("[pass] block: the device behind the conventional bridge (02:01.0) opens with no IOMMU domain, and may not master the bus"),
         forged,
         &stray,
         "the IOMMU reported a blocked write to it",

@@ -25,6 +25,7 @@
 use super::vm;
 use crate::iommu::IoFault;
 use crate::memory;
+use superior_objects::abi::PCI_BUSES;
 use core::sync::atomic::{AtomicU64, Ordering};
 use x86_64::PhysAddr;
 
@@ -141,14 +142,17 @@ pub fn init() -> Option<&'static str> {
         REGS.store(0, Ordering::Relaxed);
         return None;
     }
-    // The root table, and one context table for bus 0 (where every
-    // function the bus server hands out lives).
+    // The root table, and a context table for each bus the bus server
+    // may number (functions behind bridges are on buses of their own).
     let root = memory::carve(12)?;
-    let ctx = memory::carve(12)?;
     vm::zero_frame(root);
-    vm::zero_frame(ctx);
-    // SAFETY: freshly carved RAM, reachable through the physical map.
-    unsafe { (vm::phys_ptr(root) as *mut u64).write_volatile(ctx | 1) };
+    for bus in 0..PCI_BUSES {
+        let ctx = memory::carve(12)?;
+        vm::zero_frame(ctx);
+        // SAFETY: freshly carved RAM, reachable through the physical
+        // map; root entries are 16 bytes, one per bus.
+        unsafe { (vm::phys_ptr(root + 16 * bus) as *mut u64).write_volatile(ctx | 1) };
+    }
     ROOT.store(root, Ordering::Relaxed);
     w64(RTADDR, root);
     command(GCMD_SRTP);
@@ -317,19 +321,19 @@ pub fn fixed_pages() -> &'static [u64] {
 pub fn init_space(_header: u64, _root: u64, _domain: u16) {}
 
 fn context_entry(sid: u16) -> Option<*mut u64> {
-    // Only bus 0 has a context table.
-    if sid >> 8 != 0 {
+    if !valid_sid(sid) {
         return None;
     }
-    // SAFETY: the root table is ours; its bus-0 entry is set in `init`.
-    let ctx = unsafe { (vm::phys_ptr(ROOT.load(Ordering::Relaxed)) as *const u64).read_volatile() }
-        & !0xfff;
+    // SAFETY: the root table is ours; the entries of the first
+    // `PCI_BUSES` buses are set in `init`.
+    let root = ROOT.load(Ordering::Relaxed) + 16 * (sid >> 8) as u64;
+    let ctx = unsafe { (vm::phys_ptr(root) as *const u64).read_volatile() } & !0xfff;
     Some(vm::phys_ptr(ctx + 16 * (sid & 0xff) as u64) as *mut u64)
 }
 
 /// Whether requester ID `sid` can be bound.
 pub fn valid_sid(sid: u16) -> bool {
-    sid >> 8 == 0
+    ((sid >> 8) as u64) < PCI_BUSES
 }
 
 /// Translates requester `sid`'s DMA through the tables under `root`.

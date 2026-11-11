@@ -14,6 +14,7 @@
 use super::{fdt, gic, vm};
 use crate::iommu::IoFault;
 use crate::{kprintln, memory};
+use superior_objects::abi::PCI_BUSES;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 const IDR0: u64 = 0x00;
@@ -40,8 +41,10 @@ const CR0_CMDQEN: u32 = 1 << 3;
 const CR1_WB_ISH: u32 = 1 | (1 << 2) | (3 << 4) | (1 << 6) | (1 << 8) | (3 << 10);
 const READ_ALLOCATE: u64 = 1 << 62;
 
-/// Stream table: 2^8 entries of 64 bytes.
-const STRTAB_LOG2: u64 = 8;
+/// Stream table: an entry of 64 bytes for every function of `PCI_BUSES`
+/// buses (2^11 entries, 128 KiB).
+const STRTAB_LOG2: u64 = 8 + PCI_BUSES.trailing_zeros() as u64;
+const _: () = assert!(PCI_BUSES.is_power_of_two());
 /// Command queue: 2^5 commands of 16 bytes.
 const CMDQ_LOG2: u32 = 5;
 /// Event queue: 2^7 events of 32 bytes (one page).
@@ -130,8 +133,8 @@ pub fn init(dtb: u64) -> Option<&'static str> {
         REGS.store(0, Ordering::Relaxed);
         return None;
     }
-    let strtab = memory::carve(14)?;
-    for p in 0..4 {
+    let strtab = memory::carve(STRTAB_LOG2 as u8 + 6)?;
+    for p in 0..(64 << STRTAB_LOG2) / 4096 {
         vm::zero_frame(strtab + p * 4096);
     }
     let cmdq = memory::carve(12)?;

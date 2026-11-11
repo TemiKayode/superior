@@ -14,6 +14,7 @@
 //! whichever interrupt ID a device wrote.
 
 use crate::memory;
+use superior_objects::abi::PCI_BUSES;
 use core::sync::atomic::{AtomicU64, Ordering};
 use spin::Mutex;
 
@@ -273,13 +274,23 @@ fn init_its() {
         if kind == 0 {
             continue;
         }
-        let Some(table) = memory::carve(12) else { return };
-        zero(table, 4096);
-        // One 4 KiB page, flat.
-        write64(reg, VALID | INNER_WB | (baser & (0x1f << 48)) | kind << 56 | table | SHAREABLE);
+        // Flat tables of 4 KiB pages: one page, but for the device
+        // table (kind 1) enough for every function of `PCI_BUSES` buses.
+        let entry = ((baser >> 48) & 0x1f) + 1;
+        let bits = if kind == 1 {
+            (((PCI_BUSES << 8) * entry).next_power_of_two().trailing_zeros() as u8).max(12)
+        } else {
+            12
+        };
+        let Some(table) = memory::carve(bits) else { return };
+        zero(table, 1 << bits);
+        let pages = (1u64 << bits) / 4096;
+        write64(
+            reg,
+            VALID | INNER_WB | (baser & (0x1f << 48)) | kind << 56 | table | SHAREABLE | (pages - 1),
+        );
         if kind == 1 {
-            let entry = ((read64(reg) >> 48) & 0x1f) + 1;
-            MAX_DEVICE_ID.store(4096 / entry, Ordering::Relaxed);
+            MAX_DEVICE_ID.store((1 << bits) / entry, Ordering::Relaxed);
         }
     }
     // Physical target addresses, or processor numbers.

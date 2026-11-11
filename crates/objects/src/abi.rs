@@ -410,6 +410,12 @@ pub const CNODE_SLOT_BITS: u8 = 5;
 /// top-level table, the rest a pool for the page tables under it.
 pub const VSPACE_MIN_BITS: u64 = 14;
 pub const VSPACE_MAX_BITS: u64 = 20;
+/// PCI buses whose functions an I/O address space can be bound to and
+/// whose MSIs can be routed: requester IDs below `PCI_BUSES << 8`. The
+/// kernel sizes its IOMMU and interrupt-remapping tables for these, and
+/// the bus server numbers no bus beyond them.
+pub const PCI_BUSES: u64 = 8;
+
 /// [`Syscall::FrameMapInto`] flags.
 pub const MAP_WRITE: u64 = 1;
 pub const MAP_EXEC: u64 = 2;

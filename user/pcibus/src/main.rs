@@ -1,7 +1,8 @@
 //! The PCI bus server (spec section 5): the only component that touches
 //! PCI configuration space.
 //!
-//! It finds the functions on bus 0, and serves the `pci` interface
+//! It finds the functions on bus 0 and behind every bridge (below), and
+//! serves the `pci` interface
 //! (`superior_objects::interfaces::pci`) to drivers. A driver opens one
 //! function; from then on it is that function's only owner and gets only
 //! that function's BAR pages (device frames made from the BAR window) and
@@ -24,6 +25,18 @@
 //! and a fresh, empty domain. A device without FLR is left to the
 //! driver's own reset routine (virtio: writing 0 to the device status).
 //!
+//! Bridges: a PCI-to-PCI bridge (a PCIe root port, say) is not handed out
+//! but configured here. The scan gives it the next bus number, walks the
+//! bus behind it (and any bridges there), assigns the BARs of everything
+//! found behind it next to each other, and sets the bridge's memory
+//! window to just that range, in whole megabytes; its I/O and
+//! prefetchable windows stay shut. Buses are numbered up to
+//! `abi::PCI_BUSES`, which is as far as the kernel's IOMMU tables reach.
+//! A function behind a bridge has a requester ID of its own only on PCI
+//! Express: behind a conventional bridge its DMA and interrupts carry the
+//! bridge's ID, so no domain could isolate it, and it gets none (and so
+//! no bus mastering).
+//!
 //! Slots: 0 the `pci` endpoint (receive), 1 configuration space (I/O ports
 //! on x86-64, ECAM device memory on AArch64), 2 the BAR window (device
 //! memory), 3.. the MSI vectors, then the IOMMU-control capability (empty
@@ -33,7 +46,7 @@
 #![no_main]
 
 use superior_driver::dma_address;
-use superior_objects::abi::{CapTransfer, ObjectType, Syscall, root};
+use superior_objects::abi::{CapTransfer, ObjectType, PCI_BUSES, Syscall, root};
 use superior_objects::interfaces::{Status, pci};
 use superior_sys::{print_line, syscall, syscall_x};
 
@@ -68,6 +81,15 @@ const CMD_INTX_DISABLE: u32 = 1 << 10;
 const CAP_PCIE: u8 = 0x10;
 const CAP_MSIX: u8 = 0x11;
 const CAP_MSI: u8 = 0x05;
+// A bridge's own registers (header type 1).
+const BUS_NUMBERS: u64 = 0x18;
+const IO_WINDOW: u64 = 0x1c;
+const MEMORY_WINDOW: u64 = 0x20;
+const PREFETCH_WINDOW: u64 = 0x24;
+const PREFETCH_BASE_UPPER: u64 = 0x28;
+const PREFETCH_LIMIT_UPPER: u64 = 0x2c;
+/// A bridge's memory window is in whole megabytes.
+const MEGABYTE: u64 = 1 << 20;
 
 macro_rules! say {
     ($($t:tt)*) => { print_line(format_args!("pci: {}", format_args!($($t)*))) };
@@ -97,6 +119,11 @@ struct Func {
     domain: Option<u8>,
     /// It has a live domain, so it may master the bus.
     dma: bool,
+    /// A bridge: configured by the scan, never handed out.
+    bridge: bool,
+    /// Its requester ID is its own (it is on bus 0, or only PCI Express
+    /// bridges lie between), so a domain can isolate it.
+    isolated: bool,
 }
 
 struct Bus {
@@ -108,6 +135,9 @@ struct Bus {
     domain_owner: [Option<u8>; MAX_OPEN],
     window_base: u64,
     window_next: u64,
+    /// Functions found, and the next bus number to give a bridge.
+    found: usize,
+    next_bus: u8,
 }
 
 // ---- configuration space access -----------------------------------------
@@ -217,16 +247,19 @@ impl Bus {
         None
     }
 
-    /// Finds the functions on bus 0.
-    fn scan(&mut self) {
-        let mut n = 0;
+    /// Finds the functions on `bus` and, through its bridges, behind it.
+    /// `isolated`: functions here have requester IDs of their own.
+    fn scan(&mut self, bus: u8, isolated: bool) {
+        let first = self.found;
         for dev in 0..32u8 {
             for func in 0..8u8 {
+                let n = self.found;
                 if n == MAX_FUNCS {
+                    say!("more than {MAX_FUNCS} functions: the rest are left alone");
                     return;
                 }
                 let mut f = Func {
-                    bus: 0,
+                    bus,
                     dev,
                     func,
                     ids: 0,
@@ -237,6 +270,8 @@ impl Bus {
                     msi: [None; MSI_COUNT],
                     domain: None,
                     dma: false,
+                    bridge: false,
+                    isolated,
                 };
                 if !config::attach(n, &f) {
                     return;
@@ -251,22 +286,126 @@ impl Bus {
                 }
                 f.ids = (id & 0xffff) << 16 | id >> 16;
                 f.class = config::read(n, &f, 0x08) >> 8;
-                let multi = config::read(n, &f, 0x0c) >> 16 & 0x80 != 0;
+                let header = config::read(n, &f, 0x0c) >> 16;
+                f.bridge = header & 0x7f == 1;
                 say!(
-                    "{:02x}:{:02x}.{} {:04x}:{:04x} class {:06x}",
+                    "{:02x}:{:02x}.{} {:04x}:{:04x} class {:06x}{}",
                     f.bus,
                     dev,
                     func,
                     f.ids >> 16,
                     f.ids & 0xffff,
-                    f.class
+                    f.class,
+                    if f.bridge { ", a bridge" } else { "" }
                 );
                 self.funcs[n] = Some(f);
-                n += 1;
-                if func == 0 && !multi {
+                self.found += 1;
+                if f.bridge {
+                    // Firmware may have numbered the buses its own way:
+                    // until this bridge is given a number below, it must
+                    // answer for none.
+                    let latency = self.read(n, BUS_NUMBERS) & 0xff00_0000;
+                    self.write(n, BUS_NUMBERS, latency, 4);
+                    self.set_command(n, 0, CMD_MEMORY | CMD_BUS_MASTER | 1);
+                }
+                if func == 0 && header & 0x80 == 0 {
                     break;
                 }
             }
+        }
+        // Every bridge on this bus now forwards nothing, so each can be
+        // given its bus in turn.
+        for n in first..self.found {
+            if matches!(self.funcs[n], Some(f) if f.bridge && f.bus == bus) {
+                self.bridge(n, isolated);
+            }
+        }
+    }
+
+    /// Configures bridge `n`: a bus number, everything behind it found
+    /// and given addresses, and a memory window over exactly those.
+    fn bridge(&mut self, n: usize, isolated: bool) {
+        let f = self.funcs[n].unwrap();
+        if self.next_bus as u64 >= PCI_BUSES {
+            say!(
+                "{:02x}:{:02x}.{}: no bus number left for what is behind it",
+                f.bus,
+                f.dev,
+                f.func
+            );
+            return;
+        }
+        let secondary = self.next_bus;
+        self.next_bus += 1;
+        // Only a PCI Express port passes requester IDs on unchanged; one
+        // that bridges to conventional PCI (type 7) answers for all
+        // behind it, as a conventional bridge does.
+        let express = self
+            .capability(n, CAP_PCIE)
+            .is_some_and(|c| self.read16(n, c + 2) >> 4 & 0xf != 7);
+        // Configuration cycles for any bus from `secondary` up go
+        // through, until the last bus behind it is known.
+        let latency = self.read(n, BUS_NUMBERS) & 0xff00_0000;
+        let numbers = |subordinate: u8| {
+            latency | (subordinate as u32) << 16 | (secondary as u32) << 8 | f.bus as u32
+        };
+        self.write(n, BUS_NUMBERS, numbers(0xff), 4);
+        // No I/O and no prefetchable window: base above limit.
+        self.write(n, IO_WINDOW, 0x00f0, 2);
+        self.write(n, PREFETCH_WINDOW, 0x0000_fff0, 4);
+        self.write(n, PREFETCH_BASE_UPPER, 0, 4);
+        self.write(n, PREFETCH_LIMIT_UPPER, 0, 4);
+        let start = self.window_next.next_multiple_of(MEGABYTE);
+        self.window_next = start;
+        let first = self.found;
+        self.scan(secondary, isolated && express);
+        // What is behind it gets its addresses now, side by side: the
+        // window must cover them all and nothing else.
+        for i in first..self.found {
+            if matches!(self.funcs[i], Some(c) if !c.bridge) {
+                self.set_command(i, 0, CMD_MEMORY | CMD_BUS_MASTER | 1);
+                self.size_bars(i);
+            }
+        }
+        let end = self.window_next.next_multiple_of(MEGABYTE);
+        self.window_next = end;
+        let subordinate = self.next_bus - 1;
+        self.write(n, BUS_NUMBERS, numbers(subordinate), 4);
+        let window = if end == start {
+            self.write(n, MEMORY_WINDOW, 0x0000_fff0, 4);
+            None
+        } else if end > 1 << 32 {
+            // The window's registers are 32 bits wide.
+            say!("[fail] the BAR window is above 4 GiB: nothing behind a bridge is reachable");
+            self.write(n, MEMORY_WINDOW, 0x0000_fff0, 4);
+            None
+        } else {
+            let (base, limit) = ((start >> 16) as u32 & 0xfff0, ((end - 1) >> 16) as u32 & 0xfff0);
+            self.write(n, MEMORY_WINDOW, limit << 16 | base, 4);
+            Some((start, end - 1))
+        };
+        // The bridge passes memory accesses down, and DMA and MSIs up.
+        self.set_command(n, CMD_MEMORY | CMD_BUS_MASTER, 0);
+        let kind = if express {
+            "a PCI Express port"
+        } else {
+            "a conventional bridge, so what is behind it shares its requester ID and gets no DMA"
+        };
+        match window {
+            Some((a, b)) => say!(
+                "{:02x}:{:02x}.{} bridges to bus {secondary:02x} (to {subordinate:02x}), {} functions behind it, memory window {a:#x} to {b:#x}; {kind}",
+                f.bus,
+                f.dev,
+                f.func,
+                self.found - first
+            ),
+            None => say!(
+                "{:02x}:{:02x}.{} bridges to bus {secondary:02x} (to {subordinate:02x}), {} functions behind it, no memory window; {kind}",
+                f.bus,
+                f.dev,
+                f.func,
+                self.found - first
+            ),
         }
     }
 
@@ -423,7 +562,7 @@ impl Bus {
         let found = (0..MAX_FUNCS)
             .filter(|&i| {
                 matches!(self.funcs[i], Some(f)
-                    if (if class { f.class } else { f.ids }) as u64 == ids)
+                    if !f.bridge && (if class { f.class } else { f.ids }) as u64 == ids)
             })
             .nth(instance as usize);
         let Some(i) = found else {
@@ -440,7 +579,10 @@ impl Bus {
             );
             return ([Status::InUse as u64, 0, 0, 0], None);
         }
+        // Behind a conventional bridge its requester ID is the bridge's:
+        // no domain of its own, so no DMA.
         let domain = match self.new_domain(i) {
+            _ if !f.isolated => None,
             Ok(d) => d,
             Err(s) => return ([s as u64, 0, 0, 0], None),
         };
@@ -463,6 +605,8 @@ impl Bus {
             if again { "reopened by" } else { "given to" },
             if domain.is_some() {
                 "new, empty IOMMU domain"
+            } else if !f.isolated {
+                "behind a conventional bridge, so no bus mastering"
             } else {
                 "no IOMMU, so no bus mastering"
             }
@@ -641,9 +785,11 @@ pub extern "C" fn _start(_: u64) -> ! {
         domain_owner: [None; MAX_OPEN],
         window_base: base,
         window_next: base,
+        found: 0,
+        next_bus: 1,
     };
     say!("BAR window at {base:#x}; scanning bus 0");
-    bus.scan();
+    bus.scan(0, true);
     let mut r = syscall(Syscall::Recv, SERVICE, [0; 4]);
     loop {
         let (reply, grant) = if r.status == 0 {

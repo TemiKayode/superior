@@ -233,8 +233,19 @@ holds the rest):
   - The root task gets PCI configuration space (ports 0xcf8-0xcff, or ECAM), a BAR
     window and eight MSI vectors, and gives them to the PCI bus server
     (`user/pcibus/`), the only component that touches configuration space. It finds
-    the functions on bus 0, assigns BARs, and serves the versioned `pci` interface
-    (`crates/objects/src/interfaces.rs`). A driver opens one function and gets only
+    the functions on bus 0 and behind bridges, assigns BARs, and serves the versioned `pci` interface
+    (`crates/objects/src/interfaces.rs`). A bridge (a PCI Express root port, say)
+    is configured, not handed out: the scan gives it the next bus number (first
+    clearing the numbers firmware left, so no two bridges answer for one bus),
+    walks the bus behind it, puts the BARs of everything there side by side and
+    sets the bridge's memory window to exactly that range, with its I/O and
+    prefetchable windows shut. Buses go up to 8 (`abi::PCI_BUSES`): the kernel's
+    VT-d context tables, SMMU stream table and ITS device table are sized for
+    them, so a function on any of them gets a domain of its own and its MSIs are
+    checked against its own requester ID. Behind a conventional bridge a
+    function's DMA carries the bridge's ID instead, so it is opened with no
+    domain and refused bus mastering. The NVMe tests put the controller behind a
+    root port (bus 1) and a virtio device behind a conventional bridge (bus 2). A driver opens one function and gets only
     its BAR pages and MSI vectors; configuration writes are limited to bus
     mastering, MSI-X and plain MSI (`pci::MSI`: the bus server writes the
     function's vector into its MSI capability, for devices without MSI-X). Each opened function gets a new, empty IOMMU domain with
@@ -642,14 +653,15 @@ holds the rest):
   notifications, a 256-slot CNode pool) so filling them stays quick; normal kernels have
   32 of each, 32 address spaces and a 4096-slot pool.
 
-Not yet: buses behind bridges in the IOMMU (requester IDs on bus 0 only); Function
+Not yet: more than 8 PCI buses, I/O and prefetchable bridge windows, hot-plug, and
+DMA for devices behind conventional bridges (they share a requester ID); Function
 Level Reset is exercised only by the NVMe controller (QEMU's virtio devices on
 these buses have none); more than one command per queue in the NVMe driver,
 more than two commands in flight per disk in the AHCI driver, ATAPI
 and port multipliers; in the xHCI driver isochronous and bulk endpoints, USB 3 streams,
 hubs and more than one interrupter, and HID devices other than boot keyboards; in the network server
 IPv6 routes beyond one router and stateful DHCPv6, DNS records other than A, AAAA and CNAME (and DNS over TCP), routes beyond one gateway, and rings between
-clients and the server (frames between the server and the driver go through rings; a client's datagram still takes a call); buses behind bridges; the async executor, buffer pools and
+clients and the server (frames between the server and the driver go through rings; a client's datagram still takes a call); the async executor, buffer pools and
 power callbacks of the SDK; an IDL compiler for the interfaces; escalating a component
 given up on to a supervisor above it (today the
 manager is the only one), memory budgets from a policy service, giving the Memory Server all spare

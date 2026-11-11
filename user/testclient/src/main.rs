@@ -415,6 +415,9 @@ fn start_helper() -> Result<(), &'static str> {
 
 /// The block client, for the disk driver whose device is opened by `open`
 /// (the bus server's `OPEN` or `OPEN_CLASS` call).
+/// Where an IOMMU domain would arrive with the bridged device's `OPEN`.
+const BRIDGED_DOMAIN: u64 = 40;
+
 fn block_client(open: [u64; 4]) -> ! {
     let mut t = Checks(0, "block");
     let r = syscall(Syscall::Call, BLOCK, [block::INFO, block::VERSION, 0, 0]);
@@ -519,6 +522,37 @@ fn block_client(open: [u64; 4]) -> ! {
         r.status == 0 && r.msg[0] == Status::Denied as u64,
         format_args!("nor any BAR page"),
     );
+    // The NVMe test's machine has a device behind a conventional bridge
+    // (a virtio entropy source at 02:01.0). Its DMA would carry the
+    // bridge's requester ID, so no IOMMU domain could hold it alone: the
+    // bus server opens it without one and refuses it bus mastering.
+    if open[0] == pci::OPEN_CLASS && open[2] == 0x01_08_02 {
+        let x = CapTransfer {
+            grant: None,
+            accept: Some(BRIDGED_DOMAIN as u16),
+        };
+        let r = syscall_x(
+            Syscall::Call,
+            BLOCK_PCI,
+            [pci::OPEN, pci::VERSION, 0x1af4 << 16 | 0x1044, 0],
+            x,
+        );
+        let master = syscall(Syscall::Call, BLOCK_PCI, [pci::BUS_MASTER, 1, 0, 0]);
+        t.check(
+            r.status == 0
+                && r.msg[0] == Status::Ok as u64
+                && r.msg[1] == 2 << 8 | 1 << 3
+                && r.cap.is_none()
+                && master.status == 0
+                && master.msg[0] == Status::Denied as u64,
+            format_args!(
+                "the device behind the conventional bridge ({:02x}:{:02x}.{}) opens with no IOMMU domain, and may not master the bus",
+                r.msg[1] >> 8,
+                r.msg[1] >> 3 & 0x1f,
+                r.msg[1] & 7
+            ),
+        );
+    }
     // The device can reach only what its driver maps into its IOMMU
     // domain: aimed at another page of the driver's, the DMA must not land,
     // and the IOMMU must report the blocked write to the driver.
@@ -3253,7 +3287,15 @@ fn dns_checks(t: &mut Checks) {
     };
     let (s, www6, _) = resolve6(format_args!("www.superior.test"));
     let (s2, alias6, _) = resolve6(format_args!("alias.superior.test"));
-    let (_, again6, from_cache) = resolve6(format_args!("www.superior.test"));
+    // The injector may kill the resolver between two questions, and its
+    // cache goes with it: ask again until an answer comes from the cache.
+    let (mut again6, mut from_cache) = ([0; 16], false);
+    for _ in 0..8 {
+        (_, again6, from_cache) = resolve6(format_args!("www.superior.test"));
+        if from_cache {
+            break;
+        }
+    }
     t.check(
         s == OK && www6 == v6(0x10) && s2 == OK && alias6 == v6(0x10) && again6 == www6 && from_cache,
         format_args!(
