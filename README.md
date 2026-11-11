@@ -277,7 +277,13 @@ holds the rest):
     vectors revoked, MSI-X and MSI off, then a Function Level Reset where the device has
     one.
   - The Driver SDK (`crates/driver/`): the bus server client, MMIO registers, DMA
-    pages mapped into the device's domain, split virtqueues.
+    pages mapped into the device's domain, split virtqueues, DMA buffer pools
+    (`pool`: equal buffers that never cross a page, taken and given back in
+    constant time, a buffer given back twice refused) and an executor (`exec`:
+    `async` tasks on the driver's one thread, woken by events, with whatever the
+    driver blocks in as the idle step; no allocation). The virtio-net driver is
+    written with both: its buffers are two pools, and its loop is an interrupt
+    task and a service task. Both are tested on the host as well (12 tests).
   - Legacy PCI interrupts, for devices with no MSI: the kernel hands the root task
     an IRQ capability for each of the bus's four interrupt wires (on QEMU's q35 it
     steers the ICH9's PIRQ[E-H] to PIC lines 10, 11, 5 and 9 and marks them
@@ -760,8 +766,7 @@ these buses have none); more than one command per queue in the NVMe driver,
 more than two commands in flight per disk in the AHCI driver, ATAPI
 and port multipliers; in the xHCI driver isochronous and bulk endpoints, USB 3 streams,
 hubs and more than one interrupter, and HID devices other than boot keyboards; in the network server
-a second IPv6 router or a DHCPv6 server to test against (QEMU's network has one router and hands out no addresses, so the IPv6 route table and the DHCPv6 address client are proved by host tests alone), DNSSEC, DNS answers over TCP of more than a page, IPv4 routes beyond one gateway; the async executor, buffer pools and
-power callbacks of the SDK; an IDL compiler for the interfaces; escalating a component
+a second IPv6 router or a DHCPv6 server to test against (QEMU's network has one router and hands out no addresses, so the IPv6 route table and the DHCPv6 address client are proved by host tests alone), DNSSEC, DNS answers over TCP of more than a page, IPv4 routes beyond one gateway; the SDK's power callbacks (with suspend and resume, Phase 2); an IDL compiler for the interfaces; escalating a component
 given up on to a supervisor above it (today the
 manager is the only one), memory budgets from a policy service, giving the Memory Server all spare
 RAM (today it gets a fixed pool from its manifest), page tables for boot processes paid for from user memory,

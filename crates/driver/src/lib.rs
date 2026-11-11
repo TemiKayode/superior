@@ -13,12 +13,18 @@
 //!   domain, the only memory it can reach, with the address to program
 //!   into it.
 //! - [`virtq`]: split virtqueue rings (virtio 1.x).
+//! - [`pool`]: DMA buffer pools, taken from and given back to in
+//!   constant time.
+//! - [`exec`]: an executor for `async` tasks on the driver's one thread,
+//!   woken by events (an interrupt, a call).
 //!
-//! Still to come, per the spec: an async executor, DMA buffer pools and
-//! power-state callbacks.
+//! Still to come, per the spec: power-state callbacks (with suspend and
+//! resume).
 
 #![no_std]
 
+pub mod exec;
+pub mod pool;
 pub mod virtq;
 
 use superior_objects::abi::{CapTransfer, ObjectType, Syscall};

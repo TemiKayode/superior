@@ -27,15 +27,26 @@
 //! device never sees them. `RECV` and `SEND` go on working for a caller
 //! with no ring.
 //!
+//! It is written with the Driver SDK's pieces: its receive and transmit
+//! buffers are DMA buffer pools (`superior_driver::pool`), and its loop
+//! is two tasks on the SDK's executor (`superior_driver::exec`), one
+//! answering the interrupt and the doorbell, one serving calls, with the
+//! `Recv` that waits for both as the executor's idle step.
+//!
 //! Slots: 0 the bus server, 1 the `nic` endpoint (receive), 2 a
 //! notification, 3 untyped memory (64 KiB).
 
 #![no_std]
 #![no_main]
 
+use core::cell::{Cell, RefCell};
+use core::pin::pin;
 use core::sync::atomic::{AtomicU32, Ordering, fence};
+use superior_driver::exec::{self, Events};
+use superior_driver::pool::Pool;
 use superior_driver::virtq::{self, Queue};
 use superior_driver::{DmaPage, Failure, Mmio, Pci, dma_barrier};
+
 use superior_objects::abi::{CapTransfer, Error, Syscall};
 use superior_objects::interfaces::nic::ring;
 use superior_objects::interfaces::{Status, nic};
@@ -121,11 +132,12 @@ struct Nic {
     tx: Queue,
     rx_notify: u64,
     tx_notify: u64,
-    /// Buffer `i`'s (address for the driver, address for the device).
-    rx_buf: [(u64, u64); BUFFERS as usize],
-    tx_buf: [(u64, u64); BUFFERS as usize],
-    /// Transmit buffers the device has not finished with.
-    tx_busy: [bool; BUFFERS as usize],
+    /// The receive buffers, all with the device (or holding a frame for
+    /// the caller): buffer `i` is descriptor `i`.
+    rx_buf: Buffers,
+    /// The transmit buffers: one is taken for each frame and given back
+    /// when the device has sent it.
+    tx_buf: Buffers,
     mac: u64,
     attached: bool,
     sent: u64,
@@ -179,15 +191,12 @@ impl Bars {
     }
 }
 
-/// Buffers `2 * pages` of 2 KiB in DMA pages from `slot`, mapped at `va`.
-fn buffers(slot: u64, va: u64) -> Result<[(u64, u64); BUFFERS as usize], Failure> {
-    let mut b = [(0, 0); BUFFERS as usize];
-    for p in 0..BUFFERS / 2 {
-        let page = DmaPage::new(UNTYPED, slot + p, va + p * 4096, DOMAIN)?;
-        b[2 * p as usize] = (page.va, page.dma);
-        b[2 * p as usize + 1] = (page.va + BUFFER, page.dma + BUFFER);
-    }
-    Ok(b)
+/// A pool of `BUFFERS` 2 KiB DMA buffers (the SDK's), in pages from
+/// `slot` mapped at `va`.
+type Buffers = Pool<{ BUFFERS as usize }>;
+
+fn buffers(slot: u64, va: u64) -> Result<Buffers, Failure> {
+    Pool::new(UNTYPED, slot, va, DOMAIN, BUFFER)
 }
 
 fn start() -> Result<Nic, Failure> {
@@ -293,7 +302,6 @@ fn start() -> Result<Nic, Failure> {
         tx_notify: notify_at[1],
         rx_buf: buffers(RX_PAGES, DMA_VA + 0x2000)?,
         tx_buf: buffers(TX_PAGES, DMA_VA + 0x2000 + 4096 * (BUFFERS / 2))?,
-        tx_busy: [false; BUFFERS as usize],
         mac: (0..6).fold(0, |m, i| m << 8 | device.read8(i) as u64),
         attached: false,
         sent: 0,
@@ -339,7 +347,7 @@ impl Nic {
     /// Gives receive buffer `i` (descriptor `i`) to the device.
     fn offer(&mut self, i: u16) {
         self.rx
-            .set(i, self.rx_buf[i as usize].1, BUFFER as u32, virtq::WRITE);
+            .set(i, self.rx_buf.buffer(i as usize).map_or(0, |b| b.dma), BUFFER as u32, virtq::WRITE);
         self.rx.submit(i);
         Mmio {
             base: self.rx_notify,
@@ -368,7 +376,7 @@ impl Nic {
             // fits in each.
             unsafe {
                 core::ptr::copy_nonoverlapping(
-                    (self.rx_buf[i as usize].0 + HEADER) as *const u8,
+                    (self.rx_buf.buffer(i as usize).map_or(0, |b| b.va) + HEADER) as *const u8,
                     LENT_VA as *mut u8,
                     len as usize,
                 );
@@ -386,11 +394,11 @@ impl Nic {
     /// has sent.
     fn free_buffer(&mut self) -> Option<usize> {
         while let Some((i, _)) = self.tx.take_used() {
-            if let Some(b) = self.tx_busy.get_mut(i as usize) {
-                *b = false;
-            }
+            // One the device names twice, or never had, is not given
+            // back twice.
+            self.tx_buf.give(i as usize);
         }
-        self.tx_busy.iter().position(|b| !b)
+        self.tx_buf.take().map(|b| b.index)
     }
 
     fn send(&mut self, len: u64) -> Status {
@@ -401,6 +409,7 @@ impl Nic {
             return Status::NoSpace;
         };
         if !self.map_lent(false) {
+            self.tx_buf.give(i);
             return Status::Invalid;
         }
         self.transmit(i, LENT_VA, len);
@@ -410,14 +419,15 @@ impl Nic {
     /// Sends the `len` bytes (14 to `MAX_FRAME`) at `from` through free
     /// transmit buffer `i`.
     fn transmit(&mut self, i: usize, from: u64, len: u64) {
-        let (va, dma) = self.tx_buf[i];
+        let Some((va, dma)) = self.tx_buf.buffer(i).map(|b| (b.va, b.dma)) else {
+            return;
+        };
         // SAFETY: the buffer and the page at `from` are both mapped; the
         // header and `len` bytes fit in the 2 KiB buffer.
         unsafe {
             core::ptr::write_bytes(va as *mut u8, 0, HEADER as usize);
             core::ptr::copy_nonoverlapping(from as *const u8, (va + HEADER) as *mut u8, len as usize);
         }
-        self.tx_busy[i] = true;
         self.tx.set(i as u16, dma, (HEADER + len) as u32, 0);
         dma_barrier();
         self.tx.submit(i as u16);
@@ -506,7 +516,7 @@ impl Nic {
             let Some((i, len)) = self.rx.take_used() else {
                 break;
             };
-            let Some(&(buf, _)) = self.rx_buf.get(i as usize) else {
+            let Some(buf) = self.rx_buf.buffer(i as usize).map(|b| b.va) else {
                 continue;
             };
             let len = (len as u64).saturating_sub(HEADER).min(nic::MAX_FRAME);
@@ -554,6 +564,8 @@ impl Nic {
             if (14..=nic::MAX_FRAME).contains(&len) {
                 self.transmit(i, from, len);
                 self.by_ring += 1;
+            } else {
+                self.tx_buf.give(i);
             }
             // Only now is the slot the caller's again: moving the head
             // first would let a caller waiting on a full ring write its
@@ -625,10 +637,14 @@ impl Nic {
     }
 }
 
+/// What wakes the driver, as the executor's events.
+const IRQ: u64 = 1;
+const CALL: u64 = 2;
+
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(_: u64) -> ! {
-    let mut nic = match start() {
-        Ok(n) => n,
+    let nic = match start() {
+        Ok(n) => RefCell::new(n),
         Err((what, code)) => {
             say!("[fail] {what} ({code:#x})");
             superior_sys::park()
@@ -644,9 +660,45 @@ pub extern "C" fn _start(_: u64) -> ! {
         grant: None,
         accept: Some(LENT as u16),
     };
-    let mut reply: Option<([u64; 4], bool)> = None;
-    loop {
-        nic.before_sleep();
+    // Two tasks on the SDK's executor: one for the interrupt (and the
+    // ring's doorbell), one serving calls. The call that arrived, and the
+    // reply to send with the next wait, pass between them and `idle`.
+    let events = Events::new();
+    let call = Cell::new(None);
+    let reply: Cell<Option<([u64; 4], bool)>> = Cell::new(None);
+    let interrupts = pin!(async {
+        loop {
+            events.wait(IRQ).await;
+            nic.borrow_mut().interrupt();
+        }
+    });
+    let service = pin!(async {
+        loop {
+            events.wait(CALL).await;
+            let Some((msg, mut cap)) = call.take() else {
+                continue;
+            };
+            let msg: [u64; 4] = msg;
+            if msg[0] == nic::ATTACH && cap == Some(LENT as u16) {
+                // Keep the notification (replacing an earlier one).
+                syscall(Syscall::CapDelete, LISTENER, [0; 4]);
+                let kept = syscall(Syscall::CapMint, LENT, [LISTENER, ALL, 0, 0]).status == 0;
+                syscall(Syscall::CapDelete, LENT, [0; 4]);
+                cap = kept.then_some(LISTENER as u16);
+            }
+            let lent = cap == Some(LENT as u16);
+            let m = nic.borrow_mut().serve(msg, lent, cap);
+            if lent {
+                // The caller's frame goes back before the reply.
+                syscall(Syscall::CapDelete, LENT, [0; 4]);
+            }
+            reply.set(Some((m, msg[0] == nic::RING_START && m[0] == 0)));
+        }
+    });
+    // Nothing can run: send the reply that is due and wait for the next
+    // call or interrupt.
+    let idle = || {
+        nic.borrow_mut().before_sleep();
         let r = match reply.take() {
             Some((m, doorbell)) => {
                 let x = CapTransfer {
@@ -658,28 +710,16 @@ pub extern "C" fn _start(_: u64) -> ! {
             None => syscall_x(Syscall::Recv, SERVICE, [0; 4], accept),
         };
         if r.status == Error::Notified.code() {
-            nic.interrupt();
-            continue;
+            IRQ
+        } else if r.status != 0 {
+            0
+        } else {
+            call.set(Some((r.msg, r.cap)));
+            CALL
         }
-        if r.status != 0 {
-            continue;
-        }
-        let mut cap = r.cap;
-        if r.msg[0] == nic::ATTACH && cap == Some(LENT as u16) {
-            // Keep the notification (replacing an earlier one).
-            syscall(Syscall::CapDelete, LISTENER, [0; 4]);
-            let kept = syscall(Syscall::CapMint, LENT, [LISTENER, ALL, 0, 0]).status == 0;
-            syscall(Syscall::CapDelete, LENT, [0; 4]);
-            cap = kept.then_some(LISTENER as u16);
-        }
-        let lent = cap == Some(LENT as u16);
-        let m = nic.serve(r.msg, lent, cap);
-        if lent {
-            // The caller's frame goes back before the reply.
-            syscall(Syscall::CapDelete, LENT, [0; 4]);
-        }
-        reply = Some((m, r.msg[0] == nic::RING_START && m[0] == 0));
-    }
+    };
+    exec::run(&events, [interrupts, service], idle);
+    superior_sys::park()
 }
 
 #[panic_handler]

@@ -236,7 +236,16 @@ fn run(cmd: &mut Command) -> Result<(), String> {
 
 fn host_tests() -> Result<(), String> {
     println!("== host unit tests");
-    run(cargo().args(["test", "--quiet", "-p", "superior-objects", "-p", "superior-inet"]))?;
+    run(cargo().args([
+        "test",
+        "--quiet",
+        "-p",
+        "superior-objects",
+        "-p",
+        "superior-inet",
+        "-p",
+        "superior-driver",
+    ]))?;
     println!("== model check and long simulation (release)");
     run(cargo().args([
         "test",
