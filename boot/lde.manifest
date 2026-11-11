@@ -1,0 +1,78 @@
+# The Linux Driver Environment test (cargo xtask lde-test).
+#
+# The network test (net.manifest) with Linux's own 8139cp driver, built
+# unmodified and hosted by the Linux Driver Environment, in place of the
+# native virtio driver, on QEMU's RTL-8139C+: the same pings, datagrams,
+# names and TCP connections must come through while the injector kills
+# the Linux driver, the network server and the resolver. The card has no
+# MSI, so the bus server is given the legacy PCI interrupt lines. The
+# environment serves no frame rings yet: the server gets no pages for
+# them, and every frame takes a call. Component numbers matter: the
+# injector kills components 1, 2 and 3.
+
+component pcibus
+  image pcibus
+  priority 12
+  cspace 7
+  provides pci 0
+  device pci-config 1
+  device pci-mmio 2
+  device msi 3
+  device iommu 11
+  untyped 18 12
+  # The legacy interrupt lines, past its other slots.
+  device intx 64
+
+component lde-8139cp
+  image lde-8139cp
+  priority 11
+  cspace 7
+  uses pci 0
+  provides nic 1
+  notification 2
+  # 512 KiB: the pool the driver's memory comes from, and its page tables.
+  untyped 19 3
+
+component net
+  image net
+  # Renew the DHCP lease every 2 s (QEMU's lasts a day), so the test
+  # sees renewals; the lease is kept in the state page across restarts.
+  arg 200
+  priority 10
+  uses nic 0
+  provides net 1
+  # 2 MiB: the datagram pool, four pages for each TCP connection's
+  # rings, the loopback, and room to put back together and to fragment
+  # datagrams of 64 KiB, besides the rest.
+  memory 22
+  untyped 21 2
+  state 17
+  cspace 9
+
+# Names: asks the gateway's port 47053, where xtask answers DNS on the
+# host (QEMU's own DNS server would ask the real internet).
+component dns
+  image dns
+  arg 47053
+  priority 9
+  uses net 0
+  provides dns 1
+  untyped 12 2
+
+component client
+  image testclient
+  # The network client, for a driver with no frame rings.
+  arg 21
+  priority 8
+  uses net 0
+  uses dns 5
+  control 1
+  untyped 12 2
+
+component injector
+  image testclient
+  arg 16
+  priority 8
+  control 0
+  fault-injector
+  notification 1

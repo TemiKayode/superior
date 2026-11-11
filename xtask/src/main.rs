@@ -108,6 +108,9 @@ struct Image {
     /// A virtio network device on QEMU's user-mode network (the network
     /// test).
     net: bool,
+    /// The network device is an RTL-8139C+ instead, for Linux's driver
+    /// (the Linux Driver Environment test).
+    rtl8139: bool,
     /// A USB keyboard on an xHCI controller, typed on through QEMU's
     /// monitor (the keyboard test).
     keyboard: bool,
@@ -152,7 +155,8 @@ fn main() -> ExitCode {
                         .and_then(|_| fs_test(a, "virtio-blk"))
                         .and_then(|_| disk_test(a, "nvme"))
                         .and_then(|_| disk_test(a, "ahci"))
-                        .and_then(|_| net_test(a))
+                        .and_then(|_| net_test(a, "net"))
+                        .and_then(|_| net_test(a, "lde"))
                         .and_then(|_| tcp_test(a))
                         .and_then(|_| keyboard_test(a))
                         .and_then(|_| image(false, a))
@@ -174,7 +178,8 @@ fn main() -> ExitCode {
         Some("fs-test") => fs_test(arch, "virtio-blk"),
         Some("nvme-test") => disk_test(arch, "nvme"),
         Some("ahci-test") => disk_test(arch, "ahci"),
-        Some("net-test") => net_test(arch),
+        Some("net-test") => net_test(arch, "net"),
+        Some("lde-test") => net_test(arch, "lde"),
         Some("tcp-test") => tcp_test(arch),
         Some("keyboard-test") => keyboard_test(arch),
         Some("memory-test") => {
@@ -185,7 +190,7 @@ fn main() -> ExitCode {
         }
         Some("bench") => image(false, Arch::X86_64).and_then(|img| bench(&img)),
         _ => Err(
-            "usage: cargo xtask <image | run | test | boot-test | shell-test | cm-test | supervise-test | drivers-test | memory-test | reboot-test | fs-test | nvme-test | ahci-test | net-test | tcp-test | keyboard-test | bench | sel4-test> [x86_64 | aarch64]"
+            "usage: cargo xtask <image | run | test | boot-test | shell-test | cm-test | supervise-test | drivers-test | memory-test | reboot-test | fs-test | nvme-test | ahci-test | net-test | lde-test | tcp-test | keyboard-test | bench | sel4-test> [x86_64 | aarch64]"
                 .into(),
         ),
     });
@@ -236,6 +241,105 @@ fn host_tests() -> Result<(), String> {
         "--ignored",
         "--nocapture",
     ]))
+}
+
+/// Linux's source files the Linux Driver Environment hosts: name, path in
+/// Linux's tree, and SHA-256. They are fetched from kernel.org's stable
+/// tree at `LINUX_TAG` when first needed and kept under `target/`: Linux
+/// is GPL-2.0, and none of it is in this repository.
+const LINUX_TAG: &str = "v6.6";
+const LINUX_SOURCES: [(&str, &str, &str); 1] = [(
+    "8139cp",
+    "drivers/net/ethernet/realtek/8139cp.c",
+    "11cca9ded616d4442f980af4b03fc54f8bfe992be14bfc8e9b003d7f8b4a0ee6",
+)];
+
+/// Linux's `driver` source, unmodified: downloaded once, and checked
+/// against its pinned hash every time.
+fn linux_source(driver: &str) -> Result<PathBuf, String> {
+    let (_, in_tree, sha256) = *LINUX_SOURCES
+        .iter()
+        .find(|s| s.0 == driver)
+        .ok_or_else(|| format!("no Linux source is known for {driver}"))?;
+    let dir = root().join("target/lde").join(format!("linux-{}", &LINUX_TAG[1..]));
+    let path = dir.join(format!("{driver}.c"));
+    if !path.exists() {
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let url = format!(
+            "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/{in_tree}?h={LINUX_TAG}"
+        );
+        println!("== fetching Linux's {in_tree} ({LINUX_TAG})");
+        run(Command::new("curl").args(["-sSfL", "-o"]).arg(&path).arg(&url))?;
+    }
+    let hash = Command::new("certutil")
+        .args(["-hashfile"])
+        .arg(&path)
+        .arg("SHA256")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .or_else(|| {
+            let o = Command::new("sha256sum").arg(&path).output().ok()?;
+            Some(String::from_utf8_lossy(&o.stdout).into_owned())
+        })
+        .ok_or("could not hash a file (certutil or sha256sum)")?;
+    if !hash.replace(' ', "").to_lowercase().contains(sha256) {
+        return Err(format!(
+            "{} is not Linux {LINUX_TAG}'s {in_tree}: delete it to fetch it again",
+            path.display()
+        ));
+    }
+    Ok(path)
+}
+
+/// Compiles Linux's `driver` and the environment's C half for `arch`, in
+/// the build container (clang, with only the environment's headers), and
+/// points the component's build script at the objects.
+fn lde_objects(arch: Arch, driver: &str) -> Result<(), String> {
+    let source = linux_source(driver)?;
+    let out = root().join("target/lde").join(arch.name());
+    let newest = |dir: PathBuf| -> Option<std::time::SystemTime> {
+        let mut newest = None;
+        let mut dirs = vec![dir];
+        while let Some(d) = dirs.pop() {
+            for e in std::fs::read_dir(d).ok()?.flatten() {
+                if e.path().is_dir() {
+                    dirs.push(e.path());
+                } else {
+                    newest = newest.max(e.metadata().ok()?.modified().ok());
+                }
+            }
+        }
+        newest
+    };
+    let built = [format!("{driver}.o"), "lde.o".into()]
+        .iter()
+        .map(|o| std::fs::metadata(out.join(o)).and_then(|m| m.modified()).ok())
+        .min()
+        .flatten();
+    let sources = newest(root().join("crates/lde"))
+        .max(std::fs::metadata(&source).and_then(|m| m.modified()).ok());
+    if built.is_none() || built < sources {
+        println!("== compiling Linux's {driver} and the Linux Driver Environment ({})", arch.name());
+        let rel = |p: &Path| {
+            format!(
+                "/work/{}",
+                p.strip_prefix(root()).unwrap().to_string_lossy().replace('\\', "/")
+            )
+        };
+        docker(&[
+            "sh",
+            "/work/crates/lde/cc.sh",
+            arch.name(),
+            &rel(&source),
+            driver,
+            &rel(&out),
+        ])?;
+    }
+    // SAFETY: xtask has one thread here.
+    unsafe { env::set_var("SUPERIOR_LDE_OBJECTS", &out) };
+    Ok(())
 }
 
 /// Builds a user program as a static position-independent executable; the
@@ -310,7 +414,15 @@ fn bundle(arch: Arch, manifest: &str, driver: &str) -> Result<PathBuf, String> {
         ("memserver", "superior-memserver"),
         ("fs", "superior-fs"),
         ("testclient", "superior-testclient"),
+        // Needs Linux's source and the build container: only where used.
+        ("lde-8139cp", "superior-lde-8139cp"),
     ] {
+        if name == "lde-8139cp" {
+            if manifest != "lde" {
+                continue;
+            }
+            lde_objects(arch, "8139cp")?;
+        }
         let path = user_program(package, arch)?;
         let bytes = std::fs::read(&path).map_err(|e| format!("reading {}: {e}", path.display()))?;
         files.push((name.to_string(), bytes));
@@ -429,7 +541,8 @@ fn image_for(
         disk,
         writable: fs,
         driver,
-        net: matches!(manifest, "net" | "tcp"),
+        net: matches!(manifest, "net" | "tcp" | "lde"),
+        rtl8139: manifest == "lde",
         keyboard: manifest == "keyboard",
     })
 }
@@ -523,6 +636,7 @@ fn sel4_image() -> Result<Image, String> {
         writable: false,
         driver: "virtio-blk",
         net: false,
+        rtl8139: false,
         keyboard: false,
     })
 }
@@ -693,7 +807,12 @@ fn qemu_command(img: &Image) -> Command {
             // only).
             "user,id=n0,net=10.0.3.0/24,dhcpstart=10.0.3.30,ipv6-net=fd00:3::/64,hostfwd=tcp:127.0.0.1:47004-:8080",
             "-device",
-            "virtio-net-pci,netdev=n0,disable-legacy=on,iommu_platform=on",
+            // The RTL-8139C+ has no MSI: its interrupt is a legacy line.
+            if img.rtl8139 {
+                "rtl8139,netdev=n0"
+            } else {
+                "virtio-net-pci,netdev=n0,disable-legacy=on,iommu_platform=on"
+            },
         ]);
     }
     if img.keyboard {
@@ -1425,12 +1544,15 @@ fn tcp_test(arch: Arch) -> Result<(), String> {
     Ok(())
 }
 
-fn net_test(arch: Arch) -> Result<(), String> {
+/// The network test, with the native virtio driver (`net`) or with
+/// Linux's 8139cp driver in the Linux Driver Environment (`lde`).
+fn net_test(arch: Arch, manifest: &str) -> Result<(), String> {
     use std::collections::HashMap;
     use std::net::UdpSocket;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
-    let img = image_with(false, arch, "net")?;
+    let lde = manifest == "lde";
+    let img = image_with(false, arch, manifest)?;
     let stop = Arc::new(AtomicBool::new(false));
     let echoed = Arc::new(AtomicU64::new(0));
     // UDP echoes over IPv4 and IPv6 (QEMU sends the guest's datagrams to
@@ -1487,8 +1609,23 @@ fn net_test(arch: Arch) -> Result<(), String> {
     let _ = tcp_echo.join();
     let _ = answering.join();
     let out = out?;
+    // The Linux driver's own words, through the environment's printk.
+    let linux = [
+        "pci: 00:",
+        "10ec:8139 class 020000",
+        "lde 8139cp: 10ec:8139 at 00:",
+        "lde 8139cp: 8139cp: 8139cp: 10/100 PCI Ethernet driver v1.3 (Mar 22, 2004)",
+        "lde 8139cp: eth0: RTL-8139C+ at 0x",
+        "52:54:00:12:34:56, IRQ",
+        "lde 8139cp: the device's legacy interrupt line (wire",
+        "lde 8139cp: eth0: link up, 100Mbps, full-duplex",
+        "lde 8139cp: Linux's 8139cp driver runs the interface: MAC 52:54:00:12:34:56, link up",
+    ];
+    if lde {
+        check_log("Linux Driver Environment test", &out, &linux)?;
+    }
     let steps = [
-        "virtio-net: ready:",
+        if lde { "lde 8139cp: Linux's 8139cp driver runs" } else { "virtio-net: ready:" },
         "net: ready: MAC",
         "net: leased 10.0.3.30/24 from 10.0.3.2 via 10.0.3.2, DNS 10.0.3.3, for 86400 s",
         "[pass] net: a page of its own",
@@ -1517,7 +1654,11 @@ fn net_test(arch: Arch) -> Result<(), String> {
         "UDP datagrams of 1453 to 4000 bytes sent to itself over IPv6, in fragments, every byte right",
         "[pass] net: datagrams of 4097, 30000 and 65507 bytes sent to itself over IPv6, and a 20000-byte IPv6 ping of this host answered, every byte right",
         "TCP connections over IPv6 echoed",
-        "frames through the rings with the driver,",
+        if lde {
+            "frames to and from the driver, a call each (it has no rings)"
+        } else {
+            "frames through the rings with the driver,"
+        },
         "[cm] client asked to shut down (pass)",
     ];
     check_log("network test", &out, &steps)?;
@@ -1543,7 +1684,8 @@ fn net_test(arch: Arch) -> Result<(), String> {
                 .matches(&format!("[cm] fault injection: killing {what}\r\n"))
                 .count()
     };
-    let (server, driver, resolver) = (kills("net"), kills("virtio-net"), kills("dns"));
+    let nic = if lde { "lde-8139cp" } else { "virtio-net" };
+    let (server, driver, resolver) = (kills("net"), kills(nic), kills("dns"));
     // Kills land among the pings and the echoes, not only after them.
     let during = |what: &str| {
         out.find(what).map_or(0, |i| {

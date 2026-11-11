@@ -1,0 +1,17 @@
+[package]
+name = "superior-lde"
+description = "The Linux Driver Environment: hosts an unmodified Linux device driver in a component."
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+edition = "2024"
+publish = false
+
+[lib]
+test = false
+bench = false
+
+[dependencies]
+superior-objects = { path = "../objects" }
+superior-sys = { path = "../sys" }
+superior-driver = { path = "../driver" }

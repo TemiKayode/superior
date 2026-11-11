@@ -472,6 +472,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "superior-lde"
+version = "0.1.0"
+dependencies = [
+ "superior-driver",
+ "superior-objects",
+ "superior-sys",
+]
+
+[[package]]
+name = "superior-lde-8139cp"
+version = "0.1.0"
+dependencies = [
+ "superior-lde",
+ "superior-sys",
+]
+
+[[package]]
 name = "superior-memserver"
 version = "0.1.0"
 dependencies = [

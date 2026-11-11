@@ -256,6 +256,32 @@ holds the rest):
     one.
   - The Driver SDK (`crates/driver/`): the bus server client, MMIO registers, DMA
     pages mapped into the device's domain, split virtqueues.
+  - Legacy PCI interrupts, for devices with no MSI: the kernel hands the root task
+    an IRQ capability for each of the bus's four interrupt wires (on QEMU's q35 it
+    steers the ICH9's PIRQ[E-H] to PIC lines 10, 11, 5 and 9 and marks them
+    level-triggered; on `virt` they are shared interrupts 35 to 38), the bus server
+    works out which wire a function's pin drives (rotating through bridges) and
+    gives that line to its driver (`pci::INTX`), one function a line. The kernel
+    masks the line as it signals; the driver unmasks it (`IrqAck`) once its device
+    has let go.
+  - The Linux Driver Environment (`crates/lde/`) hosts an unmodified Linux driver
+    in a component. Linux's source file is compiled as it is (clang, in the build
+    container) against the environment's own headers, which give it Linux's kernel
+    API by name: PCI, `ioremap` and register access, `dma_alloc_coherent` and
+    `dma_map_single`, `request_irq`, network devices, NAPI, socket buffers, MII,
+    timers and `printk`. `c/lde.c` implements that for one PCI device and one
+    network interface, and a Rust host under it holds the component's
+    capabilities: it finds the device from the driver's own ID table, gives the
+    driver memory from a pool that is all the device's IOMMU domain holds, runs
+    the driver's interrupt handler and receive poll from the component's one
+    thread (so Linux's locks are empty), and serves the `nic` interface. The
+    driver gets no more than a native one does. The first is Linux 6.6's
+    `8139cp` (`user/lde-8139cp/`), on QEMU's RTL-8139C+: Linux is GPL-2.0, so its
+    source is not in this repository; `cargo xtask` fetches the one file from
+    kernel.org and checks its SHA-256. `cargo xtask lde-test` runs the whole
+    network test over it on both ISAs (pings, datagrams to 65,507 bytes, DNS, TCP,
+    IPv6) while the injector kills the Linux driver, the network server and the
+    resolver: each restart probes the device again from nothing.
   - A virtio-blk driver (`user/virtio-blk/`) serves the versioned `block`
     interface: reads land by DMA straight in a frame the client lends with the call.
     The device reaches that frame only while the read is in flight: the driver maps
@@ -653,7 +679,11 @@ holds the rest):
   notifications, a 256-slot CNode pool) so filling them stays quick; normal kernels have
   32 of each, 32 address spaces and a 4096-slot pool.
 
-Not yet: more than 8 PCI buses, I/O and prefetchable bridge windows, hot-plug, and
+Not yet: in the Linux Driver Environment anything but one network driver
+(`8139cp`), frame rings, ethtool and the MII ioctls, drivers that need work queues,
+kernel timers, more than one interrupt or a class other than network; legacy
+interrupt lines shared by two functions, and their routing on machines other
+than QEMU's q35 and `virt`; more than 8 PCI buses, I/O and prefetchable bridge windows, hot-plug, and
 DMA for devices behind conventional bridges (they share a requester ID); Function
 Level Reset is exercised only by the NVMe controller (QEMU's virtio devices on
 these buses have none); more than one command per queue in the NVMe driver,
@@ -688,6 +718,8 @@ https://claude.ai/artifact/QKJS8qH5Dfbjzn58RStq1j
 | `user/cm/` | The Component Manager: the root task, which starts every component from the boot manifest |
 | `user/shell/` | The boot shell and COM1 driver, started as a component |
 | `crates/driver/` | The Driver SDK: PCI access through the bus server, MMIO, DMA pages, virtqueues |
+| `crates/lde/` | The Linux Driver Environment: Linux's kernel API for hosted drivers (`include/`, `c/lde.c`) and its host (`src/lib.rs`) |
+| `user/lde-8139cp/` | Linux's 8139cp network driver, unmodified, in the Linux Driver Environment |
 | `user/pcibus/` | The PCI bus server |
 | `user/memserver/` | The Memory Server |
 | `user/fs/` | The filesystem server |
@@ -719,6 +751,7 @@ cargo xtask fs-test        # just the filesystem test, two boots (add aarch64 fo
 cargo xtask nvme-test      # the driver and filesystem tests on an NVMe disk (add aarch64 for that ISA)
 cargo xtask ahci-test      # the same on a SATA disk behind AHCI (add aarch64 for that ISA)
 cargo xtask net-test       # just the network test (add aarch64 for that ISA)
+cargo xtask lde-test       # the network test over Linux's 8139cp driver (needs Docker; fetches the driver from kernel.org the first time)
 cargo xtask tcp-test       # just the TCP test (add aarch64 for that ISA)
 cargo xtask keyboard-test  # just the USB keyboard test (add aarch64 for that ISA)
 cargo xtask run            # boot the shell in QEMU (x86-64), its console on this terminal

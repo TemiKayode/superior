@@ -1,0 +1,20 @@
+[package]
+name = "superior-lde-8139cp"
+description = "Linux's 8139cp network driver (RealTek RTL-8139C+), unmodified, in the Linux Driver Environment, serving the nic interface."
+version.workspace = true
+# The Rust here is the workspace's; the executable links Linux's driver
+# (GPL-2.0, fetched at build time, never in this repository), so as a
+# whole it can only be distributed under the GPL.
+license.workspace = true
+repository.workspace = true
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "superior-lde-8139cp"
+test = false
+bench = false
+
+[dependencies]
+superior-lde = { path = "../../crates/lde" }
+superior-sys = { path = "../../crates/sys" }
