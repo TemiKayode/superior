@@ -2496,7 +2496,19 @@ fn net_ring_checks(t: &mut Checks, gw: u64) {
             r.doorbells, r.waits, r.reconnects
         ),
     );
-    let st = syscall(Syscall::Call, NET, [net::RING_STATS, net::VERSION, 0, 0]).msg;
+    // The server counts since it started: if the injector has just killed
+    // it, one more request through the ring first.
+    let mut st = [0; 4];
+    for _ in 0..8 {
+        st = syscall(Syscall::Call, NET, [net::RING_STATS, net::VERSION, 0, 0]).msg;
+        if st[0] == OK && st[1] > 0 {
+            break;
+        }
+        r.submit(0, [net::RECV, s.handle, 0, 0]);
+        if !r.settle(|_, _, _| {}) {
+            recover(&mut r, &mut s);
+        }
+    }
     t.check(
         st[0] == OK && st[1] > 0,
         format_args!(
