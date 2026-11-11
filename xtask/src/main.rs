@@ -796,6 +796,12 @@ fn qemu_command(img: &Image) -> Command {
                 "pci-bridge,id=br0,chassis_nr=2",
                 "-device",
                 "virtio-rng-pci,bus=br0,addr=1,disable-legacy=on",
+                // A card with an I/O BAR behind another root port, for
+                // the port's I/O window (it has no network behind it).
+                "-device",
+                "pcie-root-port,id=rp1,chassis=3",
+                "-device",
+                "rtl8139,bus=rp1",
                 "-device",
                 "nvme-ns,drive=nvm0,bus=nvme0,nsid=1",
                 "-device",
@@ -1090,10 +1096,16 @@ fn drivers_test(img: &Image) -> Result<(), String> {
         device,
         // The NVMe controller is behind the tenth root port, on bus 10;
         // a conventional bridge with a device behind it makes bus 11.
-        pick("bridges to bus 0a (to 0a), 1 functions behind it, memory window"),
         pick("pci: 0b:01.0 1af4:1044"),
-        pick("bridges to bus 0b (to 0b), 1 functions behind it, memory window"),
-        pick("a conventional bridge, so what is behind it shares its requester ID and gets no DMA"),
+        pick("pci: 0c:00.0 10ec:8139"),
+        pick("bridges to bus 0a (to 0a), 1 functions behind it; a PCI Express port"),
+        pick("windows: memory 0x"),
+        // The virtio device's registers are in a prefetchable BAR, the
+        // RTL-8139's in an I/O BAR too: each bridge's window for those.
+        pick("bridges to bus 0b (to 0b), 1 functions behind it; a conventional bridge, so what is behind it shares its requester ID and gets no DMA"),
+        pick(", prefetchable 0x"),
+        pick("bridges to bus 0c (to 0c), 1 functions behind it; a PCI Express port"),
+        pick(", I/O 0x"),
         "given to client 2 (reset:",
         "new, empty IOMMU domain",
         // AHCI names its disks before it is ready, NVMe after.
@@ -1121,6 +1133,9 @@ fn drivers_test(img: &Image) -> Result<(), String> {
         "[pass] block: nor any BAR page",
         pick("behind a conventional bridge, so no bus mastering"),
         pick("[pass] block: the device behind the conventional bridge (0b:01.0) opens with no IOMMU domain, and may not master the bus"),
+        pick("[pass] block: its prefetchable BAR answers through the bridge's prefetchable window; then it is given back"),
+        pick("[pass] block: the RTL-8139 behind a root port (0c:00.0): MAC 52:54:00:12:34:"),
+        pick("by its I/O BAR and its memory BAR alike; writes cross over; no port past the BAR"),
         forged,
         &stray,
         "the IOMMU reported a blocked write to it",

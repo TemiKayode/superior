@@ -583,8 +583,11 @@ pub mod root {
     /// machine's routing.
     pub const INTX: u64 = STATE_STORE + STATE_PAGES;
     pub const INTX_COUNT: u64 = 4;
+    /// I/O ports for PCI BARs: a range of ports on x86-64, on AArch64 the
+    /// window of device memory that stands for them.
+    pub const PCI_IO: u64 = INTX + INTX_COUNT;
     /// The first slot with nothing in it.
-    pub const FIRST_FREE: u64 = INTX + INTX_COUNT;
+    pub const FIRST_FREE: u64 = PCI_IO + 1;
     /// The root task's argument: the bundle's length, and in the bits from
     /// [`REBOOTS_SHIFT`] how many fast reboots came before this start.
     pub const REBOOTS_SHIFT: u32 = 32;

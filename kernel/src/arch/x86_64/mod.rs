@@ -173,6 +173,18 @@ pub fn irq_unmask(line: u8) {
     interrupts::pic_unmask(line)
 }
 
+/// I/O ports for PCI BARs: on QEMU's q35 nothing else is at 0xd000 and
+/// up (configuration space's own ports, 0xcf8 to 0xcff, are below).
+pub fn pci_io_cap() -> Capability {
+    Capability::new(
+        Object::IoPort {
+            base: 0xd000,
+            count: 0x3000,
+        },
+        Rights::READ | Rights::WRITE,
+    )
+}
+
 /// The legacy PCI interrupt lines, where their routing is known.
 pub fn intx_lines() -> &'static [u8] {
     interrupts::intx_lines()

@@ -153,6 +153,22 @@ impl Pci {
         Ok(m)
     }
 
+    /// Reads `width` bytes (1, 2 or 4) at `offset` in I/O BAR `bar`.
+    pub fn io_read(&self, bar: u64, offset: u64, width: u64) -> Result<u64, Failure> {
+        self.call([pci::IO_READ, bar, offset, width], None).map(|r| r.msg[1])
+    }
+
+    /// Writes `width` bytes of `value` at `offset` in I/O BAR `bar`.
+    pub fn io_write(&self, bar: u64, offset: u64, width: u64, value: u64) -> Result<(), Failure> {
+        self.call([pci::IO_WRITE, bar | width << 8, offset, value], None)
+            .map(drop)
+    }
+
+    /// Gives the function back to the bus server.
+    pub fn close(&self) -> Result<(), Failure> {
+        self.call([pci::CLOSE, 0, 0, 0], None).map(drop)
+    }
+
     /// For a function with no MSI: takes its legacy interrupt line into
     /// `slot` and binds it to the notification in `notification`. The
     /// line is masked each time it signals: [`irq_ack`] unmasks it, once

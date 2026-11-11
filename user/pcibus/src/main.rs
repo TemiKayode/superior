@@ -27,16 +27,26 @@
 //!
 //! Bridges: a PCI-to-PCI bridge (a PCIe root port, say) is not handed out
 //! but configured here. The scan gives it the next bus number, walks the
-//! bus behind it (and any bridges there), assigns the BARs of everything
-//! found behind it next to each other, and sets the bridge's memory
-//! window to just that range, in whole megabytes; its I/O and
-//! prefetchable windows stay shut. Buses are numbered up to
+//! bus behind it (and any bridges there); then everything found behind
+//! it gets its BARs next to each other, and the bridge's windows are set
+//! to just those ranges (below). Buses are numbered up to
 //! `abi::PCI_BUSES`: every bus on x86-64, the 16 the ECAM window holds
 //! on AArch64.
 //! A function behind a bridge has a requester ID of its own only on PCI
 //! Express: behind a conventional bridge its DMA and interrupts carry the
 //! bridge's ID, so no domain could isolate it, and it gets none (and so
 //! no bus mastering).
+//!
+//! Windows: a bridge has three, for memory, prefetchable memory and I/O
+//! ports, and each is set to exactly what the BARs of that kind behind
+//! it take (in megabytes, or 4 KiB of ports), a bridge's ranges lying
+//! inside those of the bridge above it; one with nothing of a kind
+//! behind it keeps that window shut.
+//!
+//! I/O BARs get ports from a range the manifest may give (`device pci-io
+//! 84`). A driver does not get the ports themselves: it reads and writes
+//! its BAR through this server (`pci::IO_READ`, `pci::IO_WRITE`), which
+//! keeps each access inside the BAR. `pci::CLOSE` gives a function back.
 //!
 //! Legacy interrupts: a function with no MSI gets the interrupt line
 //! its pin is wired to (`pci::INTX`), one function a line: the wire of a
@@ -81,11 +91,19 @@ const DOMAINS: u64 = DOMAIN_MEMORY + MAX_OPEN as u64;
 const DOMAIN_BITS: u64 = 16;
 /// The legacy interrupt lines, one per wire.
 const INTX: u64 = 80;
+/// The I/O port range (ports on x86-64, a window of device memory on
+/// AArch64), and on AArch64 a slot for each page of it.
+const IO_PORTS: u64 = 84;
+#[cfg(target_arch = "aarch64")]
+const IO_PAGE_SLOTS: u64 = 85;
+#[cfg(target_arch = "aarch64")]
+const IO_PAGES: u64 = 16;
 const _: () = assert!(DOMAINS + MAX_OPEN as u64 <= INTX);
 const INTX_COUNT: usize = root::INTX_COUNT as usize;
 
 // Configuration space.
 const COMMAND: u64 = 0x04;
+const CMD_IO: u32 = 1 << 0;
 const CMD_MEMORY: u32 = 1 << 1;
 const CMD_BUS_MASTER: u32 = 1 << 2;
 const CMD_INTX_DISABLE: u32 = 1 << 10;
@@ -99,6 +117,7 @@ const MEMORY_WINDOW: u64 = 0x20;
 const PREFETCH_WINDOW: u64 = 0x24;
 const PREFETCH_BASE_UPPER: u64 = 0x28;
 const PREFETCH_LIMIT_UPPER: u64 = 0x2c;
+const IO_WINDOW_UPPER: u64 = 0x30;
 /// A bridge's memory window is in whole megabytes.
 const MEGABYTE: u64 = 1 << 20;
 
@@ -108,9 +127,20 @@ macro_rules! say {
 
 #[derive(Clone, Copy)]
 struct Bar {
+    /// A memory address in the BAR window, or for an I/O BAR a port.
     addr: u64,
     size: u64,
     is64: bool,
+    io: bool,
+}
+
+/// The three kinds of address a BAR asks for, each with a window of its
+/// own in a bridge.
+#[derive(Clone, Copy, PartialEq)]
+enum Kind {
+    Memory = 0,
+    Prefetch = 1,
+    Io = 2,
 }
 
 #[derive(Clone, Copy)]
@@ -135,6 +165,13 @@ struct Func {
     /// Its requester ID is its own (it is on bus 0, or only PCI Express
     /// bridges lie between), so a domain can isolate it.
     isolated: bool,
+    /// For a bridge: the bus behind it and the last bus behind that (0:
+    /// it was given none), whether it is a PCI Express port, and its
+    /// memory, prefetchable and I/O windows (first and last address).
+    secondary: u8,
+    subordinate: u8,
+    express: bool,
+    windows: [Option<(u64, u64)>; 3],
 }
 
 struct Bus {
@@ -148,9 +185,93 @@ struct Bus {
     domain_owner: [Option<u8>; MAX_OPEN],
     window_base: u64,
     window_next: u64,
+    /// The ports I/O BARs are given: the next free, and the end (both 0
+    /// if the manifest gave no port range).
+    io_next: u64,
+    io_end: u64,
     /// Functions found, and the next bus number to give a bridge.
     found: usize,
     next_bus: u16,
+}
+
+// ---- I/O ports ------------------------------------------------------------
+
+/// The port range I/O BARs are given, and access to it: real ports on
+/// x86-64; on AArch64 the machine's window of device memory that stands
+/// for them, a page of it mapped when first touched.
+#[cfg(target_arch = "x86_64")]
+mod ports {
+    use super::*;
+    /// QEMU's q35 leaves these to PCI (0xcf8 to 0xcff, below, are
+    /// configuration space's own).
+    const FIRST: u64 = 0xd000;
+    const END: u64 = 0x1_0000;
+
+    pub fn range() -> Option<(u64, u64)> {
+        // An empty slot: the manifest gave no port range.
+        (syscall(Syscall::IoPortIn, IO_PORTS, [FIRST, 1, 0, 0]).status == 0).then_some((FIRST, END))
+    }
+
+    pub fn access(port: u64, width: u64, value: Option<u64>) -> Option<u64> {
+        let r = match value {
+            Some(v) => syscall(Syscall::IoPortOut, IO_PORTS, [port, width, v, 0]),
+            None => syscall(Syscall::IoPortIn, IO_PORTS, [port, width, 0, 0]),
+        };
+        (r.status == 0).then_some(r.msg[0])
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+mod ports {
+    use super::*;
+    use superior_driver::{Mmio, map};
+    use superior_sys::USER_BASE;
+
+    const IO_VA: u64 = USER_BASE + 0x5000_0000;
+    /// Port 0 means "none" to some devices: start a page up.
+    const FIRST: u64 = 0x1000;
+    const END: u64 = IO_PAGES * 4096;
+
+    /// Maps the page of the window with `port` in it, once.
+    fn page(port: u64) -> bool {
+        let p = port / 4096;
+        let slot = IO_PAGE_SLOTS + p;
+        // Mapped already if the slot is taken.
+        p < IO_PAGES
+            && (syscall(Syscall::DeviceFrame, IO_PORTS, [p * 4096, slot, 0, 0]).status != 0
+                || map(slot, IO_VA + p * 4096, true).is_ok())
+    }
+
+    pub fn range() -> Option<(u64, u64)> {
+        let slot = IO_PAGE_SLOTS + FIRST / 4096;
+        let there = syscall(Syscall::DeviceFrame, IO_PORTS, [FIRST, slot, 0, 0]).status == 0
+            && map(slot, IO_VA + FIRST, true).is_ok();
+        there.then_some((FIRST, END))
+    }
+
+    pub fn access(port: u64, width: u64, value: Option<u64>) -> Option<u64> {
+        if !page(port) {
+            return None;
+        }
+        let m = Mmio { base: IO_VA };
+        Some(match (value, width) {
+            (None, 1) => m.read8(port) as u64,
+            (None, 2) => m.read16(port) as u64,
+            (None, _) => m.read32(port) as u64,
+            (Some(v), 1) => {
+                m.write8(port, v as u8);
+                0
+            }
+            (Some(v), 2) => {
+                m.write16(port, v as u16);
+                0
+            }
+            (Some(v), _) => {
+                m.write32(port, v as u32);
+                0
+            }
+        })
+    }
 }
 
 // ---- configuration space access -----------------------------------------
@@ -260,8 +381,9 @@ impl Bus {
         None
     }
 
-    /// Finds the functions on `bus` and, through its bridges, behind it.
-    /// `isolated`: functions here have requester IDs of their own.
+    /// Finds the functions on `bus` and, through its bridges, behind it,
+    /// numbering the buses as it goes. `isolated`: functions here have
+    /// requester IDs of their own.
     fn scan(&mut self, bus: u8, isolated: bool) {
         let first = self.found;
         for dev in 0..32u8 {
@@ -285,6 +407,10 @@ impl Bus {
                     dma: false,
                     bridge: false,
                     isolated,
+                    secondary: 0,
+                    subordinate: 0,
+                    express: false,
+                    windows: [None; 3],
                 };
                 if !config::attach(n, &f) {
                     return;
@@ -313,13 +439,15 @@ impl Bus {
                 );
                 self.funcs[n] = Some(f);
                 self.found += 1;
+                // Nothing decodes or masters the bus until it is laid
+                // out and, for a device, opened.
+                self.set_command(n, 0, CMD_MEMORY | CMD_BUS_MASTER | CMD_IO);
                 if f.bridge {
                     // Firmware may have numbered the buses its own way:
                     // until this bridge is given a number below, it must
                     // answer for none.
                     let latency = self.read(n, BUS_NUMBERS) & 0xff00_0000;
                     self.write(n, BUS_NUMBERS, latency, 4);
-                    self.set_command(n, 0, CMD_MEMORY | CMD_BUS_MASTER | 1);
                 }
                 if func == 0 && header & 0x80 == 0 {
                     break;
@@ -335,8 +463,8 @@ impl Bus {
         }
     }
 
-    /// Configures bridge `n`: a bus number, everything behind it found
-    /// and given addresses, and a memory window over exactly those.
+    /// Numbers the bus behind bridge `n` and finds what is on it (and
+    /// behind any bridges there). Its windows stay shut until `layout`.
     fn bridge(&mut self, n: usize, isolated: bool) {
         let f = self.funcs[n].unwrap();
         if self.next_bus as u64 >= PCI_BUSES {
@@ -363,79 +491,175 @@ impl Bus {
             latency | (subordinate as u32) << 16 | (secondary as u32) << 8 | f.bus as u32
         };
         self.write(n, BUS_NUMBERS, numbers(0xff), 4);
-        // No I/O and no prefetchable window: base above limit.
-        self.write(n, IO_WINDOW, 0x00f0, 2);
-        self.write(n, PREFETCH_WINDOW, 0x0000_fff0, 4);
-        self.write(n, PREFETCH_BASE_UPPER, 0, 4);
-        self.write(n, PREFETCH_LIMIT_UPPER, 0, 4);
-        let start = self.window_next.next_multiple_of(MEGABYTE);
-        self.window_next = start;
-        let first = self.found;
-        self.scan(secondary, isolated && express);
-        // What is behind it gets its addresses now, side by side: the
-        // window must cover them all and nothing else.
-        for i in first..self.found {
-            if matches!(self.funcs[i], Some(c) if !c.bridge) {
-                self.set_command(i, 0, CMD_MEMORY | CMD_BUS_MASTER | 1);
-                self.size_bars(i);
-            }
+        for kind in [Kind::Memory, Kind::Prefetch, Kind::Io] {
+            self.window(n, kind, None);
         }
-        let end = self.window_next.next_multiple_of(MEGABYTE);
-        self.window_next = end;
+        self.scan(secondary, isolated && express);
         let subordinate = (self.next_bus - 1) as u8;
         self.write(n, BUS_NUMBERS, numbers(subordinate), 4);
-        let window = if end == start {
-            self.write(n, MEMORY_WINDOW, 0x0000_fff0, 4);
-            None
-        } else if end > 1 << 32 {
-            // The window's registers are 32 bits wide.
-            say!("[fail] the BAR window is above 4 GiB: nothing behind a bridge is reachable");
-            self.write(n, MEMORY_WINDOW, 0x0000_fff0, 4);
-            None
-        } else {
-            let (base, limit) = ((start >> 16) as u32 & 0xfff0, ((end - 1) >> 16) as u32 & 0xfff0);
-            self.write(n, MEMORY_WINDOW, limit << 16 | base, 4);
-            Some((start, end - 1))
-        };
-        // The bridge passes memory accesses down, and DMA and MSIs up.
-        self.set_command(n, CMD_MEMORY | CMD_BUS_MASTER, 0);
-        let kind = if express {
-            "a PCI Express port"
-        } else {
-            "a conventional bridge, so what is behind it shares its requester ID and gets no DMA"
-        };
-        match window {
-            Some((a, b)) => say!(
-                "{:02x}:{:02x}.{} bridges to bus {secondary:02x} (to {subordinate:02x}), {} functions behind it, memory window {a:#x} to {b:#x}; {kind}",
-                f.bus,
-                f.dev,
-                f.func,
-                self.found - first
-            ),
-            None => say!(
-                "{:02x}:{:02x}.{} bridges to bus {secondary:02x} (to {subordinate:02x}), {} functions behind it, no memory window; {kind}",
-                f.bus,
-                f.dev,
-                f.func,
-                self.found - first
-            ),
+        let f = self.funcs[n].as_mut().unwrap();
+        (f.secondary, f.subordinate, f.express) = (secondary, subordinate, express);
+    }
+
+    /// Where the next BAR of `kind` goes.
+    fn cursor(&mut self, kind: Kind) -> &mut u64 {
+        match kind {
+            Kind::Io => &mut self.io_next,
+            _ => &mut self.window_next,
         }
     }
 
-    /// Sizes the function's memory BARs (with decoding off) and assigns
-    /// each an address in the window, aligned to its size.
-    fn size_bars(&mut self, i: usize) {
+    /// Sets (or with `None` shuts) bridge `n`'s window of `kind`:
+    /// `range` is its first and last address.
+    fn window(&mut self, n: usize, kind: Kind, range: Option<(u64, u64)>) {
+        match (kind, range) {
+            // Shut: base above limit.
+            (Kind::Memory, None) => self.write(n, MEMORY_WINDOW, 0x0000_fff0, 4),
+            (Kind::Prefetch, None) => {
+                self.write(n, PREFETCH_WINDOW, 0x0000_fff0, 4);
+                self.write(n, PREFETCH_BASE_UPPER, 0, 4);
+                self.write(n, PREFETCH_LIMIT_UPPER, 0, 4);
+            }
+            (Kind::Io, None) => {
+                self.write(n, IO_WINDOW, 0x00f0, 2);
+                self.write(n, IO_WINDOW_UPPER, 0, 4);
+            }
+            // Memory windows are in megabytes: the registers hold the
+            // top twelve bits of the first and last megabyte's address.
+            (Kind::Memory | Kind::Prefetch, Some((a, b))) => {
+                let (base, limit) = ((a >> 16) as u32 & 0xfff0, (b >> 16) as u32 & 0xfff0);
+                if kind == Kind::Memory {
+                    self.write(n, MEMORY_WINDOW, limit << 16 | base, 4);
+                } else {
+                    self.write(n, PREFETCH_WINDOW, limit << 16 | base, 4);
+                    self.write(n, PREFETCH_BASE_UPPER, (a >> 32) as u32, 4);
+                    self.write(n, PREFETCH_LIMIT_UPPER, (b >> 32) as u32, 4);
+                }
+            }
+            // I/O windows are in 4 KiB of ports: the top four bits of
+            // the first and last, and the bits above 16 apart.
+            (Kind::Io, Some((a, b))) => {
+                let (base, limit) = ((a >> 8) as u32 & 0xf0, (b >> 8) as u32 & 0xf0);
+                self.write(n, IO_WINDOW, limit << 8 | base, 2);
+                self.write(n, IO_WINDOW_UPPER, (b >> 16) as u32 & 0xffff_0000 | (a >> 16) as u32, 4);
+            }
+        }
+    }
+
+    /// Gives everything behind bridge `n` its addresses of `kind`, side
+    /// by side, bridges behind it included (each a range inside this
+    /// one), and sets `n`'s window of that kind to exactly the range, in
+    /// the window's own grain; a bridge with nothing of the kind behind
+    /// it keeps that window shut.
+    fn layout(&mut self, n: usize, kind: Kind) {
+        let f = self.funcs[n].unwrap();
+        if f.secondary == 0 {
+            return; // it was given no bus
+        }
+        let grain = if kind == Kind::Io { 0x1000 } else { MEGABYTE };
+        let start = self.cursor(kind).next_multiple_of(grain);
+        *self.cursor(kind) = start;
+        for i in 0..MAX_FUNCS {
+            match self.funcs[i] {
+                Some(c) if c.bus == f.secondary && c.bridge => self.layout(i, kind),
+                Some(c) if c.bus == f.secondary => self.size_bars(i, kind),
+                _ => {}
+            }
+        }
+        let end = self.cursor(kind).next_multiple_of(grain);
+        *self.cursor(kind) = end;
+        let range = if end == start {
+            None
+        } else if kind != Kind::Io && end > 1 << 32 {
+            // These windows' registers are written as 32 bits wide.
+            say!("[fail] the BAR window is above 4 GiB: nothing behind a bridge is reachable");
+            None
+        } else {
+            Some((start, end - 1))
+        };
+        self.window(n, kind, range);
+        self.funcs[n].as_mut().unwrap().windows[kind as usize] = range;
+    }
+
+    /// Lays out what is behind every bridge on bus 0, lets the bridges
+    /// pass accesses down (and DMA and MSIs up), and says what each
+    /// bridge got.
+    fn layout_all(&mut self) {
+        for kind in [Kind::Memory, Kind::Prefetch, Kind::Io] {
+            for n in 0..MAX_FUNCS {
+                if matches!(self.funcs[n], Some(f) if f.bridge && f.bus == 0) {
+                    self.layout(n, kind);
+                }
+            }
+        }
+        // What is behind a bridge has every address it will get.
+        for f in self.funcs.iter_mut().flatten().filter(|f| f.bus != 0) {
+            f.sized = true;
+        }
+        for n in 0..MAX_FUNCS {
+            let Some(f) = self.funcs[n].filter(|f| f.bridge && f.secondary != 0) else {
+                continue;
+            };
+            self.set_command(n, CMD_MEMORY | CMD_BUS_MASTER | CMD_IO, 0);
+            let behind = self
+                .funcs
+                .iter()
+                .flatten()
+                .filter(|c| (f.secondary..=f.subordinate).contains(&c.bus))
+                .count();
+            // "memory A to B, prefetchable C to D, I/O E to F", those
+            // that are open; "none" if all are shut.
+            struct Windows([Option<(u64, u64)>; 3]);
+            impl core::fmt::Display for Windows {
+                fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+                    let mut any = false;
+                    for (range, name) in self.0.iter().zip(["memory", "prefetchable", "I/O"]) {
+                        if let Some((a, b)) = range {
+                            write!(f, "{}{name} {a:#x} to {b:#x}", if any { ", " } else { "" })?;
+                            any = true;
+                        }
+                    }
+                    if any { Ok(()) } else { write!(f, "none") }
+                }
+            }
+            say!(
+                "{:02x}:{:02x}.{} bridges to bus {:02x} (to {:02x}), {behind} functions behind it; {}",
+                f.bus,
+                f.dev,
+                f.func,
+                f.secondary,
+                f.subordinate,
+                if f.express {
+                    "a PCI Express port"
+                } else {
+                    "a conventional bridge, so what is behind it shares its requester ID and gets no DMA"
+                }
+            );
+            say!("{:02x}:{:02x}.{} windows: {}", f.bus, f.dev, f.func, Windows(f.windows));
+        }
+    }
+
+    /// Sizes function `i`'s BARs of `kind` and gives each an address:
+    /// memory ones (prefetchable or not) from the BAR window, I/O ones
+    /// from the port range, if there is one.
+    fn size_bars(&mut self, i: usize, kind: Kind) {
         let mut b = 0;
         while b < 6 {
             let off = 0x10 + 4 * b as u64;
             let orig = self.read(i, off);
-            if orig & 1 != 0 {
-                b += 1; // I/O BAR: drivers get memory BARs only
+            let io = orig & 1 != 0;
+            let is64 = !io && orig >> 1 & 3 == 2;
+            let this = match (io, orig & 8 != 0) {
+                (true, _) => Kind::Io,
+                (false, true) => Kind::Prefetch,
+                (false, false) => Kind::Memory,
+            };
+            if this != kind || self.funcs[i].unwrap().bars[b].is_some() {
+                b += if is64 { 2 } else { 1 };
                 continue;
             }
-            let is64 = orig >> 1 & 3 == 2;
             self.write(i, off, 0xffff_ffff, 4);
-            let lo = self.read(i, off) & !0xf;
+            let lo = self.read(i, off) & if io { !3 } else { !0xf };
             self.write(i, off, orig, 4);
             let hi = if is64 {
                 let orig_hi = self.read(i, off + 4);
@@ -446,18 +670,41 @@ impl Bus {
             } else {
                 0xffff_ffff
             };
-            let mask = (hi as u64) << 32 | lo as u64;
+            // An I/O BAR may decode 16 bits only.
+            let mask = if io && lo >> 16 == 0 {
+                !0xffff | lo as u64
+            } else {
+                (hi as u64) << 32 | lo as u64
+            };
             if lo != 0 {
                 let size = (!mask).wrapping_add(1);
-                let align = size.max(4096);
-                let addr = (self.window_next + align - 1) & !(align - 1);
-                self.window_next = addr + size;
-                let f = self.funcs[i].as_mut().unwrap();
-                f.bars[b] = Some(Bar { addr, size, is64 });
+                let align = if io { size } else { size.max(4096) };
+                let addr = (*self.cursor(kind) + align - 1) & !(align - 1);
+                // Ports are few: a BAR that does not fit gets none.
+                if !io || addr + size <= self.io_end {
+                    *self.cursor(kind) = addr + size;
+                    let f = self.funcs[i].as_mut().unwrap();
+                    f.bars[b] = Some(Bar {
+                        addr,
+                        size,
+                        is64,
+                        io,
+                    });
+                }
             }
             b += if is64 { 2 } else { 1 };
         }
-        self.funcs[i].as_mut().unwrap().sized = true;
+    }
+
+    /// Sizes all of function `i`'s BARs (one on bus 0: nothing has to be
+    /// side by side with anything).
+    fn size_all(&mut self, i: usize) {
+        if !self.funcs[i].unwrap().sized {
+            for kind in [Kind::Memory, Kind::Prefetch, Kind::Io] {
+                self.size_bars(i, kind);
+            }
+            self.funcs[i].as_mut().unwrap().sized = true;
+        }
     }
 
     fn program_bars(&self, i: usize) {
@@ -465,13 +712,31 @@ impl Bus {
         for (b, bar) in f.bars.iter().enumerate() {
             if let Some(bar) = bar {
                 let off = 0x10 + 4 * b as u64;
-                let flags = self.read(i, off) & 0xf;
+                let flags = self.read(i, off) & if bar.io { 3 } else { 0xf };
                 self.write(i, off, bar.addr as u32 | flags, 4);
                 if bar.is64 {
                     self.write(i, off + 4, (bar.addr >> 32) as u32, 4);
                 }
             }
         }
+    }
+
+    /// Reads (or with `value` writes) `width` bytes at `offset` in
+    /// function `i`'s I/O BAR `bar`: ports only this server can reach, so
+    /// a driver's accesses stay inside its own BAR.
+    fn io(&mut self, i: usize, bar: u64, offset: u64, width: u64, value: Option<u64>) -> Result<u64, Status> {
+        let b = self.funcs[i]
+            .unwrap()
+            .bars
+            .get(bar as usize)
+            .copied()
+            .flatten()
+            .filter(|b| b.io)
+            .ok_or(Status::NotFound)?;
+        if !matches!(width, 1 | 2 | 4) || offset % width != 0 || offset.checked_add(width).is_none_or(|e| e > b.size) {
+            return Err(Status::Invalid);
+        }
+        ports::access(b.addr + offset, width, value).ok_or(Status::DeviceError)
     }
 
     /// Quiets function `i` and takes back everything its last owner had.
@@ -606,11 +871,10 @@ impl Bus {
             Err(s) => return ([s as u64, 0, 0, 0], None),
         };
         let how = self.reset(i);
-        if !self.funcs[i].unwrap().sized {
-            self.size_bars(i);
-        }
+        self.size_all(i);
         self.program_bars(i);
-        self.set_command(i, CMD_MEMORY | CMD_INTX_DISABLE, 0);
+        let has_io = self.funcs[i].unwrap().bars.iter().flatten().any(|b| b.io);
+        self.set_command(i, CMD_MEMORY | CMD_INTX_DISABLE | if has_io { CMD_IO } else { 0 }, 0);
         let f = self.funcs[i].as_mut().unwrap();
         let again = f.owner == badge;
         f.owner = badge;
@@ -630,14 +894,15 @@ impl Bus {
                 "no IOMMU, so no bus mastering"
             }
         );
-        let mask = f
-            .bars
-            .iter()
-            .enumerate()
-            .filter(|(_, b)| b.is_some())
-            .fold(0, |m, (b, _)| m | 1 << b);
+        let mask = |io: bool| {
+            f.bars
+                .iter()
+                .enumerate()
+                .filter(|(_, b)| b.is_some_and(|b| b.io == io))
+                .fold(0, |m, (b, _)| m | 1 << b)
+        };
         let bdf = (f.bus as u64) << 8 | (f.dev as u64) << 3 | f.func as u64;
-        ([Status::Ok as u64, bdf, mask, 0], domain)
+        ([Status::Ok as u64, bdf, mask(false), mask(true)], domain)
     }
 
     /// The function `badge` owns.
@@ -653,6 +918,7 @@ impl Bus {
             .get(bar as usize)
             .copied()
             .flatten()
+            .filter(|b| !b.io)
             .ok_or(Status::NotFound)?;
         if page.checked_mul(4096).is_none_or(|o| o >= b.size) {
             return Err(Status::NotFound);
@@ -823,6 +1089,23 @@ impl Bus {
                 Ok(slot) => ([Status::Ok as u64, 0, 0, 0], Some(slot)),
                 Err(s) => status(s),
             },
+            pci::IO_READ => match self.io(i, m[1], m[2], m[3], None) {
+                Ok(v) => ([Status::Ok as u64, v, 0, 0], None),
+                Err(s) => status(s),
+            },
+            pci::IO_WRITE => match self.io(i, m[1] & 0xff, m[2], m[1] >> 8, Some(m[3])) {
+                Ok(_) => status(Status::Ok),
+                Err(s) => status(s),
+            },
+            pci::CLOSE => {
+                // Given back: quiet, and anyone's to open.
+                self.reset(i);
+                let f = self.funcs[i].as_mut().unwrap();
+                say!("{:02x}:{:02x}.{} given back by client {badge}", f.bus, f.dev, f.func);
+                f.owner = 0;
+                f.dma = false;
+                status(Status::Ok)
+            }
             pci::INTX => match self.intx(i) {
                 Ok((slot, wire)) => ([Status::Ok as u64, wire, 0, 0], Some(slot)),
                 Err(s) => status(s),
@@ -854,11 +1137,19 @@ pub extern "C" fn _start(_: u64) -> ! {
         domain_owner: [None; MAX_OPEN],
         window_base: base,
         window_next: base,
+        io_next: 0,
+        io_end: 0,
         found: 0,
         next_bus: 1,
     };
-    say!("BAR window at {base:#x}; scanning bus 0");
+    if let Some((first, end)) = ports::range() {
+        (bus.io_next, bus.io_end) = (first, end);
+        say!("BAR window at {base:#x}, I/O ports {first:#x} to {:#x}; scanning bus 0", end - 1);
+    } else {
+        say!("BAR window at {base:#x}; scanning bus 0");
+    }
     bus.scan(0, true);
+    bus.layout_all();
     let mut r = syscall(Syscall::Recv, SERVICE, [0; 4]);
     loop {
         let (reply, grant) = if r.status == 0 {

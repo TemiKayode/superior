@@ -18,6 +18,8 @@ component pcibus
   provides pci 0
   device pci-config 1
   device pci-mmio 2
+  # Ports for I/O BARs.
+  device pci-io 84
   # MSI vectors: slots 3 to 10.
   device msi 3
   device iommu 11

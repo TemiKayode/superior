@@ -342,6 +342,18 @@ pub fn irq_routable(line: u8) -> bool {
 /// `(device + pin - 1) % 4`.
 const INTX_LINES: [u8; 4] = [35, 36, 37, 38];
 
+/// I/O ports for PCI BARs: QEMU `virt`'s window of device memory that
+/// stands for ports 0 to 0xffff, just below the ECAM window.
+pub fn pci_io_cap() -> Capability {
+    Capability::new(
+        Object::DeviceUntyped {
+            base: 0x3eff_0000,
+            size_bits: 16,
+        },
+        Rights::ALL,
+    )
+}
+
 /// The legacy PCI interrupt lines.
 pub fn intx_lines() -> &'static [u8] {
     &INTX_LINES

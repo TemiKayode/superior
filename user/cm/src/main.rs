@@ -582,6 +582,7 @@ fn device(name: &str) -> Option<(u64, u64)> {
         "msi" => (root::MSI, root::MSI_COUNT),
         "iommu" => (root::IOMMU, 1),
         "intx" => (root::INTX, root::INTX_COUNT),
+        "pci-io" => (root::PCI_IO, 1),
         _ => return None,
     })
 }

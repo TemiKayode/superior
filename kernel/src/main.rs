@@ -210,6 +210,7 @@ fn start_component_manager() -> Result<(), &'static str> {
             Capability::new(Object::Irq { line }, rw),
         )
     });
+    let intx = intx.chain([(root::PCI_IO as usize, arch::pci_io_cap())]);
     let mut all = [(0, caps[0].1); 48];
     let mut n = 0;
     for c in caps.into_iter().chain(pci).chain(iommu).chain(state).chain(intx) {

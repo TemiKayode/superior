@@ -417,6 +417,24 @@ fn start_helper() -> Result<(), &'static str> {
 /// (the bus server's `OPEN` or `OPEN_CLASS` call).
 /// Where an IOMMU domain would arrive with the bridged device's `OPEN`.
 const BRIDGED_DOMAIN: u64 = 40;
+/// A BAR page of a device behind a bridge, and where it is mapped.
+const BRIDGED_BAR: u64 = 41;
+const BRIDGED_BAR_VA: u64 = USER_BASE + 0x4a00_0000;
+
+/// Takes page 0 of memory BAR `bar` of the device this client has open
+/// and maps it at `BRIDGED_BAR_VA`.
+fn bridged_bar(bar: u64) -> bool {
+    syscall(Syscall::CapDelete, BRIDGED_BAR, [0; 4]);
+    let x = CapTransfer {
+        grant: None,
+        accept: Some(BRIDGED_BAR as u16),
+    };
+    let p = syscall_x(Syscall::Call, BLOCK_PCI, [pci::BAR_PAGE, bar, 0, 0], x);
+    p.status == 0
+        && p.msg[0] == Status::Ok as u64
+        && p.cap == Some(BRIDGED_BAR as u16)
+        && syscall(Syscall::FrameMap, BRIDGED_BAR, [BRIDGED_BAR_VA, 1, 0, 0]).status == 0
+}
 
 fn block_client(open: [u64; 4]) -> ! {
     let mut t = Checks(0, "block");
@@ -552,6 +570,86 @@ fn block_client(open: [u64; 4]) -> ! {
                 r.msg[1] >> 8,
                 r.msg[1] >> 3 & 0x1f,
                 r.msg[1] & 7
+            ),
+        );
+        let ok = Status::Ok as u64;
+        // Its BAR 4 is prefetchable memory, which the bridge passes
+        // through its prefetchable window: virtio's common configuration
+        // is there, and its second feature word has VERSION_1 (bit 0).
+        let version_1 = bridged_bar(4) && {
+            // SAFETY: the BAR's first page is mapped; these are two of
+            // its registers.
+            unsafe {
+                (BRIDGED_BAR_VA as *mut u32).write_volatile(1);
+                ((BRIDGED_BAR_VA + 4) as *const u32).read_volatile() & 1 == 1
+            }
+        };
+        syscall(Syscall::CapDelete, BRIDGED_BAR, [0; 4]);
+        let closed = syscall(Syscall::Call, BLOCK_PCI, [pci::CLOSE, 0, 0, 0]);
+        t.check(
+            version_1 && closed.status == 0 && closed.msg[0] == ok,
+            format_args!(
+                "its prefetchable BAR answers through the bridge's prefetchable window; then it is given back"
+            ),
+        );
+        // An RTL-8139 behind another root port has its registers twice:
+        // in an I/O BAR (0), reached through the port's I/O window and
+        // only by way of the bus server, and in a memory BAR (1).
+        syscall(Syscall::CapDelete, BRIDGED_DOMAIN, [0; 4]);
+        let r = syscall_x(
+            Syscall::Call,
+            BLOCK_PCI,
+            [pci::OPEN, pci::VERSION, 0x10ec << 16 | 0x8139, 0],
+            x,
+        );
+        let opened = r.status == 0 && r.msg[0] == ok && r.msg[3] & 1 == 1 && r.msg[2] & 2 == 2;
+        let io = |m: [u64; 4]| {
+            let r = syscall(Syscall::Call, BLOCK_PCI, m);
+            (r.status == 0 && r.msg[0] == ok).then_some(r.msg[1])
+        };
+        let mapped = opened && bridged_bar(1);
+        // SAFETY: the BAR's page is mapped while `mapped`; offsets are
+        // inside its 256 bytes of registers.
+        let mmio = |off: u64| unsafe { ((BRIDGED_BAR_VA + off) as *const u8).read_volatile() };
+        let mut mac = [0u8; 6];
+        let mut same = mapped;
+        for (i, b) in mac.iter_mut().enumerate() {
+            *b = io([pci::IO_READ, 0, i as u64, 1]).unwrap_or(0xee) as u8;
+            same &= mapped && *b == mmio(i as u64);
+        }
+        // The multicast filter's bytes hold what is written: one written
+        // through each BAR, read through the other.
+        let crossed = mapped
+            && io([pci::IO_WRITE, 1 << 8, 8, 0xa5]).is_some()
+            && mmio(8) == 0xa5
+            && {
+                // SAFETY: as above.
+                unsafe { ((BRIDGED_BAR_VA + 9) as *mut u8).write_volatile(0x5a) };
+                io([pci::IO_READ, 0, 9, 1]) == Some(0x5a)
+            };
+        // Nothing past the BAR's 256 ports, and no ports for a memory BAR.
+        let past = syscall(Syscall::Call, BLOCK_PCI, [pci::IO_READ, 0, 256, 1]);
+        let memory = syscall(Syscall::Call, BLOCK_PCI, [pci::IO_READ, 1, 0, 1]);
+        let kept_in = past.status == 0
+            && past.msg[0] == Status::Invalid as u64
+            && memory.status == 0
+            && memory.msg[0] == Status::NotFound as u64;
+        syscall(Syscall::CapDelete, BRIDGED_BAR, [0; 4]);
+        syscall(Syscall::Call, BLOCK_PCI, [pci::CLOSE, 0, 0, 0]);
+        t.check(
+            // QEMU's MAC addresses: 52:54:00:12:34 and the card's number.
+            same && mac[..5] == [0x52, 0x54, 0x00, 0x12, 0x34] && crossed && kept_in,
+            format_args!(
+                "the RTL-8139 behind a root port ({:02x}:{:02x}.{}): MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} by its I/O BAR and its memory BAR alike; writes cross over; no port past the BAR",
+                r.msg[1] >> 8,
+                r.msg[1] >> 3 & 0x1f,
+                r.msg[1] & 7,
+                mac[0],
+                mac[1],
+                mac[2],
+                mac[3],
+                mac[4],
+                mac[5]
             ),
         );
     }

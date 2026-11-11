@@ -240,9 +240,17 @@ holds the rest):
     (`crates/objects/src/interfaces.rs`). A bridge (a PCI Express root port, say)
     is configured, not handed out: the scan gives it the next bus number (first
     clearing the numbers firmware left, so no two bridges answer for one bus),
-    walks the bus behind it, puts the BARs of everything there side by side and
-    sets the bridge's memory window to exactly that range, with its I/O and
-    prefetchable windows shut. Every bus can be numbered on x86-64 (VT-d's
+    and walks the bus behind it. Then each of a bridge's three windows (memory,
+    prefetchable memory, I/O ports) is set to exactly what the BARs of that kind
+    behind it take, side by side, a bridge's ranges lying inside those of the
+    bridge above; a window with nothing behind it stays shut. I/O BARs get ports
+    from a range the kernel hands the root task (0xd000 up on q35; on `virt` the
+    window of device memory that stands for ports). A driver does not get the
+    ports: it reads and writes its I/O BAR through the bus server (`pci::IO_READ`,
+    `IO_WRITE`), which keeps every access inside the BAR. `pci::CLOSE` gives a
+    function back. The NVMe test reads an RTL-8139's registers through its I/O
+    BAR behind a root port and compares them with its memory BAR, and reaches a
+    virtio device's prefetchable BAR through a bridge's prefetchable window. Every bus can be numbered on x86-64 (VT-d's
     context table for a bus is made when a function on it is first bound), and
     the 16 that `virt`'s configuration window holds on AArch64 (the SMMU stream
     table and ITS device table are sized for them, `abi::PCI_BUSES`), so a
@@ -736,7 +744,7 @@ ethtool and the MII ioctls, firmware files, more than one interrupt or one
 device per component (QEMU's later 8255x models append stale bytes to some of
 e100's frames, so its test uses the 82557); legacy
 interrupt lines shared by two functions, and their routing on machines other
-than QEMU's q35 and `virt`; more than 16 PCI buses on AArch64, I/O and prefetchable bridge windows, hot-plug, and
+than QEMU's q35 and `virt`; more than 16 PCI buses on AArch64, port ranges handed to drivers themselves (an I/O BAR access is a call to the bus server), hot-plug, and
 DMA for devices behind conventional bridges (they share a requester ID); Function
 Level Reset is exercised only by the NVMe controller (QEMU's virtio devices on
 these buses have none); more than one command per queue in the NVMe driver,

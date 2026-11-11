@@ -93,7 +93,7 @@ pub mod pci {
     /// its BARs and enables memory decoding (bus mastering stays off).
     /// Opening again (a restarted driver: same badge) resets the device
     /// again first. Reply: `[status, bus << 8 | device << 3 | function,
-    /// bitmask of memory BARs present, 0]`.
+    /// bitmask of memory BARs present, bitmask of I/O BARs given ports]`.
     pub const OPEN: u64 = 1;
     /// `[BAR_PAGE, bar, page]`: a capability to page `page` of memory BAR
     /// `bar` (a device frame), in the call's accept slot. Reply: `[status,
@@ -129,6 +129,16 @@ pub mod pci {
     /// the wire has it, `NotFound` if the function has no pin or the
     /// machine's routing is not known. Reply: `[status, wire]`.
     pub const INTX: u64 = 9;
+    /// `[IO_READ, bar, offset, width]`: reads `width` bytes (1, 2 or 4)
+    /// at `offset` in I/O BAR `bar`. The ports stay the bus server's: it
+    /// makes the access, inside the BAR. Reply: `[status, value]`.
+    pub const IO_READ: u64 = 10;
+    /// `[IO_WRITE, bar | width << 8, offset, value]`: writes likewise.
+    pub const IO_WRITE: u64 = 11;
+    /// `[CLOSE]`: gives the caller's function back: it is reset as for
+    /// `OPEN` (domain, BAR pages and interrupts revoked), and anyone's
+    /// to open.
+    pub const CLOSE: u64 = 12;
 }
 
 /// Block devices: what a storage driver serves.
