@@ -43,6 +43,9 @@
 //! - `arg 9`, a second file client: its container must not hold the
 //!   first client's file. Memory in slot 1, a notification to block on in
 //!   slot 2.
+//! - `arg 22`, the hot-plug client (`boot/hotplug.manifest`): opens a
+//!   card the host plugs in while the machine runs, sees what it held
+//!   revoked when the card is taken out, and opens the next one.
 //! - `arg 10`, the fault injector: asks the manager (control, slot 0) to
 //!   kill the filesystem server and the disk driver at pseudo-random
 //!   moments, then blocks on the notification in slot 1.
@@ -411,6 +414,101 @@ fn start_helper() -> Result<(), &'static str> {
         return Err("could not start it");
     }
     Ok(())
+}
+
+// ---- the hot-plug client (`arg 22`, boot/hotplug.manifest) ----
+
+const HOT_PCI: u64 = 0;
+const HOT_CONTROL: u64 = 1;
+/// The card's IOMMU domain and a page of its registers arrive here.
+const HOT_DOMAIN: u64 = 2;
+const HOT_BAR: u64 = 3;
+const HOT_BAR_VA: u64 = USER_BASE + 0x4000_0000;
+/// Ticks to wait for the host to plug the card in, or take it out.
+const HOT_WAIT: u64 = 6000;
+
+/// Opens the virtio entropy card (1af4:1044), asking every 50 ms until
+/// it is there: the `OPEN` reply and whether a domain came with it.
+fn hot_open() -> Option<([u64; 4], bool)> {
+    let deadline = ticks() + HOT_WAIT;
+    while ticks() < deadline {
+        syscall(Syscall::CapDelete, HOT_DOMAIN, [0; 4]);
+        let x = CapTransfer {
+            grant: None,
+            accept: Some(HOT_DOMAIN as u16),
+        };
+        let r = syscall_x(Syscall::Call, HOT_PCI, [pci::OPEN, pci::VERSION, 0x1af4 << 16 | 0x1044, 0], x);
+        if r.status == 0 && r.msg[0] == Status::Ok as u64 {
+            return Some((r.msg, r.cap == Some(HOT_DOMAIN as u16)));
+        }
+        superior_sys::sleep(5);
+    }
+    None
+}
+
+/// Whether the card's registers answer: page 0 of its BAR 4 (virtio's
+/// common configuration), whose second feature word has VERSION_1.
+fn hot_answers() -> bool {
+    syscall(Syscall::CapDelete, HOT_BAR, [0; 4]);
+    let x = CapTransfer {
+        grant: None,
+        accept: Some(HOT_BAR as u16),
+    };
+    let p = syscall_x(Syscall::Call, HOT_PCI, [pci::BAR_PAGE, 4, 0, 0], x);
+    p.status == 0
+        && p.msg[0] == Status::Ok as u64
+        && p.cap == Some(HOT_BAR as u16)
+        && syscall(Syscall::FrameMap, HOT_BAR, [HOT_BAR_VA, 1, 0, 0]).status == 0
+        // SAFETY: the page is mapped; these are two of its registers.
+        && unsafe {
+            (HOT_BAR_VA as *mut u32).write_volatile(1);
+            ((HOT_BAR_VA + 4) as *const u32).read_volatile() & 1 == 1
+        }
+}
+
+fn hotplug_client() -> ! {
+    let mut t = Checks(0, "hotplug");
+    let place = |m: [u64; 4]| (m[1] >> 8, m[1] >> 3 & 0x1f, m[1] & 7);
+    let first = hot_open();
+    let (m, domain) = first.unwrap_or(([0; 4], false));
+    let (bus, dev, func) = place(m);
+    t.check(
+        first.is_some() && bus != 0 && domain && hot_answers(),
+        format_args!(
+            "a card plugged in while running ({bus:02x}:{dev:02x}.{func}) opens with an IOMMU domain of its own, and its registers answer"
+        ),
+    );
+    // Taken out: the bus server no longer knows this client as an owner.
+    // (The registers are not touched again: their page is being revoked.)
+    let deadline = ticks() + HOT_WAIT;
+    let mut gone = false;
+    while !gone && ticks() < deadline {
+        let r = syscall(Syscall::Call, HOT_PCI, [pci::CONFIG_READ, 0, 0, 0]);
+        gone = r.status == 0 && r.msg[0] == Status::Denied as u64;
+        if !gone {
+            superior_sys::sleep(5);
+        }
+    }
+    // What it held is gone with the card: the page cannot be mapped
+    // again, the domain answers nothing, and there is no card to open.
+    let page_gone = syscall(Syscall::FrameMap, HOT_BAR, [HOT_BAR_VA + 0x1000, 1, 0, 0]).status != 0;
+    let domain_gone = syscall(Syscall::IoFaults, HOT_DOMAIN, [0; 4]).status != 0;
+    let r = syscall(Syscall::Call, HOT_PCI, [pci::OPEN, pci::VERSION, 0x1af4 << 16 | 0x1044, 0]);
+    t.check(
+        gone && page_gone && domain_gone && r.status == 0 && r.msg[0] == Status::NotFound as u64,
+        format_args!(
+            "taken out: the page of its registers and its domain are revoked, and there is no card to open"
+        ),
+    );
+    let second = hot_open();
+    let (m, domain) = second.unwrap_or(([0; 4], false));
+    let (bus, dev, func) = place(m);
+    t.check(
+        second.is_some() && domain && hot_answers(),
+        format_args!("a card plugged in again ({bus:02x}:{dev:02x}.{func}) opens and answers like the first"),
+    );
+    syscall(Syscall::Call, HOT_CONTROL, [OP_SHUTDOWN, t.0, 0, 0]);
+    superior_sys::park()
 }
 
 /// The block client, for the disk driver whose device is opened by `open`
@@ -4057,6 +4155,7 @@ pub extern "C" fn _start(role: u64) -> ! {
         6 => hog(),
         19 => clone_child(),
         20 => reboot_client(),
+        22 => hotplug_client(),
         7 => fs_client(),
         8 => fs_verify(),
         9 => fs_other(),

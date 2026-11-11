@@ -248,7 +248,16 @@ holds the rest):
     window of device memory that stands for ports). A driver does not get the
     ports: it reads and writes its I/O BAR through the bus server (`pci::IO_READ`,
     `IO_WRITE`), which keeps every access inside the BAR. `pci::CLOSE` gives a
-    function back. The NVMe test reads an RTL-8139's registers through its I/O
+    function back. Hot-plug: a PCI Express port on bus 0 whose slot takes cards
+    while the machine runs is looked at five times a second. A card that appears
+    is powered, found and given addresses (the port's windows move to them) and
+    is opened like any other; one whose attention button is pressed, or that is
+    gone, first loses everything (its functions' domains, BAR pages and
+    interrupts are revoked, whoever held them), then the slot is powered off,
+    which lets it go. `cargo xtask hotplug-test` plugs a card in through QEMU's
+    monitor, takes it out and plugs another in, on both ISAs: the client opens
+    the first, finds its page and domain revoked when it goes, and opens the
+    second. The NVMe test reads an RTL-8139's registers through its I/O
     BAR behind a root port and compares them with its memory BAR, and reaches a
     virtio device's prefetchable BAR through a bridge's prefetchable window. Every bus can be numbered on x86-64 (VT-d's
     context table for a bus is made when a function on it is first bound), and
@@ -744,7 +753,7 @@ ethtool and the MII ioctls, firmware files, more than one interrupt or one
 device per component (QEMU's later 8255x models append stale bytes to some of
 e100's frames, so its test uses the 82557); legacy
 interrupt lines shared by two functions, and their routing on machines other
-than QEMU's q35 and `virt`; more than 16 PCI buses on AArch64, port ranges handed to drivers themselves (an I/O BAR access is a call to the bus server), hot-plug, and
+than QEMU's q35 and `virt`; more than 16 PCI buses on AArch64, port ranges handed to drivers themselves (an I/O BAR access is a call to the bus server), hot-plug of bridges or behind bridges below bus 0, a hot-plug interrupt (the slots are polled) and word of it to drivers (one whose card went finds its calls refused), and
 DMA for devices behind conventional bridges (they share a requester ID); Function
 Level Reset is exercised only by the NVMe controller (QEMU's virtio devices on
 these buses have none); more than one command per queue in the NVMe driver,
@@ -816,6 +825,7 @@ cargo xtask lde-test       # the network test over Linux's 8139cp driver (needs 
 cargo xtask lde-e100-test  # the same over Linux's e100 driver
 cargo xtask tcp-test       # just the TCP test (add aarch64 for that ISA)
 cargo xtask keyboard-test  # just the USB keyboard test (add aarch64 for that ISA)
+cargo xtask hotplug-test   # just the PCI hot-plug test (add aarch64 for that ISA)
 cargo xtask run            # boot the shell in QEMU (x86-64), its console on this terminal
 cargo xtask run aarch64    # the same on QEMU's AArch64 virt machine
 cargo xtask image  # just build target/superior.img

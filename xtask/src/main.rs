@@ -114,6 +114,9 @@ struct Image {
     /// A USB keyboard on an xHCI controller, typed on through QEMU's
     /// monitor (the keyboard test).
     keyboard: bool,
+    /// An empty PCI Express root port, and QEMU's monitor to plug cards
+    /// into it (the hot-plug test).
+    hotplug: bool,
 }
 
 /// The disk drivers, each with the PCI function its test disk appears as
@@ -160,6 +163,7 @@ fn main() -> ExitCode {
                         .and_then(|_| net_test(a, "lde-e100"))
                         .and_then(|_| tcp_test(a))
                         .and_then(|_| keyboard_test(a))
+                        .and_then(|_| hotplug_test(a))
                         .and_then(|_| image(false, a))
                         .and_then(|img| shell_session(&img))
                 })
@@ -184,6 +188,7 @@ fn main() -> ExitCode {
         Some("lde-e100-test") => net_test(arch, "lde-e100"),
         Some("tcp-test") => tcp_test(arch),
         Some("keyboard-test") => keyboard_test(arch),
+        Some("hotplug-test") => hotplug_test(arch),
         Some("memory-test") => {
             image_with(false, arch, "memory").and_then(|img| memory_test(&img))
         }
@@ -192,7 +197,7 @@ fn main() -> ExitCode {
         }
         Some("bench") => image(false, Arch::X86_64).and_then(|img| bench(&img)),
         _ => Err(
-            "usage: cargo xtask <image | run | test | boot-test | shell-test | cm-test | supervise-test | drivers-test | memory-test | reboot-test | fs-test | nvme-test | ahci-test | net-test | lde-test | lde-e100-test | tcp-test | keyboard-test | bench | sel4-test> [x86_64 | aarch64]"
+            "usage: cargo xtask <image | run | test | boot-test | shell-test | cm-test | supervise-test | drivers-test | memory-test | reboot-test | fs-test | nvme-test | ahci-test | net-test | lde-test | lde-e100-test | tcp-test | keyboard-test | hotplug-test | bench | sel4-test> [x86_64 | aarch64]"
                 .into(),
         ),
     });
@@ -576,6 +581,7 @@ fn image_for(
         net: matches!(manifest, "net" | "tcp") || linux_nic(manifest).is_some(),
         linux_nic: linux_nic(manifest).map(|l| l.1),
         keyboard: manifest == "keyboard",
+        hotplug: manifest == "hotplug",
     })
 }
 
@@ -670,6 +676,7 @@ fn sel4_image() -> Result<Image, String> {
         net: false,
         linux_nic: None,
         keyboard: false,
+        hotplug: false,
     })
 }
 
@@ -704,7 +711,7 @@ fn qemu_command(img: &Image) -> Command {
             // Images with a disk are driver tests: they need an IOMMU,
             // which QEMU emulates (VT-d) only on its q35 machine, with
             // interrupt remapping.
-            if img.disk.is_some() || img.net || img.keyboard {
+            if img.disk.is_some() || img.net || img.keyboard || img.hotplug {
                 q.args(["-machine", "q35", "-device", "intel-iommu,intremap=on"]);
             }
             if img.disk.is_some() && img.driver == "ahci" {
@@ -729,7 +736,7 @@ fn qemu_command(img: &Image) -> Command {
             // Driver tests get an SMMUv3 in front of PCI.
             let machine = if img.sel4 {
                 SEL4_MACHINE
-            } else if img.disk.is_some() || img.net || img.keyboard {
+            } else if img.disk.is_some() || img.net || img.keyboard || img.hotplug {
                 "virt,highmem=off,gic-version=3,iommu=smmuv3"
             } else {
                 "virt,highmem=off,gic-version=3"
@@ -868,6 +875,17 @@ fn qemu_command(img: &Image) -> Command {
             "-qmp",
         ])
         .arg(format!("tcp:127.0.0.1:{QMP_PORT},server=on,wait=off"));
+    }
+    if img.hotplug {
+        // An empty root port to plug cards into, and the monitor that
+        // does it. On q35 QEMU would announce hot-plug through ACPI,
+        // which nothing here reads: it is told to leave the port's own
+        // PCI Express hot-plug in charge.
+        if img.arch == Arch::X86_64 {
+            q.args(["-global", "ICH9-LPC.acpi-pci-hotplug-with-bridge-support=off"]);
+        }
+        q.args(["-device", "pcie-root-port,id=hp0,chassis=1", "-qmp"])
+            .arg(format!("tcp:127.0.0.1:{QMP_PORT},server=on,wait=off"));
     }
     q.args(["-serial", "stdio", "-no-reboot"]);
     q
@@ -1964,6 +1982,79 @@ fn type_words(
         typed += 1;
     }
     typed
+}
+
+/// Plugs a virtio entropy card into root port `hp0` through QEMU's
+/// monitor, takes it out, and plugs another in, some seconds apart.
+fn plug_cards(stop: std::sync::Arc<std::sync::atomic::AtomicBool>) {
+    use std::io::{BufRead, BufReader};
+    use std::net::TcpStream;
+    use std::sync::atomic::Ordering;
+    let mut stream = None;
+    while stream.is_none() && !stop.load(Ordering::Relaxed) {
+        stream = TcpStream::connect(("127.0.0.1", QMP_PORT)).ok();
+        if stream.is_none() {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+    let Some(mut s) = stream else { return };
+    if let Ok(r) = s.try_clone() {
+        std::thread::spawn(move || for _ in BufReader::new(r).lines().map_while(Result::ok) {});
+    }
+    let _ = s.write_all(b"{\"execute\":\"qmp_capabilities\"}\n");
+    let add = |id: &str| {
+        format!(
+            "{{\"execute\":\"device_add\",\"arguments\":{{\"driver\":\"virtio-rng-pci\",\"bus\":\"hp0\",\"id\":\"{id}\",\"disable-legacy\":\"on\"}}}}\n"
+        )
+    };
+    let del = "{\"execute\":\"device_del\",\"arguments\":{\"id\":\"hot0\"}}\n".to_string();
+    // The guest has booted by the first; each later step leaves it time
+    // to act on the one before.
+    for (wait, command) in [(5, add("hot0")), (8, del), (8, add("hot1"))] {
+        for _ in 0..wait * 10 {
+            if stop.load(Ordering::Relaxed) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        if s.write_all(command.as_bytes()).is_err() {
+            return;
+        }
+    }
+}
+
+/// Boots `boot/hotplug.manifest` with an empty root port and plugs a
+/// card in, takes it out and plugs another in while the machine runs.
+fn hotplug_test(arch: Arch) -> Result<(), String> {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let img = image_with(false, arch, "hotplug")?;
+    println!("== hot-plug test on {}", img.path.display());
+    let stop = Arc::new(AtomicBool::new(false));
+    let plugger = {
+        let stop = stop.clone();
+        std::thread::spawn(move || plug_cards(stop))
+    };
+    let out = run_to_exit(&img, Duration::from_secs(120));
+    stop.store(true, Ordering::Relaxed);
+    let _ = plugger.join();
+    let out = out?;
+    let steps = [
+        "pci: 1 hot-plug slots, looked at every 200 ms",
+        "pci: 01:00.0 1af4:1044",
+        "a card was plugged in (bus 01); windows: memory 0x",
+        "[pass] hotplug: a card plugged in while running (01:00.0) opens with an IOMMU domain of its own, and its registers answer",
+        "pci: 01:00.0 1af4:1044 removed; what its driver held is revoked",
+        "its card is let go (bus 01)",
+        "[pass] hotplug: taken out: the page of its registers and its domain are revoked, and there is no card to open",
+        "pci: 01:00.0 1af4:1044",
+        "a card was plugged in (bus 01); windows: memory 0x",
+        "[pass] hotplug: a card plugged in again (01:00.0) opens and answers like the first",
+        "[cm] client asked to shut down (pass)",
+    ];
+    check_log("hot-plug test", &out, &steps)?;
+    println!("== hot-plug test passed ({})", arch.name());
+    Ok(())
 }
 
 /// Milliseconds between key events: more than the keyboard's polling

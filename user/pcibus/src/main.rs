@@ -48,6 +48,17 @@
 //! its BAR through this server (`pci::IO_READ`, `pci::IO_WRITE`), which
 //! keeps each access inside the BAR. `pci::CLOSE` gives a function back.
 //!
+//! Hot-plug: a PCI Express port on bus 0 whose slot can take a card
+//! while the machine runs is looked at five times a second (if the
+//! manifest gives this server a notification for the timer). A card that
+//! appears is powered, found, and given addresses (new ones: the port's
+//! windows move to them), and can be opened like any other. One whose
+//! attention button is pressed (the request to take it out), or that is
+//! gone, loses everything first: its functions' domains, BAR pages and
+//! interrupts are revoked, whoever held them, and the functions
+//! forgotten; then the slot is powered off, which lets the card go. A
+//! bridge plugged in is not configured.
+//!
 //! Legacy interrupts: a function with no MSI gets the interrupt line
 //! its pin is wired to (`pci::INTX`), one function a line: the wire of a
 //! function on bus 0 is `(device + pin - 1) % 4`, and a bridge passes
@@ -64,7 +75,7 @@
 #![no_main]
 
 use superior_driver::dma_address;
-use superior_objects::abi::{CapTransfer, ObjectType, PCI_BUSES, Syscall, root};
+use superior_objects::abi::{CapTransfer, Error, ObjectType, PCI_BUSES, Syscall, root};
 use superior_objects::interfaces::{Status, pci};
 use superior_sys::{print_line, syscall, syscall_x};
 
@@ -89,6 +100,11 @@ const MAX_OPEN: usize = 4;
 const DOMAIN_MEMORY: u64 = BAR_SLOTS + MAX_BAR_PAGES as u64;
 const DOMAINS: u64 = DOMAIN_MEMORY + MAX_OPEN as u64;
 const DOMAIN_BITS: u64 = 16;
+/// A notification, if the manifest gives one (`notification 78`): its
+/// timer has the hot-plug slots looked at.
+const NOTIFY: u64 = 78;
+/// Ticks between looks at the hot-plug slots (200 ms).
+const SLOT_POLL: u64 = 20;
 /// The legacy interrupt lines, one per wire.
 const INTX: u64 = 80;
 /// The I/O port range (ports on x86-64, a window of device memory on
@@ -118,6 +134,20 @@ const PREFETCH_WINDOW: u64 = 0x24;
 const PREFETCH_BASE_UPPER: u64 = 0x28;
 const PREFETCH_LIMIT_UPPER: u64 = 0x2c;
 const IO_WINDOW_UPPER: u64 = 0x30;
+// A PCI Express port's slot registers, from its capability.
+const SLOT_CAPABILITIES: u64 = 0x14;
+const SLOT_CONTROL: u64 = 0x18;
+const SLOT_STATUS: u64 = 0x1a;
+/// Status: the attention button was pressed (asking for the card to be
+/// let go); a card is present; and the events, cleared by writing them.
+const SLOT_ATTENTION: u32 = 1 << 0;
+const SLOT_PRESENT: u32 = 1 << 6;
+const SLOT_EVENTS: u32 = 0x11f;
+/// Control: the power indicator (both bits: off; the low one: on), and
+/// power off.
+const SLOT_INDICATOR: u32 = 3 << 8;
+const SLOT_INDICATOR_ON: u32 = 1 << 8;
+const SLOT_POWER_OFF: u32 = 1 << 10;
 /// A bridge's memory window is in whole megabytes.
 const MEGABYTE: u64 = 1 << 20;
 
@@ -132,6 +162,23 @@ struct Bar {
     size: u64,
     is64: bool,
     io: bool,
+}
+
+/// A bridge's windows, for the log: "memory A to B, prefetchable C to D,
+/// I/O E to F", those that are open; "none" if all are shut.
+struct Windows([Option<(u64, u64)>; 3]);
+
+impl core::fmt::Display for Windows {
+    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+        let mut any = false;
+        for (range, name) in self.0.iter().zip(["memory", "prefetchable", "I/O"]) {
+            if let Some((a, b)) = range {
+                write!(f, "{}{name} {a:#x} to {b:#x}", if any { ", " } else { "" })?;
+                any = true;
+            }
+        }
+        if any { Ok(()) } else { write!(f, "none") }
+    }
 }
 
 /// The three kinds of address a BAR asks for, each with a window of its
@@ -181,16 +228,19 @@ struct Bus {
     msi_owner: [Option<u8>; MSI_COUNT],
     /// The function that has each legacy interrupt line.
     intx_owner: [Option<u8>; INTX_COUNT],
-    /// The function each domain slot belongs to.
+    /// The function each domain slot belongs to, and whether the slot's
+    /// block of memory has been made (it is kept when its function goes).
     domain_owner: [Option<u8>; MAX_OPEN],
+    domain_made: [bool; MAX_OPEN],
+    /// Finding what was plugged in: bridges are left alone.
+    hot: bool,
     window_base: u64,
     window_next: u64,
     /// The ports I/O BARs are given: the next free, and the end (both 0
     /// if the manifest gave no port range).
     io_next: u64,
     io_end: u64,
-    /// Functions found, and the next bus number to give a bridge.
-    found: usize,
+    /// The next bus number to give a bridge.
     next_bus: u16,
 }
 
@@ -385,14 +435,12 @@ impl Bus {
     /// numbering the buses as it goes. `isolated`: functions here have
     /// requester IDs of their own.
     fn scan(&mut self, bus: u8, isolated: bool) {
-        let first = self.found;
         for dev in 0..32u8 {
             for func in 0..8u8 {
-                let n = self.found;
-                if n == MAX_FUNCS {
+                let Some(n) = self.funcs.iter().position(Option::is_none) else {
                     say!("more than {MAX_FUNCS} functions: the rest are left alone");
                     return;
-                }
+                };
                 let mut f = Func {
                     bus,
                     dev,
@@ -438,7 +486,6 @@ impl Bus {
                     if f.bridge { ", a bridge" } else { "" }
                 );
                 self.funcs[n] = Some(f);
-                self.found += 1;
                 // Nothing decodes or masters the bus until it is laid
                 // out and, for a device, opened.
                 self.set_command(n, 0, CMD_MEMORY | CMD_BUS_MASTER | CMD_IO);
@@ -456,8 +503,8 @@ impl Bus {
         }
         // Every bridge on this bus now forwards nothing, so each can be
         // given its bus in turn.
-        for n in first..self.found {
-            if matches!(self.funcs[n], Some(f) if f.bridge && f.bus == bus) {
+        for n in 0..MAX_FUNCS {
+            if matches!(self.funcs[n], Some(f) if f.bridge && f.bus == bus && f.secondary == 0) {
                 self.bridge(n, isolated);
             }
         }
@@ -467,6 +514,10 @@ impl Bus {
     /// behind any bridges there). Its windows stay shut until `layout`.
     fn bridge(&mut self, n: usize, isolated: bool) {
         let f = self.funcs[n].unwrap();
+        if self.hot {
+            say!("{:02x}:{:02x}.{}: a bridge plugged in is not configured", f.bus, f.dev, f.func);
+            return;
+        }
         if self.next_bus as u64 >= PCI_BUSES {
             say!(
                 "{:02x}:{:02x}.{}: no bus number left for what is behind it",
@@ -607,21 +658,6 @@ impl Bus {
                 .flatten()
                 .filter(|c| (f.secondary..=f.subordinate).contains(&c.bus))
                 .count();
-            // "memory A to B, prefetchable C to D, I/O E to F", those
-            // that are open; "none" if all are shut.
-            struct Windows([Option<(u64, u64)>; 3]);
-            impl core::fmt::Display for Windows {
-                fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
-                    let mut any = false;
-                    for (range, name) in self.0.iter().zip(["memory", "prefetchable", "I/O"]) {
-                        if let Some((a, b)) = range {
-                            write!(f, "{}{name} {a:#x} to {b:#x}", if any { ", " } else { "" })?;
-                            any = true;
-                        }
-                    }
-                    if any { Ok(()) } else { write!(f, "none") }
-                }
-            }
             say!(
                 "{:02x}:{:02x}.{} bridges to bus {:02x} (to {:02x}), {behind} functions behind it; {}",
                 f.bus,
@@ -637,6 +673,129 @@ impl Bus {
             );
             say!("{:02x}:{:02x}.{} windows: {}", f.bus, f.dev, f.func, Windows(f.windows));
         }
+    }
+
+    /// Bridge `n`'s PCI Express capability, if it is a port on bus 0
+    /// with a slot that takes cards while the machine runs.
+    fn hot_slot(&self, n: usize) -> Option<u64> {
+        let f = self.funcs[n].filter(|f| f.bridge && f.bus == 0 && f.secondary != 0)?;
+        let cap = self.capability(n, CAP_PCIE).filter(|_| f.express)?;
+        // A slot is implemented, and it is hot-plug capable.
+        (self.read16(n, cap + 2) & 1 << 8 != 0 && self.read(n, cap + SLOT_CAPABILITIES) & 1 << 6 != 0)
+            .then_some(cap)
+    }
+
+    /// Looks at every hot-plug slot: a card that appeared is taken in,
+    /// one asked out (or gone) is let go.
+    fn poll_slots(&mut self) {
+        for n in 0..MAX_FUNCS {
+            let Some(cap) = self.hot_slot(n) else {
+                continue;
+            };
+            let status = self.read16(n, cap + SLOT_STATUS) as u32;
+            // The events are acknowledged by writing them back.
+            if status & SLOT_EVENTS != 0 {
+                self.write(n, cap + SLOT_STATUS, status & SLOT_EVENTS, 2);
+            }
+            let secondary = self.funcs[n].unwrap().secondary;
+            let occupied = self.funcs.iter().flatten().any(|c| c.bus == secondary);
+            let present = status & SLOT_PRESENT != 0;
+            let control = self.read16(n, cap + SLOT_CONTROL) as u32;
+            if occupied && (status & SLOT_ATTENTION != 0 || !present) {
+                self.unplug(n);
+                // Power and its indicator off: the card may be taken out.
+                self.write(n, cap + SLOT_CONTROL, control | SLOT_INDICATOR | SLOT_POWER_OFF, 2);
+            } else if present && !occupied {
+                // Power on, its indicator on; then see what it is.
+                let on = control & !(SLOT_INDICATOR | SLOT_POWER_OFF) | SLOT_INDICATOR_ON;
+                self.write(n, cap + SLOT_CONTROL, on, 2);
+                self.plug(n);
+            }
+        }
+    }
+
+    /// Finds what was plugged in behind port `n` and gives it addresses.
+    fn plug(&mut self, n: usize) {
+        let f = self.funcs[n].unwrap();
+        self.hot = true;
+        self.scan(f.secondary, f.isolated && f.express);
+        self.hot = false;
+        if !self.funcs.iter().flatten().any(|c| c.bus == f.secondary) {
+            return; // not answering yet: looked at again next time
+        }
+        for kind in [Kind::Memory, Kind::Prefetch, Kind::Io] {
+            self.layout(n, kind);
+        }
+        for c in self.funcs.iter_mut().flatten().filter(|c| c.bus == f.secondary) {
+            c.sized = true;
+        }
+        let f = self.funcs[n].unwrap();
+        say!(
+            "{:02x}:{:02x}.{}: a card was plugged in (bus {:02x}); windows: {}",
+            f.bus,
+            f.dev,
+            f.func,
+            f.secondary,
+            Windows(f.windows)
+        );
+    }
+
+    /// Lets go of what is behind port `n`: every function there loses
+    /// what its driver held and is forgotten, and the port's windows are
+    /// shut.
+    fn unplug(&mut self, n: usize) {
+        let f = self.funcs[n].unwrap();
+        for i in 0..MAX_FUNCS {
+            if matches!(self.funcs[i], Some(c) if c.bus == f.secondary) {
+                self.remove(i);
+            }
+        }
+        for kind in [Kind::Io, Kind::Prefetch, Kind::Memory] {
+            // The last range given out can be given out again.
+            if let Some((a, b)) = f.windows[kind as usize] {
+                if *self.cursor(kind) == b + 1 {
+                    *self.cursor(kind) = a;
+                }
+            }
+            self.window(n, kind, None);
+            self.funcs[n].as_mut().unwrap().windows[kind as usize] = None;
+        }
+        say!("{:02x}:{:02x}.{}: its card is let go (bus {:02x})", f.bus, f.dev, f.func, f.secondary);
+    }
+
+    /// Forgets function `i`, which is going: its owner's domain, BAR
+    /// pages and interrupts are revoked first.
+    fn remove(&mut self, i: usize) {
+        let f = self.funcs[i].unwrap();
+        self.reset(i);
+        if let Some(d) = f.domain {
+            // Every copy of the domain goes; its memory is kept for the
+            // next function to need one.
+            syscall(Syscall::CapRevoke, DOMAIN_MEMORY + d as u64, [0; 4]);
+            self.domain_owner[d as usize] = None;
+        }
+        for (p, page) in self.bar_pages.iter_mut().enumerate() {
+            if matches!(page, Some((owner, _, _)) if *owner as usize == i) {
+                syscall(Syscall::CapDelete, BAR_SLOTS + p as u64, [0; 4]);
+                *page = None;
+            }
+        }
+        for owner in self.msi_owner.iter_mut() {
+            if *owner == Some(i as u8) {
+                *owner = None;
+            }
+        }
+        say!(
+            "{:02x}:{:02x}.{} {:04x}:{:04x} removed{}",
+            f.bus,
+            f.dev,
+            f.func,
+            f.ids >> 16,
+            f.ids & 0xffff,
+            if f.owner != 0 { "; what its driver held is revoked" } else { "" }
+        );
+        config::detach(i);
+        self.funcs[i] = None;
     }
 
     /// Sizes function `i`'s BARs of `kind` and gives each an address:
@@ -796,18 +955,21 @@ impl Bus {
                     .iter()
                     .position(Option::is_none)
                     .ok_or(Status::InUse)?;
-                let made = syscall(
-                    Syscall::Retype,
-                    UNTYPED,
-                    [
-                        ObjectType::Untyped as u64,
-                        DOMAIN_BITS,
-                        DOMAIN_MEMORY + d as u64,
-                        0,
-                    ],
-                );
-                if made.status != 0 {
-                    return Err(Status::DeviceError);
+                if !self.domain_made[d] {
+                    let made = syscall(
+                        Syscall::Retype,
+                        UNTYPED,
+                        [
+                            ObjectType::Untyped as u64,
+                            DOMAIN_BITS,
+                            DOMAIN_MEMORY + d as u64,
+                            0,
+                        ],
+                    );
+                    if made.status != 0 {
+                        return Err(Status::DeviceError);
+                    }
+                    self.domain_made[d] = true;
                 }
                 self.domain_owner[d] = Some(i as u8);
                 self.funcs[i].as_mut().unwrap().domain = Some(d as u8);
@@ -1135,11 +1297,12 @@ pub extern "C" fn _start(_: u64) -> ! {
         msi_owner: [None; MSI_COUNT],
         intx_owner: [None; INTX_COUNT],
         domain_owner: [None; MAX_OPEN],
+        domain_made: [false; MAX_OPEN],
+        hot: false,
         window_base: base,
         window_next: base,
         io_next: 0,
         io_end: 0,
-        found: 0,
         next_bus: 1,
     };
     if let Some((first, end)) = ports::range() {
@@ -1150,18 +1313,36 @@ pub extern "C" fn _start(_: u64) -> ! {
     }
     bus.scan(0, true);
     bus.layout_all();
-    let mut r = syscall(Syscall::Recv, SERVICE, [0; 4]);
+    // With a notification, its timer wakes the same `Recv` that waits for
+    // calls, and the hot-plug slots are looked at.
+    let polling = syscall(Syscall::NotificationBind, NOTIFY, [0; 4]).status == 0;
+    if polling {
+        syscall(Syscall::TimerSignal, NOTIFY, [SLOT_POLL, 0, 0, 0]);
+        let slots = (0..MAX_FUNCS).filter(|&n| bus.hot_slot(n).is_some()).count();
+        say!("{slots} hot-plug slots, looked at every {} ms", SLOT_POLL * 10);
+    }
+    let mut reply: Option<([u64; 4], Option<u64>)> = None;
     loop {
-        let (reply, grant) = if r.status == 0 {
+        let r = match reply.take() {
+            Some((m, grant)) => {
+                let x = CapTransfer {
+                    grant: grant.map(|s| s as u16),
+                    accept: None,
+                };
+                syscall_x(Syscall::ReplyRecv, SERVICE, m, x)
+            }
+            None => syscall(Syscall::Recv, SERVICE, [0; 4]),
+        };
+        if r.status == Error::Notified.code() {
+            bus.poll_slots();
+            syscall(Syscall::TimerSignal, NOTIFY, [SLOT_POLL, 0, 0, 0]);
+            continue;
+        }
+        reply = Some(if r.status == 0 {
             bus.serve(r.badge, r.msg)
         } else {
             ([Status::Invalid as u64, 0, 0, 0], None)
-        };
-        let x = CapTransfer {
-            grant: grant.map(|s| s as u16),
-            accept: None,
-        };
-        r = syscall_x(Syscall::ReplyRecv, SERVICE, reply, x);
+        });
     }
 }
 

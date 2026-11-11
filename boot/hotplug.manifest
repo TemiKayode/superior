@@ -1,0 +1,32 @@
+# The hot-plug test (cargo xtask hotplug-test).
+#
+# The machine has an empty PCI Express root port. While it runs, the host
+# plugs a card into it (through QEMU's monitor), takes it out, and plugs
+# one in again. The bus server, which looks at its hot-plug slots five
+# times a second, must find the card and give it addresses; the client
+# opens it and reads its registers; when the card is asked out the bus
+# server revokes what the client held before letting it go; and the
+# second card is found and opened like the first.
+
+component pcibus
+  image pcibus
+  priority 12
+  # 2^7 slots: an ECAM page for each of 32 functions, BAR pages, domains.
+  cspace 7
+  provides pci 0
+  device pci-config 1
+  device pci-mmio 2
+  # Ports for I/O BARs.
+  device pci-io 84
+  device msi 3
+  device iommu 11
+  untyped 18 12
+  # Its timer has the hot-plug slots looked at.
+  notification 78
+
+component client
+  image testclient
+  arg 22
+  priority 8
+  uses pci 0
+  control 1
