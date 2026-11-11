@@ -425,9 +425,12 @@ pub const VSPACE_MIN_BITS: u64 = 14;
 pub const VSPACE_MAX_BITS: u64 = 20;
 /// PCI buses whose functions an I/O address space can be bound to and
 /// whose MSIs can be routed: requester IDs below `PCI_BUSES << 8`. The
-/// kernel sizes its IOMMU and interrupt-remapping tables for these, and
-/// the bus server numbers no bus beyond them.
-pub const PCI_BUSES: u64 = 8;
+/// kernel's IOMMU and interrupt tables reach these, and the bus server
+/// numbers no bus beyond them. On x86-64 that is every bus there can be
+/// (VT-d's context tables are made as buses are first used); on AArch64
+/// it is the 16 whose configuration space QEMU `virt`'s ECAM window
+/// holds below 4 GiB.
+pub const PCI_BUSES: u64 = if cfg!(target_arch = "aarch64") { 16 } else { 256 };
 
 /// [`Syscall::FrameMapInto`] flags.
 pub const MAP_WRITE: u64 = 1;

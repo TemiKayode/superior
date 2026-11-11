@@ -523,7 +523,9 @@ fn block_client(open: [u64; 4]) -> ! {
         format_args!("nor any BAR page"),
     );
     // The NVMe test's machine has a device behind a conventional bridge
-    // (a virtio entropy source at 02:01.0). Its DMA would carry the
+    // (a virtio entropy source at 0b:01.0: nine empty root ports come
+    // before the NVMe controller's, so the buses are numbered past the
+    // eight the kernel's tables once reached). Its DMA would carry the
     // bridge's requester ID, so no IOMMU domain could hold it alone: the
     // bus server opens it without one and refuses it bus mastering.
     if open[0] == pci::OPEN_CLASS && open[2] == 0x01_08_02 {
@@ -541,7 +543,7 @@ fn block_client(open: [u64; 4]) -> ! {
         t.check(
             r.status == 0
                 && r.msg[0] == Status::Ok as u64
-                && r.msg[1] == 2 << 8 | 1 << 3
+                && r.msg[1] == 0xb << 8 | 1 << 3
                 && r.cap.is_none()
                 && master.status == 0
                 && master.msg[0] == Status::Denied as u64,

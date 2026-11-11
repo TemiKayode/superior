@@ -120,7 +120,7 @@ struct Image {
 /// and the test client's role for it (which device it must be refused).
 const DISK_DRIVERS: [(&str, &str, u64); 3] = [
     ("virtio-blk", "1af4:1042 class 010000", 4),
-    ("nvme", "pci: 01:00.0 1b36:0010 class 010802", 11),
+    ("nvme", "pci: 0a:00.0 1b36:0010 class 010802", 11),
     ("ahci", "8086:2922 class 010601", 12),
 ];
 
@@ -778,9 +778,15 @@ fn qemu_command(img: &Image) -> Command {
             ))
             // The controller sits behind a PCI Express root port, on a
             // bus of its own, so the bus server must number that bus and
-            // open the port's memory window to reach it. A conventional
+            // open the port's memory window to reach it. Nine empty root
+            // ports come first, each taking a bus number, so the
+            // controller is on bus 10: past the eight buses the kernel's
+            // IOMMU and interrupt tables once reached. A conventional
             // bridge with a device behind it follows: found, but given no
             // DMA, since it would share the bridge's requester ID.
+            .args(
+                (1..=9).flat_map(|n| ["-device".to_string(), format!("pcie-root-port,id=empty{n},chassis={}", 10 + n)]),
+            )
             .args([
                 "-device",
                 "pcie-root-port,id=rp0,chassis=1",
@@ -1082,11 +1088,11 @@ fn drivers_test(img: &Image) -> Result<(), String> {
         "[cm] manifest: 3 components",
         "pci: BAR window at",
         device,
-        // The NVMe controller is behind a root port, on bus 1; a
-        // conventional bridge with a device behind it makes bus 2.
-        pick("bridges to bus 01 (to 01), 1 functions behind it, memory window"),
-        pick("pci: 02:01.0 1af4:1044"),
-        pick("bridges to bus 02 (to 02), 1 functions behind it, memory window"),
+        // The NVMe controller is behind the tenth root port, on bus 10;
+        // a conventional bridge with a device behind it makes bus 11.
+        pick("bridges to bus 0a (to 0a), 1 functions behind it, memory window"),
+        pick("pci: 0b:01.0 1af4:1044"),
+        pick("bridges to bus 0b (to 0b), 1 functions behind it, memory window"),
         pick("a conventional bridge, so what is behind it shares its requester ID and gets no DMA"),
         "given to client 2 (reset:",
         "new, empty IOMMU domain",
@@ -1114,7 +1120,7 @@ fn drivers_test(img: &Image) -> Result<(), String> {
         "[pass] block: the bus server will not give it the driver's device",
         "[pass] block: nor any BAR page",
         pick("behind a conventional bridge, so no bus mastering"),
-        pick("[pass] block: the device behind the conventional bridge (02:01.0) opens with no IOMMU domain, and may not master the bus"),
+        pick("[pass] block: the device behind the conventional bridge (0b:01.0) opens with no IOMMU domain, and may not master the bus"),
         forged,
         &stray,
         "the IOMMU reported a blocked write to it",

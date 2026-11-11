@@ -242,13 +242,15 @@ holds the rest):
     clearing the numbers firmware left, so no two bridges answer for one bus),
     walks the bus behind it, puts the BARs of everything there side by side and
     sets the bridge's memory window to exactly that range, with its I/O and
-    prefetchable windows shut. Buses go up to 8 (`abi::PCI_BUSES`): the kernel's
-    VT-d context tables, SMMU stream table and ITS device table are sized for
-    them, so a function on any of them gets a domain of its own and its MSIs are
-    checked against its own requester ID. Behind a conventional bridge a
+    prefetchable windows shut. Every bus can be numbered on x86-64 (VT-d's
+    context table for a bus is made when a function on it is first bound), and
+    the 16 that `virt`'s configuration window holds on AArch64 (the SMMU stream
+    table and ITS device table are sized for them, `abi::PCI_BUSES`), so a
+    function on any of them gets a domain of its own and its MSIs are checked
+    against its own requester ID. Behind a conventional bridge a
     function's DMA carries the bridge's ID instead, so it is opened with no
-    domain and refused bus mastering. The NVMe tests put the controller behind a
-    root port (bus 1) and a virtio device behind a conventional bridge (bus 2). A driver opens one function and gets only
+    domain and refused bus mastering. The NVMe tests put the controller behind the
+    tenth root port (bus 10) and a virtio device behind a conventional bridge (bus 11). A driver opens one function and gets only
     its BAR pages and MSI vectors; configuration writes are limited to bus
     mastering, MSI-X and plain MSI (`pci::MSI`: the bus server writes the
     function's vector into its MSI capability, for devices without MSI-X). Each opened function gets a new, empty IOMMU domain with
@@ -734,7 +736,7 @@ ethtool and the MII ioctls, firmware files, more than one interrupt or one
 device per component (QEMU's later 8255x models append stale bytes to some of
 e100's frames, so its test uses the 82557); legacy
 interrupt lines shared by two functions, and their routing on machines other
-than QEMU's q35 and `virt`; more than 8 PCI buses, I/O and prefetchable bridge windows, hot-plug, and
+than QEMU's q35 and `virt`; more than 16 PCI buses on AArch64, I/O and prefetchable bridge windows, hot-plug, and
 DMA for devices behind conventional bridges (they share a requester ID); Function
 Level Reset is exercised only by the NVMe controller (QEMU's virtio devices on
 these buses have none); more than one command per queue in the NVMe driver,

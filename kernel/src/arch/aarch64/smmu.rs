@@ -42,7 +42,7 @@ const CR1_WB_ISH: u32 = 1 | (1 << 2) | (3 << 4) | (1 << 6) | (1 << 8) | (3 << 10
 const READ_ALLOCATE: u64 = 1 << 62;
 
 /// Stream table: an entry of 64 bytes for every function of `PCI_BUSES`
-/// buses (2^11 entries, 128 KiB).
+/// buses (2^12 entries, 256 KiB).
 const STRTAB_LOG2: u64 = 8 + PCI_BUSES.trailing_zeros() as u64;
 const _: () = assert!(PCI_BUSES.is_power_of_two());
 /// Command queue: 2^5 commands of 16 bytes.

@@ -19,7 +19,7 @@ component pcibus
   device iommu 11
   untyped 18 12
   # The legacy interrupt lines, past its other slots.
-  device intx 64
+  device intx 80
 
 component lde-8139cp
   image lde-8139cp

@@ -13,6 +13,8 @@
 component pcibus
   image pcibus
   priority 12
+  # 2^7 slots: an ECAM page for each of 32 functions, BAR pages, domains.
+  cspace 7
   provides pci 0
   device pci-config 1
   device pci-mmio 2

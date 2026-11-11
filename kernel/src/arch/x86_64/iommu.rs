@@ -142,17 +142,11 @@ pub fn init() -> Option<&'static str> {
         REGS.store(0, Ordering::Relaxed);
         return None;
     }
-    // The root table, and a context table for each bus the bus server
-    // may number (functions behind bridges are on buses of their own).
+    // The root table: an entry for each of the 256 buses, none present.
+    // A bus's context table is made when a function on it is first bound
+    // (`context_entry`); until then VT-d blocks everything from it.
     let root = memory::carve(12)?;
     vm::zero_frame(root);
-    for bus in 0..PCI_BUSES {
-        let ctx = memory::carve(12)?;
-        vm::zero_frame(ctx);
-        // SAFETY: freshly carved RAM, reachable through the physical
-        // map; root entries are 16 bytes, one per bus.
-        unsafe { (vm::phys_ptr(root + 16 * bus) as *mut u64).write_volatile(ctx | 1) };
-    }
     ROOT.store(root, Ordering::Relaxed);
     w64(RTADDR, root);
     command(GCMD_SRTP);
@@ -324,11 +318,21 @@ fn context_entry(sid: u16) -> Option<*mut u64> {
     if !valid_sid(sid) {
         return None;
     }
-    // SAFETY: the root table is ours; the entries of the first
-    // `PCI_BUSES` buses are set in `init`.
-    let root = ROOT.load(Ordering::Relaxed) + 16 * (sid >> 8) as u64;
-    let ctx = unsafe { (vm::phys_ptr(root) as *const u64).read_volatile() } & !0xfff;
-    Some(vm::phys_ptr(ctx + 16 * (sid & 0xff) as u64) as *mut u64)
+    // SAFETY: the root table is ours; its entries are 16 bytes, one per
+    // bus, written only here, under the kernel lock.
+    let root = vm::phys_ptr(ROOT.load(Ordering::Relaxed) + 16 * (sid >> 8) as u64) as *mut u64;
+    let mut entry = unsafe { root.read_volatile() };
+    if entry & 1 == 0 {
+        // The bus's first function to be bound: its context table, every
+        // entry not present, so nothing else on the bus gets through.
+        let ctx = memory::carve(12)?;
+        vm::zero_frame(ctx);
+        entry = ctx | 1;
+        // SAFETY: as above. A root entry going from not present to
+        // present needs no invalidation.
+        unsafe { root.write_volatile(entry) };
+    }
+    Some(vm::phys_ptr((entry & !0xfff) + 16 * (sid & 0xff) as u64) as *mut u64)
 }
 
 /// Whether requester ID `sid` can be bound.

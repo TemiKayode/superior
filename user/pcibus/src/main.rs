@@ -31,7 +31,8 @@
 //! found behind it next to each other, and sets the bridge's memory
 //! window to just that range, in whole megabytes; its I/O and
 //! prefetchable windows stay shut. Buses are numbered up to
-//! `abi::PCI_BUSES`, which is as far as the kernel's IOMMU tables reach.
+//! `abi::PCI_BUSES`: every bus on x86-64, the 16 the ECAM window holds
+//! on AArch64.
 //! A function behind a bridge has a requester ID of its own only on PCI
 //! Express: behind a conventional bridge its DMA and interrupts carry the
 //! bridge's ID, so no domain could isolate it, and it gets none (and so
@@ -45,9 +46,9 @@
 //! Slots: 0 the `pci` endpoint (receive), 1 configuration space (I/O ports
 //! on x86-64, ECAM device memory on AArch64), 2 the BAR window (device
 //! memory), 3.. the MSI vectors, then the IOMMU-control capability (empty
-//! without an IOMMU) and untyped memory for the domains; from 64, if the
-//! manifest gives them (`device intx 64`, in a CSpace of 2^7 slots), the
-//! four legacy PCI interrupt lines.
+//! without an IOMMU) and untyped memory for the domains; from 80, if the
+//! manifest gives them (`device intx 80`), the four legacy PCI interrupt
+//! lines. Its CSpace has 2^7 slots.
 
 #![no_std]
 #![no_main]
@@ -67,7 +68,7 @@ const UNTYPED: u64 = IOMMU + 1;
 const SCRATCH: u64 = UNTYPED + 1;
 /// One ECAM page per function found (AArch64).
 const FUNC_SLOTS: u64 = SCRATCH + 1;
-const MAX_FUNCS: usize = 16;
+const MAX_FUNCS: usize = 32;
 /// The original of every BAR page handed out.
 const BAR_SLOTS: u64 = FUNC_SLOTS + MAX_FUNCS as u64;
 const MAX_BAR_PAGES: usize = 24;
@@ -78,9 +79,9 @@ const MAX_OPEN: usize = 4;
 const DOMAIN_MEMORY: u64 = BAR_SLOTS + MAX_BAR_PAGES as u64;
 const DOMAINS: u64 = DOMAIN_MEMORY + MAX_OPEN as u64;
 const DOMAIN_BITS: u64 = 16;
-const _: () = assert!(DOMAINS + MAX_OPEN as u64 <= 64);
 /// The legacy interrupt lines, one per wire.
-const INTX: u64 = 64;
+const INTX: u64 = 80;
+const _: () = assert!(DOMAINS + MAX_OPEN as u64 <= INTX);
 const INTX_COUNT: usize = root::INTX_COUNT as usize;
 
 // Configuration space.
@@ -149,7 +150,7 @@ struct Bus {
     window_next: u64,
     /// Functions found, and the next bus number to give a bridge.
     found: usize,
-    next_bus: u8,
+    next_bus: u16,
 }
 
 // ---- configuration space access -----------------------------------------
@@ -347,7 +348,7 @@ impl Bus {
             );
             return;
         }
-        let secondary = self.next_bus;
+        let secondary = self.next_bus as u8;
         self.next_bus += 1;
         // Only a PCI Express port passes requester IDs on unchanged; one
         // that bridges to conventional PCI (type 7) answers for all
@@ -381,7 +382,7 @@ impl Bus {
         }
         let end = self.window_next.next_multiple_of(MEGABYTE);
         self.window_next = end;
-        let subordinate = self.next_bus - 1;
+        let subordinate = (self.next_bus - 1) as u8;
         self.write(n, BUS_NUMBERS, numbers(subordinate), 4);
         let window = if end == start {
             self.write(n, MEMORY_WINDOW, 0x0000_fff0, 4);
