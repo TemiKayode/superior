@@ -3217,6 +3217,74 @@ fn resolve(args: core::fmt::Arguments) -> ([u64; 4], u32) {
     ([Status::Unreachable as u64, 0, 0, 0], again)
 }
 
+/// The records of DNS type `kind` of the name `args` gives, asking again
+/// while the resolver or the network is restarting: the status, how many,
+/// and the records joined with `|` (in `text`; its length).
+fn dns_records(args: core::fmt::Arguments, kind: u64, text: &mut [u8; 256]) -> (u64, u64, usize) {
+    let x = CapTransfer {
+        grant: Some(NET_PAGE as u16),
+        accept: None,
+    };
+    for _ in 0..DNS_TRIES {
+        let len = put_text(args);
+        let r = syscall_x(Syscall::Call, DNS, [dns::RECORDS, dns::VERSION, len | kind << 16, 0], x);
+        if r.status == 0 && r.msg[0] != Status::Unreachable as u64 {
+            let (mut at, mut n) = (0, 0);
+            if r.msg[0] == OK {
+                let p = net_page();
+                for i in 0..r.msg[1] {
+                    let len = u16::from_le_bytes([p[at], p[at + 1]]) as usize;
+                    if i > 0 && n < text.len() {
+                        text[n] = b'|';
+                        n += 1;
+                    }
+                    let take = len.min(text.len() - n);
+                    text[n..n + take].copy_from_slice(&p[at + 2..at + 2 + take]);
+                    n += take;
+                    at += 2 + len;
+                }
+            }
+            return (r.msg[0], r.msg[1], n);
+        }
+        superior_sys::sleep(1);
+    }
+    (Status::Unreachable as u64, 0, 0)
+}
+
+/// Records other than addresses: text, mail exchangers, services,
+/// reverse names and name servers, each as the resolver's text for it.
+fn dns_record_checks(t: &mut Checks) {
+    let mut all = true;
+    let mut want = |name: &str, kind: u64, records: u64, expect: &str| {
+        let mut text = [0u8; 256];
+        let (s, n, len) = dns_records(format_args!("{name}"), kind, &mut text);
+        let ok = s == OK && n == records && &text[..len] == expect.as_bytes();
+        if !ok {
+            say!(
+                "{name} type {kind}: status {s}, {n} records: {}",
+                core::str::from_utf8(&text[..len]).unwrap_or("(not text)")
+            );
+        }
+        all &= ok;
+    };
+    want("txt.superior.test", dns::TXT, 2, "v=spf1 -all|hello world");
+    // Through a CNAME, like an address.
+    want("alias-txt.superior.test", dns::TXT, 2, "v=spf1 -all|hello world");
+    want("superior.test", dns::MX, 2, "10 mx1.superior.test|20 mx2.superior.test");
+    want("superior.test", dns::NS, 1, "ns1.superior.test");
+    want("_sip._tcp.superior.test", dns::SRV, 1, "0 5 5060 sip.superior.test");
+    want("10.2.0.192.in-addr.arpa", dns::PTR, 1, "www.superior.test");
+    let mut text = [0u8; 256];
+    let (none, _, _) = dns_records(format_args!("www.superior.test"), dns::TXT, &mut text);
+    let (nowhere, _, _) = dns_records(format_args!("nowhere.superior.test"), dns::MX, &mut text);
+    t.check(
+        all && none == Status::NotFound as u64 && nowhere == Status::NotFound as u64,
+        format_args!(
+            "DNS records: superior.test's MX are mx1 (10) and mx2 (20), its NS ns1, its SIP SRV sip:5060; txt and its alias have two TXT; 192.0.2.10's PTR is www"
+        ),
+    );
+}
+
 /// Resolves the name `args` gives to an IPv6 address, asking again while
 /// the resolver or the network is restarting: the status, the address,
 /// and whether it came from the cache.
@@ -3317,6 +3385,7 @@ fn dns_checks(t: &mut Checks) {
             Colons(addr6)
         ),
     );
+    dns_record_checks(t);
     let (r, _) = resolve(format_args!("nowhere.superior.test"));
     let (bad, _) = resolve(format_args!("no..dots"));
     t.check(

@@ -10,6 +10,12 @@
 //! follows CNAME records in the answer to the address, and caches what it
 //! learns, names that do not exist included (for [`NEGATIVE_TTL`]).
 //!
+//! Other records (`dns::RECORDS`): a client names a record type (TXT, MX,
+//! SRV, PTR, NS, or any other by number) and gets the name's records of
+//! that type in its page, as text: the resolver asks the server each time
+//! (these are not cached), follows CNAMEs the same way, and expands the
+//! compressed names inside MX, SRV, PTR and NS data.
+//!
 //! It is crash-only: a restart loses the cache and the socket, and a call
 //! it was serving fails with `PeerRestarted`, which the client retries. If
 //! the network server restarts, the resolver's socket is gone: it binds
@@ -54,6 +60,11 @@ const MAX_NAME: usize = dns::MAX_NAME as usize;
 const TYPE_A: u16 = 1;
 const TYPE_CNAME: u16 = 5;
 const TYPE_AAAA: u16 = 28;
+const TYPE_NS: u16 = dns::NS as u16;
+const TYPE_PTR: u16 = dns::PTR as u16;
+const TYPE_MX: u16 = dns::MX as u16;
+const TYPE_TXT: u16 = dns::TXT as u16;
+const TYPE_SRV: u16 = dns::SRV as u16;
 const CLASS_IN: u16 = 1;
 const RCODE_NXDOMAIN: u16 = 3;
 
@@ -163,6 +174,68 @@ impl Name {
     }
 }
 
+/// Writes at the start of `out` one record for `dns::RECORDS`: a length
+/// (two bytes, little-endian), then the record's data (`len` bytes at
+/// `data` in message `m`, of type `kind`) as text. Returns the bytes
+/// written; `None` if the record is malformed or does not fit.
+fn record_text(m: &[u8], kind: u16, data: usize, len: usize, out: &mut [u8]) -> Option<usize> {
+    struct Text<'a>(&'a mut [u8], usize);
+    impl Text<'_> {
+        fn bytes(&mut self, b: &[u8]) -> Option<()> {
+            self.0.get_mut(self.1..self.1 + b.len())?.copy_from_slice(b);
+            self.1 += b.len();
+            Some(())
+        }
+        fn number(&mut self, n: u16) -> Option<()> {
+            let mut digits = [0u8; 5];
+            let (mut n, mut i) = (n, digits.len());
+            loop {
+                i -= 1;
+                digits[i] = b'0' + (n % 10) as u8;
+                n /= 10;
+                if n == 0 {
+                    break;
+                }
+            }
+            self.bytes(&digits[i..])?;
+            self.bytes(b" ")
+        }
+        fn name(&mut self, m: &[u8], at: usize) -> Option<()> {
+            let (n, _) = Name::read(m, at)?;
+            self.bytes(n.as_bytes())
+        }
+    }
+    let rdata = m.get(data..data + len)?;
+    let mut t = Text(out, 2);
+    match kind {
+        TYPE_TXT => {
+            // Character strings, each a length and its bytes: joined.
+            let mut at = 0;
+            while at < rdata.len() {
+                let n = rdata[at] as usize;
+                t.bytes(rdata.get(at + 1..at + 1 + n)?)?;
+                at += 1 + n;
+            }
+        }
+        TYPE_MX if len > 2 => {
+            t.number(be16(rdata, 0))?;
+            t.name(m, data + 2)?;
+        }
+        TYPE_SRV if len > 6 => {
+            for field in 0..3 {
+                t.number(be16(rdata, 2 * field))?;
+            }
+            t.name(m, data + 6)?;
+        }
+        TYPE_NS | TYPE_PTR | TYPE_CNAME => t.name(m, data)?,
+        TYPE_MX | TYPE_SRV => return None,
+        _ => t.bytes(rdata)?,
+    }
+    let end = t.1;
+    out[..2].copy_from_slice(&((end - 2) as u16).to_le_bytes());
+    Some(end)
+}
+
 #[derive(Clone, Copy)]
 struct Entry {
     name: Name,
@@ -177,6 +250,10 @@ struct Entry {
 /// How a query ended.
 enum Answer {
     Address([u8; 16], u64),
+    /// Records written to the lent page: how many, and their TTL.
+    Records(u64, u64),
+    /// The records do not fit in the page.
+    TooLong,
     NoSuchName,
     NoAnswer,
 }
@@ -262,8 +339,10 @@ impl Resolver {
         });
     }
 
-    /// Asks the DNS server for `name`'s address (`kind`: A or AAAA).
-    fn query(&mut self, name: &Name, kind: u16) -> Option<Answer> {
+    /// Asks the DNS server for `name`'s address (`kind`: A or AAAA), or
+    /// with `records` for its records of type `kind`, written into the
+    /// lent page.
+    fn query(&mut self, name: &Name, kind: u16, records: bool) -> Option<Answer> {
         for _ in 0..TRIES {
             let Some(server) = self.server() else {
                 // No lease yet, or the network server is restarting.
@@ -297,7 +376,7 @@ impl Resolver {
                     continue;
                 }
             }
-            if let Some(a) = self.wait(server, name, kind, ticks() + SECOND) {
+            if let Some(a) = self.wait(server, name, kind, records, ticks() + SECOND) {
                 return Some(a);
             }
         }
@@ -305,7 +384,14 @@ impl Resolver {
     }
 
     /// Waits until `deadline` for the answer to the query just sent.
-    fn wait(&mut self, server: u64, name: &Name, kind: u16, deadline: u64) -> Option<Answer> {
+    fn wait(
+        &mut self,
+        server: u64,
+        name: &Name,
+        kind: u16,
+        records: bool,
+        deadline: u64,
+    ) -> Option<Answer> {
         loop {
             loop {
                 match net_call([net::RECV, self.handle, 0, 0]) {
@@ -314,7 +400,8 @@ impl Resolver {
                             continue;
                         }
                         let len = (r[1] as usize).min(4096);
-                        if let Some(a) = self.answer(&page(PAGE_VA)[..len], name, kind) {
+                        let out = records.then(|| page(LENT_VA));
+                        if let Some(a) = self.answer(&page(PAGE_VA)[..len], name, kind, out) {
                             return Some(a);
                         }
                     }
@@ -339,7 +426,15 @@ impl Resolver {
     }
 
     /// Reads a response: `None` if it is not the answer to this query.
-    fn answer(&self, m: &[u8], name: &Name, want_kind: u16) -> Option<Answer> {
+    /// With `out`, the records of the type asked go there as text
+    /// (`dns::RECORDS`); without, the first address is the answer.
+    fn answer(
+        &self,
+        m: &[u8],
+        name: &Name,
+        want_kind: u16,
+        mut out: Option<&mut [u8]>,
+    ) -> Option<Answer> {
         if m.len() < 12 || be16(m, 0) != self.id || m[2] & 0x80 == 0 || be16(m, 4) != 1 {
             return None;
         }
@@ -384,11 +479,22 @@ impl Resolver {
         let mut ttl = u32::MAX;
         for _ in 0..8 {
             let mut next = None;
+            // Records written to `out`: how many, and where the next goes.
+            let (mut written, mut at) = (0u64, 0usize);
             for (owner, kind, t, data, len) in &records[..count] {
                 if owner.as_bytes() != want.as_bytes() {
                     continue;
                 }
                 match *kind {
+                    k if k == want_kind && out.is_some() => {
+                        let out = out.as_deref_mut()?;
+                        match record_text(m, k, *data, *len, &mut out[at..]) {
+                            Some(n) => at += n,
+                            None => return Some(Answer::TooLong),
+                        }
+                        written += 1;
+                        ttl = ttl.min(*t);
+                    }
                     k if k == want_kind && *len == if k == TYPE_A { 4 } else { 16 } => {
                         let mut a = [0; 16];
                         a[..*len].copy_from_slice(&m[*data..*data + *len]);
@@ -397,6 +503,9 @@ impl Resolver {
                     TYPE_CNAME => next = Name::read(m, *data).map(|(n, _)| (n, *t)),
                     _ => {}
                 }
+            }
+            if written > 0 {
+                return Some(Answer::Records(written, ttl as u64));
             }
             // No record of the type asked for, nor a CNAME on: the name
             // exists without one (NODATA).
@@ -443,6 +552,29 @@ impl Resolver {
         out
     }
 
+    /// `RECORDS`: the name's records of a type, as text in the lent page.
+    fn records(&mut self, m: [u64; 4], lent: bool) -> [u64; 4] {
+        let status = |s: Status| [s as u64, 0, 0, 0];
+        let (len, kind) = ((m[2] & 0xffff) as usize, (m[2] >> 16) as u16);
+        if !lent || m[1] != dns::VERSION || len == 0 || len > MAX_NAME + 1 || kind == 0 {
+            return status(Status::Invalid);
+        }
+        if syscall(Syscall::FrameMap, LENT, [LENT_VA, 1, 0, 0]).status != 0 {
+            return status(Status::Invalid);
+        }
+        let reply = match Name::parse(&page(LENT_VA)[..len]) {
+            None => status(Status::Invalid),
+            Some(name) => match self.query(&name, kind, true) {
+                Some(Answer::Records(n, ttl)) => [Status::Ok as u64, n, ttl.min(MAX_TTL), 0],
+                Some(Answer::TooLong) => status(Status::NoSpace),
+                Some(_) => status(Status::NotFound),
+                None => status(Status::Unreachable),
+            },
+        };
+        syscall(Syscall::FrameUnmap, LENT, [0; 4]);
+        reply
+    }
+
     /// The reply to `RESOLVE` for an A record; for AAAA, `[status, first
     /// 8 address bytes, last 8, TTL | cached << 63]`.
     fn lookup(&mut self, name: &Name, kind: u16) -> [u64; 4] {
@@ -464,7 +596,7 @@ impl Resolver {
                 None => status(Status::NotFound),
             };
         }
-        match self.query(name, kind) {
+        match self.query(name, kind, false) {
             Some(Answer::Address(a, ttl)) => {
                 self.remember(name, kind, Some(a), ttl);
                 found(a, ttl.min(MAX_TTL), 0)
@@ -478,6 +610,8 @@ impl Resolver {
                 self.remember(name, kind, None, NEGATIVE_TTL);
                 status(Status::NotFound)
             }
+            // Only `RECORDS` asks for these.
+            Some(Answer::Records(..) | Answer::TooLong) => status(Status::NotFound),
             None => status(Status::Unreachable),
         }
     }
@@ -508,6 +642,7 @@ pub extern "C" fn _start(arg: u64) -> ! {
         let reply = match call.msg[0] {
             dns::RESOLVE if call.status == 0 => r.resolve(call.msg, lent, TYPE_A),
             dns::RESOLVE6 if call.status == 0 => r.resolve(call.msg, lent, TYPE_AAAA),
+            dns::RECORDS if call.status == 0 => r.records(call.msg, lent),
             _ => [Status::Invalid as u64, 0, 0, 0],
         };
         if lent {

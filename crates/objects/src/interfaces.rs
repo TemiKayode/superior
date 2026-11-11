@@ -477,6 +477,24 @@ pub mod dns {
     /// good, 1 if it came from the cache]`. `NotFound` if the name does
     /// not exist or has no IPv6 address.
     pub const RESOLVE6: u64 = 2;
+    /// `[RECORDS, VERSION, length | type << 16]` with a frame lent
+    /// (writable) whose first `length` bytes are the name: the name's
+    /// records of that type (a DNS record type's number: [`TXT`], [`MX`],
+    /// [`SRV`], [`PTR`], [`NS`] or any other), found through CNAMEs like
+    /// an address. The frame gets them one after another, each a length
+    /// (two bytes, little-endian) and that many bytes: a TXT record's
+    /// strings joined; an MX record as `preference host`; SRV as
+    /// `priority weight port target`; PTR, NS and CNAME as the name;
+    /// names lower case and dotted, numbers decimal; any other type's
+    /// data as it came. Reply `[status, records, seconds they stay good,
+    /// 0]`: `NotFound` if the name does not exist or has none,
+    /// `NoSpace` if they do not fit in the page. These are not cached.
+    pub const RECORDS: u64 = 3;
+    pub const NS: u64 = 2;
+    pub const PTR: u64 = 12;
+    pub const MX: u64 = 15;
+    pub const TXT: u64 = 16;
+    pub const SRV: u64 = 33;
 }
 
 /// USB: what a host controller driver serves to class drivers.

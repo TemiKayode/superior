@@ -517,7 +517,11 @@ holds the rest):
     DHCP, through a UDP socket of the network server's, again every second for up
     to four tries, follows CNAMEs in the answer (with compression pointers) to the
     address, and caches what it learns, names that do not exist included (for
-    10 s). It is crash-only too: a restart loses the cache and fails the call it
+    10 s). `RECORDS` gives a name's records of any other type, as text in the
+    page: TXT strings, mail exchangers (MX) as `preference host`, services (SRV)
+    as `priority weight port target`, reverse names (PTR) and name servers (NS),
+    found through CNAMEs the same way, the compressed names inside them expanded;
+    these are asked of the server each time. It is crash-only too: a restart loses the cache and fails the call it
     was serving with `PeerRestarted`, and when the network server restarts it binds
     a new socket and asks again.
   - TCP (`crates/inet/src/tcp.rs`, a state machine with no I/O of its own, fed
@@ -692,7 +696,7 @@ these buses have none); more than one command per queue in the NVMe driver,
 more than two commands in flight per disk in the AHCI driver, ATAPI
 and port multipliers; in the xHCI driver isochronous and bulk endpoints, USB 3 streams,
 hubs and more than one interrupter, and HID devices other than boot keyboards; in the network server
-IPv6 routes beyond one router and stateful DHCPv6, DNS records other than A, AAAA and CNAME (and DNS over TCP), routes beyond one gateway, and rings between
+IPv6 routes beyond one router and stateful DHCPv6, caching of DNS records other than addresses, DNSSEC and DNS over TCP, routes beyond one gateway, and rings between
 clients and the server (frames between the server and the driver go through rings; a client's datagram still takes a call); the async executor, buffer pools and
 power callbacks of the SDK; an IDL compiler for the interfaces; escalating a component
 given up on to a supervisor above it (today the

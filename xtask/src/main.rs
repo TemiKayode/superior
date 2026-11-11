@@ -1323,6 +1323,45 @@ fn dns_records(name: &str) -> Option<Vec<(String, u16, u32, Vec<u8>)>> {
             aaaa("www.superior.test", 0x10),
         ],
         "v6only.superior.test" => vec![aaaa(name, 0x66)],
+        // Records other than addresses. A TXT record is character
+        // strings, each a length and its bytes; the second has two.
+        "txt.superior.test" | "alias-txt.superior.test" => {
+            let txt = |strings: &[&str]| {
+                let mut d = Vec::new();
+                for s in strings {
+                    d.push(s.len() as u8);
+                    d.extend_from_slice(s.as_bytes());
+                }
+                ("txt.superior.test".to_string(), 16u16, 120, d)
+            };
+            let mut v = vec![txt(&["v=spf1 -all"]), txt(&["hello ", "world"])];
+            if name != "txt.superior.test" {
+                v.insert(0, (name.to_string(), 5, 60, dns_name("txt.superior.test")));
+            }
+            v
+        }
+        "superior.test" => {
+            // Mail exchangers: a preference and a host, the first host's
+            // name ending in a compression pointer to the question's.
+            let mut mx1 = vec![0, 10, 3, b'm', b'x', b'1', 0xc0, 12];
+            mx1.shrink_to_fit();
+            let mut mx2 = vec![0, 20];
+            mx2.extend(dns_name("mx2.superior.test"));
+            vec![
+                (name.to_string(), 15, 300, mx1),
+                (name.to_string(), 15, 300, mx2),
+                (name.to_string(), 2, 300, dns_name("ns1.superior.test")),
+            ]
+        }
+        "_sip._tcp.superior.test" => {
+            // Priority 0, weight 5, port 5060.
+            let mut srv = vec![0, 0, 0, 5, 0x13, 0xc4];
+            srv.extend(dns_name("sip.superior.test"));
+            vec![(name.to_string(), 33, 60, srv)]
+        }
+        "10.2.0.192.in-addr.arpa" => {
+            vec![(name.to_string(), 12, 60, dns_name("www.superior.test"))]
+        }
         "cached.superior.test" => vec![a(name, 300, [192, 0, 2, 20])],
         "short.superior.test" => vec![a(name, 1, [192, 0, 2, 30])],
         _ => {
@@ -1643,6 +1682,7 @@ fn net_test(arch: Arch, manifest: &str) -> Result<(), String> {
         "[pass] net: alias.superior.test, a CNAME for www, is 192.0.2.10",
         "[pass] net: www.superior.test's IPv6 address is 2001:db8::10, alias's too, and the second answer was cached",
         "[pass] net: cached.superior.test has no IPv6 address; v6only.superior.test has 2001:db8::66 and no IPv4 one",
+        "[pass] net: DNS records: superior.test's MX are mx1 (10) and mx2 (20), its NS ns1, its SIP SRV sip:5060; txt and its alias have two TXT; 192.0.2.10's PTR is www",
         "[pass] net: nowhere.superior.test does not exist, and no..dots is no name",
         "[pass] net: cached.superior.test resolved 20 times,",
         "[pass] net: short.superior.test (TTL 1 s) asked of the server again after 1.5 s",
