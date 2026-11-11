@@ -29,7 +29,7 @@ component fs
   priority 10
   uses block 0
   provides fs 1
-  untyped 18 2
+  untyped 19 2
   cspace 8
 
 component client

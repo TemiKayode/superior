@@ -128,6 +128,9 @@ pub struct Tcb {
     pub status: u64,
     /// For a server: the caller it owes a reply to.
     caller: Option<Tid>,
+    /// For a server: callers it set aside to answer later
+    /// ([`Ipc::save_caller`], [`Ipc::reply_saved`]).
+    saved: [Option<Tid>; SAVED_CALLERS],
     /// Link in whichever queue this thread is on.
     next: Option<Tid>,
     /// Ticks left in this thread's time slice.
@@ -159,6 +162,9 @@ pub struct Transfer {
 /// may receive from a queued sender.
 pub const MAX_TRANSFERS: usize = 2;
 
+/// Callers one server thread may set aside at once.
+pub const SAVED_CALLERS: usize = 16;
+
 const IDLE_TCB: Tcb = Tcb {
     state: State::Inactive,
     prio: 0,
@@ -166,6 +172,7 @@ const IDLE_TCB: Tcb = Tcb {
     badge: 0,
     status: 0,
     caller: None,
+    saved: [None; SAVED_CALLERS],
     next: None,
     slice: TIMESLICE_TICKS,
     xfer: CapTransfer::NONE,
@@ -279,6 +286,13 @@ pub enum IpcError {
     /// Not a failure: the receive was answered by the thread's bound
     /// notification (the badge holds its bits).
     Notified,
+    /// `save_caller` with no caller waiting for a reply.
+    NoCaller,
+    /// `save_caller` with every saved place taken, or by a passive thread
+    /// (which runs on its caller's context: it must answer it first).
+    CannotSave,
+    /// `reply_saved` to a place out of range.
+    BadIndex,
 }
 
 impl IpcError {
@@ -288,6 +302,8 @@ impl IpcError {
             IpcError::WouldBlock => Error::WouldBlock.code(),
             IpcError::Notified => Error::Notified.code(),
             IpcError::BadObject => Error::InvalidCapability.code(),
+            IpcError::NoCaller | IpcError::BadIndex => Error::InvalidArgument.code(),
+            IpcError::CannotSave => Error::ObjectTableFull.code(),
             _ => Error::IllegalOperation.code(),
         }
     }
@@ -445,6 +461,11 @@ impl<const T: usize, const E: usize, const N: usize> Ipc<T, E, N> {
         self.threads[t as usize].caller
     }
 
+    /// Whether some server has set caller `t` aside ([`Ipc::save_caller`]).
+    pub fn is_saved(&self, t: Tid) -> bool {
+        self.threads.iter().any(|s| s.saved.contains(&Some(t)))
+    }
+
     /// Stops the current thread (it becomes inactive), e.g. after a fault
     /// nobody handles.
     pub fn suspend_current(&mut self) {
@@ -511,6 +532,11 @@ impl<const T: usize, const E: usize, const N: usize> Ipc<T, E, N> {
                     if s.caller == Some(t) {
                         s.caller = None;
                     }
+                    for k in s.saved.iter_mut() {
+                        if *k == Some(t) {
+                            *k = None;
+                        }
+                    }
                 }
                 true
             }
@@ -522,7 +548,11 @@ impl<const T: usize, const E: usize, const N: usize> Ipc<T, E, N> {
         if blocked {
             tcb.status = Error::Interrupted.code();
         }
+        let saved = core::mem::replace(&mut tcb.saved, [None; SAVED_CALLERS]);
         if let Some(caller) = tcb.caller.take() {
+            self.abandon(caller);
+        }
+        for caller in saved.into_iter().flatten() {
             self.abandon(caller);
         }
         self.schedule();
@@ -594,13 +624,11 @@ impl<const T: usize, const E: usize, const N: usize> Ipc<T, E, N> {
     /// the server is gone (a supervisor may be starting a new instance on
     /// the same endpoint).
     pub fn destroy(&mut self, t: Tid) -> Result<(), IpcError> {
-        let caller = self
-            .threads
-            .get_mut(t as usize)
-            .ok_or(IpcError::BadThread)?
-            .caller
-            .take();
-        if let Some(c) = caller {
+        let tcb = self.threads.get_mut(t as usize).ok_or(IpcError::BadThread)?;
+        let caller = tcb.caller.take();
+        let saved = core::mem::replace(&mut tcb.saved, [None; SAVED_CALLERS]);
+        // Callers it set aside too: none of their calls was answered.
+        for c in caller.into_iter().chain(saved.into_iter().flatten()) {
             self.fail_caller(c, Error::PeerRestarted);
         }
         self.suspend(t)
@@ -984,6 +1012,48 @@ impl<const T: usize, const E: usize, const N: usize> Ipc<T, E, N> {
             if waiting {
                 self.wake(c);
             }
+            self.schedule();
+        }
+        Ok(())
+    }
+
+    /// Sets aside the caller the current thread owes a reply, so it may
+    /// receive more calls before answering it ([`Ipc::reply_saved`]):
+    /// returns the place it went in. A passive thread may not (it runs
+    /// on that caller's context), nor one with every place taken.
+    pub fn save_caller(&mut self) -> Result<usize, IpcError> {
+        let cur = self.cur()?;
+        let tcb = &mut self.threads[cur as usize];
+        let Some(c) = tcb.caller else {
+            return Err(IpcError::NoCaller);
+        };
+        if tcb.passive {
+            return Err(IpcError::CannotSave);
+        }
+        let Some(i) = tcb.saved.iter().position(|s| s.is_none()) else {
+            return Err(IpcError::CannotSave);
+        };
+        tcb.saved[i] = Some(c);
+        tcb.caller = None;
+        Ok(i)
+    }
+
+    /// Answers the caller the current thread set aside in place `i` (as
+    /// [`Ipc::reply`]; no capability goes with it). A place with nobody
+    /// in it (answered already, or its caller was stopped) is a no-op.
+    pub fn reply_saved(&mut self, i: usize, msg: [u64; MSG_WORDS]) -> Result<(), IpcError> {
+        let cur = self.cur()?;
+        if i >= SAVED_CALLERS {
+            return Err(IpcError::BadIndex);
+        }
+        self.threads[cur as usize].status = 0;
+        if let Some(c) = self.threads[cur as usize].saved[i].take()
+            && self.awaits_reply(c)
+        {
+            let xfer = core::mem::replace(&mut self.threads[cur as usize].xfer, CapTransfer::NONE);
+            self.deliver(cur, c, msg, 0);
+            self.threads[cur as usize].xfer = xfer;
+            self.wake(c);
             self.schedule();
         }
         Ok(())
@@ -1461,7 +1531,11 @@ impl<const T: usize, const E: usize, const N: usize> Ipc<T, E, N> {
             }
             // A thread waiting for a reply is owed one by exactly one server.
             if tcb.state == State::BlockedReply {
-                let owers = th.iter().filter(|s| s.caller == Some(t as Tid)).count();
+                let me = Some(t as Tid);
+                let owers = th
+                    .iter()
+                    .map(|s| (s.caller == me) as usize + s.saved.iter().filter(|&&x| x == me).count())
+                    .sum::<usize>();
                 if owers != 1 {
                     return Err(format!("thread {t} awaits a reply owed by {owers} threads"));
                 }
@@ -1630,6 +1704,75 @@ mod tests {
         k.reply([42, 0, 0, 0]).unwrap();
         assert_eq!(k.current(), Some(CLIENT)); // higher prio, preempts
         assert_eq!(k.thread(CLIENT).msg[0], 42);
+    }
+
+    #[test]
+    fn saved_callers_are_answered_later_in_any_order() {
+        let mut k = K::new();
+        k.spawn(CLIENT, 1).unwrap();
+        k.spawn(OTHER, 1).unwrap();
+        k.spawn(SERVER, 5).unwrap();
+        k.schedule();
+        k.recv(EP, true).unwrap(); // the server waits
+        assert_eq!(k.current(), Some(CLIENT));
+        k.call(EP, 1, [10, 0, 0, 0]).unwrap();
+        assert_eq!(k.current(), Some(SERVER));
+        assert_eq!(k.save_caller(), Ok(0));
+        k.recv(EP, true).unwrap(); // no abandoning: CLIENT is set aside
+        assert_eq!(k.current(), Some(OTHER));
+        k.call(EP, 2, [20, 0, 0, 0]).unwrap();
+        assert_eq!(k.thread(CLIENT).state, State::BlockedReply);
+        assert_eq!(k.thread(CLIENT).status, 0);
+        assert_eq!(k.save_caller(), Ok(1));
+        assert_eq!(k.save_caller(), Err(IpcError::NoCaller));
+        // Answered in the other order; an empty place is a no-op.
+        k.reply_saved(1, [21, 0, 0, 0]).unwrap();
+        assert_eq!(k.thread(OTHER).msg[0], 21);
+        assert_eq!(k.thread(OTHER).state, State::Ready);
+        k.reply_saved(1, [99, 0, 0, 0]).unwrap();
+        assert_eq!(k.thread(OTHER).msg[0], 21);
+        k.reply_saved(0, [11, 0, 0, 0]).unwrap();
+        assert_eq!(k.thread(CLIENT).msg[0], 11);
+        assert_eq!(k.reply_saved(SAVED_CALLERS, [0; 4]), Err(IpcError::BadIndex));
+        k.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn saved_callers_learn_their_server_is_gone() {
+        let mut k = K::new();
+        k.spawn(CLIENT, 1).unwrap();
+        k.spawn(OTHER, 1).unwrap();
+        k.spawn(SERVER, 5).unwrap();
+        k.schedule();
+        k.recv(EP, true).unwrap();
+        k.call(EP, 1, [0; 4]).unwrap();
+        k.save_caller().unwrap();
+        k.recv(EP, true).unwrap();
+        k.call(EP, 2, [0; 4]).unwrap();
+        k.save_caller().unwrap();
+        // A saved caller stopped meanwhile is forgotten: no reply reaches
+        // it when it is started again and calls once more.
+        k.suspend(OTHER).unwrap();
+        k.check_invariants().unwrap();
+        k.destroy(SERVER).unwrap();
+        assert_eq!(k.thread(CLIENT).status, Error::PeerRestarted.code());
+        assert_ne!(k.thread(CLIENT).state, State::BlockedReply);
+        assert_eq!(k.thread(OTHER).state, State::Inactive);
+        k.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn a_suspended_server_abandons_its_saved_callers() {
+        let mut k = K::new();
+        k.spawn(CLIENT, 1).unwrap();
+        k.spawn(SERVER, 5).unwrap();
+        k.schedule();
+        k.recv(EP, true).unwrap();
+        k.call(EP, 1, [0; 4]).unwrap();
+        k.save_caller().unwrap();
+        k.suspend(SERVER).unwrap();
+        assert_eq!(k.thread(CLIENT).status, Error::ReplyAbandoned.code());
+        k.check_invariants().unwrap();
     }
 
     #[test]

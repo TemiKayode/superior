@@ -2151,6 +2151,17 @@ fn ipc_op(
     if op == Syscall::Reply {
         return k.ipc.reply(msg).map_err(|e| e.status());
     }
+    if op == Syscall::ReplySave {
+        let i = k.ipc.save_caller().map_err(|e| e.status())?;
+        k.ipc.set_msg_of(cur, [i as u64, 0, 0, 0]);
+        return Ok(());
+    }
+    if op == Syscall::ReplyTo {
+        if xfer.grant.is_some() {
+            return Err(Error::InvalidArgument.code());
+        }
+        return k.ipc.reply_saved(slot, msg).map_err(|e| e.status());
+    }
     let cap = *cap_slot(k, cur, slot)
         .and_then(|s| k.caps.get(s))
         .ok_or(Error::InvalidCapability.code())?;

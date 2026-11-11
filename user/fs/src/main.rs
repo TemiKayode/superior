@@ -10,26 +10,39 @@
 //! **Crash-only.** Starting is recovery: mount replays a committed journal
 //! transaction left by an instance (or a machine) that stopped before
 //! finishing it, then checks that every block and inode is accounted for.
-//! Every change is one transaction of at most [`JMAX`] blocks:
+//!
+//! **Group commit.** Requests are served one at a time, but answered in
+//! groups: the server sets each caller aside (`ReplySave`) and takes the
+//! next request already waiting, until none is (or the group is full).
+//! Every change of the group goes into one transaction of at most
+//! [`JMAX`] blocks, and then:
 //!
 //! 1. the changed blocks (data, directory, indirect, inode, bitmap) are
 //!    written to the journal area, then a flush;
 //! 2. the journal header, naming their home blocks and holding a checksum
-//!    over them, is written, then a flush. The transaction is committed:
-//!    only now is the client answered;
-//! 3. after the reply, the blocks are written home, a flush, and the
-//!    header is cleared.
+//!    over them, is written, then a flush. The group is committed: only
+//!    now is any of its requests answered (`ReplyTo`, ring completions);
+//! 3. the blocks are written home, a flush, and the header is cleared.
 //!
-//! A crash before step 2 completes leaves no valid header (the checksum
-//! fails or it is the cleared one), and the change was never acknowledged.
-//! A crash after it replays at the next mount. An operation that fails
-//! half-way (no space) reloads the inodes and bitmap from the disk, which
-//! between requests always holds the latest state. Block calls the driver
-//! fails with `PeerRestarted` (it was restarted) are retried.
+//! So clients calling at once share two flushes, not two each. A request
+//! sees the changes of those before it in its group: reading a block the
+//! group changed reads its buffer, not the disk. A crash before step 2
+//! completes leaves no valid header (the checksum fails or it is the
+//! cleared one), and nothing in the group was acknowledged; its callers
+//! learn the server restarted, and call again. A crash after it replays at
+//! the next mount.
 //!
-//! Disk layout, in 4 KiB blocks: 0 superblock, 1 journal header, 2-9
-//! journal blocks, 10-17 inodes (512 of 64 bytes; 0 is never used), 18 the
-//! block bitmap, then data. An unformatted disk is formatted at mount.
+//! A request that fails changes nothing: every check comes before the
+//! first change, but for running out of space. So a request that may
+//! change something starts a group of its own when fewer than eight
+//! blocks or two inodes are free; failing half-way, it reloads the inodes
+//! and bitmap from the disk, which outside a group holds the latest
+//! state. Block calls the driver fails with `PeerRestarted` (it was
+//! restarted) are retried.
+//!
+//! Disk layout, in 4 KiB blocks: 0 superblock, 1 journal header, 2-49
+//! journal blocks, 50-81 inodes (2048 of 64 bytes; 0 is never used), 82
+//! the block bitmap, then data. An unformatted disk is formatted at mount.
 //!
 //! Symbolic links (`fs::SYMLINK`) are inodes of their own kind whose one
 //! data block holds the target. A path is walked one component at a time
@@ -63,7 +76,7 @@
 #![no_std]
 #![no_main]
 
-use core::sync::atomic::{AtomicU32, Ordering, fence};
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering, fence};
 use superior_objects::abi::{CapTransfer, Error, ObjectType, Syscall};
 use superior_objects::interfaces::fs::ring;
 use superior_objects::interfaces::{Status, block, fs};
@@ -94,9 +107,15 @@ const B_WALK: u64 = B_PATH + 1;
 const B_WALK2: u64 = B_WALK + 1;
 /// A link's target, read while walking.
 const B_LINK: u64 = B_WALK2 + 1;
-/// Blocks a transaction changes that have no buffer of their own.
+/// Blocks a group changes that have no buffer of their own.
 const B_TX: u64 = B_LINK + 1;
-const NTX: u64 = 6;
+const NTX: u64 = 40;
+/// At most what one request changes: journal blocks, and buffers. A group
+/// closes before a request that might not fit.
+const PER_OP: usize = 12;
+const PER_OP_BUFS: u64 = 6;
+/// Requests in a group at most (calls set aside, ring submissions).
+const MAX_PEND: usize = 16;
 const BUFS: u64 = B_TX + NTX - BUF0;
 const BUF_VA: u64 = USER_BASE + 0x4000_0000;
 const LENT_VA: u64 = USER_BASE + 0x5000_0000;
@@ -123,7 +142,7 @@ const ALL: u64 = 0x1f;
 const SUPER: u64 = 0;
 const JHDR: u64 = 1;
 const JDATA: u64 = 2;
-const JMAX: usize = 8;
+const JMAX: usize = 48;
 const INODES: u64 = JDATA + JMAX as u64;
 const INODE_BLOCKS: u64 = 32;
 const BITMAP: u64 = INODES + INODE_BLOCKS;
@@ -141,7 +160,7 @@ const KIND_DIR: u8 = fs::KIND_DIR as u8;
 const KIND_LINK: u8 = fs::KIND_LINK as u8;
 const ROOT: u8 = 1;
 
-const SUPER_MAGIC: u64 = u64::from_le_bytes(*b"SUPFS003");
+const SUPER_MAGIC: u64 = u64::from_le_bytes(*b"SUPFS004");
 const JOURNAL_MAGIC: u64 = u64::from_le_bytes(*b"SUPJRNL2");
 const FNV: u64 = 0xcbf2_9ce4_8422_2325;
 
@@ -216,7 +235,18 @@ fn block_call(op: u64, blockno: u64, slot: Option<u64>) {
     crash("the block device keeps failing");
 }
 
+/// Block `b` into buffer `slot`: from the buffer holding it if the open
+/// group changed it, else from the disk.
 fn read_block(b: u64, slot: u64) {
+    match in_group(b) {
+        Some(s) if s != slot => buf(slot).copy_from_slice(buf(s)),
+        Some(_) => {}
+        None => disk_read(b, slot),
+    }
+}
+
+/// Block `b` as on the disk (mount, recovery, undoing a failed request).
+fn disk_read(b: u64, slot: u64) {
     block_call(block::READ, b, Some(slot));
 }
 
@@ -353,48 +383,81 @@ impl Inode {
     }
 }
 
-/// The blocks one change touches: (home block, buffer).
+/// The blocks the open group changes, (home block, buffer): its
+/// transaction, which [`read_block`] reads them from too.
+static HOMES: [AtomicU64; JMAX] = [const { AtomicU64::new(0) }; JMAX];
+static SLOTS: [AtomicU64; JMAX] = [const { AtomicU64::new(0) }; JMAX];
+static COUNT: AtomicUsize = AtomicUsize::new(0);
+
+fn group_len() -> usize {
+    COUNT.load(Ordering::Relaxed)
+}
+
+fn group() -> impl Iterator<Item = (u64, u64)> {
+    (0..group_len()).map(|j| {
+        (
+            HOMES[j].load(Ordering::Relaxed),
+            SLOTS[j].load(Ordering::Relaxed),
+        )
+    })
+}
+
+/// The buffer holding block `home`, if the open group changed it.
+fn in_group(home: u64) -> Option<u64> {
+    group().find(|&(h, _)| h == home).map(|(_, s)| s)
+}
+
+/// The open group's transaction: the blocks are in [`HOMES`] and
+/// [`SLOTS`]; this counts its buffers, and every change made.
 struct Tx {
-    e: [(u64, u64); JMAX],
-    n: usize,
     used: u64,
+    touched: u64,
 }
 
 impl Tx {
     fn new() -> Tx {
         Tx {
-            e: [(0, 0); JMAX],
-            n: 0,
             used: 0,
+            touched: 0,
         }
+    }
+
+    /// Empties the group (committed and home, or undone).
+    fn reset(&mut self) {
+        COUNT.store(0, Ordering::Relaxed);
+        self.used = 0;
     }
 
     fn add(&mut self, home: u64, slot: u64) {
-        if self.e[..self.n].iter().any(|&(h, _)| h == home) {
+        self.touched += 1;
+        if in_group(home).is_some() {
             return;
         }
-        if self.n == JMAX {
-            crash("a transaction outgrew the journal");
+        let n = group_len();
+        if n == JMAX {
+            crash("a group outgrew the journal");
         }
-        self.e[self.n] = (home, slot);
-        self.n += 1;
+        HOMES[n].store(home, Ordering::Relaxed);
+        SLOTS[n].store(slot, Ordering::Relaxed);
+        COUNT.store(n + 1, Ordering::Relaxed);
     }
 
-    /// Block `home` in a buffer of this transaction: zeroed if `fresh`,
-    /// else as on the disk (or as this transaction already changed it).
+    /// Block `home` in a buffer of the group: zeroed if `fresh`, else as
+    /// on the disk (or as the group already changed it).
     fn get(&mut self, home: u64, fresh: bool) -> &'static mut [u8] {
-        if let Some(&(_, s)) = self.e[..self.n].iter().find(|&&(h, _)| h == home) {
+        self.touched += 1;
+        if let Some(s) = in_group(home) {
             return buf(s);
         }
         if self.used == NTX {
-            crash("a transaction ran out of buffers");
+            crash("a group ran out of buffers");
         }
         let slot = B_TX + self.used;
         self.used += 1;
         if fresh {
             buf(slot).fill(0);
         } else {
-            read_block(home, slot);
+            disk_read(home, slot);
         }
         self.add(home, slot);
         buf(slot)
@@ -452,12 +515,30 @@ struct Found {
     ino: u64,
 }
 
+/// A request of the open group, to answer once it commits.
+#[derive(Clone, Copy)]
+enum Pend {
+    /// A call, set aside in this place.
+    Call(u64),
+    /// A ring submission, completed with this tag.
+    Ring(usize, u64),
+}
+
 struct Fs {
     blocks: u64,
     seq: u64,
-    /// Committed but not yet written home: (home block, buffer).
-    pending: [(u64, u64); JMAX],
-    npending: usize,
+    /// The open group's requests and their answers.
+    pend: [(Pend, [u64; 4]); MAX_PEND],
+    npend: usize,
+    /// Of those, each ring's: its submissions taken but not completed.
+    ring_pend: [u32; MAX_RINGS],
+    /// The ring to look at first, so that each gets its turn.
+    next_ring: usize,
+    /// Requests answered after a commit, the commits, and the most
+    /// requests one commit answered.
+    grouped: u64,
+    commits: u64,
+    largest: usize,
     rings: [Option<Ring>; MAX_RINGS],
     /// Requests taken from rings, doorbells that woke this server, and
     /// completion signals sent.
@@ -505,8 +586,13 @@ impl Fs {
         let mut f = Fs {
             blocks,
             seq: 0,
-            pending: [(0, 0); JMAX],
-            npending: 0,
+            pend: [(Pend::Call(0), [0; 4]); MAX_PEND],
+            npend: 0,
+            ring_pend: [0; MAX_RINGS],
+            next_ring: 0,
+            grouped: 0,
+            commits: 0,
+            largest: 0,
             rings: [None; MAX_RINGS],
             ring_ops: 0,
             wakeups: 0,
@@ -526,7 +612,7 @@ impl Fs {
         if syscall(Syscall::NotificationBind, DOORBELL, [0; 4]).status != 0 {
             crash("cannot bind the doorbell");
         }
-        read_block(SUPER, B_SCRATCH);
+        disk_read(SUPER, B_SCRATCH);
         if word(buf(B_SCRATCH), 0) != SUPER_MAGIC {
             f.format();
         }
@@ -549,9 +635,9 @@ impl Fs {
     /// not committed.
     fn reload(&self) {
         for i in 0..INODE_BLOCKS {
-            read_block(INODES + i, B_INODES + i);
+            disk_read(INODES + i, B_INODES + i);
         }
-        read_block(BITMAP, B_BITMAP);
+        disk_read(BITMAP, B_BITMAP);
     }
 
     fn format(&mut self) {
@@ -586,7 +672,7 @@ impl Fs {
     /// Replays a committed transaction, if the header holds one. Returns
     /// how many blocks it wrote home.
     fn replay(&mut self) -> usize {
-        read_block(JHDR, B_HDR);
+        disk_read(JHDR, B_HDR);
         let hdr = buf(B_HDR);
         let count = word(hdr, 16) as usize;
         if word(hdr, 0) != JOURNAL_MAGIC || count == 0 || count > JMAX {
@@ -595,7 +681,7 @@ impl Fs {
         self.seq = word(hdr, 8);
         // Every journal block must match the checksum before any goes home.
         let sum = Fs::header_sum(hdr, |j| {
-            read_block(JDATA + j as u64, B_SCRATCH);
+            disk_read(JDATA + j as u64, B_SCRATCH);
             fnv(FNV, buf(B_SCRATCH))
         });
         if sum != word(hdr, 24) {
@@ -603,7 +689,7 @@ impl Fs {
         }
         for j in 0..count {
             let home = word(buf(B_HDR), 32 + 8 * j);
-            read_block(JDATA + j as u64, B_SCRATCH);
+            disk_read(JDATA + j as u64, B_SCRATCH);
             write_block(home, B_SCRATCH);
         }
         flush();
@@ -617,14 +703,14 @@ impl Fs {
         flush();
     }
 
-    /// Steps 1 and 2: makes the transaction durable in the journal. Step 3
-    /// is [`Fs::checkpoint`].
-    fn commit(&mut self, tx: &Tx) {
-        let blocks = &tx.e[..tx.n];
-        if blocks.is_empty() {
+    /// Steps 1 and 2: makes the group's changes durable in the journal.
+    /// Step 3 is [`Fs::checkpoint`].
+    fn commit(&mut self) {
+        let n = group_len();
+        if n == 0 {
             return;
         }
-        for (j, &(_, slot)) in blocks.iter().enumerate() {
+        for (j, (_, slot)) in group().enumerate() {
             write_block(JDATA + j as u64, slot);
         }
         flush();
@@ -633,44 +719,26 @@ impl Fs {
         hdr.fill(0);
         set_word(hdr, 0, JOURNAL_MAGIC);
         set_word(hdr, 8, self.seq);
-        set_word(hdr, 16, blocks.len() as u64);
-        for (j, &(home, _)) in blocks.iter().enumerate() {
+        set_word(hdr, 16, n as u64);
+        for (j, (home, _)) in group().enumerate() {
             set_word(hdr, 32 + 8 * j, home);
         }
-        let sum = Fs::header_sum(hdr, |j| fnv(FNV, buf(blocks[j].1)));
+        let sum = Fs::header_sum(hdr, |j| fnv(FNV, buf(SLOTS[j].load(Ordering::Relaxed))));
         set_word(hdr, 24, sum);
         write_block(JHDR, B_HDR);
         flush();
-        self.pending[..blocks.len()].copy_from_slice(blocks);
-        self.npending = blocks.len();
     }
 
     /// Step 3: writes the committed blocks home and clears the header.
     fn checkpoint(&mut self) {
-        if self.npending == 0 {
+        if group_len() == 0 {
             return;
         }
-        for &(home, slot) in &self.pending[..self.npending] {
+        for (home, slot) in group() {
             write_block(home, slot);
         }
         flush();
         self.clear_header();
-        self.npending = 0;
-    }
-
-    /// Commits `tx` if `r` succeeded; otherwise undoes its changes to the
-    /// inodes and bitmap.
-    fn finish<T>(&mut self, tx: Tx, r: R<T>) -> R<T> {
-        match r {
-            Ok(v) => {
-                self.commit(&tx);
-                Ok(v)
-            }
-            Err(e) => {
-                self.reload();
-                Err(e)
-            }
-        }
     }
 
     // ---- blocks ----
@@ -872,20 +940,31 @@ impl Fs {
             .find(|n| n.container() == c && n.kind() == KIND_DIR && n.is_root())
     }
 
-    /// The caller's root, made (and committed on its own) if it has none.
-    fn ensure_root(&mut self, c: u64) -> R<Inode> {
+    /// The caller's root, made if it has none.
+    fn ensure_root(&self, tx: &mut Tx, c: u64) -> R<Inode> {
         if let Some(r) = self.root(c) {
             return Ok(r);
         }
-        let mut tx = Tx::new();
-        let r = self.alloc_inode(&mut tx, c, KIND_DIR, 0).map(|r| {
+        self.alloc_inode(tx, c, KIND_DIR, 0).map(|r| {
             r.bytes()[3] = ROOT;
             r
-        });
-        let r = self.finish(tx, r)?;
-        // Home at once: the request's own transaction follows.
-        self.checkpoint();
-        Ok(r)
+        })
+    }
+
+    /// The caller's root for a request making `path`, which fails with
+    /// `at_root` if it names the root. With no root yet, it is made only
+    /// if the path names a child of it (anything deeper is not there), so
+    /// that a request failing has changed nothing.
+    fn root_for(&self, tx: &mut Tx, c: u64, path: &[u8], at_root: Status) -> R<Inode> {
+        if let Some(r) = self.root(c) {
+            return Ok(r);
+        }
+        plain(path)?;
+        match next_component(path, 0) {
+            None => Err(at_root),
+            Some((_, e)) if next_component(path, e).is_none() => self.ensure_root(tx, c),
+            Some(_) => Err(Status::NotFound),
+        }
     }
 
     fn alloc_inode(&self, tx: &mut Tx, c: u64, kind: u8, parent: u64) -> R<Inode> {
@@ -1087,13 +1166,29 @@ impl Fs {
         ok.then_some(&*p).ok_or(Status::Invalid)
     }
 
-    fn open(&mut self, c: u64, m: [u64; 4], io: Io) -> R<[u64; 3]> {
+    fn open(&mut self, tx: &mut Tx, c: u64, m: [u64; 4], io: Io) -> R<[u64; 3]> {
         let path = Fs::take_path(m[1], io)?;
         let flags = m[2];
         let create = flags & fs::CREATE != 0;
-        let root = match create {
-            true => self.ensure_root(c)?,
-            false => self.root(c).ok_or(Status::NotFound)?,
+        let root = match self.root(c) {
+            Some(r) => r,
+            None if !create => return Err(Status::NotFound),
+            // An empty container: made only for a request that then
+            // succeeds (see root_for).
+            None => {
+                plain(path)?;
+                let excl = flags & fs::EXCL != 0;
+                match next_component(path, 0) {
+                    None if excl => return Err(Status::Exists),
+                    None => self.ensure_root(tx, c)?,
+                    Some((_, e))
+                        if next_component(path, e).is_none() && flags & fs::DIRECTORY == 0 =>
+                    {
+                        self.ensure_root(tx, c)?
+                    }
+                    Some(_) => return Err(Status::NotFound),
+                }
+            }
         };
         // With EXCL a link is not followed: its name is taken.
         let follow = flags & fs::NOFOLLOW == 0 && !(create && flags & fs::EXCL != 0);
@@ -1105,7 +1200,6 @@ impl Fs {
             Walked::Dir(d) => return Ok([d.handle(), d.size(), fs::KIND_DIR]),
             Walked::Entry(d, n) => (d, n),
         };
-        let mut tx = Tx::new();
         let r = match self.lookup(dir, name) {
             Some(f) => {
                 let n = Inode::of(f.ino);
@@ -1117,26 +1211,26 @@ impl Fs {
                 } else if flags & fs::DIRECTORY != 0 && n.kind() != KIND_DIR {
                     Err(Status::NotDir)
                 } else if flags & fs::TRUNC != 0 && n.kind() == KIND_FILE {
-                    self.truncate_to(&mut tx, n, 0).map(|_| n)
+                    self.truncate_to(tx, n, 0).map(|_| n)
                 } else {
                     Ok(n)
                 }
             }
             None if !create || flags & fs::DIRECTORY != 0 => Err(Status::NotFound),
             None => self
-                .alloc_inode(&mut tx, c, KIND_FILE, dir.ino)
+                .alloc_inode(tx, c, KIND_FILE, dir.ino)
                 .and_then(|n| {
-                    self.add_entry(&mut tx, dir, name, n)?;
+                    self.add_entry(tx, dir, name, n)?;
                     Ok(n)
                 }),
         };
-        let n = self.finish(tx, r)?;
+        let n = r?;
         Ok([n.handle(), n.size(), n.kind() as u64])
     }
 
-    fn mkdir(&mut self, c: u64, m: [u64; 4], io: Io) -> R<[u64; 3]> {
+    fn mkdir(&mut self, tx: &mut Tx, c: u64, m: [u64; 4], io: Io) -> R<[u64; 3]> {
         let path = Fs::take_path(m[1], io)?;
-        let root = self.ensure_root(c)?;
+        let root = self.root_for(tx, c, path, Status::Exists)?;
         let (dir, name) = match self.walk(root, path, false, B_WALK)? {
             Walked::Entry(d, n) => (d, n),
             Walked::Dir(_) => return Err(Status::Exists),
@@ -1147,14 +1241,13 @@ impl Fs {
                 _ => Err(Status::Exists),
             };
         }
-        let mut tx = Tx::new();
         let r = self
-            .alloc_inode(&mut tx, c, KIND_DIR, dir.ino)
-            .and_then(|n| self.add_entry(&mut tx, dir, name, n));
-        self.finish(tx, r).map(|_| [0; 3])
+            .alloc_inode(tx, c, KIND_DIR, dir.ino)
+            .and_then(|n| self.add_entry(tx, dir, name, n));
+        r.map(|_| [0; 3])
     }
 
-    fn unlink(&mut self, c: u64, m: [u64; 4], io: Io) -> R<[u64; 3]> {
+    fn unlink(&mut self, tx: &mut Tx, c: u64, m: [u64; 4], io: Io) -> R<[u64; 3]> {
         let path = Fs::take_path(m[1], io)?;
         let root = self.root(c).ok_or(Status::NotFound)?;
         let (dir, name) = self.entry(root, path, B_WALK)?;
@@ -1163,13 +1256,12 @@ impl Fs {
         if n.kind() == KIND_DIR && !self.is_empty_dir(n) {
             return Err(Status::NotEmpty);
         }
-        let mut tx = Tx::new();
-        Fs::entry_mut(&mut tx, f).fill(0);
-        self.free_inode(&mut tx, n);
-        self.finish(tx, Ok([0; 3]))
+        Fs::entry_mut(tx, f).fill(0);
+        self.free_inode(tx, n);
+        Ok([0; 3])
     }
 
-    fn rename(&mut self, c: u64, m: [u64; 4], io: Io) -> R<[u64; 3]> {
+    fn rename(&mut self, tx: &mut Tx, c: u64, m: [u64; 4], io: Io) -> R<[u64; 3]> {
         let (l1, l2) = (m[1], m[2]);
         let both = Fs::take_path(l1.saturating_add(l2), io)?;
         let (from, to) = both.split_at(l1 as usize);
@@ -1195,7 +1287,6 @@ impl Fs {
                 up = Inode::of(up.parent());
             }
         }
-        let mut tx = Tx::new();
         let r = match dst {
             Some(d) => {
                 let old = Inode::of(d.ino);
@@ -1204,35 +1295,35 @@ impl Fs {
                     (KIND_FILE | KIND_LINK, KIND_DIR) => Err(Status::IsDir),
                     (KIND_DIR, _) if !self.is_empty_dir(old) => Err(Status::NotEmpty),
                     _ => {
-                        self.free_inode(&mut tx, old);
-                        let e = Fs::entry_mut(&mut tx, d);
+                        self.free_inode(tx, old);
+                        let e = Fs::entry_mut(tx, d);
                         set_u32(e, 0, n.ino);
                         e[4] = n.kind();
                         Ok(())
                     }
                 }
             }
-            None => self.add_entry(&mut tx, ddir, dname, n),
+            None => self.add_entry(tx, ddir, dname, n),
         };
         let r = r.map(|_| {
-            Fs::entry_mut(&mut tx, src).fill(0);
+            Fs::entry_mut(tx, src).fill(0);
             if n.parent() != ddir.ino {
                 n.set_parent(ddir.ino);
                 tx.inode(n);
             }
             [0; 3]
         });
-        self.finish(tx, r)
+        r
     }
 
-    fn symlink(&mut self, c: u64, m: [u64; 4], io: Io) -> R<[u64; 3]> {
+    fn symlink(&mut self, tx: &mut Tx, c: u64, m: [u64; 4], io: Io) -> R<[u64; 3]> {
         let (l1, l2) = (m[1], m[2]);
         let both = Fs::take_path(l1.saturating_add(l2), io)?;
         let (path, target) = both.split_at(l1 as usize);
         if target.is_empty() || target.len() as u64 > fs::MAX_LINK || target.contains(&0) {
             return Err(Status::Invalid);
         }
-        let root = self.ensure_root(c)?;
+        let root = self.root_for(tx, c, path, Status::Exists)?;
         let (dir, name) = match self.walk(root, path, false, B_WALK)? {
             Walked::Entry(d, n) => (d, n),
             Walked::Dir(_) => return Err(Status::Exists),
@@ -1245,15 +1336,14 @@ impl Fs {
                 false => Err(Status::Exists),
             };
         }
-        let mut tx = Tx::new();
-        let r = self.alloc_inode(&mut tx, c, KIND_LINK, dir.ino).and_then(|n| {
-            let blk = self.bmap_write(&mut tx, n, 0)?;
+        let r = self.alloc_inode(tx, c, KIND_LINK, dir.ino).and_then(|n| {
+            let blk = self.bmap_write(tx, n, 0)?;
             blk[..target.len()].copy_from_slice(target);
             n.set_size(target.len() as u64);
             tx.inode(n);
-            self.add_entry(&mut tx, dir, name, n)
+            self.add_entry(tx, dir, name, n)
         });
-        self.finish(tx, r).map(|_| [0; 3])
+        r.map(|_| [0; 3])
     }
 
     fn readlink(&mut self, c: u64, m: [u64; 4], io: Io) -> R<[u64; 3]> {
@@ -1298,11 +1388,10 @@ impl Fs {
         Ok(())
     }
 
-    fn truncate(&mut self, c: u64, m: [u64; 4]) -> R<[u64; 3]> {
+    fn truncate(&mut self, tx: &mut Tx, c: u64, m: [u64; 4]) -> R<[u64; 3]> {
         let n = self.node(c, m[1])?;
-        let mut tx = Tx::new();
-        let r = self.truncate_to(&mut tx, n, m[2]);
-        self.finish(tx, r).map(|_| [0; 3])
+        let r = self.truncate_to(tx, n, m[2]);
+        r.map(|_| [0; 3])
     }
 
     /// A file's range `[off, off + len)` of at most a block, as up to two
@@ -1349,7 +1438,7 @@ impl Fs {
         Ok([len, 0, 0])
     }
 
-    fn write(&mut self, c: u64, m: [u64; 4], io: Io) -> R<[u64; 3]> {
+    fn write(&mut self, tx: &mut Tx, c: u64, m: [u64; 4], io: Io) -> R<[u64; 3]> {
         let n = self.node(c, m[1])?;
         let (off, len) = (m[2], m[3]);
         if n.kind() != KIND_FILE {
@@ -1372,14 +1461,13 @@ impl Fs {
         if !ok {
             return Err(Status::Invalid);
         }
-        let mut tx = Tx::new();
         let mut at = 0;
         let mut r = Ok(());
         for (bi, o, k) in Fs::pieces(off, len) {
             if k == 0 {
                 continue;
             }
-            match self.bmap_write(&mut tx, n, bi) {
+            match self.bmap_write(tx, n, bi) {
                 Ok(blk) => blk[o..o + k].copy_from_slice(&buf(B_DATA)[at..at + k]),
                 Err(e) => {
                     r = Err(e);
@@ -1392,7 +1480,7 @@ impl Fs {
             n.set_size(off + len);
             tx.inode(n);
         }
-        self.finish(tx, r).map(|_| [0; 3])
+        r.map(|_| [0; 3])
     }
 
     fn readdir(&mut self, c: u64, m: [u64; 4], io: Io) -> R<[u64; 3]> {
@@ -1557,28 +1645,136 @@ impl Fs {
         }
     }
 
-    /// One request of container `c`, from a call or a ring.
-    fn op(&mut self, c: u64, m: [u64; 4], io: Io) -> [u64; 4] {
-        reply(match m[0] {
-            fs::OPEN => self.open(c, m, io),
+    /// One request of container `c`, from a call or a ring, into the open
+    /// group: the answer, to give once the group commits.
+    fn op(&mut self, tx: &mut Tx, c: u64, m: [u64; 4], io: Io) -> [u64; 4] {
+        let (open, touched) = (group_len() > 0, tx.touched);
+        let r = match m[0] {
+            fs::OPEN => self.open(tx, c, m, io),
             fs::READ => self.read(c, m, io),
-            fs::WRITE => self.write(c, m, io),
+            fs::WRITE => self.write(tx, c, m, io),
             fs::STAT => self.node(c, m[1]).map(|n| [n.size(), n.kind() as u64, 0]),
-            fs::MKDIR => self.mkdir(c, m, io),
-            fs::UNLINK => self.unlink(c, m, io),
-            fs::RENAME => self.rename(c, m, io),
+            fs::MKDIR => self.mkdir(tx, c, m, io),
+            fs::UNLINK => self.unlink(tx, c, m, io),
+            fs::RENAME => self.rename(tx, c, m, io),
             fs::READDIR => self.readdir(c, m, io),
-            fs::TRUNCATE => self.truncate(c, m),
+            fs::TRUNCATE => self.truncate(tx, c, m),
             fs::STATFS => Ok(self.statfs()),
-            fs::SYMLINK => self.symlink(c, m, io),
+            fs::SYMLINK => self.symlink(tx, c, m, io),
             fs::READLINK => self.readlink(c, m, io),
             _ => Err(Status::Invalid),
-        })
+        };
+        if r.is_err() && tx.touched != touched {
+            // Out of space half-way: never with others in the group (see
+            // admit), so the disk holds the state before this request.
+            if open {
+                crash("a request failed half-way through a group");
+            }
+            tx.reset();
+            self.reload();
+        }
+        reply(r)
     }
 
-    /// A call: the reply, and a capability to grant with it.
-    fn serve(&mut self, badge: u64, m: [u64; 4], lent: bool) -> ([u64; 4], Option<u64>) {
+    /// Whether fewer blocks or inodes are free than one request may take.
+    fn low(&self) -> bool {
+        let blocks = (DATA..self.blocks).rev().filter(|&b| !self.is_used(b)).take(8).count();
+        let inodes = (1..NINODES).rev().filter(|&i| Inode::of(i).is_free()).take(2).count();
+        blocks < 8 || inodes < 2
+    }
+
+    /// Before request `op` joins the open group: closes it if the request
+    /// might not fit, or might change something and run out of space.
+    fn admit(&mut self, tx: &mut Tx, op: u64) {
+        let n = group_len();
+        if n == 0 {
+            return;
+        }
+        let reads = matches!(op, fs::READ | fs::STAT | fs::READDIR | fs::STATFS | fs::READLINK);
+        if n + PER_OP > JMAX || tx.used + PER_OP_BUFS > NTX || !reads && self.low() {
+            self.close(tx);
+        }
+    }
+
+    /// Closes the open group: commits its changes at once, answers its
+    /// requests, then writes the blocks home.
+    fn close(&mut self, tx: &mut Tx) {
+        let changed = group_len() > 0;
+        self.commit();
+        for i in 0..self.npend {
+            match self.pend[i] {
+                (Pend::Call(k), m) => {
+                    syscall(Syscall::ReplyTo, k, m);
+                }
+                (Pend::Ring(r, tag), m) => self.post(r, tag, m),
+            }
+        }
+        for r in 0..MAX_RINGS {
+            if core::mem::take(&mut self.ring_pend[r]) > 0 && self.rings[r].is_some() {
+                self.ring_posted(r);
+            }
+        }
+        if changed {
+            self.grouped += self.npend as u64;
+            self.commits += 1;
+            if self.npend > self.largest.max(1) {
+                self.largest = self.npend;
+                say!(
+                    "group commit: {} requests answered by one commit ({} requests in {} commits so far)",
+                    self.npend,
+                    self.grouped,
+                    self.commits
+                );
+            }
+        }
+        self.npend = 0;
+        self.checkpoint();
+        tx.reset();
+    }
+
+    /// A call: served into the group and set aside, or (changing the
+    /// rings, or granting a capability) alone after it.
+    fn call(&mut self, tx: &mut Tx, badge: u64, m: [u64; 4], lent: bool) {
         let c = badge & 0xffff;
+        if c == 0 || matches!(m[0], fs::RING_ATTACH | fs::RING_START | fs::RING_DOORBELL) {
+            self.close(tx);
+            let (reply, grant) = self.control(c, m, lent);
+            if lent {
+                syscall(Syscall::CapDelete, LENT, [0; 4]);
+            }
+            let x = CapTransfer {
+                grant: grant.map(|g| g as u16),
+                accept: None,
+            };
+            syscall_x(Syscall::Reply, 0, reply, x);
+            if grant.is_some() {
+                syscall(Syscall::CapDelete, MINT, [0; 4]);
+            }
+            return;
+        }
+        self.admit(tx, m[0]);
+        let io = if lent { Io::Lent } else { Io::None };
+        let reply = self.op(tx, c, m, io);
+        if lent {
+            syscall(Syscall::CapDelete, LENT, [0; 4]);
+        }
+        let saved = syscall(Syscall::ReplySave, 0, [0; 4]);
+        if saved.status == 0 {
+            self.pend[self.npend] = (Pend::Call(saved.msg[0]), reply);
+            self.npend += 1;
+            if self.npend == MAX_PEND {
+                self.close(tx);
+            }
+        } else {
+            // Nowhere to set it aside: answered with the group, now.
+            self.close(tx);
+            syscall(Syscall::Reply, 0, reply);
+        }
+    }
+
+    /// A call changing the rings: the reply, and a capability to grant
+    /// with it.
+    fn control(&mut self, c: u64, m: [u64; 4], lent: bool) -> ([u64; 4], Option<u64>) {
         if c == 0 {
             return (reply(Err(Status::Denied)), None);
         }
@@ -1592,10 +1788,7 @@ impl Fs {
                 Ok(g) => (reply(Ok([0; 3])), Some(g)),
                 Err(e) => (reply(Err(e)), None),
             },
-            _ => {
-                let io = if lent { Io::Lent } else { Io::None };
-                (self.op(c, m, io), None)
-            }
+            _ => (reply(Err(Status::Invalid)), None),
         }
     }
 
@@ -1698,75 +1891,103 @@ impl Fs {
         }
     }
 
-    /// Takes every submission there is room to complete. Returns whether
-    /// there were any.
-    fn poll_rings(&mut self) -> bool {
-        let mut any = false;
-        for r in 0..MAX_RINGS {
+    /// Takes one ring submission into the open group, from the first ring
+    /// (in turn) with one and room for its completion. Returns whether it
+    /// did. Its completion, and its slot, are given back when the group
+    /// commits.
+    fn take_ring(&mut self, tx: &mut Tx) -> bool {
+        for k in 0..MAX_RINGS {
+            let r = (self.next_ring + k) % MAX_RINGS;
             let Some(g) = self.rings[r].filter(|g| g.started) else {
                 continue;
             };
             let page = RING_VA + r as u64 * RING_STRIDE;
-            let mut posted = false;
-            loop {
-                let head = hdr(page, ring::SQ_HEAD).load(Ordering::Relaxed);
-                let tail = hdr(page, ring::SQ_TAIL).load(Ordering::Acquire);
-                let cq_tail = hdr(page, ring::CQ_TAIL).load(Ordering::Relaxed);
-                let cq_head = hdr(page, ring::CQ_HEAD).load(Ordering::Acquire);
-                if head == tail {
-                    break;
-                }
-                if tail.wrapping_sub(head) > ring::ENTRIES
-                    || cq_tail.wrapping_sub(cq_head) > ring::ENTRIES
-                {
-                    say!("ring {r}: indices out of range; dropping it");
-                    self.detach(r);
-                    break;
-                }
-                if cq_tail.wrapping_sub(cq_head) == ring::ENTRIES {
-                    break; // no room for the completion: the client reaps first
-                }
-                let sqe = page as usize + ring::SQ + (head % ring::ENTRIES) as usize * ring::SQE;
-                // SAFETY: inside the ring page, mapped while attached.
-                let w = |i: usize| unsafe { ((sqe + 8 * i) as *const u64).read_volatile() };
-                let (op, tag, m, off) = (w(0), w(1), [w(0), w(2), w(3), w(4)], w(5));
-                let reply = if op >= fs::RING_ATTACH || off >= ring::DATA {
-                    reply(Err(Status::Invalid))
-                } else {
-                    let io = Io::Shared {
-                        va: page + 4096 + off,
-                        len: (ring::DATA - off).min(fs::BLOCK) as usize,
-                    };
-                    self.op(g.container, m, io)
+            let taken = self.ring_pend[r];
+            let head = hdr(page, ring::SQ_HEAD).load(Ordering::Relaxed);
+            let tail = hdr(page, ring::SQ_TAIL).load(Ordering::Acquire);
+            let cq_tail = hdr(page, ring::CQ_TAIL).load(Ordering::Relaxed);
+            let cq_head = hdr(page, ring::CQ_HEAD).load(Ordering::Acquire);
+            if tail.wrapping_sub(head) > ring::ENTRIES
+                || cq_tail.wrapping_sub(cq_head) > ring::ENTRIES
+            {
+                say!("ring {r}: indices out of range; dropping it");
+                self.detach(r);
+                continue;
+            }
+            let next = head.wrapping_add(taken);
+            if next == tail || tail.wrapping_sub(head) < taken {
+                continue;
+            }
+            if cq_tail.wrapping_sub(cq_head) + taken >= ring::ENTRIES {
+                continue; // no room for the completion: the client reaps first
+            }
+            let sqe = page as usize + ring::SQ + (next % ring::ENTRIES) as usize * ring::SQE;
+            // SAFETY: inside the ring page, mapped while attached.
+            let w = |i: usize| unsafe { ((sqe + 8 * i) as *const u64).read_volatile() };
+            let (op, tag, m, off) = (w(0), w(1), [w(0), w(2), w(3), w(4)], w(5));
+            let reply = if op >= fs::RING_ATTACH || off >= ring::DATA {
+                reply(Err(Status::Invalid))
+            } else {
+                // Closing the group first only makes room in the ring.
+                self.admit(tx, op);
+                let io = Io::Shared {
+                    va: page + 4096 + off,
+                    len: (ring::DATA - off).min(fs::BLOCK) as usize,
                 };
-                let cqe = page as usize + ring::CQ + (cq_tail % ring::ENTRIES) as usize * ring::CQE;
-                for (i, v) in [tag, reply[0], reply[1], reply[2], reply[3]]
-                    .iter()
-                    .enumerate()
-                {
-                    // SAFETY: inside the ring page, mapped while attached.
-                    unsafe { ((cqe + 8 * i) as *mut u64).write_volatile(*v) };
-                }
-                // Committed already: the completion is the acknowledgement.
-                hdr(page, ring::CQ_TAIL).store(cq_tail.wrapping_add(1), Ordering::Release);
-                hdr(page, ring::SQ_HEAD).store(head.wrapping_add(1), Ordering::Release);
-                self.checkpoint();
-                self.ring_ops += 1;
-                posted = true;
-                any = true;
-                // Coalesced: wake a sleeping client once it has as many
-                // completions as it asked for.
-                let pending = cq_tail.wrapping_add(1).wrapping_sub(cq_head);
-                self.wake_client(r, page, pending);
+                self.op(tx, g.container, m, io)
+            };
+            self.pend[self.npend] = (Pend::Ring(r, tag), reply);
+            self.npend += 1;
+            self.ring_pend[r] += 1;
+            self.ring_ops += 1;
+            self.next_ring = (r + 1) % MAX_RINGS;
+            if self.npend == MAX_PEND {
+                self.close(tx);
             }
-            // Out of work (or room): wake a sleeping client whatever it
-            // asked for, so it can refill the queue.
-            if posted && self.rings[r].is_some() {
-                fence(Ordering::SeqCst);
-                self.wake_client(r, page, ring::ENTRIES);
-            }
+            return true;
         }
-        any
+        false
+    }
+
+    /// Completes ring `r`'s oldest submission taken, with tag `tag` and
+    /// answer `m`: the group holding it has committed.
+    fn post(&mut self, r: usize, tag: u64, m: [u64; 4]) {
+        if self.rings[r].is_none() {
+            return; // dropped since
+        }
+        let page = RING_VA + r as u64 * RING_STRIDE;
+        let head = hdr(page, ring::SQ_HEAD).load(Ordering::Relaxed);
+        let cq_tail = hdr(page, ring::CQ_TAIL).load(Ordering::Relaxed);
+        let cq_head = hdr(page, ring::CQ_HEAD).load(Ordering::Acquire);
+        if cq_tail.wrapping_sub(cq_head) >= ring::ENTRIES {
+            say!("ring {r}: completions overrun; dropping it");
+            self.detach(r);
+            return;
+        }
+        let cqe = page as usize + ring::CQ + (cq_tail % ring::ENTRIES) as usize * ring::CQE;
+        for (i, v) in [tag, m[0], m[1], m[2], m[3]].iter().enumerate() {
+            // SAFETY: inside the ring page, mapped while attached.
+            unsafe { ((cqe + 8 * i) as *mut u64).write_volatile(*v) };
+        }
+        hdr(page, ring::CQ_TAIL).store(cq_tail.wrapping_add(1), Ordering::Release);
+        hdr(page, ring::SQ_HEAD).store(head.wrapping_add(1), Ordering::Release);
+    }
+
+    /// After posting ring `r`'s completions: wakes its client if it sleeps
+    /// waiting for as many as it has (coalesced), or whatever it asked
+    /// for if the ring is out of work or room, so it can refill it.
+    fn ring_posted(&mut self, r: usize) {
+        let page = RING_VA + r as u64 * RING_STRIDE;
+        let have = hdr(page, ring::CQ_TAIL)
+            .load(Ordering::Relaxed)
+            .wrapping_sub(hdr(page, ring::CQ_HEAD).load(Ordering::Acquire));
+        self.wake_client(r, page, have);
+        let idle = hdr(page, ring::SQ_HEAD).load(Ordering::Relaxed)
+            == hdr(page, ring::SQ_TAIL).load(Ordering::Acquire);
+        if (idle || have >= ring::ENTRIES) && self.rings[r].is_some() {
+            fence(Ordering::SeqCst);
+            self.wake_client(r, page, ring::ENTRIES);
+        }
     }
 
     /// Signals ring `r`'s client if it sleeps waiting for at most
@@ -1812,25 +2033,39 @@ impl Fs {
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(_: u64) -> ! {
     let mut f = Fs::mount();
+    let mut tx = Tx::new();
     let accept = CapTransfer {
         grant: None,
         accept: Some(LENT as u16),
     };
     loop {
-        // Under load, take ring submissions without sleeping.
-        if f.poll_rings() {
+        // Ring submissions first, into the group.
+        if f.take_ring(&mut tx) {
             continue;
         }
-        // About to sleep: ask for the doorbell, then look once more, so a
-        // submission made meanwhile is either seen here or rings it.
-        f.need_wakeup(true);
-        fence(Ordering::SeqCst);
-        if f.ring_work() {
+        let r = if f.npend > 0 || group_len() > 0 {
+            // A group is open: take what else is waiting, and close it
+            // when nothing is.
+            let r = syscall_x(Syscall::NBRecv, SERVICE, [0; 4], accept);
+            if r.status == Error::WouldBlock.code() {
+                f.close(&mut tx);
+                continue;
+            }
+            r
+        } else {
+            // About to sleep: ask for the doorbell, then look once more,
+            // so a submission made meanwhile is either seen here or
+            // rings it.
+            f.need_wakeup(true);
+            fence(Ordering::SeqCst);
+            if f.ring_work() {
+                f.need_wakeup(false);
+                continue;
+            }
+            let r = syscall_x(Syscall::Recv, SERVICE, [0; 4], accept);
             f.need_wakeup(false);
-            continue;
-        }
-        let r = syscall_x(Syscall::Recv, SERVICE, [0; 4], accept);
-        f.need_wakeup(false);
+            r
+        };
         if r.status == Error::Notified.code() {
             f.wakeups += 1;
             if f.wakeups % 64 == 0 {
@@ -1844,23 +2079,10 @@ pub extern "C" fn _start(_: u64) -> ! {
             continue;
         }
         if r.status != 0 {
+            f.close(&mut tx);
             continue;
         }
-        let lent = r.cap == Some(LENT as u16);
-        let (reply, grant) = f.serve(r.badge, r.msg, lent);
-        if lent {
-            syscall(Syscall::CapDelete, LENT, [0; 4]);
-        }
-        // Committed: acknowledge, then write the blocks home.
-        let x = CapTransfer {
-            grant: grant.map(|g| g as u16),
-            accept: None,
-        };
-        syscall_x(Syscall::Reply, 0, reply, x);
-        if grant.is_some() {
-            syscall(Syscall::CapDelete, MINT, [0; 4]);
-        }
-        f.checkpoint();
+        f.call(&mut tx, r.badge, r.msg, r.cap == Some(LENT as u16));
     }
 }
 

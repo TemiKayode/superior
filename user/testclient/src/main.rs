@@ -1890,6 +1890,38 @@ fn fs_verify() -> ! {
     superior_sys::park()
 }
 
+/// Records each load client writes.
+const LOAD_RECORDS: u64 = 120;
+
+/// A load client (`arg 21`, boot/fs.manifest): appends records to a file
+/// in its own container while the others (and the main client) do the
+/// same, so the server has calls from several clients waiting at once
+/// to answer with one commit; then reads every one back.
+fn fs_load() -> ! {
+    let mut t = Checks(0, "fs load");
+    let ready = fs_setup(1);
+    let r = fs_open("load.log", fs::CREATE | fs::TRUNC);
+    let (mut acked, mut retried) = (0, 0);
+    if ready && r[0] == OK {
+        while acked < LOAD_RECORDS {
+            let (ok, tries) = append(r[1], acked);
+            retried += tries;
+            if !ok {
+                break;
+            }
+            acked += 1;
+        }
+    }
+    let back = acked > 0 && check_records(r[1], acked).is_ok();
+    t.check(
+        acked == LOAD_RECORDS && back,
+        format_args!(
+            "{acked} records written alongside the other clients, every one read back ({retried} calls cut off by a restart and retried)"
+        ),
+    );
+    superior_sys::park()
+}
+
 /// Another component (`arg 9`): its own container.
 fn fs_other() -> ! {
     let mut t = Checks(0, "fs other");
@@ -3729,6 +3761,7 @@ pub extern "C" fn _start(role: u64) -> ! {
         7 => fs_client(),
         8 => fs_verify(),
         9 => fs_other(),
+        21 => fs_load(),
         10 => injector(&[FS_INDEX, DRIVER_INDEX], false),
         // The keyboard test: a word takes some 0.2 s to type, longer than
         // most gaps between kills, so it gets pauses to come through in.

@@ -77,6 +77,9 @@ enum Op {
         blocking: bool,
     },
     Reply,
+    /// Set the caller aside, or answer one set aside.
+    SaveCaller,
+    ReplySaved(usize),
     ReplyRecv {
         ep: u16,
     },
@@ -180,7 +183,9 @@ impl Sim {
                 ep,
                 blocking: r.chance(80),
             },
-            36..=40 => Op::Reply,
+            36..=37 => Op::Reply,
+            38..=39 => Op::SaveCaller,
+            40 => Op::ReplySaved(r.below(4) as usize),
             41..=50 => Op::ReplyRecv { ep },
             51..=56 => Op::Signal {
                 ntfn,
@@ -310,6 +315,8 @@ impl Sim {
             }
             Op::Recv { ep, blocking } => self.k.recv(ep, blocking),
             Op::Reply => self.k.reply(msg(REPLY_TAG)),
+            Op::SaveCaller => self.k.save_caller().map(|_| ()),
+            Op::ReplySaved(i) => self.k.reply_saved(i, msg(REPLY_TAG)),
             Op::ReplyRecv { ep } => self.k.reply_recv(ep, msg(REPLY_TAG)),
             Op::Signal { ntfn, bits } => self.k.signal(ntfn, bits),
             Op::Wait { ntfn } => self.k.wait(ntfn),
@@ -444,6 +451,8 @@ impl Sim {
             && !matches!(
                 result,
                 Err(IpcError::NoCurrent
+                    | IpcError::NoCaller
+                    | IpcError::CannotSave
                     | IpcError::WouldBlock
                     | IpcError::ThreadActive
                     | IpcError::BadSchedParams
@@ -484,6 +493,7 @@ pub fn coverage(seeds: u64, steps: u64) -> HashMap<&'static str, u64> {
                     State::BlockedSend { call: true, .. } => "blocked calling",
                     State::BlockedSend { .. } => "blocked sending",
                     State::BlockedRecv { .. } => "blocked receiving",
+                    State::BlockedReply if k.is_saved(t) => "awaiting a saved reply",
                     State::BlockedReply => "awaiting reply",
                     State::BlockedWait { .. } => "waiting on notification",
                     State::Throttled { .. } => "throttled",
@@ -554,6 +564,7 @@ mod tests {
             "blocked sending",
             "blocked receiving",
             "awaiting reply",
+            "awaiting a saved reply",
             "waiting on notification",
             "throttled",
             "passive, no context",

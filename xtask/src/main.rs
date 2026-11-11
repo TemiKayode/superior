@@ -1223,6 +1223,20 @@ fn fs_test(arch: Arch, driver: &'static str) -> Result<(), String> {
         "[cm] client asked to shut down (pass)",
     ];
     check_log("filesystem test (first boot)", &out, &steps)?;
+    // Three load clients beside it: calls waiting at once share a commit.
+    let loads = out
+        .matches("[pass] fs load: 120 records written alongside the other clients, every one read back")
+        .count();
+    let grouped = out
+        .rfind("fs: group commit: ")
+        .map(|i| out[i..].lines().next().unwrap_or_default());
+    let Some(grouped) = grouped.filter(|_| loads == 3) else {
+        return Err(format!(
+            "filesystem test: {loads} of 3 load clients read their records back; group commit {}",
+            if out.contains("fs: group commit: ") { "seen" } else { "never answered two requests at once" }
+        ));
+    };
+    println!("== {}", grouped.trim_start_matches(|c| c != 'f'));
     let kills = out.matches("[cm] fault injection: killing").count();
     // Kills land in the later phases too (the tree, renames, unlinks).
     let later = out

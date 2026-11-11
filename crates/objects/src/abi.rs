@@ -237,6 +237,17 @@ pub enum Syscall {
     /// holder hears of it without asking (`IoFaults` then says what it
     /// was). Slot `rsi` = `u64::MAX` unbinds it.
     IoFaultNotify = 45,
+    /// Sets aside the caller this thread owes a reply, so it may receive
+    /// further calls before answering it: the reply's word 0 is the place
+    /// it went in, for `ReplyTo`. Up to `ipc::SAVED_CALLERS` at once; a
+    /// caller set aside whose server is destroyed gets `PeerRestarted`
+    /// (or `ReplyAbandoned`, suspended), as the one it owes does.
+    /// `InvalidArgument` if no caller waits; `ObjectTableFull` if every
+    /// place is taken or the thread is passive.
+    ReplySave = 46,
+    /// Answers the caller set aside in place `rdi` with the message (no
+    /// capability may go with it). A place with nobody in it is a no-op.
+    ReplyTo = 47,
     /// Maps the frame in slot `rdi` at page-aligned `rsi` in the address
     /// space in slot `r8` (Write right). `rdx` = [`MAP_WRITE`] and/or
     /// [`MAP_EXEC`], never both. Needs the frame's Map right, plus Write
@@ -307,6 +318,8 @@ impl Syscall {
             43 => Syscall::Sleep,
             44 => Syscall::Reboot,
             45 => Syscall::IoFaultNotify,
+            46 => Syscall::ReplySave,
+            47 => Syscall::ReplyTo,
             42 => Syscall::IoFaults,
             0x100 => Syscall::DebugPutStr,
             0x101 => Syscall::DebugSelftestDone,

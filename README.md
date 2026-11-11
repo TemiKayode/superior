@@ -94,7 +94,10 @@ holds the rest):
 - Idle: a CPU with no thread it can run halts until an interrupt (or a kick from another
   CPU) gives it one. The timer signals a notification each tick, so threads sleep by waiting on it.
 - IPC engine: `Send`, `Call`, `Recv`, `Reply`, `ReplyRecv`, `Signal`, `Wait`, `Yield`;
-  direct switch on call/reply (fast path); 64 fixed priorities.
+  direct switch on call/reply (fast path); 64 fixed priorities. A server may set a
+  caller aside (`ReplySave`, up to 16) and answer it later (`ReplyTo`), taking other
+  calls meanwhile; if it dies they get `PeerRestarted`, if it is suspended
+  `ReplyAbandoned` (the simulator checks every waiting caller is owed by exactly one).
 - Bound notifications (as in seL4): `NotificationBind` ties a notification to the
   calling thread, whose `Recv` and `ReplyRecv` then also return when it is signalled
   (status `Notified`, the bits as the badge). Pending bits come before queued callers.
@@ -417,13 +420,21 @@ holds the rest):
     `TooManyLinks`, as does `OPEN` with `NOFOLLOW` on a link; creating through a
     dangling link makes its target; `UNLINK` and `RENAME` act on the link itself.
     Clients cannot write `..` in a path; targets can.
-  - Crash-only, with a write-ahead journal of up to 8 blocks per change. Changed
+  - Crash-only, with a write-ahead journal of up to 48 blocks per commit. Changed
     blocks go to the journal, then a flush, then a header with their home
     addresses and a checksum, then a flush: only then is the change acknowledged.
     The blocks go home after the reply. Mount replays a committed transaction an
     instance (or the machine) left unfinished (a torn one fails its checksum and
     was never acknowledged), then checks that every block belongs to exactly one
     inode, every inode to exactly one directory, and the bitmap agrees.
+  - Group commit: requests from several clients are served one after another but
+    committed together. The server sets each caller aside (new kernel calls
+    `ReplySave` and `ReplyTo`; up to 16 per thread, failed with `PeerRestarted` if
+    the server dies) and takes the next call already waiting, or ring submission,
+    until there is none or the group is full; then one commit (two flushes) answers
+    them all. A request sees the uncommitted changes of those before it in its
+    group, and a failing one changes nothing (every check comes first; one that may
+    change something starts a group of its own when space runs low).
   - Clients retry calls cut off by a restart (a retried `UNLINK` or `RENAME`
     answering `NotFound` had already happened); the server retries block calls
     cut off by a driver restart.
@@ -438,8 +449,9 @@ holds the rest):
     then, so signals coalesce. A client resubmits what had no completion after a
     restart.
   - Limits: 2,047 files and directories (32 blocks of inodes, all held in
-    memory), 58-byte names, one request at a time, four rings, disks of up to
-    128 MiB (one bitmap block).
+    memory), 58-byte names, 16 requests per commit, four rings, disks of up to
+    128 MiB (one bitmap block). The server is one thread: requests are not served
+    in parallel, only committed together.
   - Fault injection: a manifest `fault-injector` component may ask the Component
     Manager to kill another (it is restarted as if it had crashed; such kills do
     not count towards the restart limit, which is there to stop crash loops).

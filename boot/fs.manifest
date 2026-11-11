@@ -6,6 +6,8 @@
 # shuts the machine down at once. boot/fs-verify.manifest boots the same
 # disk again. Component numbers matter: the client is component 3 in both,
 # so it gets the same container; the injector kills components 1 and 2.
+# Three load clients append to files of their own meanwhile, so calls
+# from several clients wait at once and share a commit.
 
 component pcibus
   image pcibus
@@ -34,7 +36,7 @@ component fs
   priority 10
   uses block 0
   provides fs 1
-  untyped 18 2
+  untyped 19 2
   cspace 8
 
 component client
@@ -53,3 +55,24 @@ component injector
   control 0
   fault-injector
   notification 1
+
+component load1
+  image testclient
+  arg 21
+  priority 8
+  uses fs 0
+  untyped 12 1
+
+component load2
+  image testclient
+  arg 21
+  priority 8
+  uses fs 0
+  untyped 12 1
+
+component load3
+  image testclient
+  arg 21
+  priority 8
+  uses fs 0
+  untyped 12 1
