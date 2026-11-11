@@ -5,12 +5,28 @@
 //! duplicate address detection before an address is used; ICMPv6 echo;
 //! UDP and TCP; fragments sent and put back together.
 //!
+//! Routes (`superior_inet::routes6`, RFC 4861 and RFC 4191): every
+//! router that advertises itself is kept with its preference and
+//! lifetime, with the prefixes advertisements say are on the link and the
+//! more specific routes they carry. A packet goes to its destination if
+//! that is on the link, else to the router of the longest matching route,
+//! else to the best default router; one that does not answer neighbour
+//! discovery is passed over for 30 s while another can be used.
+//!
+//! Managed addresses (`superior_inet::dhcp6`, RFC 8415): when a router
+//! advertisement says addresses are managed (its M flag), a DHCPv6
+//! client asks for one (Solicit, Advertise, Request, Reply), puts it
+//! through duplicate detection, uses it if autoconfiguration gave none,
+//! renews it at T1, rebinds at T2 and drops it when it runs out.
+//!
 //! The link-local address comes from the MAC (modified EUI-64), and so
 //! does the global one's interface half. Both, with the router, the DNS
 //! server and detection's progress, are kept in the state page, so a
 //! restarted server goes on with them at once.
 
 use super::*;
+use superior_inet::dhcp6;
+use superior_inet::routes6::{Preference, Routes};
 
 pub const ETH_IPV6: u16 = 0x86dd;
 const NH_HOP: u8 = 0;
@@ -100,9 +116,15 @@ pub struct V6 {
     pub prefix_len: u8,
     pub on_link: bool,
     pub valid_until: u64,
-    /// The default router (its link-local address) and until when.
+    /// The default router in use (its link-local address) and until when.
     pub router: u128,
     pub router_until: u64,
+    /// Every router, on-link prefix and route advertised.
+    pub routes: Routes,
+    /// The DHCPv6 client for a managed address, and the address it got
+    /// that is in use as the global one (0: none).
+    pub dhcp: dhcp6::Client,
+    pub leased: u128,
     pub dns: u128,
     /// An address on trial, and when it passes.
     pub tentative: Option<(u128, u64)>,
@@ -124,6 +146,9 @@ impl V6 {
             valid_until: 0,
             router: 0,
             router_until: 0,
+            routes: Routes::new(),
+            dhcp: dhcp6::Client::new([0; 6], SECOND),
+            leased: 0,
             dns: 0,
             tentative: None,
             rs_next: 0,
@@ -206,7 +231,7 @@ impl Net {
         if link_local(dst) || multicast(dst) || on_link {
             return Some(dst);
         }
-        (v.router != 0 && ticks() < v.router_until).then_some(v.router)
+        v.routes.next_hop(dst, ticks())
     }
 
     pub fn save6(&self) {
@@ -256,6 +281,11 @@ impl Net {
         v.on_link = w(3) >> 8 & 1 != 0;
         v.router = (w(4) as u128) << 64 | w(5) as u128;
         v.router_until = w(6);
+        // The router a predecessor used, until the others are heard again.
+        let now = ticks();
+        if v.router != 0 && now < v.router_until {
+            v.routes.advert(v.router, v.router_until - now, Preference::Medium, now);
+        }
         v.dns = (w(7) as u128) << 64 | w(8) as u128;
         v.valid_until = w(9);
         if v.global != 0 && ticks() >= v.valid_until {
@@ -268,6 +298,7 @@ impl Net {
     /// link-local one (then a router solicitation).
     pub fn start6(&mut self) {
         self.v6.ll = 0xfe80 << 112 | self.iid();
+        self.v6.dhcp = dhcp6::Client::new(self.mac, SECOND);
         if self.load6() {
             say!(
                 "IPv6 kept: {}/{} via {}",
@@ -316,6 +347,15 @@ impl Net {
                     );
                 }
             }
+        }
+        // The managed address's exchange, if a router asked for one.
+        let mut out = [0u8; dhcp6::MAX_MESSAGE];
+        let (send, event) = self.v6.dhcp.poll(now, &mut out);
+        if let Some(n) = send.filter(|_| self.v6.ll_ready) {
+            self.dhcp6_send(&out[..n]);
+        }
+        if let Some(e) = event {
+            self.dhcp6_event(e);
         }
         let v = self.v6;
         if v.ll_ready && v.global == 0 && v.tentative.is_none() && now >= v.rs_next {
@@ -486,31 +526,81 @@ impl Net {
     /// servers, from the link-local address.
     fn info_request(&mut self) {
         self.v6.info_xid = (self.v6.info_xid + 0x9e37) & 0xff_ffff;
+        let mut m = [0u8; 16];
+        m[0] = DHCP6_INFO_REQUEST;
+        m[1..4].copy_from_slice(&self.v6.info_xid.to_be_bytes()[1..]);
+        // Asking for DNS servers; no time elapsed.
+        put16(&mut m, 4, DHCP6_OPT_ORO);
+        put16(&mut m, 6, 2);
+        put16(&mut m, 8, DHCP6_OPT_DNS);
+        put16(&mut m, 10, DHCP6_OPT_ELAPSED);
+        put16(&mut m, 12, 2);
+        self.dhcp6_send(&m);
+    }
+
+    /// A DHCPv6 message, from the link-local address to every server.
+    fn dhcp6_send(&mut self, message: &[u8]) {
         let ll = self.v6.ll;
-        let len = 8 + 4 + 6 + 6;
+        let len = 8 + message.len();
         let u = &mut page(TX_VA)[54..54 + len];
         u.fill(0);
         put16(u, 0, DHCP6_CLIENT_PORT);
         put16(u, 2, DHCP6_SERVER_PORT);
         put16(u, 4, len as u16);
-        let m = &mut u[8..];
-        m[0] = DHCP6_INFO_REQUEST;
-        m[1..4].copy_from_slice(&self.v6.info_xid.to_be_bytes()[1..]);
-        // Asking for DNS servers; no time elapsed.
-        put16(m, 4, DHCP6_OPT_ORO);
-        put16(m, 6, 2);
-        put16(m, 8, DHCP6_OPT_DNS);
-        put16(m, 10, DHCP6_OPT_ELAPSED);
-        put16(m, 12, 2);
+        u[8..].copy_from_slice(message);
         let c = fold(sum(pseudo(ll, ALL_DHCP6, PROTO_UDP, len), u));
         put16(u, 6, if c == 0 { 0xffff } else { c });
         self.ip6_header(ll, ALL_DHCP6, PROTO_UDP, len, 1);
         self.out6(ALL_DHCP6, 40 + len);
     }
 
+    /// What the managed address's exchange came to.
+    fn dhcp6_event(&mut self, e: dhcp6::Event) {
+        let now = ticks();
+        match e {
+            dhcp6::Event::Bound { addr, valid, dns } => {
+                if dns != 0 && self.v6.dns == 0 {
+                    self.v6.dns = dns;
+                    say!("IPv6 DNS {} (DHCPv6)", Ip6(dns));
+                }
+                let v = &mut self.v6;
+                if addr == v.global && v.leased == addr {
+                    // Renewed.
+                    v.valid_until = now.saturating_add(valid);
+                    self.save6();
+                } else if v.global == 0 || v.leased == v.global {
+                    // In use if autoconfiguration gave no address: a
+                    // single address, on no prefix of its own, once it
+                    // has passed duplicate detection.
+                    say!("IPv6 address {} leased by DHCPv6 for {} s", Ip6(addr), valid / SECOND);
+                    v.global = 0;
+                    v.leased = addr;
+                    v.prefix_len = 128;
+                    v.on_link = false;
+                    v.valid_until = now.saturating_add(valid);
+                    self.try_address(addr);
+                }
+            }
+            dhcp6::Event::Lost { addr } => {
+                if self.v6.leased == addr {
+                    say!("IPv6 address {} is no longer leased", Ip6(addr));
+                    if self.v6.global == addr {
+                        self.v6.global = 0;
+                    }
+                    self.v6.leased = 0;
+                    self.save6();
+                }
+            }
+        }
+    }
+
     /// A DHCPv6 message to the client port: a reply to this host's
     /// Information-Request gives the DNS server.
     pub fn dhcp6(&mut self, m: &[u8]) {
+        if let Some(e) = self.v6.dhcp.receive(m, ticks()) {
+            self.dhcp6_event(e);
+            return;
+        }
         if m.len() < 4 || m[0] != DHCP6_REPLY || m[1..4] != self.v6.info_xid.to_be_bytes()[1..] {
             return;
         }
@@ -710,11 +800,28 @@ impl Net {
     /// an address in, the DNS server.
     fn ra(&mut self, src: u128, m: &[u8]) {
         let now = ticks();
-        let lifetime = be16(m, 6) as u64;
-        if lifetime > 0 {
-            self.v6.router = src;
-            self.v6.router_until = now + lifetime * SECOND;
+        let lifetime = be16(m, 6) as u64 * SECOND;
+        // A lifetime of 0 means it is not (or no longer) a default router.
+        self.v6.routes.advert(src, lifetime, Preference::from_bits(m[5] >> 3), now);
+        let best = self.v6.routes.default_router(now).unwrap_or(0);
+        if best != self.v6.router {
+            if best != 0 && self.v6.router != 0 {
+                say!("IPv6 default router now {} (was {})", Ip6(best), Ip6(self.v6.router));
+            }
+            self.v6.router = best;
         }
+        if best == src {
+            self.v6.router_until = now + lifetime;
+        }
+        // Addresses are managed (the M flag): ask DHCPv6 for one.
+        if m[5] & 0x80 != 0 {
+            self.v6.dhcp.start(self.xid, now);
+        }
+        // Lifetimes in options are in seconds, all ones meaning for ever.
+        let ticks_of = |seconds: u32| match seconds {
+            u32::MAX => u64::MAX / 4,
+            s => s as u64 * SECOND,
+        };
         let mut candidate = None;
         let mut at = 16;
         while at + 8 <= m.len() {
@@ -728,6 +835,26 @@ impl Net {
                     let mut mac = [0u8; 6];
                     mac.copy_from_slice(&o[2..8]);
                     self.learn(src, mac);
+                }
+                // A prefix that is on the link: its addresses are
+                // neighbours, whether or not an address is made in it.
+                3 if n == 32 && o[3] & 0x80 != 0 && !(o[2] == 64 && o[3] & 0x40 != 0) => {
+                    self.v6.routes.on_link(addr_at(o, 16), o[2], ticks_of(be32(o, 4)), now);
+                }
+                // A more specific route through this router (RFC 4191):
+                // the prefix's leading bytes follow, as many as it needs.
+                24 if n >= 8 && o[2] <= 128 => {
+                    let mut prefix = [0u8; 16];
+                    let given = (n - 8).min(16);
+                    prefix[..given].copy_from_slice(&o[8..8 + given]);
+                    self.v6.routes.route(
+                        u128::from_be_bytes(prefix),
+                        o[2],
+                        src,
+                        ticks_of(be32(o, 4)),
+                        Preference::from_bits(o[3] >> 3),
+                        now,
+                    );
                 }
                 // A prefix to make an address in (autonomous, /64).
                 3 if n == 32 && o[2] == 64 && o[3] & 0x40 != 0 => {

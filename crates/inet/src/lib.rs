@@ -5,6 +5,8 @@
 
 #![no_std]
 
+pub mod dhcp6;
+pub mod routes6;
 pub mod tcp;
 
 /// IPv4 address `ip` as the server keeps every address: an IPv4-mapped

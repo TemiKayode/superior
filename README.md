@@ -526,6 +526,20 @@ holds the rest):
     again, if it runs out or the DHCP server refuses it. Everything else the server
     holds is lost on a restart, but the lease is kept in its `state` page, so a
     restarted server goes on with the same address at once.
+  - IPv6 routes (`crates/inet/src/routes6.rs`, RFC 4861 and RFC 4191): every
+    router that advertises itself is kept with its preference and lifetime, with
+    the prefixes advertisements say are on the link and the more specific routes
+    they carry. A packet goes to its destination if that is on the link, else to
+    the router of the longest matching route, else to the best default router; a
+    router that does not answer neighbour discovery is passed over for 30 s while
+    another can be used. Managed addresses (`crates/inet/src/dhcp6.rs`, RFC 8415):
+    when an advertisement's M flag is set, a DHCPv6 client asks for an address
+    (Solicit, Advertise, Request, Reply), puts it through duplicate detection,
+    uses it if autoconfiguration gave none, renews it at T1, rebinds at T2 and
+    drops it when it runs out. Both are state machines with no I/O, tested on the
+    host (23 tests: preferences, expiry, failover, longest match; the four
+    messages, retransmission, renewal, rebinding, loss, messages that are not the
+    client's).
   - Rings between clients and the network server (`net::ring`, laid out as the
     filesystem's): a client attaches 16 `shared` pages and submits the calls that
     lend a page (`SEND`, `RECV` and their IPv6 and by-parts forms, for datagrams
@@ -727,7 +741,7 @@ these buses have none); more than one command per queue in the NVMe driver,
 more than two commands in flight per disk in the AHCI driver, ATAPI
 and port multipliers; in the xHCI driver isochronous and bulk endpoints, USB 3 streams,
 hubs and more than one interrupter, and HID devices other than boot keyboards; in the network server
-IPv6 routes beyond one router and stateful DHCPv6, DNSSEC, DNS answers over TCP of more than a page, routes beyond one gateway; the async executor, buffer pools and
+a second IPv6 router or a DHCPv6 server to test against (QEMU's network has one router and hands out no addresses, so the IPv6 route table and the DHCPv6 address client are proved by host tests alone), DNSSEC, DNS answers over TCP of more than a page, IPv4 routes beyond one gateway; the async executor, buffer pools and
 power callbacks of the SDK; an IDL compiler for the interfaces; escalating a component
 given up on to a supervisor above it (today the
 manager is the only one), memory budgets from a policy service, giving the Memory Server all spare

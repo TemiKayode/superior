@@ -150,6 +150,8 @@ const PERIOD: u64 = 10;
 /// Timer periods an unanswered ARP request is repeated before the frames
 /// waiting on it are dropped.
 const ARP_TRIES: u8 = 10;
+/// Ticks an IPv6 router that did not answer is passed over (30 s).
+const ROUTER_SILENT: u64 = 3000;
 
 const READ: u64 = 1;
 const WRITE: u64 = 2;
@@ -1115,6 +1117,7 @@ impl Net {
     }
 
     fn learn(&mut self, ip: u128, mac: [u8; 6]) {
+        self.v6.routes.heard(ip);
         if let Some(e) = self.arp.iter_mut().flatten().find(|e| e.0 == ip) {
             e.1 = mac;
             return;
@@ -1410,6 +1413,9 @@ impl Net {
             f.tries += 1;
             if f.tries >= ARP_TRIES {
                 self.waiting[w] = None;
+                // A router that does not answer is passed over for a
+                // while, if another can be used.
+                self.v6.routes.silent(f.hop, ticks() + ROUTER_SILENT);
                 continue;
             }
             self.waiting[w] = Some(f);
