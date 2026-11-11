@@ -1384,6 +1384,15 @@ fn dns_records(name: &str) -> Option<Vec<(String, u16, u32, Vec<u8>)>> {
             }
             v
         }
+        // Too much for a UDP answer (512 bytes): six TXT records of one
+        // 200-byte string each, which go over TCP.
+        "big.superior.test" => (0..6usize)
+            .map(|i| {
+                let mut d = vec![200u8];
+                d.extend((0..200usize).map(|j| b'a' + ((i * 7 + j) % 26) as u8));
+                (name.to_string(), 16u16, 60, d)
+            })
+            .collect(),
         "superior.test" => {
             // Mail exchangers: a preference and a host, the first host's
             // name ending in a compression pointer to the question's.
@@ -1673,10 +1682,51 @@ fn net_test(arch: Arch, manifest: &str) -> Result<(), String> {
             let mut buf = [0u8; 512];
             while !stop.load(Ordering::Relaxed) {
                 if let Ok((n, from)) = resolver.recv_from(&mut buf) {
-                    if let Some((r, name)) = dns_answer(&buf[..n]) {
+                    if let Some((mut r, name)) = dns_answer(&buf[..n]) {
                         *asked.lock().unwrap().entry(name).or_default() += 1;
+                        if r.len() > 512 {
+                            // Too long for UDP: the header and the question,
+                            // marked truncated (TC), with no records.
+                            let question = 12 + buf[12..n].iter().position(|&b| b == 0).unwrap_or(0) + 5;
+                            r.truncate(question.min(r.len()));
+                            r[2] |= 0x02;
+                            r[6..8].copy_from_slice(&[0, 0]);
+                        }
                         let _ = resolver.send_to(&r, from);
                     }
+                }
+            }
+        })
+    };
+    // The same server over TCP (RFC 7766): each message has its length
+    // before it. Its queries are counted under `tcp:<name>`.
+    let tcp_resolver = std::net::TcpListener::bind(("127.0.0.1", DNS_PORT))
+        .map_err(|e| format!("binding the DNS port {DNS_PORT} for TCP: {e}"))?;
+    tcp_resolver.set_nonblocking(true).map_err(|e| e.to_string())?;
+    let answering_tcp = {
+        let (stop, asked) = (stop.clone(), asked.clone());
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            while !stop.load(Ordering::Relaxed) {
+                let Ok((mut c, _)) = tcp_resolver.accept() else {
+                    std::thread::sleep(Duration::from_millis(20));
+                    continue;
+                };
+                let _ = c.set_nonblocking(false);
+                let _ = c.set_read_timeout(Some(Duration::from_secs(2)));
+                let mut len = [0u8; 2];
+                if c.read_exact(&mut len).is_err() {
+                    continue;
+                }
+                let mut q = vec![0u8; u16::from_be_bytes(len) as usize];
+                if c.read_exact(&mut q).is_err() {
+                    continue;
+                }
+                if let Some((r, name)) = dns_answer(&q) {
+                    *asked.lock().unwrap().entry(format!("tcp:{name}")).or_default() += 1;
+                    let mut out = (r.len() as u16).to_be_bytes().to_vec();
+                    out.extend(r);
+                    let _ = c.write_all(&out);
                 }
             }
         })
@@ -1691,6 +1741,7 @@ fn net_test(arch: Arch, manifest: &str) -> Result<(), String> {
     }
     let _ = tcp_echo.join();
     let _ = answering.join();
+    let _ = answering_tcp.join();
     let out = out?;
     // The Linux driver's own words, through the environment's printk.
     let linux: &[&str] = match lde {
@@ -1740,6 +1791,7 @@ fn net_test(arch: Arch, manifest: &str) -> Result<(), String> {
         "[pass] net: alias.superior.test, a CNAME for www, is 192.0.2.10",
         "[pass] net: www.superior.test's IPv6 address is 2001:db8::10, alias's too, and the second answer was cached",
         "[pass] net: cached.superior.test has no IPv6 address; v6only.superior.test has 2001:db8::66 and no IPv4 one",
+        "[pass] net: big.superior.test's six 200-byte TXT records, too long for UDP, came over TCP, every byte right; superior.test's MX answered from the cache",
         "[pass] net: DNS records: superior.test's MX are mx1 (10) and mx2 (20), its NS ns1, its SIP SRV sip:5060; txt and its alias have two TXT; 192.0.2.10's PTR is www",
         "[pass] net: nowhere.superior.test does not exist, and no..dots is no name",
         "[pass] net: cached.superior.test resolved 20 times,",
@@ -1796,6 +1848,9 @@ fn net_test(arch: Arch, manifest: &str) -> Result<(), String> {
     // restart in between at most), and for the 1 s one again.
     let asked = asked.lock().unwrap().clone();
     let count = |name: &str| asked.get(name).copied().unwrap_or(0);
+    if count("tcp:big.superior.test") < 1 {
+        return Err("network test: the host's DNS server was never asked over TCP".into());
+    }
     if count("cached.superior.test") > 5 || count("short.superior.test") < 2 {
         return Err(format!(
             "network test: the host was asked for cached.superior.test {} times and short.superior.test {}; want at most 5 and at least 2",

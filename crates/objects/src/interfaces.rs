@@ -526,8 +526,10 @@ pub mod dns {
     /// `priority weight port target`; PTR, NS and CNAME as the name;
     /// names lower case and dotted, numbers decimal; any other type's
     /// data as it came. Reply `[status, records, seconds they stay good,
-    /// 0]`: `NotFound` if the name does not exist or has none,
-    /// `NoSpace` if they do not fit in the page. These are not cached.
+    /// 1 if they came from the cache]`: `NotFound` if the name does not
+    /// exist or has none, `NoSpace` if they do not fit in the page. An
+    /// answer the server could not fit in a UDP datagram is fetched over
+    /// TCP (up to 4,096 bytes of it).
     pub const RECORDS: u64 = 3;
     pub const NS: u64 = 2;
     pub const PTR: u64 = 12;

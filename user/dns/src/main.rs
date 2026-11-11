@@ -12,9 +12,14 @@
 //!
 //! Other records (`dns::RECORDS`): a client names a record type (TXT, MX,
 //! SRV, PTR, NS, or any other by number) and gets the name's records of
-//! that type in its page, as text: the resolver asks the server each time
-//! (these are not cached), follows CNAMEs the same way, and expands the
-//! compressed names inside MX, SRV, PTR and NS data.
+//! that type in its page, as text: the resolver follows CNAMEs the same
+//! way, expands the compressed names inside MX, SRV, PTR and NS data, and
+//! keeps the last few short answers for their time to live.
+//!
+//! DNS over TCP (RFC 7766): when the server cuts an answer short to fit a
+//! datagram (the TC bit), the resolver asks the same question over a TCP
+//! connection of the network server's, the message with its length
+//! before it, and takes the answer from there: up to a page of it.
 //!
 //! It is crash-only: a restart loses the cache and the socket, and a call
 //! it was serving fails with `PeerRestarted`, which the client retries. If
@@ -25,7 +30,7 @@
 //! of the DHCP-given server.
 //!
 //! Slots: 0 the `net` endpoint, 1 the `dns` endpoint (receive), 2 untyped
-//! memory (one page).
+//! memory (one page); 3 to 6 are its own.
 
 #![no_std]
 #![no_main]
@@ -43,6 +48,9 @@ const SOCKET: u64 = 3;
 const PAGE: u64 = 4;
 /// Where a client's page arrives.
 const LENT: u64 = 5;
+/// The notification of the TCP connection a truncated answer is fetched
+/// over.
+const TCP_NTFN: u64 = 6;
 
 const PAGE_VA: u64 = USER_BASE + 0x4000_0000;
 const LENT_VA: u64 = PAGE_VA + 0x1000;
@@ -55,6 +63,13 @@ const NEGATIVE_TTL: u64 = 10;
 /// The longest a cached answer is kept, whatever its TTL.
 const MAX_TTL: u64 = 86_400;
 const CACHE: usize = 16;
+/// Answers of other record types kept, and the most bytes of one.
+const RECORD_CACHE: usize = 4;
+const RECORD_BYTES: usize = 512;
+/// The longest answer fetched over TCP: a page.
+const TCP_ANSWER: usize = 4096;
+/// Ticks a TCP exchange may take.
+const TCP_TICKS: u64 = 3 * SECOND;
 const MAX_NAME: usize = dns::MAX_NAME as usize;
 
 const TYPE_A: u16 = 1;
@@ -236,6 +251,9 @@ fn record_text(m: &[u8], kind: u16, data: usize, len: usize, out: &mut [u8]) -> 
     Some(end)
 }
 
+/// An answer fetched over TCP, while it is read.
+static mut TCP_BUF: [u8; TCP_ANSWER] = [0; TCP_ANSWER];
+
 #[derive(Clone, Copy)]
 struct Entry {
     name: Name,
@@ -247,11 +265,25 @@ struct Entry {
     expires: u64,
 }
 
+/// A name's records of another type, as `RECORDS` gives them.
+#[derive(Clone, Copy)]
+struct Records {
+    name: Name,
+    kind: u16,
+    count: u64,
+    len: usize,
+    text: [u8; RECORD_BYTES],
+    expires: u64,
+}
+
 /// How a query ended.
 enum Answer {
     Address([u8; 16], u64),
-    /// Records written to the lent page: how many, and their TTL.
-    Records(u64, u64),
+    /// Records written to the lent page: how many, their TTL, and the
+    /// bytes they take there.
+    Records(u64, u64, usize),
+    /// The server cut its answer short (the TC bit): ask over TCP.
+    Truncated,
     /// The records do not fit in the page.
     TooLong,
     NoSuchName,
@@ -263,6 +295,10 @@ struct Resolver {
     handle: u64,
     cache: [Option<Entry>; CACHE],
     next: usize,
+    records: [Option<Records>; RECORD_CACHE],
+    next_records: usize,
+    /// Answers fetched over TCP.
+    by_tcp: u64,
     id: u16,
     /// A port on the gateway to ask instead (tests).
     port: u16,
@@ -363,6 +399,9 @@ impl Resolver {
             m[end..end + 2].copy_from_slice(&kind.to_be_bytes());
             m[end + 2..end + 4].copy_from_slice(&CLASS_IN.to_be_bytes());
             let len = end + 4;
+            // Kept: the page is where the answer arrives.
+            let mut asked = [0u8; MAX_NAME + 2 + 16];
+            asked[..len].copy_from_slice(&m[..len]);
             match net_call([net::SEND, self.handle, server, len as u64]) {
                 Some(r) if r[0] == Status::Ok as u64 => {}
                 Some(r) if r[0] == Status::NotFound as u64 => {
@@ -376,11 +415,130 @@ impl Resolver {
                     continue;
                 }
             }
-            if let Some(a) = self.wait(server, name, kind, records, ticks() + SECOND) {
-                return Some(a);
+            match self.wait(server, name, kind, records, ticks() + SECOND) {
+                // Too big for a datagram: the same question over TCP.
+                Some(Answer::Truncated) => {
+                    if let Some(a) = self.query_tcp(server, name, kind, records, &asked[..len]) {
+                        return Some(a);
+                    }
+                }
+                Some(a) => return Some(a),
+                None => {}
             }
         }
         None
+    }
+
+    /// Sleeps on the TCP connection's notification, until `deadline` at
+    /// the latest. False if it is gone (the network server restarted) or
+    /// the time is up.
+    fn tcp_wait(&self, deadline: u64) -> bool {
+        let now = ticks();
+        if now >= deadline {
+            return false;
+        }
+        syscall(Syscall::TimerSignal, TCP_NTFN, [deadline - now, 0, 0, 0]);
+        syscall(Syscall::Wait, TCP_NTFN, [0; 4]).status == 0
+    }
+
+    /// Asks again over TCP (RFC 7766): the query `asked`, with its length
+    /// before it, on a connection of its own;
+    /// the answer comes the same way. `None` if it could not be had.
+    fn query_tcp(&mut self, server: u64, name: &Name, kind: u16, records: bool, asked: &[u8]) -> Option<Answer> {
+        let len = asked.len();
+        let mut query = [0u8; 2 + MAX_NAME + 2 + 16];
+        query[..2].copy_from_slice(&(len as u16).to_be_bytes());
+        query[2..2 + len].copy_from_slice(asked);
+        syscall(Syscall::CapDelete, TCP_NTFN, [0; 4]);
+        let x = CapTransfer {
+            grant: None,
+            accept: Some(TCP_NTFN as u16),
+        };
+        let r = syscall_x(Syscall::Call, NET, [net::TCP_CONNECT, server, 0, 0], x);
+        if r.status != 0 || r.msg[0] != Status::Ok as u64 || r.cap != Some(TCP_NTFN as u16) {
+            return None;
+        }
+        let handle = r.msg[1];
+        let deadline = ticks() + TCP_TICKS;
+        let answer = self.tcp_exchange(handle, &query[..len + 2], deadline);
+        net_call([net::CLOSE, handle, 0, 0]);
+        syscall(Syscall::CapDelete, TCP_NTFN, [0; 4]);
+        let n = answer?;
+        self.by_tcp += 1;
+        if self.by_tcp.is_power_of_two() {
+            say!("{} answers too long for UDP fetched over TCP", self.by_tcp);
+        }
+        let out = records.then(|| page(LENT_VA));
+        // SAFETY: the one thread; `tcp_exchange` has returned.
+        let whole = unsafe { &(&*(&raw const TCP_BUF))[..n] };
+        self.answer(whole, name, kind, out)
+    }
+
+    /// Sends `query` on connection `handle` once it is established and
+    /// collects the answer in `TCP_BUF`: its length, without the two
+    /// bytes that say it.
+    fn tcp_exchange(&mut self, handle: u64, query: &[u8], deadline: u64) -> Option<usize> {
+        let ok = Status::Ok as u64;
+        loop {
+            match net_call([net::TCP_STATE, handle, 0, 0]) {
+                Some(r) if r[0] == ok && r[1] == net::TCP_ESTABLISHED => break,
+                Some(r) if r[0] == ok && r[1] != net::TCP_CLOSED => {}
+                _ => return None,
+            }
+            if !self.tcp_wait(deadline) {
+                return None;
+            }
+        }
+        let mut sent = 0;
+        while sent < query.len() {
+            let rest = &query[sent..];
+            page(PAGE_VA)[..rest.len()].copy_from_slice(rest);
+            match net_call([net::SEND, handle, 0, rest.len() as u64]) {
+                Some(r) if r[0] == ok => sent += r[1] as usize,
+                Some(r) if r[0] == Status::Empty as u64 => {
+                    if !self.tcp_wait(deadline) {
+                        return None;
+                    }
+                }
+                _ => return None,
+            }
+        }
+        // SAFETY: the one thread.
+        let buf = unsafe { &mut *(&raw mut TCP_BUF) };
+        let mut got = 0;
+        // The length, then that many bytes.
+        let mut want = 2;
+        loop {
+            match net_call([net::RECV, handle, 0, 0]) {
+                Some(r) if r[0] == ok && r[1] == 0 => return None, // closed early
+                Some(r) if r[0] == ok => {
+                    let n = (r[1] as usize).min(4096);
+                    for &b in &page(PAGE_VA)[..n] {
+                        if got < 2 {
+                            want = want << 8 | b as usize;
+                        } else if got - 2 < TCP_ANSWER {
+                            buf[got - 2] = b;
+                        }
+                        got += 1;
+                        if got == 2 {
+                            want &= 0xffff;
+                            if want > TCP_ANSWER {
+                                return None; // more than this resolver holds
+                            }
+                        }
+                    }
+                    if got >= 2 && got - 2 >= want {
+                        return Some(want);
+                    }
+                }
+                Some(r) if r[0] == Status::Empty as u64 => {
+                    if !self.tcp_wait(deadline) {
+                        return None;
+                    }
+                }
+                _ => return None,
+            }
+        }
     }
 
     /// Waits until `deadline` for the answer to the query just sent.
@@ -447,6 +605,10 @@ impl Resolver {
             return None;
         }
         at += 4;
+        // Cut short to fit a datagram: what is there is not the answer.
+        if m[2] & 0x02 != 0 {
+            return Some(Answer::Truncated);
+        }
         let rcode = be16(m, 2) & 0xf;
         if rcode == RCODE_NXDOMAIN {
             return Some(Answer::NoSuchName);
@@ -505,7 +667,7 @@ impl Resolver {
                 }
             }
             if written > 0 {
-                return Some(Answer::Records(written, ttl as u64));
+                return Some(Answer::Records(written, ttl as u64, at));
             }
             // No record of the type asked for, nor a CNAME on: the name
             // exists without one (NODATA).
@@ -562,13 +724,41 @@ impl Resolver {
         if syscall(Syscall::FrameMap, LENT, [LENT_VA, 1, 0, 0]).status != 0 {
             return status(Status::Invalid);
         }
+        let now = ticks();
         let reply = match Name::parse(&page(LENT_VA)[..len]) {
             None => status(Status::Invalid),
-            Some(name) => match self.query(&name, kind, true) {
-                Some(Answer::Records(n, ttl)) => [Status::Ok as u64, n, ttl.min(MAX_TTL), 0],
-                Some(Answer::TooLong) => status(Status::NoSpace),
-                Some(_) => status(Status::NotFound),
-                None => status(Status::Unreachable),
+            Some(name) => match self
+                .records
+                .iter()
+                .flatten()
+                .find(|e| e.expires > now && e.kind == kind && e.name.as_bytes() == name.as_bytes())
+            {
+                Some(e) => {
+                    page(LENT_VA)[..e.len].copy_from_slice(&e.text[..e.len]);
+                    [Status::Ok as u64, e.count, (e.expires - now) / SECOND, 1]
+                }
+                None => match self.query(&name, kind, true) {
+                    Some(Answer::Records(n, ttl, bytes)) => {
+                        // Kept for their time to live, if they are short.
+                        if ttl > 0 && bytes <= RECORD_BYTES {
+                            let mut text = [0; RECORD_BYTES];
+                            text[..bytes].copy_from_slice(&page(LENT_VA)[..bytes]);
+                            self.records[self.next_records] = Some(Records {
+                                name,
+                                kind,
+                                count: n,
+                                len: bytes,
+                                text,
+                                expires: ticks() + ttl.min(MAX_TTL) * SECOND,
+                            });
+                            self.next_records = (self.next_records + 1) % RECORD_CACHE;
+                        }
+                        [Status::Ok as u64, n, ttl.min(MAX_TTL), 0]
+                    }
+                    Some(Answer::TooLong) => status(Status::NoSpace),
+                    Some(_) => status(Status::NotFound),
+                    None => status(Status::Unreachable),
+                },
             },
         };
         syscall(Syscall::FrameUnmap, LENT, [0; 4]);
@@ -611,7 +801,9 @@ impl Resolver {
                 status(Status::NotFound)
             }
             // Only `RECORDS` asks for these.
-            Some(Answer::Records(..) | Answer::TooLong) => status(Status::NotFound),
+            Some(Answer::Records(..) | Answer::TooLong | Answer::Truncated) => {
+                status(Status::NotFound)
+            }
             None => status(Status::Unreachable),
         }
     }
@@ -628,6 +820,9 @@ pub extern "C" fn _start(arg: u64) -> ! {
         handle: 0,
         cache: [None; CACHE],
         next: 0,
+        records: [None; RECORD_CACHE],
+        next_records: 0,
+        by_tcp: 0,
         id: ticks() as u16,
         port: arg as u16,
     };

@@ -3463,6 +3463,47 @@ fn dns_record_checks(t: &mut Checks) {
     want("superior.test", dns::NS, 1, "ns1.superior.test");
     want("_sip._tcp.superior.test", dns::SRV, 1, "0 5 5060 sip.superior.test");
     want("10.2.0.192.in-addr.arpa", dns::PTR, 1, "www.superior.test");
+    // An answer too big for a datagram: the resolver fetches it over TCP.
+    // Six TXT records of 200 bytes each.
+    let x = CapTransfer {
+        grant: Some(NET_PAGE as u16),
+        accept: None,
+    };
+    let mut big = false;
+    for _ in 0..DNS_TRIES {
+        let len = put_text(format_args!("big.superior.test"));
+        let r = syscall_x(Syscall::Call, DNS, [dns::RECORDS, dns::VERSION, len | dns::TXT << 16, 0], x);
+        if r.status == 0 && r.msg[0] != Status::Unreachable as u64 {
+            let p = net_page();
+            big = r.msg[0] == OK
+                && r.msg[1] == 6
+                && (0..6usize).all(|i| {
+                    let at = i * 202;
+                    u16::from_le_bytes([p[at], p[at + 1]]) == 200
+                        && (0..200usize).all(|j| p[at + 2 + j] == b'a' + ((i * 7 + j) % 26) as u8)
+                });
+            break;
+        }
+        superior_sys::sleep(1);
+    }
+    // Asked again, short answers come from the resolver's cache (unless
+    // the injector killed it in between: then once more).
+    let mut cached = false;
+    for _ in 0..8 {
+        let len = put_text(format_args!("superior.test"));
+        let r = syscall_x(Syscall::Call, DNS, [dns::RECORDS, dns::VERSION, len | dns::MX << 16, 0], x);
+        if r.status == 0 && r.msg[0] == OK && r.msg[1] == 2 && r.msg[3] == 1 {
+            cached = true;
+            break;
+        }
+        superior_sys::sleep(1);
+    }
+    t.check(
+        big && cached,
+        format_args!(
+            "big.superior.test's six 200-byte TXT records, too long for UDP, came over TCP, every byte right; superior.test's MX answered from the cache"
+        ),
+    );
     let mut text = [0u8; 256];
     let (none, _, _) = dns_records(format_args!("www.superior.test"), dns::TXT, &mut text);
     let (nowhere, _, _) = dns_records(format_args!("nowhere.superior.test"), dns::MX, &mut text);

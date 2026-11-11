@@ -548,8 +548,10 @@ holds the rest):
     10 s). `RECORDS` gives a name's records of any other type, as text in the
     page: TXT strings, mail exchangers (MX) as `preference host`, services (SRV)
     as `priority weight port target`, reverse names (PTR) and name servers (NS),
-    found through CNAMEs the same way, the compressed names inside them expanded;
-    these are asked of the server each time. It is crash-only too: a restart loses the cache and fails the call it
+    found through CNAMEs the same way, the compressed names inside them expanded,
+    and the last few short answers kept for their time to live. An answer the
+    server cuts short to fit a datagram (the TC bit) is asked for again over TCP
+    (RFC 7766), on a connection of the network server's: up to a page of it. It is crash-only too: a restart loses the cache and fails the call it
     was serving with `PeerRestarted`, and when the network server restarts it binds
     a new socket and asks again.
   - TCP (`crates/inet/src/tcp.rs`, a state machine with no I/O of its own, fed
@@ -725,7 +727,7 @@ these buses have none); more than one command per queue in the NVMe driver,
 more than two commands in flight per disk in the AHCI driver, ATAPI
 and port multipliers; in the xHCI driver isochronous and bulk endpoints, USB 3 streams,
 hubs and more than one interrupter, and HID devices other than boot keyboards; in the network server
-IPv6 routes beyond one router and stateful DHCPv6, caching of DNS records other than addresses, DNSSEC and DNS over TCP, routes beyond one gateway; the async executor, buffer pools and
+IPv6 routes beyond one router and stateful DHCPv6, DNSSEC, DNS answers over TCP of more than a page, routes beyond one gateway; the async executor, buffer pools and
 power callbacks of the SDK; an IDL compiler for the interfaces; escalating a component
 given up on to a supervisor above it (today the
 manager is the only one), memory budgets from a policy service, giving the Memory Server all spare
