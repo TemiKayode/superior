@@ -489,6 +489,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "superior-lde-e100"
+version = "0.1.0"
+dependencies = [
+ "superior-lde",
+ "superior-sys",
+]
+
+[[package]]
 name = "superior-memserver"
 version = "0.1.0"
 dependencies = [

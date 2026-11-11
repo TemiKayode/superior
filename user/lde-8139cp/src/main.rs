@@ -5,7 +5,7 @@
 //! driver's own ID table and serves the `nic` interface with it.
 //!
 //! Slots, as the environment wants them (in a CSpace of 2^8): 0 the bus server, 1 the `nic`
-//! endpoint (receive), 2 a notification, 3 untyped memory (512 KiB).
+//! endpoint (receive), 2 a notification, 3 untyped memory (1 MiB).
 
 #![no_std]
 #![no_main]

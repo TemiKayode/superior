@@ -108,9 +108,9 @@ struct Image {
     /// A virtio network device on QEMU's user-mode network (the network
     /// test).
     net: bool,
-    /// The network device is an RTL-8139C+ instead, for Linux's driver
-    /// (the Linux Driver Environment test).
-    rtl8139: bool,
+    /// The network device is this one instead, for a Linux driver (the
+    /// Linux Driver Environment tests).
+    linux_nic: Option<&'static str>,
     /// A USB keyboard on an xHCI controller, typed on through QEMU's
     /// monitor (the keyboard test).
     keyboard: bool,
@@ -157,6 +157,7 @@ fn main() -> ExitCode {
                         .and_then(|_| disk_test(a, "ahci"))
                         .and_then(|_| net_test(a, "net"))
                         .and_then(|_| net_test(a, "lde"))
+                        .and_then(|_| net_test(a, "lde-e100"))
                         .and_then(|_| tcp_test(a))
                         .and_then(|_| keyboard_test(a))
                         .and_then(|_| image(false, a))
@@ -180,6 +181,7 @@ fn main() -> ExitCode {
         Some("ahci-test") => disk_test(arch, "ahci"),
         Some("net-test") => net_test(arch, "net"),
         Some("lde-test") => net_test(arch, "lde"),
+        Some("lde-e100-test") => net_test(arch, "lde-e100"),
         Some("tcp-test") => tcp_test(arch),
         Some("keyboard-test") => keyboard_test(arch),
         Some("memory-test") => {
@@ -190,7 +192,7 @@ fn main() -> ExitCode {
         }
         Some("bench") => image(false, Arch::X86_64).and_then(|img| bench(&img)),
         _ => Err(
-            "usage: cargo xtask <image | run | test | boot-test | shell-test | cm-test | supervise-test | drivers-test | memory-test | reboot-test | fs-test | nvme-test | ahci-test | net-test | lde-test | tcp-test | keyboard-test | bench | sel4-test> [x86_64 | aarch64]"
+            "usage: cargo xtask <image | run | test | boot-test | shell-test | cm-test | supervise-test | drivers-test | memory-test | reboot-test | fs-test | nvme-test | ahci-test | net-test | lde-test | lde-e100-test | tcp-test | keyboard-test | bench | sel4-test> [x86_64 | aarch64]"
                 .into(),
         ),
     });
@@ -248,11 +250,33 @@ fn host_tests() -> Result<(), String> {
 /// tree at `LINUX_TAG` when first needed and kept under `target/`: Linux
 /// is GPL-2.0, and none of it is in this repository.
 const LINUX_TAG: &str = "v6.6";
-const LINUX_SOURCES: [(&str, &str, &str); 1] = [(
-    "8139cp",
-    "drivers/net/ethernet/realtek/8139cp.c",
-    "11cca9ded616d4442f980af4b03fc54f8bfe992be14bfc8e9b003d7f8b4a0ee6",
-)];
+const LINUX_SOURCES: [(&str, &str, &str); 2] = [
+    (
+        "8139cp",
+        "drivers/net/ethernet/realtek/8139cp.c",
+        "11cca9ded616d4442f980af4b03fc54f8bfe992be14bfc8e9b003d7f8b4a0ee6",
+    ),
+    (
+        "e100",
+        "drivers/net/ethernet/intel/e100.c",
+        "65f562bf302e3b28ea47ee44e77fe61c37e6ec569efdb2d020a4a84662828acd",
+    ),
+];
+
+/// The Linux driver a manifest name stands for: `lde` is the Linux Driver
+/// Environment test with 8139cp, `lde-<driver>` the same with another.
+/// With it, the QEMU device it drives.
+fn linux_nic(manifest: &str) -> Option<(&'static str, &'static str)> {
+    match manifest {
+        "lde" => Some(("8139cp", "rtl8139,netdev=n0")),
+        // The 82557: QEMU's models of the later 8255x chips read a second
+        // buffer descriptor inside a transmit command block whatever the
+        // count says, which Linux leaves as the block last held it, and
+        // so append stale bytes to some frames.
+        "lde-e100" => Some(("e100", "i82557b,netdev=n0")),
+        _ => None,
+    }
+}
 
 /// Linux's `driver` source, unmodified: downloaded once, and checked
 /// against its pinned hash every time.
@@ -382,8 +406,15 @@ fn user_program(package: &str, arch: Arch) -> Result<PathBuf, String> {
 /// Packs `boot/<manifest>.manifest` and every component executable into a
 /// boot bundle (format in `superior_objects::bundle`) and returns its path.
 fn bundle(arch: Arch, manifest: &str, driver: &str) -> Result<PathBuf, String> {
-    let mut text = std::fs::read(root().join("boot").join(format!("{manifest}.manifest")))
-        .map_err(|e| format!("reading boot/{manifest}.manifest: {e}"))?;
+    // Every Linux driver's test is lde.manifest, with its name in it.
+    let file = if linux_nic(manifest).is_some() { "lde" } else { manifest };
+    let mut text = std::fs::read(root().join("boot").join(format!("{file}.manifest")))
+        .map_err(|e| format!("reading boot/{file}.manifest: {e}"))?;
+    if let Some((linux, _)) = linux_nic(manifest) {
+        text = String::from_utf8_lossy(&text)
+            .replace("lde-8139cp", &format!("lde-{linux}"))
+            .into_bytes();
+    }
     if driver != "virtio-blk" {
         // The manifest names virtio-blk; the drivers test's client (role 4)
         // takes the role that knows this driver's device.
@@ -414,14 +445,15 @@ fn bundle(arch: Arch, manifest: &str, driver: &str) -> Result<PathBuf, String> {
         ("memserver", "superior-memserver"),
         ("fs", "superior-fs"),
         ("testclient", "superior-testclient"),
-        // Needs Linux's source and the build container: only where used.
+        // Need Linux's source and the build container: only where used.
         ("lde-8139cp", "superior-lde-8139cp"),
+        ("lde-e100", "superior-lde-e100"),
     ] {
-        if name == "lde-8139cp" {
-            if manifest != "lde" {
+        if let Some(driver) = name.strip_prefix("lde-") {
+            if linux_nic(manifest).map(|l| l.0) != Some(driver) {
                 continue;
             }
-            lde_objects(arch, "8139cp")?;
+            lde_objects(arch, driver)?;
         }
         let path = user_program(package, arch)?;
         let bytes = std::fs::read(&path).map_err(|e| format!("reading {}: {e}", path.display()))?;
@@ -541,8 +573,8 @@ fn image_for(
         disk,
         writable: fs,
         driver,
-        net: matches!(manifest, "net" | "tcp" | "lde"),
-        rtl8139: manifest == "lde",
+        net: matches!(manifest, "net" | "tcp") || linux_nic(manifest).is_some(),
+        linux_nic: linux_nic(manifest).map(|l| l.1),
         keyboard: manifest == "keyboard",
     })
 }
@@ -636,7 +668,7 @@ fn sel4_image() -> Result<Image, String> {
         writable: false,
         driver: "virtio-blk",
         net: false,
-        rtl8139: false,
+        linux_nic: None,
         keyboard: false,
     })
 }
@@ -807,12 +839,10 @@ fn qemu_command(img: &Image) -> Command {
             // only).
             "user,id=n0,net=10.0.3.0/24,dhcpstart=10.0.3.30,ipv6-net=fd00:3::/64,hostfwd=tcp:127.0.0.1:47004-:8080",
             "-device",
-            // The RTL-8139C+ has no MSI: its interrupt is a legacy line.
-            if img.rtl8139 {
-                "rtl8139,netdev=n0"
-            } else {
-                "virtio-net-pci,netdev=n0,disable-legacy=on,iommu_platform=on"
-            },
+            // The cards Linux's drivers are for have no MSI: their
+            // interrupt is a legacy line.
+            img.linux_nic
+                .unwrap_or("virtio-net-pci,netdev=n0,disable-legacy=on,iommu_platform=on"),
         ]);
     }
     if img.keyboard {
@@ -1590,7 +1620,7 @@ fn net_test(arch: Arch, manifest: &str) -> Result<(), String> {
     use std::net::UdpSocket;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
-    let lde = manifest == "lde";
+    let lde = linux_nic(manifest).map(|l| l.0);
     let img = image_with(false, arch, manifest)?;
     let stop = Arc::new(AtomicBool::new(false));
     let echoed = Arc::new(AtomicU64::new(0));
@@ -1649,23 +1679,37 @@ fn net_test(arch: Arch, manifest: &str) -> Result<(), String> {
     let _ = answering.join();
     let out = out?;
     // The Linux driver's own words, through the environment's printk.
-    let linux = [
-        "pci: 00:",
-        "10ec:8139 class 020000",
-        "lde 8139cp: 10ec:8139 at 00:",
-        "lde 8139cp: 8139cp: 8139cp: 10/100 PCI Ethernet driver v1.3 (Mar 22, 2004)",
-        "lde 8139cp: eth0: RTL-8139C+ at 0x",
-        "52:54:00:12:34:56, IRQ",
-        "lde 8139cp: the device's legacy interrupt line (wire",
-        "lde 8139cp: eth0: link up, 100Mbps, full-duplex",
-        "lde 8139cp: Linux's 8139cp driver runs the interface: MAC 52:54:00:12:34:56, link up",
-        "lde 8139cp: frame rings started",
-    ];
-    if lde {
-        check_log("Linux Driver Environment test", &out, &linux)?;
-    }
+    let linux: &[&str] = match lde {
+        Some("8139cp") => &[
+            "pci: 00:",
+            "10ec:8139 class 020000",
+            "lde 8139cp: 10ec:8139 at 00:",
+            "lde 8139cp: 8139cp: 8139cp: 10/100 PCI Ethernet driver v1.3 (Mar 22, 2004)",
+            "lde 8139cp: eth0: RTL-8139C+ at 0x",
+            "52:54:00:12:34:56, IRQ",
+            "lde 8139cp: the device's legacy interrupt line (wire",
+            "lde 8139cp: eth0: link up, 100Mbps, full-duplex",
+            "lde 8139cp: Linux's 8139cp driver runs the interface: MAC 52:54:00:12:34:56, link up",
+            "lde 8139cp: frame rings started",
+        ],
+        Some(_) => &[
+            "pci: 00:",
+            "8086:1229 class 020000",
+            "lde e100: 8086:1229 at 00:",
+            "lde e100: e100: Intel(R) PRO/100 Network Driver",
+            "lde e100: eth0: addr 0x",
+            "52:54:00:12:34:56",
+            "lde e100: the device's legacy interrupt line (wire",
+            "lde e100: Linux's e100 driver runs the interface: MAC 52:54:00:12:34:56",
+            "lde e100: frame rings started",
+            "lde e100: eth0: NIC Link is Up 100 Mbps Full Duplex",
+        ],
+        None => &[],
+    };
+    check_log("Linux Driver Environment test", &out, linux)?;
+    let ready = lde.map(|d| format!("lde {d}: Linux's {d} driver runs"));
     let steps = [
-        if lde { "lde 8139cp: Linux's 8139cp driver runs" } else { "virtio-net: ready:" },
+        ready.as_deref().unwrap_or("virtio-net: ready:"),
         "net: ready: MAC",
         "net: leased 10.0.3.30/24 from 10.0.3.2 via 10.0.3.2, DNS 10.0.3.3, for 86400 s",
         "[pass] net: a page of its own",
@@ -1721,8 +1765,8 @@ fn net_test(arch: Arch, manifest: &str) -> Result<(), String> {
                 .matches(&format!("[cm] fault injection: killing {what}\r\n"))
                 .count()
     };
-    let nic = if lde { "lde-8139cp" } else { "virtio-net" };
-    let (server, driver, resolver) = (kills("net"), kills(nic), kills("dns"));
+    let nic = lde.map_or("virtio-net".to_string(), |d| format!("lde-{d}"));
+    let (server, driver, resolver) = (kills("net"), kills(&nic), kills("dns"));
     // Kills land among the pings and the echoes, not only after them.
     let during = |what: &str| {
         out.find(what).map_or(0, |i| {

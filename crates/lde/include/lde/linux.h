@@ -112,6 +112,8 @@ typedef long long loff_t;
 #define ENODEV 19
 #define EINVAL 22
 #define ENOSPC 28
+#define ENODATA 61
+#define ENOTSUPP 524
 #define EOPNOTSUPP 95
 #define EADDRNOTAVAIL 99
 #define ENETDOWN 100
@@ -124,6 +126,8 @@ static inline bool IS_ERR(const void *ptr)
 {
 	return (unsigned long)ptr >= (unsigned long)-MAX_ERRNO;
 }
+static inline bool IS_ERR_OR_NULL(const void *ptr) { return !ptr || IS_ERR(ptr); }
+static inline int PTR_ERR_OR_ZERO(const void *ptr) { return IS_ERR(ptr) ? PTR_ERR(ptr) : 0; }
 
 /* ---- printing (lde.c) */
 
@@ -159,11 +163,16 @@ void *memset(void *dst, int c, size_t n);
 int memcmp(const void *a, const void *b, size_t n);
 size_t strlen(const char *s);
 ssize_t strscpy(char *dst, const char *src, size_t size);
+char *strcpy(char *dst, const char *src);
+char *strncpy(char *dst, const char *src, size_t n);
+static inline void put_unaligned_le32(u32 v, void *p) { memcpy(p, &v, 4); }
+static inline u32 get_unaligned_le32(const void *p) { u32 v; memcpy(&v, p, 4); return v; }
 
 #define GFP_KERNEL 0u
 #define GFP_ATOMIC 1u
 void *kmalloc(size_t size, gfp_t gfp);
 void *kzalloc(size_t size, gfp_t gfp);
+void *kcalloc(size_t n, size_t size, gfp_t gfp);
 void kfree(const void *p);
 
 /* ---- time */
@@ -174,7 +183,36 @@ unsigned long lde_host_jiffies(void);
 #define time_after(a, b) ((long)((b) - (a)) < 0)
 #define time_before(a, b) time_after(b, a)
 #define time_after_eq(a, b) ((long)((a) - (b)) >= 0)
+#define round_jiffies(j) (j)
+#define cpu_relax() barrier()
 void udelay(unsigned long usecs);
+#define msleep_interruptible(ms) (msleep(ms), 0ul)
+
+/* Kernel timers and work: the component's loop runs what is due between
+ * interrupts and calls, on the one thread (lde.c). */
+struct timer_list {
+	void (*function)(struct timer_list *t);
+	unsigned long expires;
+	bool lde_pending;
+	struct timer_list *lde_next;
+};
+void timer_setup(struct timer_list *t, void (*function)(struct timer_list *), unsigned int flags);
+int mod_timer(struct timer_list *t, unsigned long expires);
+int del_timer_sync(struct timer_list *t);
+#define del_timer(t) del_timer_sync(t)
+#define from_timer(var, t, field) container_of(t, __typeof__(*var), field)
+struct work_struct {
+	void (*func)(struct work_struct *work);
+	bool lde_pending;
+	struct work_struct *lde_next;
+};
+#define INIT_WORK(w, f) do { (w)->func = (f); (w)->lde_pending = false; } while (0)
+bool schedule_work(struct work_struct *work);
+bool cancel_work_sync(struct work_struct *work);
+struct delayed_work {
+	struct work_struct work;
+	struct timer_list timer;
+};
 void mdelay(unsigned long msecs);
 void msleep(unsigned int msecs);
 long schedule_timeout_uninterruptible(long timeout);
@@ -207,6 +245,7 @@ void lde_host_wmb(void);
 #define MODULE_AUTHOR(x) LDE_NOTHING
 #define MODULE_DESCRIPTION(x) LDE_NOTHING
 #define MODULE_LICENSE(x) LDE_NOTHING
+#define MODULE_FIRMWARE(x) LDE_NOTHING
 #define MODULE_VERSION(x) LDE_NOTHING
 #define MODULE_PARM_DESC(name, x) LDE_NOTHING
 #define MODULE_DEVICE_TABLE(bus, table) LDE_NOTHING
@@ -238,6 +277,23 @@ static inline void *dev_get_drvdata(const struct device *dev) { return dev->driv
 static inline void dev_set_drvdata(struct device *dev, void *data) { dev->driver_data = data; }
 static inline const char *dev_name(const struct device *dev) { return dev->name; }
 static inline int device_set_wakeup_enable(struct device *dev, bool on) { (void)dev; (void)on; return 0; }
+static inline bool device_can_wakeup(struct device *dev) { (void)dev; return false; }
+/* Nothing ever shuts the system down under a driver. */
+enum { SYSTEM_RUNNING, SYSTEM_POWER_OFF };
+#define system_state SYSTEM_RUNNING
+
+/* Firmware files: there are none to load. */
+struct firmware {
+	size_t size;
+	const u8 *data;
+};
+static inline int request_firmware(const struct firmware **fw, const char *name, struct device *dev)
+{
+	(void)name; (void)dev;
+	*fw = NULL;
+	return -ENOENT;
+}
+static inline void release_firmware(const struct firmware *fw) { (void)fw; }
 #define dev_err(dev, fmt, ...) _printk("%s: " fmt, dev_name(dev), ##__VA_ARGS__)
 #define dev_warn(dev, fmt, ...) _printk("%s: " fmt, dev_name(dev), ##__VA_ARGS__)
 #define dev_info(dev, fmt, ...) _printk("%s: " fmt, dev_name(dev), ##__VA_ARGS__)
@@ -248,6 +304,10 @@ static inline int device_set_wakeup_enable(struct device *dev, bool on) { (void)
 #define PCI_ANY_ID (~0u)
 #define PCI_VENDOR_ID_REALTEK 0x10ec
 #define PCI_DEVICE_ID_REALTEK_8139 0x8139
+#define PCI_VENDOR_ID_INTEL 0x8086
+#define PCI_CLASS_NETWORK_ETHERNET 0x0200
+#define PCI_FUNC(devfn) ((devfn) & 7)
+#define PCI_SLOT(devfn) ((devfn) >> 3 & 0x1f)
 #define PCI_VENDOR_ID_TTTECH 0x0357
 #define PCI_DEVICE_ID_TTTECH_MC322 0x000a
 #define PCI_COMMAND 0x04
@@ -269,6 +329,7 @@ struct pci_dev {
 	struct device dev;
 	u16 vendor, device, subsystem_vendor, subsystem_device;
 	u8 revision;
+	unsigned int devfn;
 	unsigned int irq;
 	struct {
 		resource_size_t start, len;
@@ -276,13 +337,29 @@ struct pci_dev {
 	} resource[6];
 	struct pci_driver *driver;
 };
+typedef unsigned int pci_ers_result_t;
+typedef unsigned int pci_channel_state_t;
+enum { PCI_ERS_RESULT_NONE = 1, PCI_ERS_RESULT_CAN_RECOVER, PCI_ERS_RESULT_NEED_RESET,
+       PCI_ERS_RESULT_DISCONNECT, PCI_ERS_RESULT_RECOVERED };
+enum { pci_channel_io_normal = 1, pci_channel_io_frozen, pci_channel_io_perm_failure };
+struct pci_error_handlers {
+	pci_ers_result_t (*error_detected)(struct pci_dev *dev, pci_channel_state_t error);
+	pci_ers_result_t (*slot_reset)(struct pci_dev *dev);
+	void (*resume)(struct pci_dev *dev);
+};
 struct pci_driver {
 	const char *name;
 	const struct pci_device_id *id_table;
 	int (*probe)(struct pci_dev *dev, const struct pci_device_id *id);
 	void (*remove)(struct pci_dev *dev);
+	void (*shutdown)(struct pci_dev *dev);
+	const struct pci_error_handlers *err_handler;
 	struct device_driver driver;
 };
+#define to_pci_dev(d) container_of(d, struct pci_dev, dev)
+static inline void pci_pme_active(struct pci_dev *dev, bool on) { (void)dev; (void)on; }
+static inline int pci_prepare_to_sleep(struct pci_dev *dev) { (void)dev; return 0; }
+static inline int pci_wake_from_d3(struct pci_dev *dev, bool on) { (void)dev; (void)on; return 0; }
 int pci_register_driver(struct pci_driver *drv);
 void pci_unregister_driver(struct pci_driver *drv);
 #define module_pci_driver(drv) \
@@ -350,7 +427,26 @@ static inline int dma_mapping_error(struct device *dev, dma_addr_t dma)
 	(void)dev;
 	return dma == DMA_MAPPING_ERROR;
 }
-static inline int dma_set_mask_and_coherent(struct device *dev, u64 mask) { (void)dev; (void)mask; return 0; }
+/* The mask is kept: a mapping the device could not address fails. */
+int dma_set_mask(struct device *dev, u64 mask);
+#define dma_set_mask_and_coherent(dev, mask) dma_set_mask(dev, mask)
+#define dma_rmb() barrier()
+#define dma_wmb() lde_host_wmb()
+static inline void dma_sync_single_for_cpu(struct device *dev, dma_addr_t dma, size_t size, enum dma_data_direction dir)
+{
+	(void)dev; (void)dma; (void)size; (void)dir;
+}
+static inline void dma_sync_single_for_device(struct device *dev, dma_addr_t dma, size_t size, enum dma_data_direction dir)
+{
+	(void)dev; (void)dma; (void)size; (void)dir;
+	lde_host_wmb();
+}
+/* A DMA pool: blocks of one size the device can reach. */
+struct dma_pool;
+struct dma_pool *dma_pool_create(const char *name, struct device *dev, size_t size, size_t align, size_t boundary);
+void dma_pool_destroy(struct dma_pool *pool);
+void *dma_pool_zalloc(struct dma_pool *pool, gfp_t gfp, dma_addr_t *dma);
+void dma_pool_free(struct dma_pool *pool, void *va, dma_addr_t dma);
 
 /* ---- interrupts */
 
@@ -380,6 +476,7 @@ static inline void synchronize_irq(unsigned int irq) { (void)irq; }
 #define ETH_P_802_2 0x0004
 #define VLAN_HLEN 4
 #define VLAN_ETH_HLEN 18
+#define VLAN_ETH_FRAME_LEN 1518
 #define ETH_GSTRING_LEN 32
 #define IFNAMSIZ 16
 #define IPPROTO_TCP 6
@@ -421,6 +518,7 @@ u32 ether_crc(int length, unsigned char *data);
 #define NETIF_F_HW_VLAN_CTAG_TX (1ULL << 7)
 #define NETIF_F_HW_VLAN_CTAG_RX (1ULL << 8)
 #define NETIF_F_TSO (1ULL << 16)
+#define NETIF_F_VLAN_CHALLENGED (1ULL << 10)
 #define NETIF_F_RXCSUM (1ULL << 29)
 #define NETIF_F_RXFCS (1ULL << 34)
 #define NETIF_F_RXALL (1ULL << 35)
@@ -428,12 +526,18 @@ u32 ether_crc(int length, unsigned char *data);
 #define NETIF_F_TSO_MASK NETIF_F_TSO
 #define IFF_PROMISC 0x100
 #define IFF_ALLMULTI 0x200
+#define IFF_SUPP_NOFCS (1 << 14)
 #define NETDEV_TX_OK 0
 #define NETDEV_TX_BUSY 0x10
 #define NETIF_MSG_DRV 0x0001
 #define NETIF_MSG_PROBE 0x0002
 #define NETIF_MSG_LINK 0x0004
 #define netif_msg_link(p) ((p)->msg_enable & NETIF_MSG_LINK)
+#define netif_err(priv, type, dev, fmt, ...) netdev_err(dev, fmt, ##__VA_ARGS__)
+#define netif_info(priv, type, dev, fmt, ...) netdev_info(dev, fmt, ##__VA_ARGS__)
+#define netif_warn(priv, type, dev, fmt, ...) netdev_warn(dev, fmt, ##__VA_ARGS__)
+/* Used at debug level: compiled, checked and left out. */
+#define netif_printk(priv, type, level, dev, fmt, ...) lde_no_print(fmt, ##__VA_ARGS__)
 
 struct sk_buff;
 struct net_device;
@@ -486,7 +590,7 @@ struct net_device {
 	char name[IFNAMSIZ];
 	const unsigned char *dev_addr;
 	unsigned char lde_addr[8];
-	unsigned int flags;
+	unsigned int flags, priv_flags;
 	unsigned int mtu, min_mtu, max_mtu;
 	netdev_features_t features, hw_features, vlan_features;
 	const struct net_device_ops *netdev_ops;
@@ -532,8 +636,8 @@ static inline void netdev_completed_queue(struct net_device *dev, unsigned int p
 }
 static inline void netdev_reset_queue(struct net_device *dev) { (void)dev; }
 /* No multicast addresses are ever subscribed. */
-#define netdev_mc_count(dev) 0
-#define netdev_for_each_mc_addr(ha, dev) for ((ha) = NULL; (ha); (ha) = NULL)
+#define netdev_mc_count(dev) ((void)(dev), 0)
+#define netdev_for_each_mc_addr(ha, dev) for ((void)(dev), (ha) = NULL; (ha); (ha) = NULL)
 static inline void netdev_stats_to_stats64(struct rtnl_link_stats64 *s64, const struct net_device_stats *s)
 {
 	const unsigned long *from = (const unsigned long *)s;
@@ -592,13 +696,15 @@ struct sk_buff {
 	__be16 protocol;
 	u16 vlan_tci;
 	u8 ip_summed;
-	bool lde_vlan;
+	bool lde_vlan, no_fcs;
 	struct net_device *dev;
 	unsigned char *lde_mac_header;
 	struct skb_shared_info lde_shared;
 };
 struct sk_buff *alloc_skb(unsigned int size, gfp_t gfp);
 struct sk_buff *netdev_alloc_skb_ip_align(struct net_device *dev, unsigned int length);
+#define netdev_alloc_skb(dev, length) netdev_alloc_skb_ip_align(dev, length)
+static inline void skb_tx_timestamp(struct sk_buff *skb) { (void)skb; }
 struct sk_buff *napi_alloc_skb(struct napi_struct *napi, unsigned int length);
 void kfree_skb(struct sk_buff *skb);
 #define dev_kfree_skb(skb) kfree_skb(skb)
@@ -641,6 +747,7 @@ static inline void skb_copy_to_linear_data_offset(struct sk_buff *skb, int off, 
 
 /* ---- MII (lde.c) */
 
+/* The MII management registers and their bits (IEEE 802.3, clause 22). */
 #define MII_BMCR 0x00
 #define MII_BMSR 0x01
 #define MII_PHYSID1 0x02
@@ -648,13 +755,57 @@ static inline void skb_copy_to_linear_data_offset(struct sk_buff *skb, int off, 
 #define MII_ADVERTISE 0x04
 #define MII_LPA 0x05
 #define MII_EXPANSION 0x06
+#define MII_CTRL1000 0x09
+#define MII_STAT1000 0x0a
+#define MII_ESTATUS 0x0f
+#define MII_DCOUNTER 0x12
+#define MII_FCSCOUNTER 0x13
+#define MII_NWAYTEST 0x14
+#define MII_RERRCOUNTER 0x15
+#define MII_SREVISION 0x16
+#define MII_RESV1 0x17
+#define MII_LBRERROR 0x18
+#define MII_PHYADDR 0x19
+#define MII_RESV2 0x1a
+#define MII_TPISTATUS 0x1b
+#define MII_NCONFIG 0x1c
+#define BMCR_SPEED1000 0x0040
+#define BMCR_CTST 0x0080
+#define BMCR_FULLDPLX 0x0100
 #define BMCR_ANRESTART 0x0200
+#define BMCR_ISOLATE 0x0400
+#define BMCR_PDOWN 0x0800
 #define BMCR_ANENABLE 0x1000
+#define BMCR_SPEED100 0x2000
+#define BMCR_LOOPBACK 0x4000
+#define BMCR_RESET 0x8000
+#define BMSR_ERCAP 0x0001
+#define BMSR_JCD 0x0002
 #define BMSR_LSTATUS 0x0004
+#define BMSR_ANEGCAPABLE 0x0008
+#define BMSR_RFAULT 0x0010
+#define BMSR_ANEGCOMPLETE 0x0020
+#define BMSR_10HALF 0x0800
+#define BMSR_10FULL 0x1000
+#define BMSR_100HALF 0x2000
+#define BMSR_100FULL 0x4000
+#define BMSR_100BASE4 0x8000
+#define ADVERTISE_CSMA 0x0001
+#define ADVERTISE_10HALF 0x0020
+#define ADVERTISE_10FULL 0x0040
+#define ADVERTISE_100HALF 0x0080
+#define ADVERTISE_100FULL 0x0100
+#define ADVERTISE_100BASE4 0x0200
+#define ADVERTISE_PAUSE_CAP 0x0400
+#define ADVERTISE_PAUSE_ASYM 0x0800
+#define ADVERTISE_ALL (ADVERTISE_10HALF | ADVERTISE_10FULL | ADVERTISE_100HALF | ADVERTISE_100FULL)
+#define LPA_10HALF 0x0020
 #define LPA_10FULL 0x0040
 #define LPA_100HALF 0x0080
 #define LPA_100FULL 0x0100
 #define LPA_100BASE4 0x0200
+#define LPA_LPACK 0x4000
+#define EXPANSION_NWAY 0x0001
 struct mii_if_info {
 	int phy_id;
 	int advertising;
@@ -679,13 +830,38 @@ struct ethtool_link_ksettings;
 unsigned int mii_check_media(struct mii_if_info *mii, unsigned int ok_to_print, unsigned int init_media);
 int mii_link_ok(struct mii_if_info *mii);
 int mii_nway_restart(struct mii_if_info *mii);
+#define ETHTOOL_GSET 1
+#define SPEED_10 10
+#define SPEED_100 100
+#define DUPLEX_HALF 0
+#define DUPLEX_FULL 1
+#define AUTONEG_DISABLE 0
+#define AUTONEG_ENABLE 1
+struct ethtool_cmd {
+	u32 cmd, supported, advertising;
+	u16 speed;
+	u8 duplex, port, phy_address, transceiver, autoneg;
+	u16 speed_hi;
+};
+static inline u32 ethtool_cmd_speed(const struct ethtool_cmd *c) { return (u32)c->speed_hi << 16 | c->speed; }
+void mii_ethtool_gset(struct mii_if_info *mii, struct ethtool_cmd *cmd);
+int mii_ethtool_sset(struct mii_if_info *mii, struct ethtool_cmd *cmd);
+void mii_check_link(struct mii_if_info *mii);
 void mii_ethtool_get_link_ksettings(struct mii_if_info *mii, struct ethtool_link_ksettings *cmd);
 int mii_ethtool_set_link_ksettings(struct mii_if_info *mii, const struct ethtool_link_ksettings *cmd);
 int generic_mii_ioctl(struct mii_if_info *mii, struct mii_ioctl_data *data, int cmd, unsigned int *duplex_changed);
 
 /* ---- ethtool: the tables compile; nothing calls them yet */
 
+#define ETH_SS_TEST 0
 #define ETH_SS_STATS 1
+#define ETH_TEST_FL_OFFLINE 1
+#define ETH_TEST_FL_FAILED 2
+struct ethtool_test {
+	u32 cmd, flags, reserved, len;
+};
+struct ethtool_ts_info;
+enum ethtool_phys_id_state { ETHTOOL_ID_INACTIVE, ETHTOOL_ID_ACTIVE, ETHTOOL_ID_ON, ETHTOOL_ID_OFF };
 #define WAKE_PHY (1 << 0)
 #define WAKE_UCAST (1 << 1)
 #define WAKE_MCAST (1 << 2)
@@ -730,6 +906,11 @@ struct ethtool_ops {
 	int (*set_eeprom)(struct net_device *, struct ethtool_eeprom *, u8 *);
 	void (*get_ringparam)(struct net_device *, struct ethtool_ringparam *,
 			      struct kernel_ethtool_ringparam *, struct netlink_ext_ack *);
+	int (*set_ringparam)(struct net_device *, struct ethtool_ringparam *,
+			     struct kernel_ethtool_ringparam *, struct netlink_ext_ack *);
+	void (*self_test)(struct net_device *, struct ethtool_test *, u64 *);
+	int (*set_phys_id)(struct net_device *, enum ethtool_phys_id_state);
+	int (*get_ts_info)(struct net_device *, struct ethtool_ts_info *);
 	void (*get_strings)(struct net_device *, u32 stringset, u8 *);
 	void (*get_ethtool_stats)(struct net_device *, struct ethtool_stats *, u64 *);
 	int (*get_sset_count)(struct net_device *, int);
@@ -737,5 +918,6 @@ struct ethtool_ops {
 	int (*set_link_ksettings)(struct net_device *, const struct ethtool_link_ksettings *);
 };
 u32 ethtool_op_get_link(struct net_device *dev);
+int ethtool_op_get_ts_info(struct net_device *dev, struct ethtool_ts_info *info);
 
 #endif

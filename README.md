@@ -268,8 +268,9 @@ holds the rest):
     in a component. Linux's source file is compiled as it is (clang, in the build
     container) against the environment's own headers, which give it Linux's kernel
     API by name: PCI, `ioremap` and register access, `dma_alloc_coherent` and
-    `dma_map_single`, `request_irq`, network devices, NAPI, socket buffers, MII,
-    timers and `printk`. `c/lde.c` implements that for one PCI device and one
+    `dma_map_single`, DMA pools, `request_irq`, network devices, NAPI, socket
+    buffers, MII, kernel timers, work, `request_firmware` (it finds none) and
+    `printk`. `c/lde.c` implements that for one PCI device and one
     network interface, and a Rust host under it holds the component's
     capabilities: it finds the device from the driver's own ID table, gives the
     driver memory from a pool that is all the device's IOMMU domain holds, runs
@@ -277,11 +278,15 @@ holds the rest):
     thread (so Linux's locks are empty), and serves the `nic` interface, frame
     rings included: what the driver delivers goes into the receive ring and what
     the server puts in the transmit ring goes to the driver's transmit routine. The
-    driver gets no more than a native one does. The first is Linux 6.6's
-    `8139cp` (`user/lde-8139cp/`), on QEMU's RTL-8139C+: Linux is GPL-2.0, so its
-    source is not in this repository; `cargo xtask` fetches the one file from
-    kernel.org and checks its SHA-256. `cargo xtask lde-test` runs the whole
-    network test over it on both ISAs (pings, datagrams to 65,507 bytes, DNS, TCP,
+    driver gets no more than a native one does. Two drivers from Linux 6.6 run
+    this way: RealTek's `8139cp` (`user/lde-8139cp/`, on QEMU's RTL-8139C+) and
+    Intel's `e100` (`user/lde-e100/`, on QEMU's 82557), which brings a watchdog
+    timer, a work item, a DMA pool and a firmware request with it. Linux is
+    GPL-2.0, so its source is not in this repository; `cargo xtask` fetches each
+    file from kernel.org and checks its SHA-256. A driver killed in the middle of
+    something leaves its device there (these cards have no reset the bus server
+    can give), so the host tries a failed probe once more. `cargo xtask lde-test`
+    and `lde-e100-test` run the whole network test over each on both ISAs (pings, datagrams to 65,507 bytes, DNS, TCP,
     IPv6) while the injector kills the Linux driver, the network server and the
     resolver: each restart probes the device again from nothing.
   - A virtio-blk driver (`user/virtio-blk/`) serves the versioned `block`
@@ -685,9 +690,10 @@ holds the rest):
   notifications, a 256-slot CNode pool) so filling them stays quick; normal kernels have
   32 of each, 32 address spaces and a 4096-slot pool.
 
-Not yet: in the Linux Driver Environment anything but one network driver
-(`8139cp`), ethtool and the MII ioctls, drivers that need work queues,
-kernel timers, more than one interrupt or a class other than network; legacy
+Not yet: in the Linux Driver Environment drivers of a class other than network,
+ethtool and the MII ioctls, firmware files, more than one interrupt or one
+device per component (QEMU's later 8255x models append stale bytes to some of
+e100's frames, so its test uses the 82557); legacy
 interrupt lines shared by two functions, and their routing on machines other
 than QEMU's q35 and `virt`; more than 8 PCI buses, I/O and prefetchable bridge windows, hot-plug, and
 DMA for devices behind conventional bridges (they share a requester ID); Function
@@ -726,6 +732,7 @@ https://claude.ai/artifact/QKJS8qH5Dfbjzn58RStq1j
 | `crates/driver/` | The Driver SDK: PCI access through the bus server, MMIO, DMA pages, virtqueues |
 | `crates/lde/` | The Linux Driver Environment: Linux's kernel API for hosted drivers (`include/`, `c/lde.c`) and its host (`src/lib.rs`) |
 | `user/lde-8139cp/` | Linux's 8139cp network driver, unmodified, in the Linux Driver Environment |
+| `user/lde-e100/` | Linux's e100 network driver, likewise |
 | `user/pcibus/` | The PCI bus server |
 | `user/memserver/` | The Memory Server |
 | `user/fs/` | The filesystem server |
@@ -758,6 +765,7 @@ cargo xtask nvme-test      # the driver and filesystem tests on an NVMe disk (ad
 cargo xtask ahci-test      # the same on a SATA disk behind AHCI (add aarch64 for that ISA)
 cargo xtask net-test       # just the network test (add aarch64 for that ISA)
 cargo xtask lde-test       # the network test over Linux's 8139cp driver (needs Docker; fetches the driver from kernel.org the first time)
+cargo xtask lde-e100-test  # the same over Linux's e100 driver
 cargo xtask tcp-test       # just the TCP test (add aarch64 for that ISA)
 cargo xtask keyboard-test  # just the USB keyboard test (add aarch64 for that ISA)
 cargo xtask run            # boot the shell in QEMU (x86-64), its console on this terminal

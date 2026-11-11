@@ -164,10 +164,131 @@ void *kzalloc(size_t size, gfp_t gfp)
 	return lde_host_alloc(size);
 }
 
+void *kcalloc(size_t n, size_t size, gfp_t gfp)
+{
+	(void)gfp;
+	return size && n > (size_t)-1 / size ? NULL : lde_host_alloc(n * size);
+}
+
 void kfree(const void *p)
 {
 	if (p)
 		lde_host_free(p);
+}
+
+char *strcpy(char *dst, const char *src)
+{
+	char *d = dst;
+	while ((*d++ = *src++))
+		;
+	return dst;
+}
+
+char *strncpy(char *dst, const char *src, size_t n)
+{
+	size_t i = 0;
+	for (; i < n && src[i]; i++)
+		dst[i] = src[i];
+	for (; i < n; i++)
+		dst[i] = 0;
+	return dst;
+}
+
+/* ---- timers and work: run by lde_tick, from the component's loop */
+
+static struct timer_list *timers;
+static struct work_struct *works;
+
+void timer_setup(struct timer_list *t, void (*function)(struct timer_list *), unsigned int flags)
+{
+	(void)flags;
+	t->function = function;
+	t->lde_pending = false;
+	t->lde_next = NULL;
+}
+
+int del_timer_sync(struct timer_list *t)
+{
+	bool was = t->lde_pending;
+	for (struct timer_list **at = &timers; *at; at = &(*at)->lde_next) {
+		if (*at == t) {
+			*at = t->lde_next;
+			break;
+		}
+	}
+	t->lde_pending = false;
+	t->lde_next = NULL;
+	return was;
+}
+
+int mod_timer(struct timer_list *t, unsigned long expires)
+{
+	int was = del_timer_sync(t);
+	t->expires = expires;
+	t->lde_pending = true;
+	t->lde_next = timers;
+	timers = t;
+	return was;
+}
+
+bool schedule_work(struct work_struct *work)
+{
+	if (work->lde_pending)
+		return false;
+	work->lde_pending = true;
+	work->lde_next = works;
+	works = work;
+	return true;
+}
+
+bool cancel_work_sync(struct work_struct *work)
+{
+	bool was = work->lde_pending;
+	for (struct work_struct **at = &works; *at; at = &(*at)->lde_next) {
+		if (*at == work) {
+			*at = work->lde_next;
+			break;
+		}
+	}
+	work->lde_pending = false;
+	return was;
+}
+
+/* Ticks until the next timer is due (1 if one is, or work waits); 0 if
+ * there is nothing to wake for. */
+unsigned long lde_next_timer(void)
+{
+	unsigned long now = jiffies, soonest = 0;
+	if (works)
+		return 1;
+	for (struct timer_list *t = timers; t; t = t->lde_next) {
+		unsigned long in = time_after(t->expires, now) ? t->expires - now : 1;
+		if (!soonest || in < soonest)
+			soonest = in;
+	}
+	return soonest;
+}
+
+static void run_timers_and_work(void)
+{
+	/* One at a time, from the list's head each time: what runs may set
+	 * or delete any timer. */
+	for (;;) {
+		struct timer_list *due = NULL;
+		for (struct timer_list *t = timers; t; t = t->lde_next)
+			if (!time_after(t->expires, jiffies))
+				due = t;
+		if (!due)
+			break;
+		del_timer_sync(due);
+		due->function(due);
+	}
+	while (works) {
+		struct work_struct *w = works;
+		works = w->lde_next;
+		w->lde_pending = false;
+		w->func(w);
+	}
 }
 
 ssize_t strscpy(char *dst, const char *src, size_t size)
@@ -262,6 +383,7 @@ int lde_probe(u16 vendor, u16 dev, u32 bars)
 	device.subsystem_vendor = subsystem & 0xffff;
 	device.subsystem_device = subsystem >> 16;
 	device.revision = lde_host_config_read(0x08) & 0xff;
+	device.devfn = location & 0xff;
 	/* The line's number means nothing here: there is one, the host's. */
 	device.irq = 1;
 	device.driver = driver;
@@ -371,11 +493,62 @@ void dma_free_coherent(struct device *dev, size_t size, void *va, dma_addr_t dma
 	lde_host_free(va);
 }
 
+/* What the device can address, as its driver said. */
+static u64 dma_mask = ~0ull;
+
+int dma_set_mask(struct device *dev, u64 mask)
+{
+	(void)dev;
+	dma_mask = mask;
+	return 0;
+}
+
 dma_addr_t dma_map_single(struct device *dev, void *ptr, size_t size, enum dma_data_direction dir)
 {
 	(void)dev;
 	(void)dir;
-	return lde_host_dma(ptr, size);
+	dma_addr_t dma = lde_host_dma(ptr, size);
+	if (dma != DMA_MAPPING_ERROR && ((dma + size - 1) & ~dma_mask))
+		return DMA_MAPPING_ERROR;
+	return dma;
+}
+
+struct dma_pool {
+	size_t size;
+};
+
+struct dma_pool *dma_pool_create(const char *name, struct device *dev, size_t size, size_t align, size_t boundary)
+{
+	struct dma_pool *pool = kzalloc(sizeof(*pool), GFP_KERNEL);
+	(void)name;
+	(void)dev;
+	(void)align; /* the host's blocks are aligned to 64 bytes or a page */
+	(void)boundary;
+	if (pool)
+		pool->size = size;
+	return pool;
+}
+
+void dma_pool_destroy(struct dma_pool *pool)
+{
+	kfree(pool);
+}
+
+void *dma_pool_zalloc(struct dma_pool *pool, gfp_t gfp, dma_addr_t *dma)
+{
+	void *p = dma_alloc_coherent(NULL, pool->size, dma, gfp);
+	if (p && ((*dma + pool->size - 1) & ~dma_mask)) {
+		lde_host_free(p);
+		return NULL;
+	}
+	return p;
+}
+
+void dma_pool_free(struct dma_pool *pool, void *va, dma_addr_t dma)
+{
+	(void)pool;
+	(void)dma;
+	lde_host_free(va);
 }
 
 /* ---- the interrupt */
@@ -529,11 +702,20 @@ u32 ethtool_op_get_link(struct net_device *dev)
 	return dev->lde_carrier;
 }
 
-/* The transmit watchdog: a queue the driver stopped and has not woken
- * for `watchdog_timeo` is reported to it. */
+int ethtool_op_get_ts_info(struct net_device *dev, struct ethtool_ts_info *info)
+{
+	(void)dev;
+	(void)info;
+	return -EOPNOTSUPP;
+}
+
+/* The driver's timers and work that are due; and the transmit watchdog:
+ * a queue the driver stopped and has not woken for `watchdog_timeo` is
+ * reported to it. */
 void lde_tick(void)
 {
 	struct net_device *dev = netdev;
+	run_timers_and_work();
 	if (!dev || !dev->lde_running || !dev->lde_stopped || !dev->lde_carrier)
 		return;
 	if (dev->watchdog_timeo <= 0 || !dev->netdev_ops->ndo_tx_timeout)
@@ -739,6 +921,44 @@ int mii_link_ok(struct mii_if_info *mii)
 {
 	mii->mdio_read(mii->dev, mii->phy_id, MII_BMSR);
 	return !!(mii->mdio_read(mii->dev, mii->phy_id, MII_BMSR) & BMSR_LSTATUS);
+}
+
+void mii_check_link(struct mii_if_info *mii)
+{
+	bool has = mii_link_ok(mii);
+	if (has && !netif_carrier_ok(mii->dev))
+		netif_carrier_on(mii->dev);
+	else if (!has && netif_carrier_ok(mii->dev))
+		netif_carrier_off(mii->dev);
+}
+
+/* The link as negotiated: what both ends advertise. */
+void mii_ethtool_gset(struct mii_if_info *mii, struct ethtool_cmd *cmd)
+{
+	struct net_device *dev = mii->dev;
+	int bmcr = mii->mdio_read(dev, mii->phy_id, MII_BMCR);
+	cmd->phy_address = mii->phy_id;
+	cmd->speed_hi = 0;
+	if (bmcr & BMCR_ANENABLE) {
+		int common = mii->mdio_read(dev, mii->phy_id, MII_ADVERTISE) &
+			     mii->mdio_read(dev, mii->phy_id, MII_LPA);
+		cmd->autoneg = AUTONEG_ENABLE;
+		cmd->speed = common & (LPA_100FULL | LPA_100HALF | LPA_100BASE4) ? SPEED_100 : SPEED_10;
+		cmd->duplex = (common & LPA_100FULL) || (common & (LPA_100HALF | LPA_10FULL)) == LPA_10FULL ?
+			DUPLEX_FULL : DUPLEX_HALF;
+	} else {
+		cmd->autoneg = AUTONEG_DISABLE;
+		cmd->speed = bmcr & BMCR_SPEED100 ? SPEED_100 : SPEED_10;
+		cmd->duplex = bmcr & BMCR_FULLDPLX ? DUPLEX_FULL : DUPLEX_HALF;
+	}
+	mii->full_duplex = cmd->duplex == DUPLEX_FULL;
+}
+
+int mii_ethtool_sset(struct mii_if_info *mii, struct ethtool_cmd *cmd)
+{
+	(void)mii;
+	(void)cmd;
+	return -EOPNOTSUPP;
 }
 
 int mii_nway_restart(struct mii_if_info *mii)

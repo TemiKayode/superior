@@ -21,7 +21,10 @@
 //!   unmasks the line; the driver's NAPI poll runs from the loop, only
 //!   while the receive queue has room for what it may deliver.
 //! - One thread: handler, poll and transmit never run at once, so Linux's
-//!   locks are empty.
+//!   locks are empty. The driver's kernel timers and work run from the
+//!   loop too: it sleeps no longer than until the next timer is due.
+//! - What there is none of fails as Linux would have it fail: firmware
+//!   files (`request_firmware` finds none), ethtool and MII ioctls.
 //!
 //! The component serves the `nic` interface: by calls (`RECV`, `SEND`),
 //! and through frame rings (`nic::ring`) once its caller has set them up.
@@ -30,8 +33,8 @@
 //! ring go to the driver's transmit routine, with no call for either; the
 //! caller's doorbell is a badged copy of the component's notification, so
 //! it wakes the same loop the interrupt does. Slots: 0 the bus server, 1
-//! the `nic` endpoint (receive), 2 a notification, 3 untyped memory (512
-//! KiB), in a CSpace of 2^8 slots.
+//! the `nic` endpoint (receive), 2 a notification, 3 untyped memory (1
+//! MiB), in a CSpace of 2^8 slots.
 
 #![no_std]
 
@@ -57,7 +60,8 @@ const LISTENER: u64 = 7;
 const BAR_SLOTS: u64 = 8;
 const MAX_BAR_PAGES: u64 = 16;
 const POOL: u64 = BAR_SLOTS + MAX_BAR_PAGES;
-const POOL_PAGES: usize = 96;
+/// Enough for a driver that keeps 256 receive buffers of 2 KiB (e100).
+const POOL_PAGES: usize = 192;
 /// The doorbell: this component's notification, to signal only, granted
 /// to the ring's caller.
 const DOORBELL: u64 = POOL + POOL_PAGES as u64;
@@ -92,6 +96,7 @@ unsafe extern "C" {
     fn lde_poll();
     fn lde_xmit(frame: *const c_void, len: usize) -> c_int;
     fn lde_tick();
+    fn lde_next_timer() -> c_ulong;
     fn lde_mac(mac: *mut u8);
     fn lde_carrier() -> c_int;
 }
@@ -121,12 +126,14 @@ struct Host {
     /// The device: where it is, its memory BARs.
     location: u32,
     bars: u64,
-    /// Each BAR's size, and whether its pages are mapped; pages mapped in
-    /// all.
+    /// Each BAR's size, and how many of its pages are mapped; pages
+    /// mapped in all.
     bar_size: [u64; 6],
-    bar_mapped: [bool; 6],
+    bar_mapped: [u64; 6],
     bar_pages: u64,
     irq_taken: bool,
+    /// What `udelay` counts: cycle-counter steps in a microsecond.
+    cycles_per_usec: u64,
     /// The pool: each page's device address and use, and each class's
     /// list of free blocks (linked through their first words).
     dma: [u64; POOL_PAGES],
@@ -159,9 +166,10 @@ static HOST: Cell = Cell(UnsafeCell::new(Host {
     location: 0,
     bars: 0,
     bar_size: [0; 6],
-    bar_mapped: [false; 6],
+    bar_mapped: [0; 6],
     bar_pages: 0,
     irq_taken: false,
+    cycles_per_usec: 0,
     dma: [0; POOL_PAGES],
     used: [Use::Free; POOL_PAGES],
     free: [core::ptr::null_mut(); CLASSES.len()],
@@ -336,20 +344,25 @@ extern "C" fn lde_host_location() -> u32 {
 }
 
 fn bar_va(bar: usize) -> u64 {
-    BAR_VA + bar as u64 * MAX_BAR_PAGES * PAGE as u64
+    // 16 MiB apart: the six stay clear of the pool's addresses.
+    BAR_VA + bar as u64 * 0x100_0000
 }
 
-/// Maps memory BAR `bar` whole, once. False if it cannot be.
-fn map_bar(bar: usize) -> bool {
+/// Maps memory BAR `bar` as far as its page `upto` (to the end of the BAR
+/// with `None`), unless it is already. False if it cannot be.
+fn map_bar(bar: usize, upto: Option<u64>) -> bool {
     if bar >= 6 || host().bars & 1 << bar == 0 {
         return false;
     }
-    if host().bar_mapped[bar] {
-        return true;
-    }
-    let mut page = 0;
     loop {
-        let at = host().bar_pages;
+        let h = host();
+        let page = h.bar_mapped[bar];
+        // The size is known once the first page is mapped.
+        let pages = if page == 0 { 1 } else { h.bar_size[bar].div_ceil(PAGE as u64) };
+        if page >= upto.map_or(pages, |u| (u + 1).min(pages)) {
+            return true;
+        }
+        let at = h.bar_pages;
         if at == MAX_BAR_PAGES {
             say!("[fail] BAR {bar} needs more than {MAX_BAR_PAGES} pages mapped");
             return false;
@@ -359,11 +372,7 @@ fn map_bar(bar: usize) -> bool {
                 let h = host();
                 h.bar_pages += 1;
                 h.bar_size[bar] = size;
-                page += 1;
-                if page * PAGE as u64 >= size {
-                    h.bar_mapped[bar] = true;
-                    return true;
-                }
+                h.bar_mapped[bar] += 1;
             }
             Err((what, code)) => {
                 say!("[fail] BAR {bar}: {what} ({code:#x})");
@@ -375,12 +384,13 @@ fn map_bar(bar: usize) -> bool {
 
 #[unsafe(no_mangle)]
 extern "C" fn lde_host_bar_size(bar: c_uint) -> u64 {
-    if map_bar(bar as usize) { host().bar_size[bar as usize] } else { 0 }
+    // Its first page tells the size; the rest is mapped when asked for.
+    if map_bar(bar as usize, Some(0)) { host().bar_size[bar as usize] } else { 0 }
 }
 
 #[unsafe(no_mangle)]
 extern "C" fn lde_host_bar_map(bar: c_uint) -> *mut c_void {
-    if map_bar(bar as usize) {
+    if map_bar(bar as usize, None) {
         bar_va(bar as usize) as *mut c_void
     } else {
         core::ptr::null_mut()
@@ -431,11 +441,11 @@ extern "C" fn lde_host_sleep(ticks: c_ulong) {
 
 #[unsafe(no_mangle)]
 extern "C" fn lde_host_udelay(usecs: c_ulong) {
-    // No clock is fine enough: spin for at least as long on any machine
-    // these run on.
-    for _ in 0..usecs as u64 * 200 {
-        core::hint::spin_loop();
-    }
+    // The tick is too coarse: the cycle counter, measured against it
+    // at the start.
+    let per_usec = host().cycles_per_usec.max(1);
+    let end = superior_sys::cycles().wrapping_add(usecs as u64 * per_usec);
+    while (end.wrapping_sub(superior_sys::cycles()) as i64) > 0 {}
 }
 
 #[unsafe(no_mangle)]
@@ -459,7 +469,24 @@ extern "C" fn lde_host_rx(frame: *const c_void, len: usize) {
 
 // ---- the component
 
+/// Measures the cycle counter against the tick: from one tick's edge to
+/// the next but one.
+fn calibrate() {
+    let edge = |from: u64| loop {
+        let t = superior_sys::ticks();
+        if t != from {
+            break (t, superior_sys::cycles());
+        }
+    };
+    let (t0, c0) = edge(superior_sys::ticks());
+    let (_, c1) = edge(t0 + 1);
+    let (_, c1) = if c1 == c0 { edge(t0 + 2) } else { (0, c1) };
+    // Two ticks of 1,000,000 / TICK_HZ microseconds each.
+    host().cycles_per_usec = c1.wrapping_sub(c0) / (2 * 1_000_000 / TICK_HZ);
+}
+
 fn start() -> Result<(), Failure> {
+    calibrate();
     // SAFETY: the driver's module initialisation, once, first.
     if unsafe { lde_module_init() } != 0 {
         return Err(("the driver's module initialisation failed", 0));
@@ -501,8 +528,21 @@ fn start() -> Result<(), Failure> {
         location & 7,
         POOL_PAGES * PAGE / 1024
     );
-    // SAFETY: the driver's probe, after its module initialisation.
-    let rc = unsafe { lde_probe(vendor, device, bars as u32) };
+    // A driver killed in the middle of something (reading the EEPROM a
+    // bit at a time, say) leaves the device there, and there is no reset
+    // to give it: the probe that runs into that fails, and in failing
+    // ends what was left open. So a failed probe is tried once more.
+    let mut rc = 0;
+    for attempt in 0..2 {
+        // SAFETY: the driver's probe, after its module initialisation.
+        rc = unsafe { lde_probe(vendor, device, bars as u32) };
+        if rc == 0 {
+            break;
+        }
+        if attempt == 0 {
+            say!("the driver's probe failed (errno {}): trying once more", -rc);
+        }
+    }
     if rc != 0 {
         return Err(("the driver's probe failed, errno", -rc as u64));
     }
@@ -676,6 +716,8 @@ fn ring_pump_tx() -> bool {
 /// put in a ring meanwhile is left there with nobody to signal.
 fn before_sleep() {
     loop {
+        // SAFETY: lde.c's, from the one thread.
+        unsafe { lde_tick() };
         pump();
         if !host().ring {
             return;
@@ -747,6 +789,7 @@ fn send(len: u64) -> Status {
                     lde_interrupt();
                     lde_tick();
                 }
+                pump();
             }
             1 => return Status::NoSpace,
             _ => return Status::DeviceError,
@@ -808,6 +851,10 @@ pub fn run(name: &'static str) -> ! {
     let mut reply: Option<([u64; 4], bool)> = None;
     loop {
         before_sleep();
+        // The driver's next timer wakes the loop like an interrupt.
+        // SAFETY: lde.c's, from the one thread.
+        let wake = unsafe { lde_next_timer() } as u64;
+        syscall(Syscall::TimerSignal, NOTIFY, [wake, 0, 0, 0]);
         let r = match reply.take() {
             Some((m, doorbell)) => {
                 let x = CapTransfer {

@@ -28,8 +28,10 @@ component lde-8139cp
   uses pci 0
   provides nic 1
   notification 2
-  # 512 KiB: the pool the driver's memory comes from, and its page tables.
-  untyped 19 3
+  # 1 MiB: the pool the driver's memory comes from (768 KiB), and its
+  # page tables.
+  memory 21
+  untyped 20 3
 
 component net
   image net

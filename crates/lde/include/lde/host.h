@@ -58,8 +58,11 @@ int lde_poll_weight(void);
 void lde_poll(void);
 /* Sends a frame: 0, 1 if the driver's queue is full for now, or -errno. */
 int lde_xmit(const void *frame, size_t len);
-/* Now and then: the transmit watchdog. */
+/* Runs the driver's timers and work that are due, and the transmit
+ * watchdog; and how many ticks until it must be called again (0: only
+ * when something else happens). */
 void lde_tick(void);
+unsigned long lde_next_timer(void);
 /* The interface's MAC address (6 bytes) and whether its link is up. */
 void lde_mac(u8 *mac);
 int lde_carrier(void);
