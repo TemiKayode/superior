@@ -333,7 +333,18 @@ fn msi_lines() -> core::ops::Range<u8> {
 }
 
 pub fn irq_routable(line: u8) -> bool {
-    line == UART_IRQ || msi_lines().contains(&line)
+    line == UART_IRQ || msi_lines().contains(&line) || INTX_LINES.contains(&line)
+}
+
+/// QEMU `virt`'s four PCI interrupt wires: shared interrupts 3 to 6
+/// (interrupt IDs 35 to 38), level-triggered as every shared interrupt
+/// is until told otherwise. A function on bus 0 drives wire
+/// `(device + pin - 1) % 4`.
+const INTX_LINES: [u8; 4] = [35, 36, 37, 38];
+
+/// The legacy PCI interrupt lines.
+pub fn intx_lines() -> &'static [u8] {
+    &INTX_LINES
 }
 
 /// The message a device writes to raise MSI line `line`, if it is one:

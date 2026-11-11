@@ -120,6 +120,15 @@ pub mod pci {
     /// first with `MSI_VECTOR`) into its MSI capability and enables it,
     /// one vector, legacy interrupts off; or disables it.
     pub const MSI: u64 = 8;
+    /// `[INTX]`: for a function with no MSI at all: the legacy interrupt
+    /// line its interrupt pin is wired to (an IRQ capability) in the
+    /// call's accept slot, and its legacy interrupts enabled. The line is
+    /// level-triggered: the kernel masks it as it signals, and the driver
+    /// unmasks it (`IrqAck`) once the device has let go of it. A line is
+    /// one function's at a time: `InUse` if another function that shares
+    /// the wire has it, `NotFound` if the function has no pin or the
+    /// machine's routing is not known. Reply: `[status, wire]`.
+    pub const INTX: u64 = 9;
 }
 
 /// Block devices: what a storage driver serves.

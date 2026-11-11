@@ -204,9 +204,15 @@ fn start_component_manager() -> Result<(), &'static str> {
             Capability::new(frame, Rights::ALL),
         )
     });
+    let intx = arch::intx_lines().iter().enumerate().map(|(n, &line)| {
+        (
+            root::INTX as usize + n,
+            Capability::new(Object::Irq { line }, rw),
+        )
+    });
     let mut all = [(0, caps[0].1); 48];
     let mut n = 0;
-    for c in caps.into_iter().chain(pci).chain(iommu).chain(state) {
+    for c in caps.into_iter().chain(pci).chain(iommu).chain(state).chain(intx) {
         all[n] = c;
         n += 1;
     }

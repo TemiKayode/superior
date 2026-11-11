@@ -6,6 +6,7 @@
 
 use super::{apic, gdt, syscall};
 use crate::kprintln;
+use core::sync::atomic::{AtomicBool, Ordering};
 use spin::Lazy;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame};
 use x86_64::VirtAddr;
@@ -55,6 +56,12 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
         idt[PIC_BASE + COM1_IRQ]
             .set_handler_addr(VirtAddr::new(syscall::com1_entry as *const () as u64));
     }
+    for (line, entry) in INTX_LINES.iter().zip(syscall::INTX_ENTRIES) {
+        // SAFETY: each entry saves the user frame like the timer's.
+        unsafe {
+            idt[PIC_BASE + line].set_handler_addr(VirtAddr::new(entry as *const () as u64));
+        }
+    }
     for (n, entry) in syscall::MSI_ENTRIES.iter().enumerate() {
         // SAFETY: each entry saves the user frame like the timer's.
         unsafe {
@@ -73,7 +80,56 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
 pub const PIC_BASE: u8 = 0x20;
 /// COM1's interrupt line, handed to the serial driver.
 pub const COM1_IRQ: u8 = 4;
-/// Lines user space may own: only COM1 for now.
+/// The PIC lines the four PCI interrupt pins' wires are routed to on
+/// QEMU's q35 machine ([`init_intx`]): level-triggered, and free of ISA
+/// devices there.
+pub const INTX_LINES: [u8; 4] = [10, 11, 5, 9];
+static INTX_ROUTED: AtomicBool = AtomicBool::new(false);
+
+/// The legacy PCI interrupt lines, if this machine's routing is known:
+/// line `(device + pin - 1) % 4` for a function on bus 0.
+pub fn intx_lines() -> &'static [u8] {
+    if INTX_ROUTED.load(Ordering::Relaxed) {
+        &INTX_LINES
+    } else {
+        &[]
+    }
+}
+
+/// Routes the PCI interrupt wires to PIC lines. Which wire a function's
+/// pin drives, and how wires reach interrupt lines, is the board's
+/// business (ACPI's `_PRT` describes it); the kernel knows it for QEMU's
+/// q35 alone, where functions in slots 0 to 24 drive wire PIRQ[E-H]
+/// number `(device + pin - 1) % 4`, and the ICH9's LPC bridge (00:1f.0)
+/// steers each wire to the PIC line in its PIRQ[E-H]_ROUT register.
+fn init_intx() {
+    use x86_64::instructions::port::Port;
+    const LPC: u32 = 0x8000_0000 | 0x1f << 11;
+    // SAFETY: the legacy configuration ports, before any other user of
+    // them exists; the ELCR ports are the PIC's.
+    unsafe {
+        let mut address = Port::<u32>::new(0xcf8);
+        address.write(LPC);
+        if Port::<u32>::new(0xcfc).read() != 0x2918_8086 {
+            return; // not an ICH9: routing unknown
+        }
+        // PIRQE_ROUT to PIRQH_ROUT: bit 7 clear routes the wire.
+        address.write(LPC | 0x68);
+        let rout = INTX_LINES.iter().rev().fold(0u32, |r, &l| r << 8 | l as u32);
+        Port::<u32>::new(0xcfc).write(rout);
+        address.write(0);
+        // PCI interrupts are level-triggered, active low: say so in the
+        // PIC's edge/level control registers.
+        let level = INTX_LINES.iter().fold(0u16, |m, &l| m | 1 << l);
+        let mut elcr1 = Port::<u8>::new(0x4d0);
+        let mut elcr2 = Port::<u8>::new(0x4d1);
+        let (low, high) = (elcr1.read(), elcr2.read());
+        elcr1.write(low | level as u8);
+        elcr2.write(high | (level >> 8) as u8);
+    }
+    INTX_ROUTED.store(true, Ordering::Relaxed);
+}
+
 /// MSI vectors: interrupt lines `MSI_LINE_BASE ..` arrive on vectors
 /// `MSI_VECTOR_BASE ..` at the local APIC.
 pub const MSI_VECTOR_BASE: u8 = 0x40;
@@ -104,43 +160,58 @@ pub fn msi_message(line: u8, source: Option<u16>) -> Option<(u64, u64)> {
 }
 
 pub fn irq_routable(line: u8) -> bool {
-    line == COM1_IRQ || is_msi(line)
+    line == COM1_IRQ || is_msi(line) || intx_lines().contains(&line)
 }
 
-/// Masks a line on the master PIC (lines 0-7).
-pub fn pic_mask(line: u8) {
+/// The mask register of the PIC that has `line` (the master: lines 0-7,
+/// the slave: 8-15), and the line's bit in it.
+fn pic_of(line: u8) -> (x86_64::instructions::port::Port<u8>, u8) {
     use x86_64::instructions::port::Port;
-    let mut data = Port::<u8>::new(0x21);
-    // SAFETY: read-modify-write of the master PIC's mask register.
-    unsafe {
-        let m = data.read();
-        data.write(m | 1 << line);
+    if line < 8 {
+        (Port::new(0x21), 1 << line)
+    } else {
+        (Port::new(0xa1), 1 << (line - 8))
     }
 }
 
-/// Unmasks a line on the master PIC.
+/// Masks a PIC line.
+pub fn pic_mask(line: u8) {
+    let (mut data, bit) = pic_of(line);
+    // SAFETY: read-modify-write of a PIC's mask register.
+    unsafe {
+        let m = data.read();
+        data.write(m | bit);
+    }
+}
+
+/// Unmasks a PIC line.
 pub fn pic_unmask(line: u8) {
     if line >= 16 {
         return; // not a PIC line (an MSI vector: never masked)
     }
-    use x86_64::instructions::port::Port;
-    let mut data = Port::<u8>::new(0x21);
+    let (mut data, bit) = pic_of(line);
     // SAFETY: as in `pic_mask`.
     unsafe {
         let m = data.read();
-        data.write(m & !(1 << line));
+        data.write(m & !bit);
     }
 }
 
-/// End of interrupt on the master PIC.
-pub fn pic_eoi(_line: u8) {
+/// End of interrupt for a PIC line: at the slave too, for one of its.
+pub fn pic_eoi(line: u8) {
     use x86_64::instructions::port::Port;
-    // SAFETY: non-specific EOI to the master PIC's command port.
-    unsafe { Port::<u8>::new(0x20).write(0x20) };
+    // SAFETY: non-specific EOI to the PICs' command ports.
+    unsafe {
+        if line >= 8 {
+            Port::<u8>::new(0xa0).write(0x20);
+        }
+        Port::<u8>::new(0x20).write(0x20);
+    }
 }
 
 pub fn init() {
     disable_legacy_pic();
+    init_intx();
     IDT.load();
 }
 

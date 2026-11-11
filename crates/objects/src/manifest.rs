@@ -32,7 +32,8 @@
 //!   fault-injector          # may ask the manager to kill components
 //! ```
 //!
-//! Slots are in the component's own CSpace, a CNode of [`CSPACE_SLOTS`].
+//! Slots are in the component's own CSpace, a CNode of [`CSPACE_SLOTS`]
+//! (more, up to 256 nameable here, after a `cspace` directive).
 //! Parsing checks everything that can be checked without the bundle:
 //! unique names, slots in range and not reused, every `uses` matching
 //! some `provides`, and every lazy component providing something (or it
@@ -225,9 +226,12 @@ impl<'a> Manifest<'a> {
             let number = |w: &'a str| -> Result<u64, ParseError<'a>> {
                 w.parse::<u64>().map_err(|_| err("expected a number", w))
             };
+            // Slots past the usual CSpace are for a component whose
+            // `cspace` directive, earlier, made it larger.
+            let slots = (1usize << c.cspace_bits).min(256);
             let slot = |w: &'a str| -> Result<u8, ParseError<'a>> {
                 match w.parse::<usize>() {
-                    Ok(s) if s < CSPACE_SLOTS => Ok(s as u8),
+                    Ok(s) if s < slots => Ok(s as u8),
                     _ => Err(err("slot out of range", w)),
                 }
             };

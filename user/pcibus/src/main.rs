@@ -37,10 +37,17 @@
 //! bridge's ID, so no domain could isolate it, and it gets none (and so
 //! no bus mastering).
 //!
+//! Legacy interrupts: a function with no MSI gets the interrupt line
+//! its pin is wired to (`pci::INTX`), one function a line: the wire of a
+//! function on bus 0 is `(device + pin - 1) % 4`, and a bridge passes
+//! the pins of what is behind it on rotated by their device numbers.
+//!
 //! Slots: 0 the `pci` endpoint (receive), 1 configuration space (I/O ports
 //! on x86-64, ECAM device memory on AArch64), 2 the BAR window (device
 //! memory), 3.. the MSI vectors, then the IOMMU-control capability (empty
-//! without an IOMMU) and untyped memory for the domains.
+//! without an IOMMU) and untyped memory for the domains; from 64, if the
+//! manifest gives them (`device intx 64`, in a CSpace of 2^7 slots), the
+//! four legacy PCI interrupt lines.
 
 #![no_std]
 #![no_main]
@@ -72,6 +79,9 @@ const DOMAIN_MEMORY: u64 = BAR_SLOTS + MAX_BAR_PAGES as u64;
 const DOMAINS: u64 = DOMAIN_MEMORY + MAX_OPEN as u64;
 const DOMAIN_BITS: u64 = 16;
 const _: () = assert!(DOMAINS + MAX_OPEN as u64 <= 64);
+/// The legacy interrupt lines, one per wire.
+const INTX: u64 = 64;
+const INTX_COUNT: usize = root::INTX_COUNT as usize;
 
 // Configuration space.
 const COMMAND: u64 = 0x04;
@@ -131,6 +141,8 @@ struct Bus {
     /// (function, BAR, page) of each BAR page original.
     bar_pages: [Option<(u8, u8, u16)>; MAX_BAR_PAGES],
     msi_owner: [Option<u8>; MSI_COUNT],
+    /// The function that has each legacy interrupt line.
+    intx_owner: [Option<u8>; INTX_COUNT],
     /// The function each domain slot belongs to.
     domain_owner: [Option<u8>; MAX_OPEN],
     window_base: u64,
@@ -473,6 +485,12 @@ impl Bus {
         for v in self.funcs[i].unwrap().msi.iter().flatten() {
             syscall(Syscall::CapRevoke, MSI + *v as u64, [0; 4]);
         }
+        for (w, owner) in self.intx_owner.iter_mut().enumerate() {
+            if *owner == Some(i as u8) {
+                syscall(Syscall::CapRevoke, INTX + w as u64, [0; 4]);
+                *owner = None;
+            }
+        }
         if let Some(cap) = self.capability(i, CAP_MSIX) {
             let ctl = self.read16(i, cap + 2) as u32;
             self.write(i, cap + 2, ctl & !(1 << 15), 2);
@@ -713,6 +731,51 @@ impl Bus {
     }
 
     /// Serves one call. Returns the reply and a capability to grant.
+    /// The interrupt wire function `i`'s pin drives.
+    fn wire(&self, i: usize) -> Option<usize> {
+        let f = self.funcs[i].unwrap();
+        let pin = self.read8(i, 0x3d) as usize;
+        if !(1..=4).contains(&pin) {
+            return None;
+        }
+        let (mut bus, mut dev, mut pin) = (f.bus, f.dev as usize, pin - 1);
+        // Up through each bridge: the pin comes out rotated by the
+        // device number.
+        while bus != 0 {
+            let up = (0..MAX_FUNCS).find(|&b| {
+                matches!(self.funcs[b], Some(g) if g.bridge)
+                    && (self.read(b, BUS_NUMBERS) >> 8) as u8 == bus
+            })?;
+            pin = (pin + dev) % 4;
+            let g = self.funcs[up].unwrap();
+            (bus, dev) = (g.bus, g.dev as usize);
+        }
+        // On QEMU's q35 the slots from 25 up are the chipset's, wired
+        // their own way.
+        if cfg!(target_arch = "x86_64") && dev >= 25 {
+            return None;
+        }
+        Some((pin + dev) % 4)
+    }
+
+    /// Gives function `i` its legacy interrupt line: the slot of the
+    /// capability to grant, and the wire.
+    fn intx(&mut self, i: usize) -> Result<(u64, u64), Status> {
+        let w = self.wire(i).ok_or(Status::NotFound)?;
+        match self.intx_owner[w] {
+            Some(o) if o as usize != i => return Err(Status::InUse),
+            _ => {}
+        }
+        // An empty slot: the manifest gave no lines, or the kernel does
+        // not know this machine's routing.
+        if syscall(Syscall::IrqAck, INTX + w as u64, [0; 4]).status != 0 {
+            return Err(Status::NotFound);
+        }
+        self.intx_owner[w] = Some(i as u8);
+        self.set_command(i, 0, CMD_INTX_DISABLE);
+        Ok((INTX + w as u64, w as u64))
+    }
+
     fn serve(&mut self, badge: u64, m: [u64; 4]) -> ([u64; 4], Option<u64>) {
         let status = |s: Status| ([s as u64, 0, 0, 0], None);
         if m[0] == pci::OPEN || m[0] == pci::OPEN_CLASS {
@@ -759,6 +822,10 @@ impl Bus {
                 Ok(slot) => ([Status::Ok as u64, 0, 0, 0], Some(slot)),
                 Err(s) => status(s),
             },
+            pci::INTX => match self.intx(i) {
+                Ok((slot, wire)) => ([Status::Ok as u64, wire, 0, 0], Some(slot)),
+                Err(s) => status(s),
+            },
             _ => status(Status::Invalid),
         }
     }
@@ -782,6 +849,7 @@ pub extern "C" fn _start(_: u64) -> ! {
         funcs: [None; MAX_FUNCS],
         bar_pages: [None; MAX_BAR_PAGES],
         msi_owner: [None; MSI_COUNT],
+        intx_owner: [None; INTX_COUNT],
         domain_owner: [None; MAX_OPEN],
         window_base: base,
         window_next: base,

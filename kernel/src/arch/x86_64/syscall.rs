@@ -599,6 +599,59 @@ extern "C" fn com1_handler(frame: &mut UserFrame) -> Exit {
     crate::task::handle_irq(frame, super::interrupts::COM1_IRQ)
 }
 
+/// Entries for the PCI interrupt lines (`interrupts::INTX_LINES`), like
+/// COM1's: masked until the driver acknowledges, since the device holds
+/// its line down until the driver has dealt with it.
+macro_rules! intx_entries {
+    ($($entry:ident $handler:ident $n:literal),* $(,)?) => {
+        $(
+            #[unsafe(naked)]
+            pub unsafe extern "C" fn $entry() {
+                naked_asm!(
+                    "push r11",
+                    "push rcx",
+                    "push rax",
+                    "push rbx",
+                    "push rdx",
+                    "push rsi",
+                    "push rdi",
+                    "push rbp",
+                    "push r8",
+                    "push r9",
+                    "push r10",
+                    "push r12",
+                    "push r13",
+                    "push r14",
+                    "push r15",
+                    "cld", // the ABI wants DF clear; user code may have set it
+                    "mov rdi, rsp",
+                    "call {handler}",
+                    "jmp {ret}",
+                    handler = sym $handler,
+                    ret = sym return_to_user,
+                )
+            }
+
+            extern "C" fn $handler(frame: &mut UserFrame) -> Exit {
+                let line = super::interrupts::INTX_LINES[$n];
+                super::interrupts::pic_mask(line);
+                super::interrupts::pic_eoi(line);
+                crate::task::handle_irq(frame, line)
+            }
+        )*
+
+        /// The entry for each PCI interrupt line, in order.
+        pub const INTX_ENTRIES: [unsafe extern "C" fn(); 4] = [$($entry),*];
+    };
+}
+
+intx_entries!(
+    intx0_entry intx0_handler 0,
+    intx1_entry intx1_handler 1,
+    intx2_entry intx2_handler 2,
+    intx3_entry intx3_handler 3,
+);
+
 /// Entries for the MSI vectors, one per vector: each saves the user
 /// registers as the timer's does and passes its vector's index on.
 macro_rules! msi_entries {

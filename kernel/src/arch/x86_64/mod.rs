@@ -173,6 +173,11 @@ pub fn irq_unmask(line: u8) {
     interrupts::pic_unmask(line)
 }
 
+/// The legacy PCI interrupt lines, where their routing is known.
+pub fn intx_lines() -> &'static [u8] {
+    interrupts::intx_lines()
+}
+
 /// Reads an I/O port the caller's capability grants.
 pub fn io_in(port: u16, width: u64) -> u64 {
     use x86_64::instructions::port::Port;

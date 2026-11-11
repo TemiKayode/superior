@@ -560,8 +560,15 @@ pub mod root {
     /// across a fast reboot ([`Syscall::Reboot`]), zeroed at power-on.
     pub const STATE_STORE: u64 = IOMMU + 1;
     pub const STATE_PAGES: u64 = 16;
+    /// The legacy PCI interrupt lines (IRQ capabilities), [`INTX_COUNT`]
+    /// of them in consecutive slots, for functions with no MSI: the one a
+    /// function's pin reaches is slot `(device + pin - 1) % 4` for a
+    /// function on bus 0. Empty where the kernel does not know the
+    /// machine's routing.
+    pub const INTX: u64 = STATE_STORE + STATE_PAGES;
+    pub const INTX_COUNT: u64 = 4;
     /// The first slot with nothing in it.
-    pub const FIRST_FREE: u64 = STATE_STORE + STATE_PAGES;
+    pub const FIRST_FREE: u64 = INTX + INTX_COUNT;
     /// The root task's argument: the bundle's length, and in the bits from
     /// [`REBOOTS_SHIFT`] how many fast reboots came before this start.
     pub const REBOOTS_SHIFT: u32 = 32;

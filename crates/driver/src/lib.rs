@@ -153,6 +153,21 @@ impl Pci {
         Ok(m)
     }
 
+    /// For a function with no MSI: takes its legacy interrupt line into
+    /// `slot` and binds it to the notification in `notification`. The
+    /// line is masked each time it signals: [`irq_ack`] unmasks it, once
+    /// the device no longer asserts it. Returns which of the bus's four
+    /// interrupt wires it is.
+    pub fn intx(&self, slot: u64, notification: u64) -> Result<u64, Failure> {
+        let r = self.call([pci::INTX, 0, 0, 0], Some(slot))?;
+        if r.cap != Some(slot as u16) {
+            return Err(("no interrupt line arrived", 0));
+        }
+        sys(Syscall::IrqSetNotification, slot, [notification, 0, 0, 0])
+            .map(|_| r.msg[1])
+            .map_err(|e| ("binding the interrupt line", e))
+    }
+
     /// Takes MSI vector `n` into `slot` and nothing more: the vector is
     /// routed for no device until [`msi_message`] says otherwise.
     pub fn take_msi_vector(&self, n: u64, slot: u64) -> Result<(), Failure> {
@@ -184,6 +199,12 @@ impl Pci {
         }
         Ok(None)
     }
+}
+
+/// Unmasks the level-triggered interrupt line in `slot`, which the kernel
+/// masked when it signalled.
+pub fn irq_ack(slot: u64) {
+    syscall(Syscall::IrqAck, slot, [0; 4]);
 }
 
 /// Registers mapped at `base`.
