@@ -23,17 +23,24 @@
 //! - One thread: handler, poll and transmit never run at once, so Linux's
 //!   locks are empty.
 //!
-//! The component serves the `nic` interface by calls (`RECV`, `SEND`);
-//! frame rings are still to come. Slots: 0 the bus server, 1 the `nic`
-//! endpoint (receive), 2 a notification, 3 untyped memory (512 KiB), in a
-//! CSpace of 2^7 slots.
+//! The component serves the `nic` interface: by calls (`RECV`, `SEND`),
+//! and through frame rings (`nic::ring`) once its caller has set them up.
+//! Then the frames the driver delivers go from the host's receive queue
+//! into the receive ring, and the frames the caller puts in the transmit
+//! ring go to the driver's transmit routine, with no call for either; the
+//! caller's doorbell is a badged copy of the component's notification, so
+//! it wakes the same loop the interrupt does. Slots: 0 the bus server, 1
+//! the `nic` endpoint (receive), 2 a notification, 3 untyped memory (512
+//! KiB), in a CSpace of 2^8 slots.
 
 #![no_std]
 
 use core::cell::UnsafeCell;
 use core::ffi::{c_char, c_int, c_uint, c_ulong, c_void};
+use core::sync::atomic::{AtomicU32, Ordering, fence};
 use superior_driver::{DmaPage, Failure, Pci, dma_barrier, irq_ack};
 use superior_objects::abi::{CapTransfer, Error, Syscall, TICK_HZ};
+use superior_objects::interfaces::nic::ring;
 use superior_objects::interfaces::{Status, nic};
 use superior_sys::{USER_BASE, print_line, syscall, syscall_x};
 
@@ -51,13 +58,20 @@ const BAR_SLOTS: u64 = 8;
 const MAX_BAR_PAGES: u64 = 16;
 const POOL: u64 = BAR_SLOTS + MAX_BAR_PAGES;
 const POOL_PAGES: usize = 96;
-const _: () = assert!(POOL + POOL_PAGES as u64 <= 128);
+/// The doorbell: this component's notification, to signal only, granted
+/// to the ring's caller.
+const DOORBELL: u64 = POOL + POOL_PAGES as u64;
+/// The caller's ring pages.
+const RING: u64 = DOORBELL + 1;
+const _: () = assert!(RING + ring::PAGES <= 256);
 /// Every right, for keeping a granted capability.
 const ALL: u64 = 0x1f;
+const WRITE: u64 = 2;
 
 const BAR_VA: u64 = USER_BASE + 0x4000_0000;
 const POOL_VA: u64 = USER_BASE + 0x5000_0000;
 const LENT_VA: u64 = USER_BASE + 0x6000_0000;
+const RING_VA: u64 = USER_BASE + 0x7000_0000;
 const PAGE: usize = 4096;
 
 /// Linux's `HZ` in the headers is the kernel's tick rate.
@@ -125,6 +139,16 @@ struct Host {
     rx_tail: usize,
     rx_dropped: u64,
     attached: bool,
+    /// The caller's ring: pages attached so far, whether it is started,
+    /// and this side's ends of the two rings.
+    ring_pages: u64,
+    ring: bool,
+    ring_rx_tail: u32,
+    ring_tx_head: u32,
+    /// Frames sent and received, and how many of them through the rings.
+    sent: u64,
+    received: u64,
+    by_ring: u64,
 }
 
 struct Cell(UnsafeCell<Host>);
@@ -147,7 +171,25 @@ static HOST: Cell = Cell(UnsafeCell::new(Host {
     rx_tail: 0,
     rx_dropped: 0,
     attached: false,
+    ring_pages: 0,
+    ring: false,
+    ring_rx_tail: 0,
+    ring_tx_head: 0,
+    sent: 0,
+    received: 0,
+    by_ring: 0,
 }));
+
+/// Word `off` of the ring's header page.
+fn hdr(off: usize) -> &'static AtomicU32 {
+    // SAFETY: only used while the ring is started, its header mapped.
+    unsafe { &*((RING_VA + off as u64) as *const AtomicU32) }
+}
+
+/// Where frame `i` of a ring whose slots start at page `page` lies.
+fn ring_slot(page: u64, i: u32, slots: u32) -> u64 {
+    RING_VA + page * PAGE as u64 + (i % slots) as u64 * ring::SLOT
+}
 
 /// The host's state. The driver calls back into the host while the host
 /// calls the driver, so no reference from here is held across a call into
@@ -469,6 +511,9 @@ fn start() -> Result<(), Failure> {
     if rc != 0 {
         return Err(("the driver could not bring the interface up, errno", -rc as u64));
     }
+    if syscall(Syscall::CapMint, NOTIFY, [DOORBELL, WRITE, 2, 0]).status != 0 {
+        return Err(("making the doorbell", 0));
+    }
     Ok(())
 }
 
@@ -491,13 +536,179 @@ fn pump() {
         }
     }
     let h = host();
-    if h.attached && h.rx_waiting() > before {
+    if !h.ring && h.attached && h.rx_waiting() > before {
         syscall(Syscall::Signal, LISTENER, [0; 4]);
+    }
+}
+
+fn count_frame(sent: bool, by_ring: bool) {
+    let h = host();
+    if sent {
+        h.sent += 1;
+    } else {
+        h.received += 1;
+    }
+    h.by_ring += by_ring as u64;
+    let (s, r, b) = (h.sent, h.received, h.by_ring);
+    if sent && s.is_power_of_two() && s >= 64 {
+        say!("{s} frames sent, {r} received ({b} of them through the rings)");
+    }
+}
+
+/// `RING_ATTACH`: keeps and maps page `page` of the caller's ring.
+fn ring_attach(page: u64, lent: bool) -> Status {
+    if !lent || page >= ring::PAGES {
+        return Status::Invalid;
+    }
+    if page == 0 {
+        ring_drop();
+    }
+    if host().ring || page != host().ring_pages {
+        return Status::Invalid;
+    }
+    // A copy of what was lent: the lent capability goes after the call.
+    if syscall(Syscall::CapMint, LENT, [RING + page, ALL, 0, 0]).status != 0 {
+        return Status::Invalid;
+    }
+    let va = RING_VA + page * PAGE as u64;
+    if syscall(Syscall::FrameMap, RING + page, [va, 1, 0, 0]).status != 0 {
+        syscall(Syscall::CapDelete, RING + page, [0; 4]);
+        return Status::Invalid;
+    }
+    host().ring_pages += 1;
+    Status::Ok
+}
+
+/// Lets go of the ring: its pages, and the caller's doorbell.
+fn ring_drop() {
+    let h = host();
+    h.ring = false;
+    for p in 0..h.ring_pages {
+        // Deleting the capability unmaps the page.
+        syscall(Syscall::CapDelete, RING + p, [0; 4]);
+    }
+    h.ring_pages = 0;
+    syscall(Syscall::CapRevoke, DOORBELL, [0; 4]);
+}
+
+/// `RING_START`: the rings begin empty. The reply grants DOORBELL.
+fn ring_start() -> Status {
+    let h = host();
+    if h.ring || h.ring_pages != ring::PAGES {
+        return Status::Invalid;
+    }
+    for off in (0..PAGE).step_by(4) {
+        hdr(off).store(0, Ordering::Relaxed);
+    }
+    fence(Ordering::SeqCst);
+    (h.ring_rx_tail, h.ring_tx_head) = (0, 0);
+    h.ring = true;
+    say!("frame rings started");
+    Status::Ok
+}
+
+/// Moves received frames from the host's queue into the receive ring, as
+/// many as it has room for, and tells a sleeping caller.
+fn ring_pump_rx() {
+    let mut moved = false;
+    while host().ring && host().rx_waiting() > 0 {
+        let h = host();
+        let head = hdr(ring::RX_HEAD).load(Ordering::Acquire);
+        if ring::waiting(head, h.ring_rx_tail, ring::RX_SLOTS) == ring::RX_SLOTS {
+            // Full: the rest wait in the queue (`before_sleep` tells the
+            // caller).
+            break;
+        }
+        let i = h.rx_head % RX_FRAMES;
+        let len = h.rx_len[i] as usize;
+        let at = h.ring_rx_tail % ring::RX_SLOTS;
+        let to = ring_slot(ring::RX_PAGE, h.ring_rx_tail, ring::RX_SLOTS);
+        // SAFETY: the ring's pages are mapped; a queued frame fits a slot.
+        unsafe { core::ptr::copy_nonoverlapping(h.rx[i].as_ptr(), to as *mut u8, len) };
+        hdr(ring::RX_LEN + 4 * at as usize).store(len as u32, Ordering::Relaxed);
+        h.rx_head += 1;
+        h.ring_rx_tail = h.ring_rx_tail.wrapping_add(1);
+        hdr(ring::RX_TAIL).store(h.ring_rx_tail, Ordering::Release);
+        count_frame(false, true);
+        moved = true;
+    }
+    if moved {
+        fence(Ordering::SeqCst);
+        if hdr(ring::CALLER_SLEEPS).swap(0, Ordering::SeqCst) != 0 && host().attached {
+            syscall(Syscall::Signal, LISTENER, [0; 4]);
+        }
+    }
+}
+
+/// Sends the frames waiting in the transmit ring. True if some are left
+/// because the driver's transmit queue is full: its interrupt, when the
+/// device has sent some, wakes the loop.
+fn ring_pump_tx() -> bool {
+    while host().ring {
+        let head = host().ring_tx_head;
+        let tail = hdr(ring::TX_TAIL).load(Ordering::Acquire);
+        if ring::waiting(head, tail, ring::TX_SLOTS) == 0 {
+            break;
+        }
+        let at = head % ring::TX_SLOTS;
+        // Read once: the caller may change it at any time.
+        let len = hdr(ring::TX_LEN + 4 * at as usize).load(Ordering::Relaxed) as u64;
+        let from = ring_slot(ring::TX_PAGE, head, ring::TX_SLOTS);
+        if (14..=nic::MAX_FRAME).contains(&len) {
+            // SAFETY: the slot is mapped; lde.c copies the frame out
+            // before it returns.
+            match unsafe { lde_xmit(from as *const c_void, len as usize) } {
+                0 => count_frame(true, true),
+                1 => return true,
+                _ => {} // the interface is down: the frame is lost
+            }
+        }
+        // Only now is the slot the caller's again.
+        let h = host();
+        h.ring_tx_head = head.wrapping_add(1);
+        hdr(ring::TX_HEAD).store(h.ring_tx_head, Ordering::Release);
+    }
+    false
+}
+
+/// Before the component waits: runs the driver's poll, empties the rings
+/// as far as it can, says it sleeps, and looks once more, so that nothing
+/// put in a ring meanwhile is left there with nobody to signal.
+fn before_sleep() {
+    loop {
+        pump();
+        if !host().ring {
+            return;
+        }
+        ring_pump_rx();
+        let stuck = ring_pump_tx();
+        hdr(ring::DRIVER_SLEEPS).store(1, Ordering::SeqCst);
+        // Frames kept from a full ring wait in the queue, and behind it
+        // in the driver: the caller rings the doorbell once it has taken
+        // some.
+        // SAFETY: lde.c's, from the one thread.
+        let held = host().rx_waiting() > 0 || unsafe { lde_poll_pending() } != 0;
+        hdr(ring::RX_STALLED).store(held as u32, Ordering::SeqCst);
+        fence(Ordering::SeqCst);
+        let h = host();
+        let tail = hdr(ring::TX_TAIL).load(Ordering::Acquire);
+        let to_send = ring::waiting(h.ring_tx_head, tail, ring::TX_SLOTS) != 0;
+        let head = hdr(ring::RX_HEAD).load(Ordering::Acquire);
+        let room = ring::waiting(head, h.ring_rx_tail, ring::RX_SLOTS) < ring::RX_SLOTS;
+        if !((to_send && !stuck) || (room && held)) {
+            return;
+        }
+        hdr(ring::DRIVER_SLEEPS).store(0, Ordering::SeqCst);
     }
 }
 
 fn recv() -> [u64; 4] {
     let attached = host().attached as u64;
+    if host().ring {
+        // Frames go to the ring, in order.
+        ring_pump_rx();
+        return [Status::Empty as u64, 0, attached, 1];
+    }
     let h = host();
     if h.rx_waiting() == 0 {
         return [Status::Empty as u64, 0, attached, 0];
@@ -510,6 +721,7 @@ fn recv() -> [u64; 4] {
     // SAFETY: the lent page is mapped and a frame fits in it.
     unsafe { core::ptr::copy_nonoverlapping(h.rx[i].as_ptr(), LENT_VA as *mut u8, len) };
     h.rx_head += 1;
+    count_frame(false, false);
     [Status::Ok as u64, len as u64, attached, 0]
 }
 
@@ -523,7 +735,10 @@ fn send(len: u64) -> Status {
     for attempt in 0..2 {
         // SAFETY: the lent page is mapped; lde.c copies the frame.
         match unsafe { lde_xmit(LENT_VA as *const c_void, len as usize) } {
-            0 => return Status::Ok,
+            0 => {
+                count_frame(true, false);
+                return Status::Ok;
+            }
             1 if attempt == 0 => {
                 // The driver's queue is full: let it see what the device
                 // has sent since its last interrupt, and try once more.
@@ -554,6 +769,8 @@ fn serve(m: [u64; 4], lent: bool, cap: Option<u16>) -> [u64; 4] {
         }
         nic::RECV if lent => recv(),
         nic::SEND if lent => status(send(m[1])),
+        nic::RING_ATTACH => status(ring_attach(m[1], lent)),
+        nic::RING_START => status(ring_start()),
         _ => status(Status::Invalid),
     }
 }
@@ -588,19 +805,30 @@ pub fn run(name: &'static str) -> ! {
         grant: None,
         accept: Some(LENT as u16),
     };
-    let mut reply: Option<[u64; 4]> = None;
+    let mut reply: Option<([u64; 4], bool)> = None;
     loop {
-        pump();
+        before_sleep();
         let r = match reply.take() {
-            Some(m) => syscall_x(Syscall::ReplyRecv, SERVICE, m, accept),
+            Some((m, doorbell)) => {
+                let x = CapTransfer {
+                    grant: doorbell.then_some(DOORBELL as u16),
+                    ..accept
+                };
+                syscall_x(Syscall::ReplyRecv, SERVICE, m, x)
+            }
             None => syscall_x(Syscall::Recv, SERVICE, [0; 4], accept),
         };
         if r.status == Error::Notified.code() {
-            // The driver's handler quiets the device (it masks what it
-            // leaves for the poll), so the line can be unmasked after.
+            // The interrupt, or the doorbell (the handler then finds
+            // nothing to do). The driver's handler quiets the device (it
+            // masks what it leaves for the poll), so the line can be
+            // unmasked after.
             // SAFETY: lde.c's, from the one thread.
             unsafe { lde_interrupt() };
             irq_ack(IRQ);
+            if host().ring {
+                hdr(ring::DRIVER_SLEEPS).store(0, Ordering::SeqCst);
+            }
             continue;
         }
         if r.status != 0 {
@@ -620,6 +848,6 @@ pub fn run(name: &'static str) -> ! {
             // The caller's frame goes back before the reply.
             syscall(Syscall::CapDelete, LENT, [0; 4]);
         }
-        reply = Some(m);
+        reply = Some((m, r.msg[0] == nic::RING_START && m[0] == 0));
     }
 }

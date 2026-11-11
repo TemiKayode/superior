@@ -1620,6 +1620,7 @@ fn net_test(arch: Arch, manifest: &str) -> Result<(), String> {
         "lde 8139cp: the device's legacy interrupt line (wire",
         "lde 8139cp: eth0: link up, 100Mbps, full-duplex",
         "lde 8139cp: Linux's 8139cp driver runs the interface: MAC 52:54:00:12:34:56, link up",
+        "lde 8139cp: frame rings started",
     ];
     if lde {
         check_log("Linux Driver Environment test", &out, &linux)?;
@@ -1654,11 +1655,7 @@ fn net_test(arch: Arch, manifest: &str) -> Result<(), String> {
         "UDP datagrams of 1453 to 4000 bytes sent to itself over IPv6, in fragments, every byte right",
         "[pass] net: datagrams of 4097, 30000 and 65507 bytes sent to itself over IPv6, and a 20000-byte IPv6 ping of this host answered, every byte right",
         "TCP connections over IPv6 echoed",
-        if lde {
-            "frames to and from the driver, a call each (it has no rings)"
-        } else {
-            "frames through the rings with the driver,"
-        },
+        "frames through the rings with the driver,",
         "[cm] client asked to shut down (pass)",
     ];
     check_log("network test", &out, &steps)?;

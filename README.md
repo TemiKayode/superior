@@ -274,7 +274,9 @@ holds the rest):
     capabilities: it finds the device from the driver's own ID table, gives the
     driver memory from a pool that is all the device's IOMMU domain holds, runs
     the driver's interrupt handler and receive poll from the component's one
-    thread (so Linux's locks are empty), and serves the `nic` interface. The
+    thread (so Linux's locks are empty), and serves the `nic` interface, frame
+    rings included: what the driver delivers goes into the receive ring and what
+    the server puts in the transmit ring goes to the driver's transmit routine. The
     driver gets no more than a native one does. The first is Linux 6.6's
     `8139cp` (`user/lde-8139cp/`), on QEMU's RTL-8139C+: Linux is GPL-2.0, so its
     source is not in this repository; `cargo xtask` fetches the one file from
@@ -680,7 +682,7 @@ holds the rest):
   32 of each, 32 address spaces and a 4096-slot pool.
 
 Not yet: in the Linux Driver Environment anything but one network driver
-(`8139cp`), frame rings, ethtool and the MII ioctls, drivers that need work queues,
+(`8139cp`), ethtool and the MII ioctls, drivers that need work queues,
 kernel timers, more than one interrupt or a class other than network; legacy
 interrupt lines shared by two functions, and their routing on machines other
 than QEMU's q35 and `virt`; more than 8 PCI buses, I/O and prefetchable bridge windows, hot-plug, and

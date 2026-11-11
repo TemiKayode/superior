@@ -5,10 +5,8 @@
 # native virtio driver, on QEMU's RTL-8139C+: the same pings, datagrams,
 # names and TCP connections must come through while the injector kills
 # the Linux driver, the network server and the resolver. The card has no
-# MSI, so the bus server is given the legacy PCI interrupt lines. The
-# environment serves no frame rings yet: the server gets no pages for
-# them, and every frame takes a call. Component numbers matter: the
-# injector kills components 1, 2 and 3.
+# MSI, so the bus server is given the legacy PCI interrupt lines.
+# Component numbers matter: the injector kills components 1, 2 and 3.
 
 component pcibus
   image pcibus
@@ -26,7 +24,7 @@ component pcibus
 component lde-8139cp
   image lde-8139cp
   priority 11
-  cspace 7
+  cspace 8
   uses pci 0
   provides nic 1
   notification 2
@@ -47,6 +45,9 @@ component net
   memory 22
   untyped 21 2
   state 17
+  # The frame rings it shares with the driver (nic::ring): kept by the
+  # manager, so a restart of either side leaves the other's mapped.
+  shared 13 18
   cspace 9
 
 # Names: asks the gateway's port 47053, where xtask answers DNS on the
@@ -61,8 +62,7 @@ component dns
 
 component client
   image testclient
-  # The network client, for a driver with no frame rings.
-  arg 21
+  arg 13
   priority 8
   uses net 0
   uses dns 5

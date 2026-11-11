@@ -1935,8 +1935,8 @@ fn injector(targets: &[u64], pauses: bool) -> ! {
     unreachable!()
 }
 
-// ---- the network client (`arg 13`, boot/net.manifest; `arg 21` for a
-// driver with no frame rings, boot/lde.manifest) ----
+// ---- the network client (`arg 13`, boot/net.manifest and
+// boot/lde.manifest) ----
 
 const NET: u64 = 0;
 const NET_CONTROL: u64 = 1;
@@ -3385,9 +3385,7 @@ fn echo_at(k: u64, j: u64) -> u8 {
     }
 }
 
-/// `rings`: the NIC driver serves frame rings (the Linux Driver
-/// Environment's, `arg 21`, does not yet).
-fn net_client(rings: bool) -> ! {
+fn net_client() -> ! {
     let mut t = Checks(0, "net");
     let made = syscall(
         Syscall::Retype,
@@ -3522,20 +3520,13 @@ fn net_client(rings: bool) -> ! {
     // Frames go between the server and the driver through their rings;
     // only around a restart of either does one take a call.
     let s = syscall(Syscall::Call, NET, [net::LINK_STATS, net::VERSION, 0, 0]).msg;
-    if rings {
-        t.check(
-            s[0] == OK && s[3] > 0 && s[1] > 20 * s[2],
-            format_args!(
-                "{} frames through the rings with the driver, {} by a call each; rings set up {} times",
-                s[1], s[2], s[3]
-            ),
-        );
-    } else {
-        t.check(
-            s[0] == OK && s[3] == 0 && s[1] == 0 && s[2] > 1000,
-            format_args!("{} frames to and from the driver, a call each (it has no rings)", s[2]),
-        );
-    }
+    t.check(
+        s[0] == OK && s[3] > 0 && s[1] > 20 * s[2],
+        format_args!(
+            "{} frames through the rings with the driver, {} by a call each; rings set up {} times",
+            s[1], s[2], s[3]
+        ),
+    );
     syscall(Syscall::Call, NET_CONTROL, [OP_SHUTDOWN, t.0, 0, 0]);
     superior_sys::park()
 }
@@ -3659,8 +3650,7 @@ pub extern "C" fn _start(role: u64) -> ! {
         4 => block_client([pci::OPEN, pci::VERSION, 0x1af4 << 16 | 0x1042, 0]),
         11 => block_client([pci::OPEN_CLASS, pci::VERSION, 0x01_08_02, 0]),
         12 => block_client([pci::OPEN_CLASS, pci::VERSION, 0x01_06_01, 0]),
-        13 => net_client(true),
-        21 => net_client(false),
+        13 => net_client(),
         14 => keyboard_client(),
         15 => df_spinner(),
         5 => memory_client(),

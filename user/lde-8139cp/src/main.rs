@@ -4,7 +4,7 @@
 //! here with its host (`superior_lde`), which finds the device from the
 //! driver's own ID table and serves the `nic` interface with it.
 //!
-//! Slots, as the environment wants them: 0 the bus server, 1 the `nic`
+//! Slots, as the environment wants them (in a CSpace of 2^8): 0 the bus server, 1 the `nic`
 //! endpoint (receive), 2 a notification, 3 untyped memory (512 KiB).
 
 #![no_std]
