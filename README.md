@@ -526,6 +526,17 @@ holds the rest):
     again, if it runs out or the DHCP server refuses it. Everything else the server
     holds is lost on a restart, but the lease is kept in its `state` page, so a
     restarted server goes on with the same address at once.
+  - Rings between clients and the network server (`net::ring`, laid out as the
+    filesystem's): a client attaches 16 `shared` pages and submits the calls that
+    lend a page (`SEND`, `RECV` and their IPv6 and by-parts forms, for datagrams
+    and TCP bytes alike) through a submission queue, the page being one of the
+    ring's; the server answers through a completion queue. It takes a ring's
+    worth from each client before every wait, so calls keep their turn; a client
+    rings the doorbell (the server's own notification, badged) only when the
+    server said it sleeps, and the server signals a client only when it asked. A
+    restarted server has lost the rings with the sockets: the client's completion
+    notification is destroyed, and it sets both up again. The network test echoes
+    thousands of datagrams this way under fault injection, with no call each.
   - A DNS resolver (`user/dns/`), a component of its own, serves the `dns`
     interface: a client lends a page holding a name and gets its IPv4 address
     (`RESOLVE`, an A record) or its IPv6 address (`RESOLVE6`, an AAAA record,
@@ -714,8 +725,7 @@ these buses have none); more than one command per queue in the NVMe driver,
 more than two commands in flight per disk in the AHCI driver, ATAPI
 and port multipliers; in the xHCI driver isochronous and bulk endpoints, USB 3 streams,
 hubs and more than one interrupter, and HID devices other than boot keyboards; in the network server
-IPv6 routes beyond one router and stateful DHCPv6, caching of DNS records other than addresses, DNSSEC and DNS over TCP, routes beyond one gateway, and rings between
-clients and the server (frames between the server and the driver go through rings; a client's datagram still takes a call); the async executor, buffer pools and
+IPv6 routes beyond one router and stateful DHCPv6, caching of DNS records other than addresses, DNSSEC and DNS over TCP, routes beyond one gateway; the async executor, buffer pools and
 power callbacks of the SDK; an IDL compiler for the interfaces; escalating a component
 given up on to a supervisor above it (today the
 manager is the only one), memory budgets from a policy service, giving the Memory Server all spare

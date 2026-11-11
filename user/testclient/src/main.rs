@@ -1530,6 +1530,10 @@ fn rbuf(t: usize) -> &'static mut [u8] {
 }
 
 struct Ring {
+    /// The server's endpoint, and its attach, start and doorbell
+    /// operations (the filesystem's or the network server's).
+    server: u64,
+    ops: [u64; 3],
     sq_tail: u32,
     cq_head: u32,
     /// Each tag's request, while in flight: `[op, a, b, c]`.
@@ -1544,6 +1548,10 @@ struct Ring {
 impl Ring {
     /// Maps the shared pages and sets the ring up with the server.
     fn new() -> Option<Ring> {
+        Ring::with(FS, [fs::RING_ATTACH, fs::RING_START, fs::RING_DOORBELL])
+    }
+
+    fn with(server: u64, ops: [u64; 3]) -> Option<Ring> {
         for p in 0..ring::PAGES {
             let va = RING_VA + 4096 * p;
             if syscall(Syscall::FrameMap, RING_SHARED + p, [va, 1, 0, 0]).status != 0 {
@@ -1551,6 +1559,8 @@ impl Ring {
             }
         }
         let mut r = Ring {
+            server,
+            ops,
             sq_tail: 0,
             cq_head: 0,
             inflight: [None; DEPTH],
@@ -1573,18 +1583,19 @@ impl Ring {
                     grant: Some((RING_SHARED + p) as u16),
                     accept: None,
                 };
-                let r = syscall_x(Syscall::Call, FS, [fs::RING_ATTACH, p, 0, 0], x);
+                let r = syscall_x(Syscall::Call, self.server, [self.ops[0], p, 0, 0], x);
                 if r.status != 0 || r.msg[0] != OK {
                     continue 'again;
                 }
             }
-            for (op, slot) in [(fs::RING_START, RING_COMPL), (fs::RING_DOORBELL, RING_BELL)] {
+            for (op, slot) in [(self.ops[1], RING_COMPL), (self.ops[2], RING_BELL)] {
                 let x = CapTransfer {
                     grant: None,
                     accept: Some(slot as u16),
                 };
-                let r = syscall_x(Syscall::Call, FS, [op, 0, 0, 0], x);
+                let r = syscall_x(Syscall::Call, self.server, [op, 0, 0, 0], x);
                 if r.status != 0 || r.msg[0] != OK || r.cap != Some(slot as u16) {
+                    superior_sys::sleep(1);
                     continue 'again;
                 }
             }
@@ -1679,6 +1690,25 @@ impl Ring {
             }
         }
         true
+    }
+
+    /// Has everything in flight answered: `done(tag, reply, buffer)` for
+    /// each. False if the server is gone (restarted).
+    fn settle(&mut self, mut done: impl FnMut(usize, [u64; 4], &[u8])) -> bool {
+        loop {
+            if !self.kick() {
+                return false;
+            }
+            while let Some((t, r)) = self.reap() {
+                done(t, r, rbuf(t));
+            }
+            if self.inflight.iter().all(|x| x.is_none()) {
+                return true;
+            }
+            if !self.wait() {
+                return false;
+            }
+        }
     }
 
     /// Runs requests `0..n`, `DEPTH` in flight: `make(i, buffer)` fills
@@ -2359,6 +2389,121 @@ impl Sock {
             _ => self.rebind(),
         }
     }
+}
+
+/// Rounds of datagrams through the client's ring, and for at least this
+/// many ticks, so the injector's kills land among them.
+const RING_ROUNDS: u64 = 100;
+const RING_TICKS: u64 = 300;
+const RING_BURST: usize = 4;
+
+/// UDP echoes through the client's ring with the network server
+/// (`net::ring`): each round submits a burst of datagrams, then asks for
+/// what has arrived a burst at a time, sleeping on the socket's
+/// notification when there is nothing. No request takes a call. Under
+/// fault injection: a restarted server has lost the ring and the socket,
+/// and both are set up again.
+fn net_ring_checks(t: &mut Checks, gw: u64) {
+    let ops = [net::RING_ATTACH, net::RING_START, net::RING_DOORBELL];
+    let (Some(mut r), Some(mut s)) = (Ring::with(NET, ops), Sock::new(true)) else {
+        t.check(false, format_args!("the client's ring with the network server: set up"));
+        return;
+    };
+    let to = gw | ECHO_PORT as u64;
+    let (mut echoed, mut requests, mut resent, mut round) = (0u64, 0u64, 0u64, 0u64);
+    let start = ticks();
+    // The ring, and the socket if the server lost it, set up again.
+    let recover = |r: &mut Ring, s: &mut Sock| {
+        r.inflight = [None; DEPTH];
+        r.reconnects += 1;
+        r.register();
+        s.rebind_if_lost();
+    };
+    while round < RING_ROUNDS || ticks() < start + RING_TICKS {
+        let number = |b: usize| 5_000_000 + round * RING_BURST as u64 + b as u64;
+        let length = |k: u64| 64 + k * 37 % 1200;
+        let mut seen = [false; RING_BURST];
+        let mut tries = 0;
+        'round: while tries < NET_TRIES {
+            tries += 1;
+            resent += (tries > 1) as u64;
+            for b in (0..RING_BURST).filter(|&b| !seen[b]) {
+                let (k, buf) = (number(b), rbuf(b));
+                for j in 0..length(k) {
+                    buf[j as usize] = echo_at(k, j);
+                }
+                r.submit(b, [net::SEND, s.handle, to, length(k)]);
+                requests += 1;
+            }
+            let mut sent = true;
+            if !r.settle(|_, reply, _| sent &= reply[0] == OK) || !sent {
+                recover(&mut r, &mut s);
+                continue 'round;
+            }
+            let deadline = ticks() + NET_TIMEOUT;
+            loop {
+                for b in 0..RING_BURST {
+                    r.submit(RING_BURST + b, [net::RECV, s.handle, 0, 0]);
+                    requests += 1;
+                }
+                let (mut empty, mut lost) = (0, false);
+                let alive = r.settle(|_, reply, buf| {
+                    if reply[0] == Status::Empty as u64 {
+                        empty += 1;
+                    } else if reply[0] != OK {
+                        lost = true;
+                    } else if let Some(b) = (0..RING_BURST).find(|&b| {
+                        let k = number(b);
+                        reply[1] == length(k)
+                            && reply[2] == to
+                            && buf[..reply[1] as usize]
+                                .iter()
+                                .enumerate()
+                                .all(|(j, &x)| x == echo_at(k, j as u64))
+                    }) {
+                        seen[b] = true;
+                    }
+                });
+                if !alive || lost {
+                    recover(&mut r, &mut s);
+                    continue 'round;
+                }
+                if seen.iter().all(|&x| x) {
+                    break 'round;
+                }
+                if empty == RING_BURST {
+                    // Nothing waiting: sleep on the socket's notification.
+                    let now = ticks();
+                    if now >= deadline {
+                        continue 'round;
+                    }
+                    syscall(Syscall::TimerSignal, NET_NTFN, [deadline - now, 0, 0, 0]);
+                    if syscall(Syscall::Wait, NET_NTFN, [0; 4]).status != 0 {
+                        recover(&mut r, &mut s);
+                        continue 'round;
+                    }
+                }
+            }
+        }
+        echoed += seen.iter().filter(|&&x| x).count() as u64;
+        round += 1;
+    }
+    let total = round * RING_BURST as u64;
+    t.check(
+        echoed == total && requests >= 2 * r.doorbells,
+        format_args!(
+            "{echoed} of {total} UDP datagrams echoed through the client's ring, every byte right: {requests} requests, {} doorbells, {} sleeps ({resent} rounds again, ring set up {} more times)",
+            r.doorbells, r.waits, r.reconnects
+        ),
+    );
+    let st = syscall(Syscall::Call, NET, [net::RING_STATS, net::VERSION, 0, 0]).msg;
+    t.check(
+        st[0] == OK && st[1] > 0,
+        format_args!(
+            "the server took {} requests from clients' rings since it last started, woken by {} doorbells",
+            st[1], st[2]
+        ),
+    );
 }
 
 // ---- TCP: in the network test, and the TCP test (`arg 18`,
@@ -3618,6 +3763,7 @@ fn net_client() -> ! {
     dns_checks(&mut t);
     tcp_under_faults(&mut t, Dest::V4(gw | TCP_ECHO_PORT as u64));
     ipv6_checks(&mut t);
+    net_ring_checks(&mut t, gw);
     // Frames go between the server and the driver through their rings;
     // only around a restart of either does one take a call.
     let s = syscall(Syscall::Call, NET, [net::LINK_STATS, net::VERSION, 0, 0]).msg;

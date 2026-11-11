@@ -69,8 +69,9 @@
 #![no_std]
 #![no_main]
 
-use core::sync::atomic::{AtomicU32, Ordering, fence};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
 use superior_objects::abi::{CapTransfer, Error, ObjectType, Syscall};
+use superior_objects::interfaces::net::ring as cring;
 use superior_objects::interfaces::nic::ring;
 use superior_inet::tcp::{self, Bufs, Tcb};
 use superior_inet::{Key, MAX_REASSEMBLED, Outcome, Reassembler, fold, ipv4, mapped, pseudo, sum};
@@ -113,6 +114,15 @@ const REASM_PAGES: u64 = PIECES_PAGES + BIG_PAGES as u64;
 /// Socket `i`'s notification.
 const SOCK_NTFN: u64 = REASM_PAGES + REASM_SIZE.div_ceil(4096) as u64;
 
+/// Clients' rings (`net::ring`): each one's completion notification,
+/// the server's own doorbell (its notification, badged), and each one's
+/// pages.
+const MAX_CRINGS: usize = 4;
+const CRING_NTFN: u64 = SOCK_NTFN + SOCKETS as u64;
+const CRING_BELL: u64 = CRING_NTFN + MAX_CRINGS as u64;
+const CRING_PAGES: u64 = CRING_BELL + 1;
+const _: () = assert!(CRING_PAGES + MAX_CRINGS as u64 * cring::PAGES <= 512);
+
 const RX_VA: u64 = USER_BASE + 0x4000_0000;
 const TX_VA: u64 = RX_VA + 0x1000;
 const LENT_VA: u64 = RX_VA + 0x2000;
@@ -124,10 +134,17 @@ const WHOLE_VA: u64 = RX_VA + 0x40_0000;
 const PIECES_VA: u64 = RX_VA + 0x50_0000;
 const REASM_VA: u64 = RX_VA + 0x60_0000;
 const RING_VA: u64 = RX_VA + 0x70_0000;
+/// Client rings, `CRING_STRIDE` apart.
+const CRING_VA: u64 = RX_VA + 0x80_0000;
+const CRING_STRIDE: u64 = 0x2_0000;
+const _: () = assert!(cring::PAGES * 4096 <= CRING_STRIDE);
 
 /// Badges on this thread's notification.
 const RX: u64 = 1;
 const TIMER: u64 = 2;
+/// A client rang its ring's doorbell (or the server its own, with ring
+/// work left over).
+const RINGBELL: u64 = 4;
 /// Ticks between timer wakeups (100 ms).
 const PERIOD: u64 = 10;
 /// Timer periods an unanswered ARP request is repeated before the frames
@@ -343,6 +360,11 @@ struct Net {
     arp_next: usize,
     waiting: [Option<Waiting>; WAITING],
     sockets: [Option<Socket>; SOCKETS],
+    crings: [Option<ClientRing>; MAX_CRINGS],
+    /// Requests taken from clients' rings, and doorbells that woke the
+    /// server for them.
+    cring_ops: u64,
+    cring_bells: u64,
     /// Handles carry this, so an old instance's handles do not match.
     epoch: u64,
     next_id: u16,
@@ -484,6 +506,9 @@ static mut NET: Net = Net {
     arp_next: 0,
     waiting: [None; WAITING],
     sockets: [const { None }; SOCKETS],
+    crings: [None; MAX_CRINGS],
+    cring_ops: 0,
+    cring_bells: 0,
     epoch: 0,
     next_id: 0,
     conns: [None; CONNS],
@@ -522,6 +547,48 @@ fn count(word: usize, n: u64) {
 fn counted(word: usize) -> u64 {
     // SAFETY: as in `count`.
     unsafe { state().add(word).read_volatile() }
+}
+
+/// Where the page a request lends is: `LENT_VA` for a call (mapped for
+/// the time it is used), or a data page of the caller's ring.
+static DATA: AtomicU64 = AtomicU64::new(LENT_VA);
+
+/// Maps the page lent with a call; a ring's page is mapped already.
+fn map_lent(writable: bool) -> bool {
+    DATA.load(Ordering::Relaxed) != LENT_VA
+        || syscall(Syscall::FrameMap, LENT, [LENT_VA, writable as u64, 0, 0]).status == 0
+}
+
+fn unmap_lent() {
+    if DATA.load(Ordering::Relaxed) == LENT_VA {
+        syscall(Syscall::FrameUnmap, LENT, [0; 4]);
+    }
+}
+
+/// The page the request being served lends.
+fn lent_page() -> &'static mut [u8] {
+    page(DATA.load(Ordering::Relaxed))
+}
+
+/// A client's ring.
+#[derive(Clone, Copy)]
+struct ClientRing {
+    /// The client's badge.
+    owner: u64,
+    /// Pages attached so far.
+    attached: u64,
+    started: bool,
+}
+
+/// A word of a client ring's header.
+fn chdr(page: u64, off: usize) -> &'static AtomicU32 {
+    // SAFETY: the ring page is mapped while the ring is attached, and the
+    // offsets are inside it and aligned.
+    unsafe { &*((page + off as u64) as *const AtomicU32) }
+}
+
+fn cring_va(r: usize) -> u64 {
+    CRING_VA + r as u64 * CRING_STRIDE
 }
 
 fn page(va: u64) -> &'static mut [u8] {
@@ -1799,12 +1866,12 @@ impl Net {
         if n == 0 {
             return [Status::Empty as u64, 0, 0, 0];
         }
-        if syscall(Syscall::FrameMap, LENT, [LENT_VA, 0, 0, 0]).status != 0 {
+        if !map_lent(false) {
             return [Status::Invalid as u64, 0, 0, 0];
         }
         let k = self.conns[c].as_mut().unwrap();
-        let n = k.tcb.write(&mut bufs(c), &page(LENT_VA)[..n]);
-        syscall(Syscall::FrameUnmap, LENT, [0; 4]);
+        let n = k.tcb.write(&mut bufs(c), &lent_page()[..n]);
+        unmap_lent();
         self.pump(c);
         [Status::Ok as u64, n as u64, 0, 0]
     }
@@ -1822,12 +1889,12 @@ impl Net {
                 [Status::Empty as u64, 0, 0, 0]
             };
         }
-        if syscall(Syscall::FrameMap, LENT, [LENT_VA, 1, 0, 0]).status != 0 {
+        if !map_lent(true) {
             return [Status::Invalid as u64, 0, 0, 0];
         }
         let k = self.conns[c].as_mut().unwrap();
-        let n = k.tcb.read(&bufs(c), &mut page(LENT_VA)[..4096]);
-        syscall(Syscall::FrameUnmap, LENT, [0; 4]);
+        let n = k.tcb.read(&bufs(c), &mut lent_page()[..4096]);
+        unmap_lent();
         self.pump(c);
         [Status::Ok as u64, n as u64, peer, 0]
     }
@@ -1928,10 +1995,10 @@ impl Net {
     /// staged. One too big for the transmit page is built in `pieces()`
     /// and goes in fragments.
     fn send(&mut self, i: usize, to: Option<u128>, port: u16, len: usize) -> Status {
-        if len > MAX_DATAGRAM || syscall(Syscall::FrameMap, LENT, [LENT_VA, 0, 0, 0]).status != 0 {
+        if len > MAX_DATAGRAM || !map_lent(false) {
             return Status::Invalid;
         }
-        let lent = page(LENT_VA);
+        let lent = lent_page();
         let (dst, at) = match to {
             Some(d) => (d, 0),
             None => {
@@ -1943,7 +2010,7 @@ impl Net {
         let s = self.sockets[i].as_ref().unwrap();
         let staged = len > 4096 - at;
         if staged && s.staged != len {
-            syscall(Syscall::FrameUnmap, LENT, [0; 4]);
+            unmap_lent();
             return Status::Invalid;
         }
         let (kind, stage) = (s.kind, s.stage);
@@ -1960,7 +2027,7 @@ impl Net {
         } else {
             out[8..].copy_from_slice(&lent[at..at + len]);
         }
-        syscall(Syscall::FrameUnmap, LENT, [0; 4]);
+        unmap_lent();
         if staged {
             self.drop_staged(i);
         }
@@ -2022,13 +2089,13 @@ impl Net {
             s.stage[have..need].copy_from_slice(&more[..need - have]);
             s.stage_pages = need;
         }
-        if syscall(Syscall::FrameMap, LENT, [LENT_VA, 0, 0, 0]).status != 0 {
+        if !map_lent(false) {
             return Status::Invalid;
         }
         let s = self.sockets[i].as_mut().unwrap();
-        pool_write(&s.stage, offset, &page(LENT_VA)[..len]);
+        pool_write(&s.stage, offset, &lent_page()[..len]);
         s.staged = offset + len;
-        syscall(Syscall::FrameUnmap, LENT, [0; 4]);
+        unmap_lent();
         Status::Ok
     }
 
@@ -2041,12 +2108,12 @@ impl Net {
         if offset >= d.len as usize {
             return [Status::Empty as u64, 0, 0, 0];
         }
-        if syscall(Syscall::FrameMap, LENT, [LENT_VA, 1, 0, 0]).status != 0 {
+        if !map_lent(true) {
             return [Status::Invalid as u64, 0, 0, 0];
         }
         let n = (d.len as usize - offset).min(4096);
-        pool_read(&d.pages, offset, &mut page(LENT_VA)[..n]);
-        syscall(Syscall::FrameUnmap, LENT, [0; 4]);
+        pool_read(&d.pages, offset, &mut lent_page()[..n]);
+        unmap_lent();
         [Status::Ok as u64, n as u64, 0, 0]
     }
 
@@ -2058,19 +2125,19 @@ impl Net {
         if s.count == 0 {
             return [Status::Empty as u64, 0, 0, 0];
         }
-        if syscall(Syscall::FrameMap, LENT, [LENT_VA, 1, 0, 0]).status != 0 {
+        if !map_lent(true) {
             return [Status::Invalid as u64, 0, 0, 0];
         }
         let d = s.queue[s.head];
         let n = d.len as usize;
-        let lent = page(LENT_VA);
+        let lent = lent_page();
         let at = if six { 16 } else { 0 };
         let first = n.min(4096 - at);
         pool_read(&d.pages, 0, &mut lent[at..at + first]);
         if six {
             lent[..16].copy_from_slice(&d.from.to_be_bytes());
         }
-        syscall(Syscall::FrameUnmap, LENT, [0; 4]);
+        unmap_lent();
         s.head = (s.head + 1) % QUEUE;
         s.count -= 1;
         // Kept while the client may fetch the rest.
@@ -2089,31 +2156,229 @@ impl Net {
 
     /// The address a client's page starts with (`TCP_CONNECT6`).
     fn lent_addr(&self) -> Option<u128> {
-        if syscall(Syscall::FrameMap, LENT, [LENT_VA, 0, 0, 0]).status != 0 {
+        if !map_lent(false) {
             return None;
         }
         let mut a = [0u8; 16];
-        a.copy_from_slice(&page(LENT_VA)[..16]);
-        syscall(Syscall::FrameUnmap, LENT, [0; 4]);
+        a.copy_from_slice(&lent_page()[..16]);
+        unmap_lent();
         Some(u128::from_be_bytes(a))
     }
 
     /// Writes `addrs` to the start of the client's page.
     fn lend_addrs(&self, addrs: &[u128]) -> bool {
-        if syscall(Syscall::FrameMap, LENT, [LENT_VA, 1, 0, 0]).status != 0 {
+        if !map_lent(true) {
             return false;
         }
         for (k, a) in addrs.iter().enumerate() {
-            page(LENT_VA)[16 * k..16 * k + 16].copy_from_slice(&a.to_be_bytes());
+            lent_page()[16 * k..16 * k + 16].copy_from_slice(&a.to_be_bytes());
         }
-        syscall(Syscall::FrameUnmap, LENT, [0; 4]);
+        unmap_lent();
         true
+    }
+
+    fn cring_of(&self, owner: u64) -> Option<usize> {
+        self.crings.iter().position(|r| r.is_some_and(|r| r.owner == owner))
+    }
+
+    /// `RING_ATTACH`: takes page `page` of `owner`'s ring, lent in this
+    /// call.
+    fn cring_attach(&mut self, owner: u64, page: u64, lent: bool) -> Status {
+        if !lent || page >= cring::PAGES {
+            return Status::Invalid;
+        }
+        if page == 0 {
+            if let Some(r) = self.cring_of(owner) {
+                self.cring_detach(r);
+            }
+            let Some(r) = self.crings.iter().position(|r| r.is_none()) else {
+                return Status::InUse;
+            };
+            self.crings[r] = Some(ClientRing {
+                owner,
+                attached: 0,
+                started: false,
+            });
+        }
+        let Some(r) = self.cring_of(owner) else {
+            return Status::Invalid;
+        };
+        let mut g = self.crings[r].unwrap();
+        if g.started || page != g.attached {
+            return Status::Invalid;
+        }
+        let slot = CRING_PAGES + r as u64 * cring::PAGES + page;
+        // A copy of what was lent: the lent capability goes after the call.
+        if syscall(Syscall::CapMint, LENT, [slot, 0x1f, 0, 0]).status != 0 {
+            return Status::Invalid;
+        }
+        if syscall(Syscall::FrameMap, slot, [cring_va(r) + page * 4096, 1, 0, 0]).status != 0 {
+            syscall(Syscall::CapDelete, slot, [0; 4]);
+            return Status::Invalid;
+        }
+        g.attached += 1;
+        self.crings[r] = Some(g);
+        Status::Ok
+    }
+
+    /// Drops ring `r`: its pages, and the client's copies of its
+    /// completion notification.
+    fn cring_detach(&mut self, r: usize) {
+        let Some(g) = self.crings[r].take() else {
+            return;
+        };
+        for p in 0..g.attached {
+            // Deleting the capability unmaps the page.
+            syscall(Syscall::CapDelete, CRING_PAGES + r as u64 * cring::PAGES + p, [0; 4]);
+        }
+        syscall(Syscall::CapRevoke, CRING_NTFN + r as u64, [0; 4]);
+    }
+
+    /// `RING_START` and `RING_DOORBELL`: whether MINT now holds what the
+    /// reply grants (the completion notification; the doorbell).
+    fn cring_grant(&mut self, owner: u64, start: bool) -> Status {
+        let Some(r) = self.cring_of(owner) else {
+            return Status::NotFound;
+        };
+        let mut g = self.crings[r].unwrap();
+        let (src, rights, badge) = if start {
+            if g.started || g.attached != cring::PAGES {
+                return Status::Invalid;
+            }
+            for off in (0..cring::SQ).step_by(4) {
+                chdr(cring_va(r), off).store(0, Ordering::Relaxed);
+            }
+            fence(Ordering::SeqCst);
+            g.started = true;
+            self.crings[r] = Some(g);
+            (CRING_NTFN + r as u64, READ, 0)
+        } else {
+            if !g.started {
+                return Status::Invalid;
+            }
+            // From the notification itself: a badged copy cannot be badged.
+            (SELF, WRITE, RINGBELL)
+        };
+        syscall(Syscall::CapDelete, MINT, [0; 4]);
+        match syscall(Syscall::CapMint, src, [MINT, rights, badge, 0]).status {
+            0 => Status::Ok,
+            _ => Status::Invalid,
+        }
+    }
+
+    /// Serves up to a ring's worth of submissions from each client's
+    /// ring, completing each as it is served, and wakes the clients that
+    /// sleep for completions.
+    fn serve_rings(&mut self) {
+        for r in 0..MAX_CRINGS {
+            let mut served = 0;
+            while served < cring::ENTRIES && self.cring_one(r) {
+                served += 1;
+            }
+            if served > 0 && self.crings[r].is_some() {
+                let page = cring_va(r);
+                // The client sleeps until this many completions wait.
+                let w = chdr(page, cring::CLIENT_WAITING);
+                let want = w.load(Ordering::Acquire);
+                let have = chdr(page, cring::CQ_TAIL)
+                    .load(Ordering::Relaxed)
+                    .wrapping_sub(chdr(page, cring::CQ_HEAD).load(Ordering::Acquire));
+                let idle = chdr(page, cring::SQ_HEAD).load(Ordering::Relaxed)
+                    == chdr(page, cring::SQ_TAIL).load(Ordering::Acquire);
+                if want != 0
+                    && (want <= have || idle)
+                    && w.compare_exchange(want, 0, Ordering::AcqRel, Ordering::Relaxed).is_ok()
+                {
+                    syscall(Syscall::Signal, CRING_NTFN + r as u64, [0; 4]);
+                }
+            }
+        }
+    }
+
+    /// Serves ring `r`'s next submission, if it has one and room for its
+    /// completion.
+    fn cring_one(&mut self, r: usize) -> bool {
+        let Some(g) = self.crings[r].filter(|g| g.started) else {
+            return false;
+        };
+        let page = cring_va(r);
+        let head = chdr(page, cring::SQ_HEAD).load(Ordering::Relaxed);
+        let tail = chdr(page, cring::SQ_TAIL).load(Ordering::Acquire);
+        let cq_tail = chdr(page, cring::CQ_TAIL).load(Ordering::Relaxed);
+        let cq_head = chdr(page, cring::CQ_HEAD).load(Ordering::Acquire);
+        if tail.wrapping_sub(head) > cring::ENTRIES || cq_tail.wrapping_sub(cq_head) > cring::ENTRIES {
+            say!("client ring {r}: indices out of range; dropping it");
+            self.cring_detach(r);
+            return false;
+        }
+        if head == tail || cq_tail.wrapping_sub(cq_head) == cring::ENTRIES {
+            return false; // nothing to do, or the client must reap first
+        }
+        let sqe = page as usize + cring::SQ + (head % cring::ENTRIES) as usize * cring::SQE;
+        // SAFETY: inside the ring page, mapped while attached. Each word
+        // is read once: the client may change it at any time.
+        let w = |i: usize| unsafe { ((sqe + 8 * i) as *const u64).read_volatile() };
+        let (op, tag, m, off) = (w(0), w(1), [w(0), w(2), w(3), w(4)], w(5));
+        let lends = matches!(
+            op,
+            net::SEND | net::SEND6 | net::RECV | net::RECV6 | net::SEND_PART | net::RECV_PART
+        );
+        let reply = if !lends || off % 4096 != 0 || off >= cring::DATA {
+            [Status::Invalid as u64, 0, 0, 0]
+        } else {
+            // The page the call would have lent is the ring's.
+            DATA.store(page + 4096 + off, Ordering::Relaxed);
+            let (reply, _) = self.serve(g.owner, m, true);
+            DATA.store(LENT_VA, Ordering::Relaxed);
+            reply
+        };
+        self.cring_ops += 1;
+        let cqe = page as usize + cring::CQ + (cq_tail % cring::ENTRIES) as usize * cring::CQE;
+        for (i, v) in [tag, reply[0], reply[1], reply[2], reply[3]].iter().enumerate() {
+            // SAFETY: inside the ring page, mapped while attached.
+            unsafe { ((cqe + 8 * i) as *mut u64).write_volatile(*v) };
+        }
+        chdr(page, cring::CQ_TAIL).store(cq_tail.wrapping_add(1), Ordering::Release);
+        chdr(page, cring::SQ_HEAD).store(head.wrapping_add(1), Ordering::Release);
+        true
+    }
+
+    /// Whether some client's ring has a submission there is room to
+    /// complete.
+    fn cring_work(&self) -> bool {
+        (0..MAX_CRINGS).any(|r| {
+            let page = cring_va(r);
+            self.crings[r].is_some_and(|g| g.started)
+                && chdr(page, cring::SQ_HEAD).load(Ordering::Relaxed)
+                    != chdr(page, cring::SQ_TAIL).load(Ordering::Acquire)
+                && chdr(page, cring::CQ_TAIL)
+                    .load(Ordering::Relaxed)
+                    .wrapping_sub(chdr(page, cring::CQ_HEAD).load(Ordering::Acquire))
+                    < cring::ENTRIES
+        })
+    }
+
+    /// Tells every ring's client whether this server sleeps.
+    fn cring_sleeps(&self, on: bool) {
+        for r in 0..MAX_CRINGS {
+            if self.crings[r].is_some_and(|g| g.started) {
+                chdr(cring_va(r), cring::FLAGS).store(on as u32 * cring::NEED_WAKEUP, Ordering::SeqCst);
+            }
+        }
     }
 
     /// One client call: the reply, and whether MINT is granted with it.
     fn serve(&mut self, badge: u64, m: [u64; 4], lent: bool) -> ([u64; 4], bool) {
         let status = |s: Status| ([s as u64, 0, 0, 0], false);
         match m[0] {
+            net::RING_STATS if m[1] == net::VERSION => {
+                ([Status::Ok as u64, self.cring_ops, self.cring_bells, 0], false)
+            }
+            net::RING_ATTACH => status(self.cring_attach(badge, m[1], lent)),
+            net::RING_START | net::RING_DOORBELL => {
+                let s = self.cring_grant(badge, m[0] == net::RING_START);
+                ([s as u64, 0, 0, 0], s == Status::Ok)
+            }
             net::LINK_STATS if m[1] == net::VERSION => (
                 [
                     Status::Ok as u64,
@@ -2316,6 +2581,12 @@ fn start(n: &mut Net) -> Result<(), (&'static str, u64)> {
     for i in 0..SOCKETS as u64 {
         retype(ObjectType::Notification, SOCK_NTFN + i)?;
     }
+    for r in 0..MAX_CRINGS as u64 {
+        retype(ObjectType::Notification, CRING_NTFN + r)?;
+    }
+    if syscall(Syscall::CapMint, SELF, [CRING_BELL, WRITE, RINGBELL, 0]).status != 0 {
+        return Err(("minting the rings' doorbell", 0));
+    }
     // Pages made at start: (first slot, where they go, how many).
     let runs = [
         (POOL_PAGES, POOL_VA, POOL, "a pool page"),
@@ -2396,15 +2667,29 @@ pub extern "C" fn _start(arg: u64) -> ! {
         accept: Some(LENT as u16),
     };
     loop {
+        // Clients' rings first: what they send goes out, and what they
+        // ask to receive is answered, with no call. One pass, so calls get
+        // their turn; if work is left the server rings its own doorbell
+        // rather than sleep on it.
+        n.serve_rings();
+        n.run_loopback();
+        n.cring_sleeps(true);
+        fence(Ordering::SeqCst);
+        if n.cring_work() {
+            n.cring_sleeps(false);
+            syscall(Syscall::Signal, CRING_BELL, [0; 4]);
+        }
         // With a ring, received frames are taken here, whatever woke the
         // server, and never by a call.
         n.before_sleep();
         n.run_loopback();
         let r = syscall_x(Syscall::Recv, SERVICE, [0; 4], accept);
+        n.cring_sleeps(false);
         if n.ring_up {
             hdr(ring::CALLER_SLEEPS).store(0, Ordering::SeqCst);
         }
         if r.status == Error::Notified.code() {
+            n.cring_bells += (r.badge & RINGBELL != 0) as u64;
             let timer = r.badge & TIMER != 0;
             if timer {
                 syscall(Syscall::TimerSignal, TIMER_CAP, [PERIOD, 0, 0, 0]);

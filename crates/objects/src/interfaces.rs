@@ -435,6 +435,45 @@ pub mod net {
     /// call each, times the rings were set up]`, counted across restarts.
     pub const LINK_STATS: u64 = 22;
 
+    /// `[RING_ATTACH, page]` with page `page` of the caller's ring granted
+    /// (pages 0 to [`ring::PAGES`] - 1, in order; page 0 drops a ring the
+    /// caller had). The pages should be ones the manager keeps across
+    /// restarts (`shared`), so neither side's restart unmaps the other's.
+    pub const RING_ATTACH: u64 = 23;
+    /// `[RING_START]` once every page is attached: the server clears the
+    /// ring header and starts taking requests from it. The reply grants
+    /// the completion notification (Read) the caller sleeps on. It belongs
+    /// to the server: if the server is restarted it is destroyed, and a
+    /// caller waiting on it wakes with `ObjectDestroyed`, its cue to set
+    /// the ring up again (and its sockets: they went with the server).
+    pub const RING_START: u64 = 24;
+    /// `[RING_DOORBELL]`: the reply grants the doorbell (Write), signalled
+    /// when the server has said it is going to sleep.
+    pub const RING_DOORBELL: u64 = 25;
+    /// `[RING_STATS, VERSION]`: reply `[status, requests taken from
+    /// clients' rings, doorbells that woke the server for them]`.
+    pub const RING_STATS: u64 = 26;
+
+    /// Tier 2 rings (spec section 3) between a client and the network
+    /// server, laid out as the filesystem's are ([`super::fs::ring`]): a
+    /// submission and a completion queue in a page shared with the
+    /// server, and data pages after it. Under load a client's datagrams
+    /// and TCP bytes take no system call each: the server takes
+    /// submissions while it has work and asks for the doorbell
+    /// (`NEED_WAKEUP`) only before it sleeps; the caller asks for a
+    /// completion signal (`CLIENT_WAITING`) only before it sleeps.
+    ///
+    /// A submission is the words of a call that lends a page (`SEND`,
+    /// `SEND6`, `RECV`, `RECV6`, `SEND_PART` or `RECV_PART`: `[op, a, b,
+    /// c]`) with a tag the completion carries back, and the offset in the
+    /// data pages (a whole page's) of the page the call would have lent.
+    /// A completion is the tag and the reply's words. `RECV` answers
+    /// `Empty` at once when nothing has arrived: the caller waits on the
+    /// socket's notification, as with calls.
+    pub mod ring {
+        pub use super::super::fs::ring::*;
+    }
+
     /// TCP states, as `TCP_STATE` gives them (RFC 9293's names).
     pub const TCP_CLOSED: u64 = 0;
     pub const TCP_SYN_SENT: u64 = 1;

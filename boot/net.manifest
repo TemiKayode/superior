@@ -65,6 +65,8 @@ component client
   uses dns 5
   control 1
   untyped 12 2
+  # Its ring with the network server (net::ring).
+  shared 16 16
 
 component injector
   image testclient

@@ -1753,6 +1753,8 @@ fn net_test(arch: Arch, manifest: &str) -> Result<(), String> {
         "UDP datagrams of 1453 to 4000 bytes sent to itself over IPv6, in fragments, every byte right",
         "[pass] net: datagrams of 4097, 30000 and 65507 bytes sent to itself over IPv6, and a 20000-byte IPv6 ping of this host answered, every byte right",
         "TCP connections over IPv6 echoed",
+        "UDP datagrams echoed through the client's ring, every byte right:",
+        "requests from clients' rings since it last started",
         "frames through the rings with the driver,",
         "[cm] client asked to shut down (pass)",
     ];
