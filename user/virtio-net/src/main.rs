@@ -551,12 +551,15 @@ impl Nic {
             // Read once: the caller may change it at any time.
             let len = hdr(ring::TX_LEN + 4 * at as usize).load(Ordering::Relaxed) as u64;
             let from = Self::slot(ring::TX_PAGE, self.tx_head, ring::TX_SLOTS);
-            self.tx_head = self.tx_head.wrapping_add(1);
-            hdr(ring::TX_HEAD).store(self.tx_head, Ordering::Release);
             if (14..=nic::MAX_FRAME).contains(&len) {
                 self.transmit(i, from, len);
                 self.by_ring += 1;
             }
+            // Only now is the slot the caller's again: moving the head
+            // first would let a caller waiting on a full ring write its
+            // next frame over this one while it was being copied out.
+            self.tx_head = self.tx_head.wrapping_add(1);
+            hdr(ring::TX_HEAD).store(self.tx_head, Ordering::Release);
         }
         false
     }

@@ -977,19 +977,30 @@ impl Net {
         // A full ring: the driver, on another CPU or about to be woken,
         // is on its way through it, so wait for a slot rather than lose
         // the frame (a datagram in 45 fragments fills the ring at once).
-        // Not for ever: the device may be stuck, or the driver dead.
+        // Not for ever: the device may be stuck, or the driver dead (a
+        // dead driver's ring stays full, and waiting out the limit for
+        // each of 45 fragments would hold every client up for seconds).
         let mut since = None;
         loop {
             let head = hdr(ring::TX_HEAD).load(Ordering::Acquire);
             if ring::waiting(head, self.tx_tail, ring::TX_SLOTS) < ring::TX_SLOTS {
                 break;
             }
-            if hdr(ring::DRIVER_SLEEPS).swap(0, Ordering::SeqCst) != 0 && !self.ring_bell() {
+            // Ringing the doorbell wakes a sleeping driver, and fails at
+            // once if the driver was killed (the doorbell was its own):
+            // then the ring is given up and the frame goes by a call,
+            // which waits for the new driver.
+            hdr(ring::DRIVER_SLEEPS).store(0, Ordering::SeqCst);
+            if !self.ring_bell() {
                 return None;
             }
             let now = ticks();
             if now >= *since.get_or_insert(now) + FULL_RING_TICKS {
-                return Some(Status::NoSpace);
+                // A driver that is there but not sending: the ring is set
+                // up afresh at the next timer tick, rather than every
+                // frame of a burst waiting this long in turn.
+                self.ring_up = false;
+                return None;
             }
             syscall(Syscall::Yield, 0, [0; 4]);
         }
