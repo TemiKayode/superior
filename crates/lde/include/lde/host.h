@@ -28,6 +28,9 @@ u32 lde_host_location(void);
  * mapped (NULL on failure). */
 u64 lde_host_bar_size(unsigned int bar);
 void *lde_host_bar_map(unsigned int bar);
+/* Reads (`write` 0, into `*value`) or writes `width` bytes (1, 2 or 4) at
+ * `offset` in I/O BAR `bar`, through the bus server. 0 or -errno. */
+int lde_host_io(unsigned int bar, unsigned int offset, unsigned int width, int write, u32 value, u32 *value_out);
 /* Lets the device do DMA. 0 or -errno. */
 int lde_host_bus_master(int on);
 /* Has the device's interrupt line delivered to the component's loop,

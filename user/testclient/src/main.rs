@@ -4805,6 +4805,240 @@ fn display_client() -> ! {
     superior_sys::park()
 }
 
+// ---- the audio clients (`arg 29` and `arg 30`, boot/audio.manifest) ----
+
+const AUDIO: u64 = 0;
+const AUDIO_CONTROL: u64 = 1;
+const AUDIO_MEMORY: u64 = 2;
+/// The notification the mixer signals as frames play (and the timer).
+const AUDIO_NTFN: u64 = 3;
+/// The ring's pages, mapped in a row.
+const AUDIO_RING: u64 = 8;
+const AUDIO_RING_VA: u64 = USER_BASE + 0x4000_0000;
+/// Components the second audio client kills: the sound driver and the
+/// mixer.
+const SOUND_DRIVER_INDEX: u64 = 1;
+const MIXER_INDEX: u64 = 2;
+/// The rate `cargo xtask audio-test` records at.
+const AUDIO_RATE: u64 = 22050;
+/// Ticks a sound gets to play, a driver's restart included.
+const PLAY_TICKS: u64 = 3000;
+
+/// A test sound: its length in frames, amplitude, and the left and right
+/// channels' periods. `cargo xtask audio-test` has the same table.
+#[derive(Clone, Copy)]
+struct Sound {
+    name: &'static str,
+    frames: u64,
+    amp: i64,
+    periods: (u64, u64),
+}
+
+const A1: Sound = Sound { name: "a1", frames: 6615, amp: 6000, periods: (100, 150) };
+const A2: Sound = Sound { name: "a2", frames: 44100, amp: 7000, periods: (60, 90) };
+const B2: Sound = Sound { name: "b2", frames: 11025, amp: 9000, periods: (44, 70) };
+const B3: Sound = Sound { name: "b3", frames: 6615, amp: 8000, periods: (80, 120) };
+const B4: Sound = Sound { name: "b4", frames: 6615, amp: 5000, periods: (50, 200) };
+/// Played last: QEMU writes the recording through a buffer, which its
+/// exit on AArch64 does not flush, so the end of b4 gets pushed out
+/// with silence after it.
+const SILENCE: Sound = Sound { name: "silence", frames: 4410, amp: 0, periods: (2, 2) };
+
+/// A triangle wave: `-amp` at 0, up to `amp` over half the period and down
+/// again over the rest. `cargo xtask audio-test` computes the same.
+fn triangle(i: u64, period: u64, amp: i64) -> i16 {
+    let p = (i % period) as i64;
+    let half = period as i64 / 2;
+    let v = if p < half { -amp + 2 * amp * p / half } else { amp - 2 * amp * (p - half) / (period as i64 - half) };
+    v as i16
+}
+
+impl Sound {
+    /// Frame `i` (S16LE stereo).
+    fn frame(&self, i: u64) -> u32 {
+        let l = triangle(i, self.periods.0, self.amp) as u16 as u32;
+        let r = triangle(i, self.periods.1, self.amp) as u16 as u32;
+        l | r << 16
+    }
+}
+
+/// A call to the mixer: `Err` if it failed (the mixer restarted), else
+/// the reply.
+fn audio_call(m: [u64; 4], grant: Option<u64>) -> Result<[u64; 4], ()> {
+    let x = CapTransfer {
+        grant: grant.map(|s| s as u16),
+        accept: None,
+    };
+    let r = syscall_x(Syscall::Call, AUDIO, m, x);
+    if r.status == 0 { Ok(r.msg) } else { Err(()) }
+}
+
+/// The mixer's `INFO` (rate, streams started, streams playing), tried
+/// again while it restarts.
+fn audio_info() -> [u64; 4] {
+    for _ in 0..400 {
+        if let Ok(m) = audio_call(superior_objects::idl::audio::info(), None) {
+            if m[0] == 0 {
+                return m;
+            }
+        }
+        superior_sys::sleep(5);
+    }
+    [u64::MAX; 4]
+}
+
+/// Waits until `f` holds of the mixer's `INFO`; whether it came to.
+fn audio_until(mut f: impl FnMut([u64; 4]) -> bool) -> bool {
+    let end = ticks() + PLAY_TICKS;
+    while ticks() < end {
+        if f(audio_info()) {
+            return true;
+        }
+        superior_sys::sleep(2);
+    }
+    false
+}
+
+fn audio_wait(ticks: u64) {
+    syscall(Syscall::TimerSignal, AUDIO_NTFN, [ticks, 0, 0, 0]);
+    syscall(Syscall::Wait, AUDIO_NTFN, [0; 4]);
+}
+
+fn make_audio_ring(t: &mut Checks) {
+    use superior_objects::idl::audio;
+    let mut made = syscall(Syscall::Retype, AUDIO_MEMORY, [ObjectType::Notification as u64, 0, AUDIO_NTFN, 0]).status == 0;
+    for p in 0..audio::RING_PAGES {
+        made &= syscall(Syscall::Retype, AUDIO_MEMORY, [ObjectType::Frame as u64, 0, AUDIO_RING + p, 0]).status == 0
+            && syscall(Syscall::FrameMap, AUDIO_RING + p, [AUDIO_RING_VA + p * 4096, 1, 0, 0]).status == 0;
+    }
+    t.check(made, format_args!("a ring of {} pages for {} frames", audio::RING_PAGES, audio::RING_FRAMES));
+}
+
+/// A client's stream: frames written, and what the mixer last said had
+/// played and could be written.
+struct Player {
+    written: u64,
+    played: u64,
+    limit: u64,
+}
+
+/// Lends the ring and the notification and starts the stream; tried again
+/// while the mixer restarts. Whether it started.
+fn audio_set_up(p: &mut Player) -> bool {
+    use superior_objects::idl::audio;
+    for _ in 0..100 {
+        let ok = (0..audio::RING_PAGES).all(|i| audio_call(audio::attach(i), Some(AUDIO_RING + i)) == Ok([0; 4]))
+            && audio_call(audio::listen(), Some(AUDIO_NTFN)) == Ok([0; 4])
+            && audio_call(audio::start(), None).is_ok_and(|m| m[0] == 0);
+        if ok {
+            *p = Player { written: 0, played: 0, limit: audio::RING_FRAMES };
+            return true;
+        }
+        superior_sys::sleep(5);
+    }
+    false
+}
+
+/// Commits what is written; whether the mixer took it.
+fn audio_commit(p: &mut Player) -> bool {
+    match audio_call(superior_objects::idl::audio::commit(p.written), None) {
+        Ok(m) if m[0] == 0 => {
+            (p.played, p.limit) = (m[1], m[2]);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Plays `s` to the end, writing as much at a time as the ring takes;
+/// whether all of it played.
+fn play(p: &mut Player, s: &Sound) -> bool {
+    let ring = superior_objects::idl::audio::RING_FRAMES;
+    let first = p.written;
+    let end = ticks() + PLAY_TICKS;
+    let mut commits = 0;
+    while ticks() < end {
+        while p.written - first < s.frames && p.written < p.limit {
+            let at = AUDIO_RING_VA + p.written % ring * 4;
+            // SAFETY: inside the ring, mapped and writable.
+            unsafe { (at as *mut u32).write_volatile(s.frame(p.written - first)) };
+            p.written += 1;
+        }
+        if !audio_commit(p) {
+            say!("[fail] audio: {}: the mixer refused a commit", s.name);
+            return false;
+        }
+        commits += 1;
+        if p.written - first == s.frames && p.played >= p.written {
+            say!("audio: {}: {} frames played, {commits} commits", s.name, s.frames);
+            return true;
+        }
+        audio_wait(5);
+    }
+    false
+}
+
+/// The first audio client: plays a1, then a2 once the second client's
+/// stream is started, then keeps its stream, setting it up again whenever
+/// the mixer restarts.
+fn audio_first() -> ! {
+    let mut t = Checks(0, "audio");
+    make_audio_ring(&mut t);
+    let info = audio_info();
+    t.check(info[0] == 0 && info[1] == AUDIO_RATE, format_args!("the mixer plays at {} Hz", info[1]));
+    let mut p = Player { written: 0, played: 0, limit: 0 };
+    t.check(audio_set_up(&mut p), format_args!("stream A set up"));
+    t.check(play(&mut p, &A1), format_args!("stream A: a1 played to the end"));
+    t.check(audio_until(|m| m[2] == 2), format_args!("stream A: the second stream is started"));
+    t.check(play(&mut p, &A2), format_args!("stream A: a2 played to the end, in pieces of a ring"));
+    loop {
+        audio_wait(5);
+        if !audio_commit(&mut p) {
+            say!("audio: stream A: the mixer restarted; setting the stream up again");
+            t.check(audio_set_up(&mut p), format_args!("stream A set up again after the mixer's restart"));
+        }
+    }
+}
+
+/// The second audio client: plays b2 over a2, then b3 after having the
+/// mixer killed and b4 after having the sound driver killed; the host
+/// checks the sound QEMU recorded.
+fn audio_second() -> ! {
+    let mut t = Checks(0, "audio");
+    make_audio_ring(&mut t);
+    let mut seen = false;
+    t.check(
+        audio_until(|m| {
+            seen |= m[3] >= 1;
+            seen && m[3] == 0
+        }),
+        format_args!("a1 played and done"),
+    );
+    let mut p = Player { written: 0, played: 0, limit: 0 };
+    t.check(audio_set_up(&mut p), format_args!("stream B set up"));
+    t.check(audio_until(|m| m[3] >= 1), format_args!("a2 playing"));
+    superior_sys::sleep(20);
+    let b2 = play(&mut p, &B2);
+    t.check(b2 && audio_until(|m| m[3] == 0), format_args!("b2 played over a2, and both done"));
+    say!("audio: killing the mixer");
+    syscall(Syscall::Call, AUDIO_CONTROL, [OP_KILL, MIXER_INDEX, 0, 0]);
+    let again = audio_set_up(&mut p) && audio_until(|m| m[2] == 2);
+    t.check(again, format_args!("both streams set up again after the mixer's restart"));
+    t.check(
+        play(&mut p, &B3) && audio_until(|m| m[3] == 0),
+        format_args!("b3 played after the mixer's restart"),
+    );
+    say!("audio: killing the sound driver");
+    syscall(Syscall::Call, AUDIO_CONTROL, [OP_KILL, SOUND_DRIVER_INDEX, 0, 0]);
+    t.check(
+        play(&mut p, &B4) && audio_until(|m| m[3] == 0),
+        format_args!("b4 played after the sound driver's restart"),
+    );
+    t.check(play(&mut p, &SILENCE), format_args!("silence played, for the recording's sake"));
+    say!("audio: done ({} failed)", t.0);
+    syscall(Syscall::Call, AUDIO_CONTROL, [OP_SHUTDOWN, t.0, 0, 0]);
+    superior_sys::park()
+}
 
 fn crasher() -> ! {
     say!("crasher: starting");
@@ -4848,6 +5082,8 @@ pub extern "C" fn _start(role: u64) -> ! {
         26 => desktop_second(),
         27 => input_first(),
         28 => input_second(),
+        29 => audio_first(),
+        30 => audio_second(),
         _ => probe(),
     }
 }

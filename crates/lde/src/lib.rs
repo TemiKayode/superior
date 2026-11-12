@@ -26,13 +26,17 @@
 //!   after another, so Linux's locks are empty. Its kernel timers and work
 //!   run from the loop too: it sleeps no longer than until the next timer
 //!   is due.
+//! - Ports: those of the device's I/O BARs, which the bus server reads
+//!   and writes for the driver (`pci::IO_READ`, `pci::IO_WRITE`); no
+//!   other.
 //! - What there is none of fails as Linux would have it fail: firmware
-//!   files (`request_firmware` finds none), ethtool and MII ioctls, legacy
-//!   I/O ports.
+//!   files (`request_firmware` finds none), ethtool and MII ioctls, ports
+//!   beyond the device's own.
 //!
 //! What the component serves depends on the driver's class: a network
 //! driver serves `nic` ([`run`], in [`net`]), a display driver serves
-//! `display` ([`run_display`], in [`display`]). Slots: 0 the bus server, 1
+//! `display` ([`run_display`], in [`display`]), a sound driver serves
+//! `audio` ([`run_sound`], in [`sound`]). Slots: 0 the bus server, 1
 //! the endpoint it serves (receive), 2 a notification, 3 untyped memory
 //! (1 MiB); the rest are the host's.
 
@@ -40,9 +44,11 @@
 
 mod display;
 mod net;
+mod sound;
 
 pub use display::run as run_display;
 pub use net::run;
+pub use sound::run as run_sound;
 
 use core::cell::UnsafeCell;
 use core::ffi::{c_char, c_int, c_uint, c_ulong, c_void};
@@ -369,6 +375,25 @@ extern "C" fn lde_host_bar_size(bar: c_uint) -> u64 {
 #[unsafe(no_mangle)]
 extern "C" fn lde_host_bar_map(bar: c_uint) -> *mut c_void {
     bar_base(bar as usize).map_or(core::ptr::null_mut(), |va| va as *mut c_void)
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn lde_host_io(bar: c_uint, offset: c_uint, width: c_uint, write: c_int, value: u32, out: *mut u32) -> c_int {
+    let (bar, offset, width) = (bar as u64, offset as u64, width as u64);
+    if write != 0 {
+        return match pci().io_write(bar, offset, width, value as u64) {
+            Ok(()) => 0,
+            Err(_) => -EIO,
+        };
+    }
+    match pci().io_read(bar, offset, width) {
+        Ok(v) => {
+            // SAFETY: lde.c passes a local for a read.
+            unsafe { *out = v as u32 };
+            0
+        }
+        Err(_) => -EIO,
+    }
 }
 
 #[unsafe(no_mangle)]

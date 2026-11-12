@@ -122,6 +122,9 @@ struct Image {
     /// QEMU's bochs-display as the only display, and its monitor to take
     /// screenshots through (the display test).
     display: bool,
+    /// QEMU's ENSONIQ AudioPCI, recording what it plays to this WAV file
+    /// (the audio test).
+    audio: Option<PathBuf>,
 }
 
 /// The disk drivers, each with the PCI function its test disk appears as
@@ -170,6 +173,7 @@ fn main() -> ExitCode {
                         .and_then(|_| display_test(a))
                         .and_then(|_| desktop_test(a))
                         .and_then(|_| input_test(a))
+                        .and_then(|_| audio_test(a))
                         .and_then(|_| tcp_test(a))
                         .and_then(|_| keyboard_test(a))
                         .and_then(|_| hotplug_test(a))
@@ -198,6 +202,7 @@ fn main() -> ExitCode {
         Some("display-test") => display_test(arch),
         Some("desktop-test") => desktop_test(arch),
         Some("input-test") => input_test(arch),
+        Some("audio-test") => audio_test(arch),
         Some("tcp-test") => tcp_test(arch),
         Some("keyboard-test") => keyboard_test(arch),
         Some("hotplug-test") => hotplug_test(arch),
@@ -209,7 +214,7 @@ fn main() -> ExitCode {
         }
         Some("bench") => image(false, Arch::X86_64).and_then(|img| bench(&img)),
         _ => Err(
-            "usage: cargo xtask <idl | image | run | test | boot-test | shell-test | cm-test | supervise-test | drivers-test | memory-test | reboot-test | fs-test | nvme-test | ahci-test | net-test | lde-test | lde-e100-test | display-test | desktop-test | input-test | tcp-test | keyboard-test | hotplug-test | bench | sel4-test> [x86_64 | aarch64]"
+            "usage: cargo xtask <idl | image | run | test | boot-test | shell-test | cm-test | supervise-test | drivers-test | memory-test | reboot-test | fs-test | nvme-test | ahci-test | net-test | lde-test | lde-e100-test | display-test | desktop-test | input-test | audio-test | tcp-test | keyboard-test | hotplug-test | bench | sel4-test> [x86_64 | aarch64]"
                 .into(),
         ),
     });
@@ -315,7 +320,7 @@ fn host_tests() -> Result<(), String> {
 /// tree at `LINUX_TAG` when first needed and kept under `target/`: Linux
 /// is GPL-2.0, and none of it is in this repository.
 const LINUX_TAG: &str = "v6.6";
-const LINUX_SOURCES: [(&str, &str, &str); 3] = [
+const LINUX_SOURCES: [(&str, &str, &str); 5] = [
     (
         "8139cp",
         "drivers/net/ethernet/realtek/8139cp.c",
@@ -331,14 +336,36 @@ const LINUX_SOURCES: [(&str, &str, &str); 3] = [
         "drivers/gpu/drm/tiny/bochs.c",
         "93b0b9a15cd1268b206ac1bbf71aec8338232ed0d47bc5969cd6c4453c86c3c4",
     ),
+    (
+        "ens1370",
+        "sound/pci/ens1370.c",
+        "44ca3cd3b0f6b83644545572436a72a095c7f50a4c6bdcc55b58cefca6ff2853",
+    ),
+    (
+        "ak4531_codec",
+        "sound/pci/ak4531_codec.c",
+        "06336bb38b00cfe39c26196232e0e24049a7f4bc1af6cc21571fb204b9d7def5",
+    ),
 ];
 
 /// The Linux driver a manifest hosts in the Linux Driver Environment:
-/// a network test's, or the display test's.
+/// a network test's, the display tests', or the audio test's.
 fn linux_driver(manifest: &str) -> Option<&'static str> {
     match manifest {
         "display" | "desktop" | "input" => Some("bochs"),
+        "audio" => Some("es1370"),
         _ => linux_nic(manifest).map(|l| l.0),
+    }
+}
+
+/// The Linux source files (names in `LINUX_SOURCES`) of a driver, by the
+/// name its component has (`lde-<driver>`): its own first, then the
+/// library code it links (the ES1370's codec, which Linux builds as a
+/// module of its own).
+fn linux_files(driver: &str) -> Vec<&'static str> {
+    match driver {
+        "es1370" => vec!["ens1370", "ak4531_codec"],
+        d => LINUX_SOURCES.iter().filter(|s| s.0 == d).map(|s| s.0).collect(),
     }
 }
 
@@ -396,11 +423,13 @@ fn linux_source(driver: &str) -> Result<PathBuf, String> {
     Ok(path)
 }
 
-/// Compiles Linux's `driver` and the environment's C half for `arch`, in
-/// the build container (clang, with only the environment's headers), and
-/// points the component's build script at the objects.
+/// Compiles Linux's `driver` (its source files) and the environment's C
+/// half for `arch`, in the build container (clang, with only the
+/// environment's headers), and points the component's build script at the
+/// objects.
 fn lde_objects(arch: Arch, driver: &str) -> Result<(), String> {
-    let source = linux_source(driver)?;
+    let files = linux_files(driver);
+    let sources = files.iter().map(|f| linux_source(f)).collect::<Result<Vec<_>, _>>()?;
     let out = root().join("target/lde").join(arch.name());
     let newest = |dir: PathBuf| -> Option<std::time::SystemTime> {
         let mut newest = None;
@@ -416,14 +445,18 @@ fn lde_objects(arch: Arch, driver: &str) -> Result<(), String> {
         }
         newest
     };
-    let built = [format!("{driver}.o"), "lde.o".into(), "lde-net.o".into(), "lde-drm.o".into()]
+    let built = files
         .iter()
+        .map(|f| format!("{f}.o"))
+        .chain(["lde", "lde-net", "lde-drm", "lde-snd"].map(|h| format!("{h}.o")))
         .map(|o| std::fs::metadata(out.join(o)).and_then(|m| m.modified()).ok())
         .min()
         .flatten();
-    let sources = newest(root().join("crates/lde"))
-        .max(std::fs::metadata(&source).and_then(|m| m.modified()).ok());
-    if built.is_none() || built < sources {
+    let changed = sources
+        .iter()
+        .map(|s| std::fs::metadata(s).and_then(|m| m.modified()).ok())
+        .fold(newest(root().join("crates/lde")), Option::max);
+    if built.is_none() || built < changed {
         println!("== compiling Linux's {driver} and the Linux Driver Environment ({})", arch.name());
         let rel = |p: &Path| {
             format!(
@@ -431,14 +464,11 @@ fn lde_objects(arch: Arch, driver: &str) -> Result<(), String> {
                 p.strip_prefix(root()).unwrap().to_string_lossy().replace('\\', "/")
             )
         };
-        docker(&[
-            "sh",
-            "/work/crates/lde/cc.sh",
-            arch.name(),
-            &rel(&source),
-            driver,
-            &rel(&out),
-        ])?;
+        let mut args = vec!["sh".to_string(), "/work/crates/lde/cc.sh".into(), arch.name().into(), rel(&out)];
+        // The module's name is its first file's, as Linux's Kbuild has it.
+        args.push(files[0].into());
+        args.extend(sources.iter().map(|s| rel(s)));
+        docker(&args.iter().map(String::as_str).collect::<Vec<_>>())?;
     }
     // SAFETY: xtask has one thread here.
     unsafe { env::set_var("SUPERIOR_LDE_OBJECTS", &out) };
@@ -525,10 +555,12 @@ fn bundle(arch: Arch, manifest: &str, driver: &str) -> Result<PathBuf, String> {
         ("fs", "superior-fs"),
         ("testclient", "superior-testclient"),
         ("compositor", "superior-compositor"),
+        ("mixer", "superior-mixer"),
         // Need Linux's source and the build container: only where used.
         ("lde-8139cp", "superior-lde-8139cp"),
         ("lde-e100", "superior-lde-e100"),
         ("lde-bochs", "superior-lde-bochs"),
+        ("lde-es1370", "superior-lde-es1370"),
     ] {
         if let Some(driver) = name.strip_prefix("lde-") {
             if linux_driver(manifest) != Some(driver) {
@@ -660,6 +692,7 @@ fn image_for(
         mouse: manifest == "input",
         hotplug: manifest == "hotplug",
         display: matches!(manifest, "display" | "desktop" | "input"),
+        audio: (manifest == "audio").then(|| audio_wav(arch)),
     })
 }
 
@@ -757,6 +790,7 @@ fn sel4_image() -> Result<Image, String> {
         mouse: false,
         hotplug: false,
         display: false,
+        audio: None,
     })
 }
 
@@ -791,7 +825,7 @@ fn qemu_command(img: &Image) -> Command {
             // Images with a disk are driver tests: they need an IOMMU,
             // which QEMU emulates (VT-d) only on its q35 machine, with
             // interrupt remapping.
-            if img.disk.is_some() || img.net || img.keyboard || img.hotplug || img.display {
+            if img.disk.is_some() || img.net || img.keyboard || img.hotplug || img.display || img.audio.is_some() {
                 q.args(["-machine", "q35", "-device", "intel-iommu,intremap=on"]);
             }
             if img.disk.is_some() && img.driver == "ahci" {
@@ -816,7 +850,7 @@ fn qemu_command(img: &Image) -> Command {
             // Driver tests get an SMMUv3 in front of PCI.
             let machine = if img.sel4 {
                 SEL4_MACHINE
-            } else if img.disk.is_some() || img.net || img.keyboard || img.hotplug || img.display {
+            } else if img.disk.is_some() || img.net || img.keyboard || img.hotplug || img.display || img.audio.is_some() {
                 "virt,highmem=off,gic-version=3,iommu=smmuv3"
             } else {
                 "virt,highmem=off,gic-version=3"
@@ -977,6 +1011,17 @@ fn qemu_command(img: &Image) -> Command {
         }
         q.arg("-device")
             .arg(format!("{card},xres={},yres={},edid=on", SCREEN.0, SCREEN.1));
+    }
+    if let Some(wav) = &img.audio {
+        // The card Linux's ES1370 driver is for, its DMA through the
+        // IOMMU; QEMU records what it plays, at the rate the driver plays
+        // at (so nothing is resampled), to a WAV file.
+        q.arg("-audiodev")
+            .arg(format!(
+                "wav,id=snd0,path={},out.frequency={AUDIO_RATE},out.channels=2,out.format=s16",
+                wav.display()
+            ))
+            .args(["-device", "ES1370,audiodev=snd0"]);
     }
     if img.keyboard || img.hotplug || img.display {
         // QEMU's monitor, to type, plug cards and take screenshots through.
@@ -2567,6 +2612,178 @@ fn input_test(arch: Arch) -> Result<(), String> {
         return Err(format!("input test: {} screenshots taken, want {}", shots.len(), input_pictures().len()));
     }
     println!("== input test passed ({})", arch.name());
+    Ok(())
+}
+
+/// The rate the audio test's sound card plays at and QEMU records at.
+const AUDIO_RATE: u32 = 22050;
+
+/// Where QEMU records the audio test's sound.
+fn audio_wav(arch: Arch) -> PathBuf {
+    root().join("target").join(format!("audio-{}.wav", arch.name()))
+}
+
+/// A test sound of the audio test: length in frames, amplitude, and the
+/// left and right channels' periods. The test client has the same table.
+struct TestSound {
+    name: &'static str,
+    frames: usize,
+    amp: i64,
+    periods: (i64, i64),
+}
+
+const A1: TestSound = TestSound { name: "a1", frames: 6615, amp: 6000, periods: (100, 150) };
+const A2: TestSound = TestSound { name: "a2", frames: 44100, amp: 7000, periods: (60, 90) };
+const B2: TestSound = TestSound { name: "b2", frames: 11025, amp: 9000, periods: (44, 70) };
+const B3: TestSound = TestSound { name: "b3", frames: 6615, amp: 8000, periods: (80, 120) };
+const B4: TestSound = TestSound { name: "b4", frames: 6615, amp: 5000, periods: (50, 200) };
+
+/// A triangle wave, as the test client makes it.
+fn triangle(i: usize, period: i64, amp: i64) -> i16 {
+    let p = i as i64 % period;
+    let half = period / 2;
+    let v = if p < half { -amp + 2 * amp * p / half } else { amp - 2 * amp * (p - half) / (period - half) };
+    v as i16
+}
+
+impl TestSound {
+    /// Frame `i`, silence past the end.
+    fn frame(&self, i: usize) -> (i16, i16) {
+        if i >= self.frames {
+            return (0, 0);
+        }
+        (triangle(i, self.periods.0, self.amp), triangle(i, self.periods.1, self.amp))
+    }
+}
+
+/// Checks the audio test's recording: a1, then a2 with b2 mixed into it
+/// from some frame on, then b3, then b4, each frame exact, with nothing
+/// but silence between them (of any length). A summary of what was found.
+fn check_recording(bytes: &[u8]) -> Result<String, String> {
+    // QEMU writes the header's sizes when it closes the file, which an
+    // exit through the debug port does not wait for: the samples are
+    // everything after the 44-byte header.
+    let data = bytes.get(44..).ok_or("no WAV header")?;
+    let w: Vec<(i16, i16)> = data
+        .chunks_exact(4)
+        .map(|f| (i16::from_le_bytes([f[0], f[1]]), i16::from_le_bytes([f[2], f[3]])))
+        .collect();
+    let mut at = 0;
+    let mut gaps = Vec::new();
+    let skip = |at: &mut usize, gaps: &mut Vec<usize>| {
+        let from = *at;
+        while *at < w.len() && w[*at] == (0, 0) {
+            *at += 1;
+        }
+        gaps.push(*at - from);
+    };
+    let exact = |at: &mut usize, s: &TestSound| -> Result<(), String> {
+        for i in 0..s.frames {
+            let got = w.get(*at + i).copied();
+            if got != Some(s.frame(i)) {
+                return Err(format!(
+                    "{} differs at its frame {i} (recording frame {}): {got:?}, want {:?}",
+                    s.name,
+                    *at + i,
+                    s.frame(i)
+                ));
+            }
+        }
+        *at += s.frames;
+        Ok(())
+    };
+    skip(&mut at, &mut gaps);
+    exact(&mut at, &A1)?;
+    skip(&mut at, &mut gaps);
+    // a2 alone until b2 comes in, then the sum, saturating.
+    let d = (0..A2.frames).find(|&t| w.get(at + t).copied() != Some(A2.frame(t))).ok_or("a2 played with no b2 in it")?;
+    if d == 0 {
+        return Err("a2 differs at its first frame".into());
+    }
+    let mixed = |t: usize| {
+        let (a, b) = (A2.frame(t), if t >= d { B2.frame(t - d) } else { (0, 0) });
+        (a.0.saturating_add(b.0), a.1.saturating_add(b.1))
+    };
+    for t in 0..A2.frames.max(d + B2.frames) {
+        let got = w.get(at + t).copied();
+        if got != Some(mixed(t)) {
+            return Err(format!(
+                "a2 with b2 from its frame {d} differs at frame {t} (recording frame {}): {got:?}, want {:?}",
+                at + t,
+                mixed(t)
+            ));
+        }
+    }
+    at += A2.frames.max(d + B2.frames);
+    skip(&mut at, &mut gaps);
+    exact(&mut at, &B3)?;
+    skip(&mut at, &mut gaps);
+    exact(&mut at, &B4)?;
+    skip(&mut at, &mut gaps);
+    if at != w.len() {
+        return Err(format!("sound after b4, at recording frame {at}: {:?}", w[at]));
+    }
+    let ms = |frames: usize| frames * 1000 / AUDIO_RATE as usize;
+    Ok(format!(
+        "{} frames recorded ({} ms): a1; a2 with b2 mixed in from its frame {d} ({} ms on); b3; b4, every sample exact; silences of {:?} frames around them",
+        w.len(),
+        ms(w.len()),
+        ms(d),
+        gaps
+    ))
+}
+
+/// Boots `boot/audio.manifest`: Linux's ES1370 driver in the Linux Driver
+/// Environment on QEMU's ENSONIQ AudioPCI, which records what it plays to
+/// a WAV file, and the mixer between it and two clients. The first plays
+/// a sound, then a long one, over which the second plays one of its own;
+/// the second has the mixer killed and plays another, then the driver
+/// killed and plays a last one. Every sample of the recording must be
+/// what the clients played, mixed.
+fn audio_test(arch: Arch) -> Result<(), String> {
+    let img = image_with(false, arch, "audio")?;
+    let wav = img.audio.clone().ok_or("the audio image has no recording")?;
+    println!("== audio test on {}", img.path.display());
+    let _ = std::fs::remove_file(&wav);
+    let out = run_to_exit(&img, Duration::from_secs(180))?;
+    let log = [
+        "Linux's es1370 driver runs the sound card",
+        "mixer: ready: up to 4 streams mixed at 22050 Hz",
+        "[pass] audio: the mixer plays at 22050 Hz",
+        "audio: a1: 6615 frames played",
+        "[pass] audio: stream A: a1 played to the end",
+        "[pass] audio: a2 playing",
+        "audio: b2: 11025 frames played",
+        "audio: a2: 44100 frames played",
+        "[pass] audio: b2 played over a2, and both done",
+        "audio: killing the mixer",
+        "[cm] fault injection: killing mixer",
+        "mixer: ready: up to 4 streams",
+        "[pass] audio: both streams set up again after the mixer's restart",
+        "audio: b3: 6615 frames played",
+        "[pass] audio: b3 played after the mixer's restart",
+        "audio: killing the sound driver",
+        "[cm] fault injection: killing lde-es1370",
+        "Linux's es1370 driver runs the sound card",
+        "mixer: the sound driver restarted; ring lent again",
+        "audio: b4: 6615 frames played",
+        "[pass] audio: b4 played after the sound driver's restart",
+        "audio: done (0 failed)",
+        "[cm] second asked to shut down (pass)",
+    ];
+    check_log("audio test", &out, &log)?;
+    for line in [
+        "[pass] audio: stream A set up again after the mixer's restart",
+        "[pass] audio: stream A: a2 played to the end, in pieces of a ring",
+    ] {
+        if !out.contains(line) {
+            return Err(format!("audio test: missing {line:?}"));
+        }
+    }
+    let bytes = std::fs::read(&wav).map_err(|e| format!("audio test: reading {}: {e}", wav.display()))?;
+    let found = check_recording(&bytes).map_err(|e| format!("audio test: the recording: {e}"))?;
+    println!("== {found}");
+    println!("== audio test passed ({})", arch.name());
     Ok(())
 }
 

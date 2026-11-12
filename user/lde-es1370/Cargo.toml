@@ -1,0 +1,20 @@
+[package]
+name = "superior-lde-es1370"
+description = "Linux's ES1370 sound driver (QEMU's ENSONIQ AudioPCI) and its AK4531 codec, unmodified, in the Linux Driver Environment, serving the audio interface."
+version.workspace = true
+# The Rust here is the workspace's; the executable links Linux's driver
+# (GPL-2.0, fetched at build time, never in this repository), so as a
+# whole it can only be distributed under the GPL.
+license.workspace = true
+repository.workspace = true
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "superior-lde-es1370"
+test = false
+bench = false
+
+[dependencies]
+superior-lde = { path = "../../crates/lde" }
+superior-sys = { path = "../../crates/sys" }

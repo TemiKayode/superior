@@ -1,0 +1,17 @@
+[package]
+name = "superior-mixer"
+description = "The mixer: serves the audio interface to every component that plays sound, adds their streams together and plays the sum through the sound driver."
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "superior-mixer"
+test = false
+bench = false
+
+[dependencies]
+superior-objects = { path = "../../crates/objects" }
+superior-sys = { path = "../../crates/sys" }

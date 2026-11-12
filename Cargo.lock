@@ -517,7 +517,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "superior-lde-es1370"
+version = "0.1.0"
+dependencies = [
+ "superior-lde",
+ "superior-sys",
+]
+
+[[package]]
 name = "superior-memserver"
+version = "0.1.0"
+dependencies = [
+ "superior-objects",
+ "superior-sys",
+]
+
+[[package]]
+name = "superior-mixer"
 version = "0.1.0"
 dependencies = [
  "superior-objects",

@@ -144,6 +144,33 @@ int _printk(const char *fmt, ...)
 	return 0;
 }
 
+int sprintf(char *buf, const char *fmt, ...)
+{
+	struct out o = { .n = 0 };
+	__builtin_va_list ap;
+	__builtin_va_start(ap, fmt);
+	format(&o, fmt, ap);
+	__builtin_va_end(ap);
+	memcpy(buf, o.buf, o.n);
+	buf[o.n] = 0;
+	return o.n;
+}
+
+int snprintf(char *buf, size_t size, const char *fmt, ...)
+{
+	struct out o = { .n = 0 };
+	__builtin_va_list ap;
+	__builtin_va_start(ap, fmt);
+	format(&o, fmt, ap);
+	__builtin_va_end(ap);
+	if (size) {
+		size_t n = o.n < size - 1 ? o.n : size - 1;
+		memcpy(buf, o.buf, n);
+		buf[n] = 0;
+	}
+	return o.n;
+}
+
 void lde_bug(const char *file, int line)
 {
 	_printk("BUG at %s:%d: the driver cannot go on\n", file, line);
@@ -183,6 +210,13 @@ char *strcpy(char *dst, const char *src)
 	while ((*d++ = *src++))
 		;
 	return dst;
+}
+
+int strcmp(const char *a, const char *b)
+{
+	for (; *a && *a == *b; a++, b++)
+		;
+	return (unsigned char)*a - (unsigned char)*b;
 }
 
 char *strncpy(char *dst, const char *src, size_t n)
@@ -397,7 +431,11 @@ int lde_probe(u16 vendor, u16 dev, u32 bars)
 			device.resource[bar].len = lde_host_bar_size(bar);
 			device.resource[bar].flags = IORESOURCE_MEM;
 		} else if (low & 1) {
-			/* An I/O BAR: there, but never assigned. */
+			/* An I/O BAR: the port the bus server gave it. Its size is
+			 * the bus server's to know (it refuses ports past the end);
+			 * no I/O BAR is larger than 256 ports. */
+			device.resource[bar].start = low & ~3u;
+			device.resource[bar].len = 256;
 			device.resource[bar].flags = IORESOURCE_IO;
 		}
 	}
@@ -469,36 +507,50 @@ void __iomem *ioremap(resource_size_t phys, size_t size)
 	return NULL;
 }
 
-/* ---- legacy ports: none */
+/* ---- ports: those of the device's I/O BARs, through the bus server */
 
-static void no_port(unsigned long port)
+/* The I/O BAR `port` lies in (the one starting nearest below it), or -1. */
+static int port_bar(unsigned long port, unsigned int *offset)
 {
-	lde_once(_printk("the driver reached for I/O port %lx, which it cannot have\n", port));
+	int found = -1;
+	for (int bar = 0; bar < 6; bar++) {
+		resource_size_t start = device.resource[bar].start;
+		if ((device.resource[bar].flags & IORESOURCE_IO) && port >= start &&
+		    port - start < device.resource[bar].len &&
+		    (found < 0 || start > device.resource[found].start))
+			found = bar;
+	}
+	if (found < 0)
+		lde_once(_printk("the driver reached for I/O port %lx, which it cannot have\n", port));
+	else
+		*offset = port - device.resource[found].start;
+	return found;
 }
 
-u8 inb(unsigned long port)
+static u32 port_in(unsigned long port, unsigned int width)
 {
-	no_port(port);
-	return 0xff;
+	unsigned int offset;
+	int bar = port_bar(port, &offset);
+	u32 v;
+	if (bar < 0 || lde_host_io(bar, offset, width, 0, 0, &v))
+		return width == 4 ? ~0u : (1u << 8 * width) - 1;
+	return v;
 }
 
-u16 inw(unsigned long port)
+static void port_out(unsigned long port, unsigned int width, u32 v)
 {
-	no_port(port);
-	return 0xffff;
+	unsigned int offset;
+	int bar = port_bar(port, &offset);
+	if (bar >= 0)
+		lde_host_io(bar, offset, width, 1, v, NULL);
 }
 
-void outb(u8 v, unsigned long port)
-{
-	(void)v;
-	no_port(port);
-}
-
-void outw(u16 v, unsigned long port)
-{
-	(void)v;
-	no_port(port);
-}
+u8 inb(unsigned long port) { return port_in(port, 1); }
+u16 inw(unsigned long port) { return port_in(port, 2); }
+u32 inl(unsigned long port) { return port_in(port, 4); }
+void outb(u8 v, unsigned long port) { port_out(port, 1, v); }
+void outw(u16 v, unsigned long port) { port_out(port, 2, v); }
+void outl(u32 v, unsigned long port) { port_out(port, 4, v); }
 
 /* ---- DMA */
 

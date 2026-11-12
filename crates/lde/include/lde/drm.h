@@ -187,7 +187,6 @@ static inline void drm_fbdev_generic_setup(struct drm_device *dev, unsigned int 
 {
 	(void)dev; (void)bpp;
 }
-static inline int pcim_enable_device(struct pci_dev *pdev) { return pci_enable_device(pdev); }
 #define devm_ioremap(dev, phys, size) ((void)(dev), ioremap(phys, size))
 
 #define drm_module_pci_driver_if_modeset(drv, modeset) \

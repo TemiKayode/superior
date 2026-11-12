@@ -363,6 +363,17 @@ holds the rest):
     its restarted instance; each time QEMU's monitor takes a screenshot and every
     pixel of the 800x600 screen must be the picture's. The network host is
     `src/net.rs`, the display host `src/display.rs`.
+  - Sound drivers likewise: the environment declares ALSA's card, control and
+    PCM API (`c/lde-snd.c`) and the host (`src/sound.rs`) serves the `audio`
+    interface (`interfaces/audio.idl`): the client lends a ring of 16 pages
+    (16384 frames of 16-bit stereo) and commits frames to it; the host copies
+    them into the driver's DMA buffer ahead of the device, zeroes what has
+    played, and counts what played from the driver's pointer and its period
+    interrupts. A driver whose registers are I/O ports reaches them through the
+    bus server. Linux's ES1370 driver (`user/lde-es1370/`, `sound/pci/ens1370.c`
+    with the AK4531 codec it drives) runs this way on QEMU's ENSONIQ AudioPCI;
+    the host unmutes the codec's master and PCM outputs through the driver's own
+    mixer controls.
   - A virtio-blk driver (`user/virtio-blk/`) serves the versioned `block`
     interface: reads land by DMA straight in a frame the client lends with the call.
     The device reaches that frame only while the read is in flight: the driver maps
@@ -837,6 +848,21 @@ holds the rest):
   and a click gives A the focus. B must have got "def" and no other key. Six
   screenshots, the pointer drawn by xtask from the same shape, must have every
   pixel right.
+- The mixer (`user/mixer/`), the sound server. It is the sound driver's one
+  client and serves the same `audio` interface to every component that plays
+  sound: it adds their streams together, sample by sample and saturating, into a
+  ring it lends the driver, kept three periods (about half a second) ahead of the
+  device, and stops the driver's stream when every stream has played what it was
+  given. A stream that runs dry is silent until its client writes more, and none
+  of its frames is skipped. Crash-only: a restarted mixer knows no streams and
+  refuses its clients' next calls, so they set theirs up again; a restarted driver
+  refuses the mixer's next call, and it lends the ring again. `cargo xtask
+  audio-test` boots `boot/audio.manifest` on both ISAs with QEMU recording what
+  the card plays to a WAV file: the first client plays a sound, then a 2-second one
+  in pieces of a ring, over which the second client plays one of its own; the
+  second kills the mixer and plays another, then kills the driver and plays a last
+  one. Every sample of the recording must be the clients' triangle waves, the
+  overlapping two summed, with only silence between the sounds.
 - Interrupt and exception entries clear the direction flag. User code may be
   interrupted mid-way through a backward copy, with the flag set; the kernel's own
   copies need it clear, and without the `cld` they ran backwards, wrecking saved
@@ -875,9 +901,12 @@ with the pointer), the toolkit and the shell above it, a hardware cursor plane,
 pointer events when a window moves or appears under a still pointer, keyboard
 layouts and key repeat (keys are USB usages), and surviving a client
 that dies at the very moment its window is read (the compositor then faults and
-is restarted, which its clients survive); in the Linux Driver Environment drivers of a class other than network
-and simple display (GPUs with command submission, so Mesa's Vulkan drivers, which
-also need a POSIX environment), cursor planes and dirty-rectangle damage,
+is restarted, which its clients survive); in the mixer resampling (every stream
+plays at the driver's rate), volume, formats other than 16-bit stereo and
+recording; in the Linux Driver Environment drivers of a class other than network,
+simple display and simple PCI sound (GPUs with command submission, so Mesa's Vulkan drivers, which
+also need a POSIX environment; HDA, with its codec bus, and USB audio), sound capture,
+MIDI and the AC'97 codecs, cursor planes and dirty-rectangle damage,
 ethtool and the MII ioctls, firmware files, more than one interrupt or one
 device per component (QEMU's later 8255x models append stale bytes to some of
 e100's frames, so its test uses the 82557); legacy
@@ -917,12 +946,14 @@ https://claude.ai/artifact/QKJS8qH5Dfbjzn58RStq1j
 | `user/shell/` | The boot shell and COM1 driver, started as a component |
 | `crates/driver/` | The Driver SDK: PCI access through the bus server, MMIO, DMA pages, virtqueues, DMA buffer pools, an executor |
 | `crates/idl/` | The IDL compiler: interface descriptions to Rust |
-| `interfaces/` | Interface descriptions (`pci.idl`, the PCI bus server's; `display.idl`; `window.idl`) |
-| `crates/lde/` | The Linux Driver Environment: Linux's kernel API for hosted drivers (`include/`, `c/lde.c`, `c/lde-net.c`, `c/lde-drm.c`) and its host (`src/lib.rs`, `src/net.rs`, `src/display.rs`) |
+| `interfaces/` | Interface descriptions (`pci.idl`, the PCI bus server's; `display.idl`; `window.idl`; `audio.idl`) |
+| `crates/lde/` | The Linux Driver Environment: Linux's kernel API for hosted drivers (`include/`, `c/lde.c`, `c/lde-net.c`, `c/lde-drm.c`, `c/lde-snd.c`) and its host (`src/lib.rs`, `src/net.rs`, `src/display.rs`, `src/sound.rs`) |
 | `user/lde-8139cp/` | Linux's 8139cp network driver, unmodified, in the Linux Driver Environment |
 | `user/lde-e100/` | Linux's e100 network driver, likewise |
 | `user/lde-bochs/` | Linux's bochs DRM display driver, likewise |
+| `user/lde-es1370/` | Linux's ES1370 sound driver, likewise |
 | `user/compositor/` | The display server: windows from every client over the desktop |
+| `user/mixer/` | The sound server: every client's stream mixed through the sound driver |
 | `user/pcibus/` | The PCI bus server |
 | `user/memserver/` | The Memory Server |
 | `user/fs/` | The filesystem server |
@@ -935,7 +966,7 @@ https://claude.ai/artifact/QKJS8qH5Dfbjzn58RStq1j
 | `user/xhci/` | The xHCI (USB) host controller driver |
 | `user/hid/` | The USB HID keyboard and mouse driver |
 | `user/echo/`, `user/counter/`, `user/testclient/` | Test components for the Component Manager, supervision and drivers |
-| `boot/` | Component manifests: `shell.manifest` (normal boot), `test.manifest` (`cm-test`), `supervise.manifest` (`supervise-test`) , `drivers.manifest` (`drivers-test`) , `memory.manifest` (`memory-test`), `reboot.manifest` (`reboot-test`), `fs.manifest` and `fs-verify.manifest` (`fs-test`), `net.manifest` (`net-test`), `tcp.manifest` (`tcp-test`), `keyboard.manifest` (`keyboard-test`), `display.manifest` (`display-test`), `desktop.manifest` (`desktop-test`), `input.manifest` (`input-test`) |
+| `boot/` | Component manifests: `shell.manifest` (normal boot), `test.manifest` (`cm-test`), `supervise.manifest` (`supervise-test`) , `drivers.manifest` (`drivers-test`) , `memory.manifest` (`memory-test`), `reboot.manifest` (`reboot-test`), `fs.manifest` and `fs-verify.manifest` (`fs-test`), `net.manifest` (`net-test`), `tcp.manifest` (`tcp-test`), `keyboard.manifest` (`keyboard-test`), `display.manifest` (`display-test`), `desktop.manifest` (`desktop-test`), `input.manifest` (`input-test`), `audio.manifest` (`audio-test`) |
 | `sel4/` | Docker build of seL4 and rust-sel4's kernel loader, for running the shell on seL4 |
 | `xtask/` | Build driver: user program, kernel, disk image, QEMU boot |
 
@@ -959,6 +990,7 @@ cargo xtask lde-e100-test  # the same over Linux's e100 driver
 cargo xtask display-test   # Linux's bochs display driver: two pictures, checked pixel by pixel from QEMU screenshots
 cargo xtask desktop-test   # the compositor: two clients' windows through restarts, five screenshots checked pixel by pixel
 cargo xtask input-test     # the compositor's pointer, focus and keys from a USB mouse and keyboard, six screenshots checked
+cargo xtask audio-test     # Linux's ES1370 driver and the mixer: two clients' sounds through restarts, every recorded sample checked
 cargo xtask tcp-test       # just the TCP test (add aarch64 for that ISA)
 cargo xtask keyboard-test  # just the USB keyboard test (add aarch64 for that ISA)
 cargo xtask hotplug-test   # just the PCI hot-plug test (add aarch64 for that ISA)

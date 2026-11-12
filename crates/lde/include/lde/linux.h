@@ -116,6 +116,7 @@ typedef u64 uint64_t;
 #define ENODEV 19
 #define EINVAL 22
 #define ENOSPC 28
+#define ENOSYS 38
 #define ENODATA 61
 #define ENOTSUPP 524
 #define EOPNOTSUPP 95
@@ -136,6 +137,8 @@ static inline int PTR_ERR_OR_ZERO(const void *ptr) { return IS_ERR(ptr) ? PTR_ER
 /* ---- printing (lde.c) */
 
 int _printk(const char *fmt, ...) __printf(1, 2);
+int sprintf(char *buf, const char *fmt, ...) __printf(2, 3);
+int snprintf(char *buf, size_t size, const char *fmt, ...) __printf(3, 4);
 void lde_bug(const char *file, int line) __attribute__((noreturn));
 
 #define KERN_ERR ""
@@ -167,6 +170,7 @@ void *memcpy(void *dst, const void *src, size_t n);
 void *memset(void *dst, int c, size_t n);
 int memcmp(const void *a, const void *b, size_t n);
 size_t strlen(const char *s);
+int strcmp(const char *a, const char *b);
 ssize_t strscpy(char *dst, const char *src, size_t size);
 char *strcpy(char *dst, const char *src);
 char *strncpy(char *dst, const char *src, size_t n);
@@ -238,11 +242,22 @@ typedef struct { int unused; } spinlock_t;
 #define wmb() lde_host_wmb()
 #define mb() lde_host_wmb()
 void lde_host_wmb(void);
+struct mutex { int unused; };
+#define mutex_init(m) ((void)(m))
+#define mutex_lock(m) ((void)(m))
+#define mutex_unlock(m) ((void)(m))
 #define rtnl_lock() do { } while (0)
 #define rtnl_unlock() do { } while (0)
 #define synchronize_rcu() do { } while (0)
 
 /* ---- modules */
+
+/* No optional part of the kernel is configured in (a driver's joystick
+ * port, say): drivers leave out what would use it. */
+#define IS_ENABLED(option) 0
+#define IS_REACHABLE(option) 0
+struct module;
+#define THIS_MODULE ((struct module *)0)
 
 #define lde_nothing(tag) struct lde_nothing_##tag
 #define lde_nothing_1(line) lde_nothing(line)
@@ -313,6 +328,7 @@ static inline void release_firmware(const struct firmware *fw) { (void)fw; }
 #define PCI_VENDOR_ID_REALTEK 0x10ec
 #define PCI_DEVICE_ID_REALTEK_8139 0x8139
 #define PCI_VENDOR_ID_INTEL 0x8086
+#define PCI_VENDOR_ID_ENSONIQ 0x1274
 #define PCI_SUBVENDOR_ID_REDHAT_QUMRANET 0x1af4
 #define PCI_SUBDEVICE_ID_QEMU 0x1100
 #define PCI_CLASS_NETWORK_ETHERNET 0x0200
@@ -333,6 +349,9 @@ struct pci_device_id {
 };
 #define PCI_DEVICE(vend, dev) \
 	.vendor = (vend), .device = (dev), .subvendor = PCI_ANY_ID, .subdevice = PCI_ANY_ID
+/* As Linux has it, followed by the class and its mask (0). */
+#define PCI_VDEVICE(vend, dev) \
+	.vendor = PCI_VENDOR_ID_##vend, .device = (dev), .subvendor = PCI_ANY_ID, .subdevice = PCI_ANY_ID, 0, 0
 
 struct pci_driver;
 struct pci_dev {
@@ -378,6 +397,8 @@ void pci_unregister_driver(struct pci_driver *drv);
 
 int pci_enable_device(struct pci_dev *dev);
 void pci_disable_device(struct pci_dev *dev);
+/* Managed ("devm") resources: the component's life is the driver's. */
+static inline int pcim_enable_device(struct pci_dev *pdev) { return pci_enable_device(pdev); }
 int pci_request_regions(struct pci_dev *dev, const char *name);
 static inline int pci_request_region(struct pci_dev *dev, int bar, const char *name)
 {
@@ -411,12 +432,16 @@ static inline u32 readl(const void __iomem *p) { return *(const volatile u32 *)p
 static inline void writeb(u8 v, void __iomem *p) { *(volatile u8 *)p = v; }
 static inline void writew(u16 v, void __iomem *p) { *(volatile u16 *)p = v; }
 static inline void writel(u32 v, void __iomem *p) { *(volatile u32 *)p = v; }
-/* Legacy port I/O: no component has ports of its own; a driver that
- * reaches for one is told it read all ones (lde.c logs it once). */
+/* Port I/O: a port in one of the device's I/O BARs (whose start, in the
+ * pci_dev, is the port the bus server gave it) is read and written by the
+ * bus server for the driver, which reaches no other port; any other port
+ * reads as all ones (lde.c logs it once). */
 u8 inb(unsigned long port);
 u16 inw(unsigned long port);
+u32 inl(unsigned long port);
 void outb(u8 v, unsigned long port);
 void outw(u16 v, unsigned long port);
+void outl(u32 v, unsigned long port);
 struct resource;
 static inline struct resource *request_region(unsigned long start, unsigned long n, const char *name)
 {
@@ -485,6 +510,8 @@ void dma_pool_free(struct dma_pool *pool, void *va, dma_addr_t dma);
 typedef irqreturn_t (*irq_handler_t)(int irq, void *dev);
 int request_irq(unsigned int irq, irq_handler_t handler, unsigned long flags, const char *name, void *dev);
 void free_irq(unsigned int irq, void *dev);
+#define devm_request_irq(device, irq, handler, flags, name, dev) \
+	((void)(device), request_irq(irq, handler, flags, name, dev))
 static inline void disable_irq(unsigned int irq) { (void)irq; }
 static inline void disable_irq_nosync(unsigned int irq) { (void)irq; }
 static inline void enable_irq(unsigned int irq) { (void)irq; }

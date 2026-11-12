@@ -1,0 +1,63 @@
+# The audio test (cargo xtask audio-test).
+#
+# Linux's ES1370 driver runs QEMU's ENSONIQ AudioPCI, which records what
+# it plays to a WAV file; the mixer serves two clients, adds their streams
+# together and plays the sum through the driver. The second client has
+# the mixer and then the driver killed between sounds; the host checks
+# every sample of the recording. Component numbers matter: the second
+# client kills components 1 and 2.
+
+component pcibus
+  image pcibus
+  priority 12
+  cspace 7
+  provides pci 0
+  device pci-config 1
+  device pci-mmio 2
+  device pci-io 84
+  device msi 3
+  device iommu 11
+  untyped 18 12
+  device intx 80
+
+component lde-es1370
+  image lde-es1370
+  priority 11
+  # Its slots: the pool, the BARs and the mixer's ring.
+  cspace 8
+  uses pci 0
+  provides sound 1
+  notification 2
+  # 1 MiB: the pool the driver's memory comes from (768 KiB), and its
+  # page tables.
+  memory 21
+  untyped 20 3
+
+component mixer
+  image mixer
+  priority 10
+  cspace 8
+  uses sound 0
+  provides audio 1
+  notification 2
+  # Its ring: 16 pages.
+  untyped 17 3
+
+component first
+  image testclient
+  arg 29
+  priority 8
+  uses audio 0
+  cspace 7
+  # Its ring and a notification.
+  untyped 17 2
+
+component second
+  image testclient
+  arg 30
+  priority 8
+  uses audio 0
+  control 1
+  fault-injector
+  cspace 7
+  untyped 17 2

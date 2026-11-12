@@ -9,7 +9,7 @@ fn main() {
         println!("cargo:warning=SUPERIOR_LDE_OBJECTS is not set: build this with cargo xtask");
         return;
     };
-    for object in ["e100.o", "lde.o", "lde-net.o", "lde-drm.o"] {
+    for object in ["e100.o", "lde.o", "lde-net.o", "lde-drm.o", "lde-snd.o"] {
         let path = std::path::Path::new(&dir).join(object);
         println!("cargo:rerun-if-changed={}", path.display());
         println!("cargo:rustc-link-arg={}", path.display());
