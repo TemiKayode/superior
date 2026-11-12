@@ -330,14 +330,16 @@ impl Net {
         if let Some((a, t)) = self.v6.tentative {
             if now >= t {
                 self.v6.tentative = None;
+                // Said before it is saved: a kill between the two then
+                // repeats detection and the line, rather than keeping the
+                // address unannounced.
                 if a == self.v6.ll {
                     self.v6.ll_ready = true;
-                    self.save6();
                     say!("IPv6 link-local {}", Ip6(a));
+                    self.save6();
                     self.v6.rs_next = now;
                 } else {
                     self.v6.global = a;
-                    self.save6();
                     say!(
                         "IPv6 address {}/{} via {}, DNS {}",
                         Ip6(a),
@@ -345,6 +347,7 @@ impl Net {
                         Ip6(self.v6.router),
                         Ip6(self.v6.dns)
                     );
+                    self.save6();
                 }
             }
         }
