@@ -74,7 +74,7 @@ a { color: var(--accent); }
 </main>
 
 <script>
-const UPDATED = "2026-11-11";
+const UPDATED = "2026-11-12";
 // s: done | part | open. ev: the evidence (commit and test) for done items, or what is left.
 const PHASES = [
   { id: "P0", name: "Foundations", months: "Months 0–6",
@@ -129,7 +129,7 @@ const PHASES = [
   { id: "P2", name: "Graphics, UX and trust chain", months: "Months 12–24",
     gate: "Daily-drivable on reference hardware; latency budgets met; power and driver gate passed at month 24.",
     groups: [{ name: "Deliverables", tasks: [
-      { t: "GPU drivers through LDE plus Mesa Vulkan", s: "open" },
+      { t: "GPU drivers through LDE plus Mesa Vulkan", s: "part", ev: "First display driver done (<code>6af2b2c</code>): Linux 6.6&#39;s <code>bochs</code> DRM driver, fetched from kernel.org with its SHA-256 checked and compiled unmodified, runs as a component in the Linux Driver Environment. The environment gained Linux&#39;s DRM API as simple-display-pipe drivers use it (<code>c/lde-drm.c</code>): the device and its registration, mode configuration, connectors whose modes come from the display&#39;s EDID (detailed, established and standard timings, VESA&#39;s DMT table) or the standard list, VRAM GEM objects and framebuffers, and atomic commits in Linux&#39;s order. Its host serves a new <code>display</code> interface: the client lends its surface a page at a time and picks a mode; the host has the driver make two framebuffers in video memory and at each flush copies the rectangle into the hidden one, has the driver flip to it and catches the other up. Underneath: the kernel&#39;s <code>DeviceFrame</code> makes a power-of-two run of device pages (up to 1 GiB) as one frame, the PCI bus server hands over a whole BAR that way (<code>pci::BAR_FRAME</code>), and a manifest <code>vspace</code> gives a component the page tables for 16 MiB of video memory. <code>cargo xtask display-test</code>, on QEMU&#39;s bochs-display on AArch64 and its standard VGA on x86-64 (the bootloader needs its BIOS; the same registers): the driver reads the EDID (800x600 preferred), the client draws a picture and redraws a patch of it (two flips), kills the driver and has a second picture shown by its restarted instance; each time QEMU&#39;s monitor takes a screenshot and all 480,000 pixels must be the picture&#39;s. It passes on both ISAs. Still to do: GPUs with command submission (virtio-gpu&#39;s 3D mode, then the reference laptops&#39; GPUs) and Mesa&#39;s Vulkan drivers over them, which also need the POSIX environment of Phase 3&#39;s Linux personality or a port of their own." },
       { t: "Display server, compositor, toolkit and shell", s: "open" },
       { t: "Audio and input", s: "open" }, { t: "Wi-Fi", s: "open" },
       { t: "Suspend and resume", s: "open" },
