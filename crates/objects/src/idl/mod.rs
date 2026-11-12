@@ -5,12 +5,16 @@
 //! not what its description gives.
 //!
 //! The first is the PCI bus server's, which the Driver SDK calls through
-//! these; the hand-written modules in [`crate::interfaces`] describe the
+//! these; the display interface was described this way from the start.
+//! The hand-written modules in [`crate::interfaces`] describe the
 //! rest (and what travels with each call) until they are moved over.
 
 #[path = "pci.rs"]
 mod pci_file;
 pub use pci_file::pci;
+#[path = "display.rs"]
+mod display_file;
+pub use display_file::display;
 
 #[cfg(test)]
 mod tests {
@@ -33,6 +37,7 @@ mod tests {
             (pci::IO_READ, by_hand::IO_READ),
             (pci::IO_WRITE, by_hand::IO_WRITE),
             (pci::CLOSE, by_hand::CLOSE),
+            (pci::BAR_FRAME, by_hand::BAR_FRAME),
         ];
         for (generated, written) in pairs {
             assert_eq!(generated, written);

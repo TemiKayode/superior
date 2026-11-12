@@ -48,6 +48,10 @@ typedef u64 netdev_features_t;
 typedef int irqreturn_t;
 typedef int netdev_tx_t;
 typedef long long loff_t;
+typedef u8 uint8_t;
+typedef u16 uint16_t;
+typedef u32 uint32_t;
+typedef u64 uint64_t;
 
 #define true 1
 #define false 0
@@ -154,6 +158,7 @@ void lde_bug(const char *file, int line) __attribute__((noreturn));
 #define BUG() lde_bug(__FILE__, __LINE__)
 #define BUG_ON(c) do { if (unlikely(c)) BUG(); } while (0)
 #define WARN_ON(c) ({ bool _w = !!(c); if (_w) _printk("warning at %s:%d\n", __FILE__, __LINE__); _w; })
+#define WARN_ON_ONCE(c) ({ bool _w = !!(c); if (_w) lde_once(_printk("warning at %s:%d\n", __FILE__, __LINE__)); _w; })
 #define WARN_ONCE(c, fmt, ...) ({ bool _w = !!(c); if (_w) lde_once(_printk(fmt, ##__VA_ARGS__)); _w; })
 
 /* ---- strings and memory */
@@ -251,6 +256,7 @@ void lde_host_wmb(void);
 #define MODULE_DEVICE_TABLE(bus, table) LDE_NOTHING
 #define module_param(name, type, perm) LDE_NOTHING
 #define module_param_array(name, type, nump, perm) LDE_NOTHING
+#define module_param_named(name, var, type, perm) LDE_NOTHING
 /* The host calls these (lde.c) to load the driver. */
 #define module_init(fn) int lde_module_init(void) { return fn(); }
 #define module_exit(fn) void lde_module_exit(void) { fn(); }
@@ -271,6 +277,8 @@ struct device_driver {
 	const char *name;
 	const struct dev_pm_ops *pm;
 };
+/* Power management has no caller yet (Phase 2's suspend and resume). */
+#define SET_SYSTEM_SLEEP_PM_OPS(suspend_fn, resume_fn)
 #define SIMPLE_DEV_PM_OPS(name, suspend_fn, resume_fn) \
 	const struct dev_pm_ops __maybe_unused name = { .suspend = suspend_fn, .resume = resume_fn }
 static inline void *dev_get_drvdata(const struct device *dev) { return dev->driver_data; }
@@ -305,6 +313,8 @@ static inline void release_firmware(const struct firmware *fw) { (void)fw; }
 #define PCI_VENDOR_ID_REALTEK 0x10ec
 #define PCI_DEVICE_ID_REALTEK_8139 0x8139
 #define PCI_VENDOR_ID_INTEL 0x8086
+#define PCI_SUBVENDOR_ID_REDHAT_QUMRANET 0x1af4
+#define PCI_SUBDEVICE_ID_QEMU 0x1100
 #define PCI_CLASS_NETWORK_ETHERNET 0x0200
 #define PCI_FUNC(devfn) ((devfn) & 7)
 #define PCI_SLOT(devfn) ((devfn) >> 3 & 0x1f)
@@ -369,6 +379,11 @@ void pci_unregister_driver(struct pci_driver *drv);
 int pci_enable_device(struct pci_dev *dev);
 void pci_disable_device(struct pci_dev *dev);
 int pci_request_regions(struct pci_dev *dev, const char *name);
+static inline int pci_request_region(struct pci_dev *dev, int bar, const char *name)
+{
+	(void)dev; (void)bar; (void)name; /* the function is this component's alone */
+	return 0;
+}
 void pci_release_regions(struct pci_dev *dev);
 void pci_set_master(struct pci_dev *dev);
 int pci_read_config_word(struct pci_dev *dev, int where, u16 *val);
@@ -396,6 +411,19 @@ static inline u32 readl(const void __iomem *p) { return *(const volatile u32 *)p
 static inline void writeb(u8 v, void __iomem *p) { *(volatile u8 *)p = v; }
 static inline void writew(u16 v, void __iomem *p) { *(volatile u16 *)p = v; }
 static inline void writel(u32 v, void __iomem *p) { *(volatile u32 *)p = v; }
+/* Legacy port I/O: no component has ports of its own; a driver that
+ * reaches for one is told it read all ones (lde.c logs it once). */
+u8 inb(unsigned long port);
+u16 inw(unsigned long port);
+void outb(u8 v, unsigned long port);
+void outw(u16 v, unsigned long port);
+struct resource;
+static inline struct resource *request_region(unsigned long start, unsigned long n, const char *name)
+{
+	(void)start; (void)n; (void)name;
+	return NULL;
+}
+static inline void release_region(unsigned long start, unsigned long n) { (void)start; (void)n; }
 #define ioread8(p) readb(p)
 #define ioread16(p) readw(p)
 #define ioread32(p) readl(p)

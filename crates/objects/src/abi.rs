@@ -176,7 +176,9 @@ pub enum Syscall {
     /// `Retype` this picks the page, so the holder can reach exactly the
     /// registers it needs (one PCI function's configuration space, one BAR
     /// page). Device frames may alias; who gets which is the holder's
-    /// policy (the PCI bus server's).
+    /// policy (the PCI bus server's). `r8`, if not 0, makes the frame
+    /// `2^r8` bytes (up to [`DEVICE_FRAME_MAX_BITS`]): a run of pages a
+    /// map maps from its address on (a video card's memory, say).
     DeviceFrame = 36,
     /// Binds the I/O address space in slot `rdi` to the PCI function with
     /// requester ID `rdx` (bus << 8 | device << 3 | function), using the
@@ -420,6 +422,9 @@ pub const SERVICE_UNAVAILABLE: u64 = u64::MAX;
 
 /// Frames are 4 KiB.
 pub const FRAME_BITS: u8 = 12;
+/// The largest device frame `DeviceFrame` makes: 1 GiB (a video card's
+/// memory, mapped as a run of pages).
+pub const DEVICE_FRAME_MAX_BITS: u64 = 30;
 /// A CNode holds from 2^4 to 2^11 slots, each taking 2^5 bytes.
 pub const CNODE_MIN_BITS: u64 = 4;
 pub const CNODE_MAX_BITS: u64 = 20;

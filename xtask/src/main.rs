@@ -117,6 +117,9 @@ struct Image {
     /// An empty PCI Express root port, and QEMU's monitor to plug cards
     /// into it (the hot-plug test).
     hotplug: bool,
+    /// QEMU's bochs-display as the only display, and its monitor to take
+    /// screenshots through (the display test).
+    display: bool,
 }
 
 /// The disk drivers, each with the PCI function its test disk appears as
@@ -162,6 +165,7 @@ fn main() -> ExitCode {
                         .and_then(|_| net_test(a, "net"))
                         .and_then(|_| net_test(a, "lde"))
                         .and_then(|_| net_test(a, "lde-e100"))
+                        .and_then(|_| display_test(a))
                         .and_then(|_| tcp_test(a))
                         .and_then(|_| keyboard_test(a))
                         .and_then(|_| hotplug_test(a))
@@ -187,6 +191,7 @@ fn main() -> ExitCode {
         Some("net-test") => net_test(arch, "net"),
         Some("lde-test") => net_test(arch, "lde"),
         Some("lde-e100-test") => net_test(arch, "lde-e100"),
+        Some("display-test") => display_test(arch),
         Some("tcp-test") => tcp_test(arch),
         Some("keyboard-test") => keyboard_test(arch),
         Some("hotplug-test") => hotplug_test(arch),
@@ -198,7 +203,7 @@ fn main() -> ExitCode {
         }
         Some("bench") => image(false, Arch::X86_64).and_then(|img| bench(&img)),
         _ => Err(
-            "usage: cargo xtask <idl | image | run | test | boot-test | shell-test | cm-test | supervise-test | drivers-test | memory-test | reboot-test | fs-test | nvme-test | ahci-test | net-test | lde-test | lde-e100-test | tcp-test | keyboard-test | hotplug-test | bench | sel4-test> [x86_64 | aarch64]"
+            "usage: cargo xtask <idl | image | run | test | boot-test | shell-test | cm-test | supervise-test | drivers-test | memory-test | reboot-test | fs-test | nvme-test | ahci-test | net-test | lde-test | lde-e100-test | display-test | tcp-test | keyboard-test | hotplug-test | bench | sel4-test> [x86_64 | aarch64]"
                 .into(),
         ),
     });
@@ -304,7 +309,7 @@ fn host_tests() -> Result<(), String> {
 /// tree at `LINUX_TAG` when first needed and kept under `target/`: Linux
 /// is GPL-2.0, and none of it is in this repository.
 const LINUX_TAG: &str = "v6.6";
-const LINUX_SOURCES: [(&str, &str, &str); 2] = [
+const LINUX_SOURCES: [(&str, &str, &str); 3] = [
     (
         "8139cp",
         "drivers/net/ethernet/realtek/8139cp.c",
@@ -315,7 +320,21 @@ const LINUX_SOURCES: [(&str, &str, &str); 2] = [
         "drivers/net/ethernet/intel/e100.c",
         "65f562bf302e3b28ea47ee44e77fe61c37e6ec569efdb2d020a4a84662828acd",
     ),
+    (
+        "bochs",
+        "drivers/gpu/drm/tiny/bochs.c",
+        "93b0b9a15cd1268b206ac1bbf71aec8338232ed0d47bc5969cd6c4453c86c3c4",
+    ),
 ];
+
+/// The Linux driver a manifest hosts in the Linux Driver Environment:
+/// a network test's, or the display test's.
+fn linux_driver(manifest: &str) -> Option<&'static str> {
+    match manifest {
+        "display" => Some("bochs"),
+        _ => linux_nic(manifest).map(|l| l.0),
+    }
+}
 
 /// The Linux driver a manifest name stands for: `lde` is the Linux Driver
 /// Environment test with 8139cp, `lde-<driver>` the same with another.
@@ -391,7 +410,7 @@ fn lde_objects(arch: Arch, driver: &str) -> Result<(), String> {
         }
         newest
     };
-    let built = [format!("{driver}.o"), "lde.o".into()]
+    let built = [format!("{driver}.o"), "lde.o".into(), "lde-net.o".into(), "lde-drm.o".into()]
         .iter()
         .map(|o| std::fs::metadata(out.join(o)).and_then(|m| m.modified()).ok())
         .min()
@@ -502,9 +521,10 @@ fn bundle(arch: Arch, manifest: &str, driver: &str) -> Result<PathBuf, String> {
         // Need Linux's source and the build container: only where used.
         ("lde-8139cp", "superior-lde-8139cp"),
         ("lde-e100", "superior-lde-e100"),
+        ("lde-bochs", "superior-lde-bochs"),
     ] {
         if let Some(driver) = name.strip_prefix("lde-") {
-            if linux_nic(manifest).map(|l| l.0) != Some(driver) {
+            if linux_driver(manifest) != Some(driver) {
                 continue;
             }
             lde_objects(arch, driver)?;
@@ -631,6 +651,7 @@ fn image_for(
         linux_nic: linux_nic(manifest).map(|l| l.1),
         keyboard: manifest == "keyboard",
         hotplug: manifest == "hotplug",
+        display: manifest == "display",
     })
 }
 
@@ -726,6 +747,7 @@ fn sel4_image() -> Result<Image, String> {
         linux_nic: None,
         keyboard: false,
         hotplug: false,
+        display: false,
     })
 }
 
@@ -760,7 +782,7 @@ fn qemu_command(img: &Image) -> Command {
             // Images with a disk are driver tests: they need an IOMMU,
             // which QEMU emulates (VT-d) only on its q35 machine, with
             // interrupt remapping.
-            if img.disk.is_some() || img.net || img.keyboard || img.hotplug {
+            if img.disk.is_some() || img.net || img.keyboard || img.hotplug || img.display {
                 q.args(["-machine", "q35", "-device", "intel-iommu,intremap=on"]);
             }
             if img.disk.is_some() && img.driver == "ahci" {
@@ -785,7 +807,7 @@ fn qemu_command(img: &Image) -> Command {
             // Driver tests get an SMMUv3 in front of PCI.
             let machine = if img.sel4 {
                 SEL4_MACHINE
-            } else if img.disk.is_some() || img.net || img.keyboard || img.hotplug {
+            } else if img.disk.is_some() || img.net || img.keyboard || img.hotplug || img.display {
                 "virt,highmem=off,gic-version=3,iommu=smmuv3"
             } else {
                 "virt,highmem=off,gic-version=3"
@@ -934,6 +956,24 @@ fn qemu_command(img: &Image) -> Command {
             q.args(["-global", "ICH9-LPC.acpi-pci-hotplug-with-bridge-support=off"]);
         }
         q.args(["-device", "pcie-root-port,id=hp0,chassis=1", "-qmp"])
+            .arg(format!("tcp:127.0.0.1:{QMP_PORT},server=on,wait=off"));
+    }
+    if img.display {
+        // One display, which the Linux bochs driver drives, its EDID giving
+        // the screen's size as the preferred mode: on x86 QEMU's standard
+        // VGA in place of the default one (the bootloader needs its BIOS),
+        // on AArch64 bochs-display (no BIOS there; the same registers in
+        // MMIO).
+        let card = match img.arch {
+            Arch::X86_64 => "VGA",
+            Arch::Aarch64 => "bochs-display",
+        };
+        if img.arch == Arch::X86_64 {
+            q.args(["-vga", "none"]);
+        }
+        q.arg("-device")
+            .arg(format!("{card},xres={},yres={},edid=on", SCREEN.0, SCREEN.1))
+            .arg("-qmp")
             .arg(format!("tcp:127.0.0.1:{QMP_PORT},server=on,wait=off"));
     }
     q.args(["-serial", "stdio", "-no-reboot"]);
@@ -1985,6 +2025,182 @@ fn net_test(arch: Arch, manifest: &str) -> Result<(), String> {
 /// The port QEMU's monitor (QMP) listens on in the keyboard test.
 const QMP_PORT: u16 = 47011;
 
+/// The size the display test gives QEMU's bochs-display, which its EDID
+/// reports as the preferred mode.
+const SCREEN: (usize, usize) = (800, 600);
+/// The patch the display client redraws in the first picture.
+const PATCH: (usize, usize, usize, usize) = (100, 150, 320, 200);
+
+/// The display client's test picture (user/testclient: `test_pixel`):
+/// (red, green, blue) at (x, y) in phase `phase`.
+fn test_pixel(x: usize, y: usize, phase: usize) -> [u8; 3] {
+    [
+        ((x + 64 * phase) & 0xff) as u8,
+        ((y + 32 * phase) & 0xff) as u8,
+        ((((x >> 3) ^ (y >> 3)) * 8 + 16 * phase) & 0xff) as u8,
+    ]
+}
+
+/// What screenshot `k` must show: the first picture (phase 1, the patch
+/// in phase 2), then the second (phase 3).
+fn expected_pixel(k: usize, x: usize, y: usize) -> [u8; 3] {
+    let (px, py, pw, ph) = PATCH;
+    match k {
+        0 if (px..px + pw).contains(&x) && (py..py + ph).contains(&y) => test_pixel(x, y, 2),
+        0 => test_pixel(x, y, 1),
+        _ => test_pixel(x, y, 3),
+    }
+}
+
+/// Has QEMU's monitor write the screen to `path` (a PPM file).
+fn screendump(path: &Path) -> Result<(), String> {
+    use std::io::{BufRead, BufReader};
+    use std::net::TcpStream;
+    let s = TcpStream::connect(("127.0.0.1", QMP_PORT)).map_err(|e| format!("QMP: {e}"))?;
+    s.set_read_timeout(Some(Duration::from_secs(20))).map_err(|e| e.to_string())?;
+    let mut w = s.try_clone().map_err(|e| e.to_string())?;
+    let mut r = BufReader::new(s);
+    let mut line = String::new();
+    // Each answer is a line with "return" (or "error"); events come too.
+    let mut answer = |r: &mut BufReader<TcpStream>| -> Result<String, String> {
+        loop {
+            line.clear();
+            if r.read_line(&mut line).map_err(|e| format!("QMP: {e}"))? == 0 {
+                return Err("QMP: the monitor hung up".into());
+            }
+            if line.contains("\"return\"") || line.contains("\"error\"") {
+                return Ok(line.clone());
+            }
+        }
+    };
+    let file = path.to_string_lossy().replace('\\', "/");
+    w.write_all(b"{\"execute\":\"qmp_capabilities\"}\n").map_err(|e| e.to_string())?;
+    answer(&mut r)?;
+    let cmd = format!("{{\"execute\":\"screendump\",\"arguments\":{{\"filename\":\"{file}\"}}}}\n");
+    w.write_all(cmd.as_bytes()).map_err(|e| e.to_string())?;
+    let a = answer(&mut r)?;
+    if a.contains("\"error\"") {
+        return Err(format!("QMP screendump: {}", a.trim()));
+    }
+    Ok(())
+}
+
+/// Checks screenshot `k`, a PPM file, pixel by pixel.
+fn check_screenshot(path: &Path, k: usize) -> Result<String, String> {
+    let data = std::fs::read(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
+    // "P6", width, height, the largest value, each followed by one
+    // whitespace byte, then the pixels.
+    let mut fields = Vec::new();
+    let mut at = 0;
+    while fields.len() < 4 && at < data.len() {
+        while at < data.len() && data[at].is_ascii_whitespace() {
+            at += 1;
+        }
+        let start = at;
+        while at < data.len() && !data[at].is_ascii_whitespace() {
+            at += 1;
+        }
+        fields.push(String::from_utf8_lossy(&data[start..at]).into_owned());
+    }
+    at += 1;
+    let size = (fields.get(1).and_then(|f| f.parse().ok()), fields.get(2).and_then(|f| f.parse().ok()));
+    if fields.first().map(String::as_str) != Some("P6") || size != (Some(SCREEN.0), Some(SCREEN.1)) {
+        return Err(format!("screenshot {}: {:?}, not an {}x{} PPM", k + 1, fields, SCREEN.0, SCREEN.1));
+    }
+    let pixels = &data[at.min(data.len())..];
+    if pixels.len() < SCREEN.0 * SCREEN.1 * 3 {
+        return Err(format!("screenshot {}: {} bytes of pixels, too few", k + 1, pixels.len()));
+    }
+    let mut wrong = 0;
+    let mut first = None;
+    for y in 0..SCREEN.1 {
+        for x in 0..SCREEN.0 {
+            let i = (y * SCREEN.0 + x) * 3;
+            let (have, want) = ([pixels[i], pixels[i + 1], pixels[i + 2]], expected_pixel(k, x, y));
+            if have != want {
+                wrong += 1;
+                first.get_or_insert((x, y, have, want));
+            }
+        }
+    }
+    match first {
+        None => Ok(format!(
+            "screenshot {}: all {} pixels of the {}x{} screen are the picture's",
+            k + 1,
+            SCREEN.0 * SCREEN.1,
+            SCREEN.0,
+            SCREEN.1
+        )),
+        Some((x, y, have, want)) => Err(format!(
+            "screenshot {}: {wrong} pixels wrong, the first at ({x}, {y}): {have:?}, not {want:?}",
+            k + 1
+        )),
+    }
+}
+
+/// Boots `boot/display.manifest`: Linux's bochs driver in the Linux
+/// Driver Environment on QEMU's bochs-display. When the client says a
+/// picture is on the screen, QEMU's monitor takes a screenshot, and every
+/// pixel must be the picture's: the first after two flips (the second
+/// framebuffer must hold the first picture and the patch), the second
+/// after the driver was killed and restarted.
+fn display_test(arch: Arch) -> Result<(), String> {
+    let img = image_with(false, arch, "display")?;
+    println!("== display test on {}", img.path.display());
+    let shots: Arc<Mutex<Vec<Result<String, String>>>> = Arc::default();
+    let markers = [
+        "[pass] display: picture 1 on the screen",
+        "[pass] display: picture 2 on the screen",
+    ];
+    let taken = shots.clone();
+    let out = run_to_exit_watching(&img, Duration::from_secs(120), move |all| {
+        let mut taken = taken.lock().unwrap();
+        let k = taken.len();
+        if k < markers.len() && all.contains(markers[k]) {
+            let path = root().join("target").join(format!("display-{}-{}.ppm", arch.name(), k + 1));
+            let _ = std::fs::remove_file(&path);
+            taken.push(screendump(&path).and_then(|()| check_screenshot(&path, k)));
+        }
+    });
+    let out = out?;
+    let steps = [
+        "lde bochs: 1234:1111 at 00:",
+        "lde bochs: BAR 0 (16384 KiB) mapped whole, as one frame",
+        "lde bochs: [drm] Found bochs VGA, ID 0xb0c",
+        "lde bochs: [drm] Framebuffer size 16384 kB @ 0x",
+        "lde bochs: [drm] Found EDID data blob.",
+        "lde bochs: [drm] Initialized bochs-drm 1.0.0 20130925 for 00:",
+        "modes from the display's EDID; 800x600 at",
+        "lde bochs: Linux's bochs driver runs the display",
+        "[pass] display: a surface of 469 pages for 800x600",
+        "[pass] display: the display's EDID gives",
+        "lde bochs: 800x600 at",
+        "[pass] display: 469 surface pages lent; 800x600 shown, pitch 3200",
+        "lde bochs: flip 1: framebuffer 1 shown, 800x600 at (0, 0) copied in",
+        "lde bochs: flip 2: framebuffer 0 shown, 320x200 at (100, 150) copied in",
+        "[pass] display: picture 1 on the screen: flipped to framebuffer 1 and back to 0",
+        "[pass] display: a rectangle past the screen's edge is refused",
+        "display: killing the driver",
+        "[cm] fault injection: killing lde-bochs",
+        "lde bochs: [drm] Found EDID data blob.",
+        "[pass] display: 469 surface pages lent; 800x600 shown, pitch 3200",
+        "[pass] display: picture 2 on the screen after the driver's restart (flip 1)",
+        "display: done (0 failed)",
+        "[cm] client asked to shut down (pass)",
+    ];
+    check_log("display test", &out, &steps)?;
+    let shots = shots.lock().unwrap();
+    if shots.len() != markers.len() {
+        return Err(format!("display test: {} screenshots taken, want {}", shots.len(), markers.len()));
+    }
+    for s in shots.iter() {
+        println!("== {}", s.clone()?);
+    }
+    println!("== display test passed ({})", arch.name());
+    Ok(())
+}
+
+
 /// Types `word` and a space, again and again, on the USB keyboard `kbd0`
 /// through QEMU's monitor, until `stop`. Returns the words typed.
 fn type_words(
@@ -2258,6 +2474,17 @@ fn reboot_test(img: &Image) -> Result<(), String> {
 /// Boots `img` with no input until QEMU exits, echoing its output, and
 /// returns the output if it exited with the pass code.
 fn run_to_exit(img: &Image, limit: Duration) -> Result<String, String> {
+    run_to_exit_watching(img, limit, |_| {})
+}
+
+/// As [`run_to_exit`], calling `watch` with all the output so far each
+/// time more arrives (the guest waits meanwhile only if its output pipe
+/// fills).
+fn run_to_exit_watching(
+    img: &Image,
+    limit: Duration,
+    mut watch: impl FnMut(&str) + Send + 'static,
+) -> Result<String, String> {
     let mut child = qemu_command(img)
         .args(["-display", "none"])
         .stdin(Stdio::null())
@@ -2275,6 +2502,7 @@ fn run_to_exit(img: &Image, limit: Duration) -> Result<String, String> {
             let _ = std::io::stdout().write_all(&buf[..n]);
             let _ = std::io::stdout().flush();
             all.extend_from_slice(&buf[..n]);
+            watch(&String::from_utf8_lossy(&all));
         }
         all
     });

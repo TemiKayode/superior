@@ -47,3 +47,8 @@ op IO_WRITE = 11 (bar_and_width, offset, value)
 
 # Gives the function back: reset as for OPEN, and anyone's to open.
 op CLOSE = 12
+
+# A capability to all of memory BAR `bar` as one device frame, its pages
+# in a row (mapped from one address on): for a BAR too large to take a
+# page at a time, such as a video card's memory.
+op BAR_FRAME = 13 (bar) -> (size)

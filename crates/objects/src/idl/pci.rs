@@ -193,4 +193,27 @@ pub mod pci {
     pub const fn close() -> [u64; 4] {
         [CLOSE, 0, 0, 0]
     }
+
+    /// A capability to all of memory BAR `bar` as one device frame, its pages
+    /// in a row (mapped from one address on): for a BAR too large to take a
+    /// page at a time, such as a video card's memory.
+    pub const BAR_FRAME: u64 = 13;
+    /// The message of a `BAR_FRAME` call.
+    pub const fn bar_frame(bar: u64) -> [u64; 4] {
+        [BAR_FRAME, bar, 0, 0]
+    }
+    /// What a `BAR_FRAME` call answers.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct BarFrameReply {
+        pub size: u64,
+    }
+    /// Reads a `BAR_FRAME` reply: its results, or the status it failed with.
+    pub fn bar_frame_reply(m: [u64; 4]) -> Result<BarFrameReply, Status> {
+        match Status::from_u64(m[0]) {
+            Status::Ok => Ok(BarFrameReply {
+                size: m[1],
+            }),
+            s => Err(s),
+        }
+    }
 }

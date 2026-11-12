@@ -221,7 +221,11 @@ holds the rest):
 - Driver framework v1 (spec section 5). Drivers are ordinary components that reach
   exactly one device:
   - Kernel: device-memory capabilities (`DeviceUntyped`), which make only frames,
-    never zeroed and never kernel objects; `DeviceFrame` picks the page.
+    never zeroed and never kernel objects; `DeviceFrame` picks the page, or a
+    larger power-of-two run of them (up to 1 GiB) as one frame, which maps as its
+    pages in a row and unmaps whole. The bus server hands a driver a whole memory
+    BAR that way (`pci::BAR_FRAME`), for video memory too big to take a page at a
+    time.
   - Kernel: MSI vectors delivered as notification signals, with `IrqMsiMessage`
     saying what the device must write. MSIs are remapped, since an MSI is just a
     DMA write: `IrqMsiMessage` also names the I/O address space of the function
@@ -343,6 +347,22 @@ holds the rest):
     and `lde-e100-test` run the whole network test over each on both ISAs (pings, datagrams to 65,507 bytes, DNS, TCP,
     IPv6) while the injector kills the Linux driver, the network server and the
     resolver: each restart probes the device again from nothing.
+  - Display drivers likewise: `c/lde-drm.c` gives a driver Linux's DRM API as
+    simple-display-pipe drivers use it (the device and its registration, mode
+    configuration, connectors with EDID read and parsed into modes (detailed,
+    established and standard timings, VESA's DMT table) or the standard list
+    without one, VRAM GEM objects and framebuffers, atomic commits in Linux's
+    order), and the host serves the `display` interface (`interfaces/display.idl`):
+    the client lends its surface a page at a time and asks for a mode; the host has
+    the driver make two framebuffers in video memory and, at each flush, copies the
+    rectangle into the hidden one, has the driver flip to it and catches the other
+    up. Linux's `bochs` driver (`user/lde-bochs/`) runs this way, on QEMU's
+    bochs-display on AArch64 and its standard VGA on x86 (the same registers).
+    `cargo xtask display-test` boots it on both ISAs: the client draws a picture,
+    then redraws a patch of it, kills the driver and has a second picture shown by
+    its restarted instance; each time QEMU's monitor takes a screenshot and every
+    pixel of the 800x600 screen must be the picture's. The network host is
+    `src/net.rs`, the display host `src/display.rs`.
   - A virtio-blk driver (`user/virtio-blk/`) serves the versioned `block`
     interface: reads land by DMA straight in a frame the client lends with the call.
     The device reaches that frame only while the read is in flight: the driver maps
@@ -457,7 +477,9 @@ holds the rest):
     60 s, then the system stops.
   - Components may have larger CSpaces (manifest `cspace`, up to 2^18 slots). The
     manager makes a component's CNode first from its block, so a large one, aligned
-    to its size, wastes none of it.
+    to its size, wastes none of it. A component's address space may be larger too
+    (manifest `vspace`, up to 2^20 bytes, page tables included), for a driver that
+    maps a video card's memory.
   `cargo xtask memory-test` boots `boot/memory.manifest`:
   - a client pages its heap in by touching it, and every page arrives zeroed;
   - it takes frames up to its quota and is refused one more;
@@ -803,7 +825,9 @@ holds the rest):
   notifications, a 256-slot CNode pool) so filling them stays quick; normal kernels have
   32 of each, 32 address spaces and a 4096-slot pool.
 
-Not yet: in the Linux Driver Environment drivers of a class other than network,
+Not yet: in the Linux Driver Environment drivers of a class other than network
+and simple display (GPUs with command submission, so Mesa's Vulkan drivers, which
+also need a POSIX environment), cursor planes and dirty-rectangle damage,
 ethtool and the MII ioctls, firmware files, more than one interrupt or one
 device per component (QEMU's later 8255x models append stale bytes to some of
 e100's frames, so its test uses the 82557); legacy
@@ -842,10 +866,11 @@ https://claude.ai/artifact/QKJS8qH5Dfbjzn58RStq1j
 | `user/shell/` | The boot shell and COM1 driver, started as a component |
 | `crates/driver/` | The Driver SDK: PCI access through the bus server, MMIO, DMA pages, virtqueues, DMA buffer pools, an executor |
 | `crates/idl/` | The IDL compiler: interface descriptions to Rust |
-| `interfaces/` | Interface descriptions (`pci.idl`, the PCI bus server's) |
-| `crates/lde/` | The Linux Driver Environment: Linux's kernel API for hosted drivers (`include/`, `c/lde.c`) and its host (`src/lib.rs`) |
+| `interfaces/` | Interface descriptions (`pci.idl`, the PCI bus server's; `display.idl`) |
+| `crates/lde/` | The Linux Driver Environment: Linux's kernel API for hosted drivers (`include/`, `c/lde.c`, `c/lde-net.c`, `c/lde-drm.c`) and its host (`src/lib.rs`, `src/net.rs`, `src/display.rs`) |
 | `user/lde-8139cp/` | Linux's 8139cp network driver, unmodified, in the Linux Driver Environment |
 | `user/lde-e100/` | Linux's e100 network driver, likewise |
+| `user/lde-bochs/` | Linux's bochs DRM display driver, likewise |
 | `user/pcibus/` | The PCI bus server |
 | `user/memserver/` | The Memory Server |
 | `user/fs/` | The filesystem server |
@@ -879,6 +904,7 @@ cargo xtask ahci-test      # the same on a SATA disk behind AHCI (add aarch64 fo
 cargo xtask net-test       # just the network test (add aarch64 for that ISA)
 cargo xtask lde-test       # the network test over Linux's 8139cp driver (needs Docker; fetches the driver from kernel.org the first time)
 cargo xtask lde-e100-test  # the same over Linux's e100 driver
+cargo xtask display-test   # Linux's bochs display driver: two pictures, checked pixel by pixel from QEMU screenshots
 cargo xtask tcp-test       # just the TCP test (add aarch64 for that ISA)
 cargo xtask keyboard-test  # just the USB keyboard test (add aarch64 for that ISA)
 cargo xtask hotplug-test   # just the PCI hot-plug test (add aarch64 for that ISA)

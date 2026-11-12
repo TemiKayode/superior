@@ -59,7 +59,7 @@ use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use spin::{Mutex, MutexGuard};
 use superior_objects::abi::{
-    CNODE_SLOT_BITS, CapTransfer, Error, FaultKind, FaultReply, MAP_EXEC, MAP_WRITE, ObjectType,
+    CNODE_SLOT_BITS, CapTransfer, DEVICE_FRAME_MAX_BITS, Error, FaultKind, FaultReply, MAP_EXEC, MAP_WRITE, ObjectType,
     Syscall,
 };
 use superior_objects::cap::{CapError, Capability, Object, Rights, Slot, Table};
@@ -991,7 +991,7 @@ fn frame_dma_address(k: &mut Kernel, cur: Tid, slot: u64) -> Result<(), u64> {
 }
 
 /// `DeviceFrame`: rdi = device memory, rsi = page offset, rdx = empty
-/// slot.
+/// slot, r8 = the frame's size in bits (0 for a page).
 fn device_frame(k: &mut Kernel, cur: Tid, f: &Args) -> Result<(), u64> {
     let src = own_slot(k, cur, f.a0).ok_or(Error::InvalidCapability.code())?;
     let cap = *k.caps.get(src).ok_or(Error::InvalidCapability.code())?;
@@ -999,7 +999,11 @@ fn device_frame(k: &mut Kernel, cur: Tid, f: &Args) -> Result<(), u64> {
         return Err(Error::InvalidCapability.code());
     };
     let offset = f.a1;
-    if !offset.is_multiple_of(4096) || offset >= 1 << size_bits {
+    let bits = if f.a3 == 0 { 12 } else { f.a3 };
+    if !(12..=DEVICE_FRAME_MAX_BITS).contains(&bits)
+        || !offset.is_multiple_of(4096)
+        || offset.checked_add(1 << bits).is_none_or(|end| end > 1 << size_bits)
+    {
         return Err(Error::InvalidArgument.code());
     }
     let dst = own_slot(k, cur, f.a2).ok_or(Error::InvalidArgument.code())?;
@@ -1009,7 +1013,7 @@ fn device_frame(k: &mut Kernel, cur: Tid, f: &Args) -> Result<(), u64> {
     let frame = Capability::new(
         Object::Frame {
             paddr: base + offset,
-            size_bits: 12,
+            size_bits: bits as u8,
         },
         Rights::READ | Rights::WRITE | Rights::GRANT | Rights::MAP,
     );
@@ -1463,7 +1467,7 @@ fn revoke_index(k: &mut Kernel, s: usize) -> Result<(), u64> {
     } = k;
     caps.revoke_each(s, |i, c| {
         objects |= reapable(&c.object);
-        unmap_parts(mapped, io_mapped, vspaces, io_spaces, i);
+        unmap_parts(mapped, io_mapped, vspaces, io_spaces, i, frame_pages(&c.object));
     })
     .map_err(cap_error)?;
     // Revoking only frames and memory (the Memory Server's pages) leaves
@@ -1508,7 +1512,16 @@ fn delete_index(k: &mut Kernel, s: usize) -> Result<(), u64> {
 /// Unmaps the frame whose capability is in table slot `s`, if mapped,
 /// from its address space and from its I/O address space.
 fn unmap_slot(k: &mut Kernel, s: usize) {
-    unmap_parts(&mut k.mapped, &mut k.io_mapped, &k.vspaces, &k.io_spaces, s);
+    let pages = k.caps.get(s).map_or(1, |c| frame_pages(&c.object));
+    unmap_parts(&mut k.mapped, &mut k.io_mapped, &k.vspaces, &k.io_spaces, s, pages);
+}
+
+/// The pages a mapping of the object covers: a frame's, or one.
+fn frame_pages(o: &Object) -> u64 {
+    match o {
+        Object::Frame { size_bits, .. } => 1 << (size_bits.max(&12) - 12),
+        _ => 1,
+    }
 }
 
 /// [`unmap_slot`], on the parts of the kernel it needs (so it can run
@@ -1519,10 +1532,13 @@ fn unmap_parts(
     vspaces: &[Option<VSpace>],
     io_spaces: &[Option<IoDomain>],
     s: usize,
+    pages: u64,
 ) {
     if let Some((id, va)) = mapped[s].take() {
         if let Some(v) = vspaces[id as usize] {
-            v.root.unmap(va);
+            for p in 0..pages {
+                v.root.unmap(va + p * 4096);
+            }
             smp::shootdown(v.root.root_pa(), false);
         }
     }
@@ -1671,6 +1687,7 @@ fn map_into(k: &mut Kernel, cur: Tid, slot: u64, va: u64, flags: u64, id: u16) -
     let Object::Frame { paddr, .. } = cap.object else {
         return Err(Error::InvalidCapability.code());
     };
+    let pages = frame_pages(&cap.object);
     let (writable, executable) = (flags & MAP_WRITE != 0, flags & MAP_EXEC != 0);
     // Writable or executable, never both.
     if flags & !(MAP_WRITE | MAP_EXEC) != 0 || (writable && executable) {
@@ -1684,7 +1701,12 @@ fn map_into(k: &mut Kernel, cur: Tid, slot: u64, va: u64, flags: u64, id: u16) -
     if !cap.rights.contains(needed) {
         return Err(Error::InsufficientRights.code());
     }
-    if !va.is_multiple_of(4096) || !(USER_BASE..USER_END).contains(&va) {
+    // A large (device) frame is mapped as a run of pages from `va`.
+    let end = va.checked_add(pages * 4096);
+    if !va.is_multiple_of(4096) || !(USER_BASE..USER_END).contains(&va) || end.is_none_or(|e| e > USER_END) {
+        return Err(Error::InvalidArgument.code());
+    }
+    if executable && pages > 1 {
         return Err(Error::InvalidArgument.code());
     }
     if k.mapped[s].is_some() {
@@ -1693,12 +1715,22 @@ fn map_into(k: &mut Kernel, cur: Tid, slot: u64, va: u64, flags: u64, id: u16) -
     let v = k.vspaces[id as usize]
         .as_mut()
         .ok_or(Error::IllegalOperation.code())?;
-    v.root
-        .map_frame(va, paddr, writable, executable, &mut v.pool)
-        .map_err(|e| match e {
-            MapError::InUse => Error::AlreadyMapped.code(),
-            MapError::OutOfMemory => Error::NotEnoughMemory.code(),
-        })?;
+    for p in 0..pages {
+        let at = va + p * 4096;
+        if let Err(e) = v.root.map_frame(at, paddr + p * 4096, writable, executable, &mut v.pool) {
+            // Undo the pages mapped so far.
+            for q in 0..p {
+                v.root.unmap(va + q * 4096);
+            }
+            if p > 0 {
+                smp::shootdown(v.root.root_pa(), false);
+            }
+            return Err(match e {
+                MapError::InUse => Error::AlreadyMapped.code(),
+                MapError::OutOfMemory => Error::NotEnoughMemory.code(),
+            });
+        }
+    }
     k.mapped[s] = Mapping::new(id, va);
     Ok(())
 }

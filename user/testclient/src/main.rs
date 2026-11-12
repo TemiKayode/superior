@@ -46,6 +46,12 @@
 //! - `arg 22`, the hot-plug client (`boot/hotplug.manifest`): opens a
 //!   card the host plugs in while the machine runs, sees what it held
 //!   revoked when the card is taken out, and opens the next one.
+//! - `arg 24`, the display client (`boot/display.manifest`): draws test
+//!   pictures in a surface of its own pages, lends it to the display
+//!   driver (slot 0) and has them shown, kills the driver (control, slot
+//!   1) and has the next shown by its restarted instance; `cargo xtask
+//!   display-test` checks every pixel of the screen each time. Memory in
+//!   slot 2.
 //! - `arg 10`, the fault injector: asks the manager (control, slot 0) to
 //!   kill the filesystem server and the disk driver at pseudo-random
 //!   moments, then blocks on the notification in slot 1.
@@ -55,6 +61,7 @@
 
 use core::sync::atomic::{AtomicU32, Ordering, fence};
 use superior_objects::abi::{CapTransfer, Error, ObjectType, Syscall, root};
+use superior_objects::idl::display;
 use superior_objects::interfaces::fs::ring;
 use superior_objects::interfaces::{Status, block, dns, fs, input, mem, net, pci};
 use superior_sys::{Called, USER_BASE, call_retry, print_line, syscall, syscall_x};
@@ -4187,6 +4194,137 @@ fn ticks() -> u64 {
     syscall(Syscall::Ticks, 0, [0; 4]).msg[0]
 }
 
+// ---- the display client (`arg 24`, boot/display.manifest) ----
+
+const DISPLAY: u64 = 0;
+const DISPLAY_CONTROL: u64 = 1;
+const DISPLAY_MEMORY: u64 = 2;
+/// The surface's pages, mapped in a row.
+const SURFACE: u64 = 8;
+const SURFACE_VA: u64 = USER_BASE + 0x4000_0000;
+/// The driver's component, which this client kills halfway.
+const DISPLAY_DRIVER_INDEX: u64 = 1;
+/// The size `cargo xtask display-test` gives QEMU's display, which its
+/// EDID must report as preferred.
+const SCREEN: (u64, u64) = (800, 600);
+/// The rectangle the second flush of the first picture redraws.
+const PATCH: (u64, u64, u64, u64) = (100, 150, 320, 200);
+/// Ticks the host gets to take a screenshot of each picture.
+const SCREENSHOT_TICKS: u64 = 300;
+
+/// The test picture's pixel at (x, y) in phase `phase` (XRGB8888). `cargo
+/// xtask display-test` computes the same to check the screenshots.
+fn test_pixel(x: u64, y: u64, phase: u64) -> u32 {
+    let r = (x + 64 * phase) & 0xff;
+    let g = (y + 32 * phase) & 0xff;
+    let b = (((x >> 3) ^ (y >> 3)) * 8 + 16 * phase) & 0xff;
+    (r << 16 | g << 8 | b) as u32
+}
+
+fn draw(x0: u64, y0: u64, w: u64, h: u64, phase: u64) {
+    let pitch = SCREEN.0;
+    for y in y0..y0 + h {
+        for x in x0..x0 + w {
+            // SAFETY: the surface's pages are mapped, writable, and hold
+            // the whole screen.
+            unsafe { ((SURFACE_VA as *mut u32).add((y * pitch + x) as usize)).write(test_pixel(x, y, phase)) };
+        }
+    }
+}
+
+fn rect(x: u64, y: u64, w: u64, h: u64) -> u64 {
+    x | y << 16 | w << 32 | h << 48
+}
+
+/// A display call; after a restart, retried until the new instance
+/// answers.
+fn display_call(m: [u64; 4], page: Option<u64>) -> [u64; 4] {
+    let x = CapTransfer {
+        grant: page.map(|p| (SURFACE + p) as u16),
+        accept: None,
+    };
+    for _ in 0..100 {
+        let r = syscall_x(Syscall::Call, DISPLAY, m, x);
+        if r.status == 0 {
+            return r.msg;
+        }
+        superior_sys::sleep(5);
+    }
+    [u64::MAX; 4]
+}
+
+/// Lends the surface and shows the preferred mode: the mode's index.
+fn display_set_up(t: &mut Checks, pages: u64, first: bool) -> Option<u64> {
+    let info = display_call(display::info(), None);
+    let (modes, preferred, edid) = (info[1], info[2], info[3]);
+    let m = display_call(display::mode(preferred), None);
+    if first {
+        t.check(
+            info[0] == 0 && edid == 1 && modes > 1 && m[0] == 0 && (m[1], m[2]) == SCREEN,
+            format_args!(
+                "the display's EDID gives {modes} modes, {}x{} at {} Hz preferred",
+                m[1], m[2], m[3]
+            ),
+        );
+    }
+    let lent = (0..pages).all(|p| display_call(display::attach(p), Some(p))[0] == 0);
+    let r = display_call(display::set_mode(preferred), None);
+    t.check(
+        lent && r[0] == 0 && r[1] == SCREEN.0 * 4 && r[2] != r[3],
+        format_args!(
+            "{pages} surface pages lent; {}x{} shown, pitch {}, framebuffers at {:#x} and {:#x}",
+            SCREEN.0, SCREEN.1, r[1], r[2], r[3]
+        ),
+    );
+    (r[0] == 0).then_some(preferred)
+}
+
+fn display_client() -> ! {
+    let mut t = Checks(0, "display");
+    let pages = (SCREEN.0 * SCREEN.1 * 4).div_ceil(4096);
+    let mut made = true;
+    for p in 0..pages {
+        made &= syscall(Syscall::Retype, DISPLAY_MEMORY, [ObjectType::Frame as u64, 0, SURFACE + p, 0]).status == 0
+            && syscall(Syscall::FrameMap, SURFACE + p, [SURFACE_VA + p * 4096, 1, 0, 0]).status == 0;
+    }
+    t.check(made, format_args!("a surface of {pages} pages for {}x{}", SCREEN.0, SCREEN.1));
+    display_set_up(&mut t, pages, true);
+    // The first picture: all of it, then a patch of it in another phase.
+    // The second flush shows the other framebuffer, which must have the
+    // first picture as well as the patch.
+    draw(0, 0, SCREEN.0, SCREEN.1, 1);
+    let a = display_call(display::flush(rect(0, 0, SCREEN.0, SCREEN.1)), None);
+    let (px, py, pw, ph) = PATCH;
+    draw(px, py, pw, ph, 2);
+    let b = display_call(display::flush(rect(px, py, pw, ph)), None);
+    t.check(
+        a[0] == 0 && b[0] == 0 && (a[1], b[1]) == (1, 0) && (a[2], b[2]) == (1, 2),
+        format_args!("picture 1 on the screen: flipped to framebuffer {} and back to {}", a[1], b[1]),
+    );
+    let past = display_call(display::flush(rect(SCREEN.0 - 10, 0, 20, 10)), None);
+    t.check(
+        past[0] == Status::Invalid as u64,
+        format_args!("a rectangle past the screen's edge is refused"),
+    );
+    superior_sys::sleep(SCREENSHOT_TICKS);
+    // The driver dies; its restarted instance knows nothing of the
+    // surface or the mode, and gets both again.
+    say!("display: killing the driver");
+    syscall(Syscall::Call, DISPLAY_CONTROL, [OP_KILL, DISPLAY_DRIVER_INDEX, 0, 0]);
+    display_set_up(&mut t, pages, false);
+    draw(0, 0, SCREEN.0, SCREEN.1, 3);
+    let c = display_call(display::flush(rect(0, 0, SCREEN.0, SCREEN.1)), None);
+    t.check(
+        c[0] == 0 && c[2] == 1,
+        format_args!("picture 2 on the screen after the driver's restart (flip {})", c[2]),
+    );
+    superior_sys::sleep(SCREENSHOT_TICKS);
+    say!("display: done ({} failed)", t.0);
+    syscall(Syscall::Call, DISPLAY_CONTROL, [OP_SHUTDOWN, t.0, 0, 0]);
+    superior_sys::park()
+}
+
+
 fn crasher() -> ! {
     say!("crasher: starting");
     // SAFETY: deliberately not: this must fault.
@@ -4224,6 +4362,7 @@ pub extern "C" fn _start(role: u64) -> ! {
         // The network test: the driver, the network server, the resolver.
         16 => injector(&[1, 2, 3], false),
         18 => tcp_client(),
+        24 => display_client(),
         _ => probe(),
     }
 }

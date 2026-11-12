@@ -125,6 +125,17 @@ impl Pci {
         Ok(r.msg[1])
     }
 
+    /// Takes all of memory BAR `bar` into `slot` as one frame and maps it
+    /// at `va`, its pages in a row; returns the BAR's size.
+    pub fn map_bar(&self, bar: u64, slot: u64, va: u64) -> Result<u64, Failure> {
+        let r = self.call(pci::bar_frame(bar), Some(slot))?;
+        if r.cap != Some(slot as u16) {
+            return Err(("no BAR frame arrived", 0));
+        }
+        map(slot, va, true).map_err(|e| ("mapping a BAR", e))?;
+        Ok(r.msg[1])
+    }
+
     pub fn bus_master(&self, on: bool) -> Result<(), Failure> {
         self.call(pci::bus_master(on as u64), None)
             .map(drop)

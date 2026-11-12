@@ -29,6 +29,8 @@
 //!   shared 9 16             # 9 pages (slots 16-24) kept across restarts,
 //!                           # to share with a server (rings, buffers)
 //!   cspace 9                # a CSpace of 2^9 slots (default 2^6)
+//!   vspace 18               # an address space of 2^18 bytes, page
+//!                           # tables included (default 2^16)
 //!   quota 64                # pages the Memory Server may give it
 //!   heap 32                 # a demand-zero heap of 32 pages
 //!   fault-injector          # may ask the manager to kill components
@@ -54,6 +56,11 @@ pub const MAX_HEAP_PAGES: u64 = 4096;
 pub const MEMORY_MIN_BITS: u8 = 16;
 pub const MEMORY_MAX_BITS: u8 = 24;
 pub const DEFAULT_MEMORY_BITS: u8 = 20;
+/// Bounds on a component's address space (its top table and the pool its
+/// page tables come from), in bits: 2^16 bytes holds 15 page tables, for
+/// some 30 MiB mapped; a driver mapping a video card's memory needs more.
+pub const VSPACE_BITS: u8 = 16;
+pub const VSPACE_MAX_BITS: u8 = 20;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Start {
@@ -120,6 +127,8 @@ pub struct Component<'a> {
     pub memory_bits: u8,
     /// Its CSpace size in bits.
     pub cspace_bits: u8,
+    /// Its address space's size in bits.
+    pub vspace_bits: u8,
     /// Pages the Memory Server may give it (heap and frames together).
     pub quota_pages: u64,
     /// Pages of demand-zero heap at `USER_BASE + mem::HEAP_OFFSET`.
@@ -141,6 +150,7 @@ impl<'a> Component<'a> {
             arg: 0,
             memory_bits: DEFAULT_MEMORY_BITS,
             cspace_bits: CSPACE_BITS,
+            vspace_bits: VSPACE_BITS,
             quota_pages: 0,
             heap_pages: 0,
             injector: false,
@@ -299,6 +309,16 @@ impl<'a> Manifest<'a> {
                     }
                     None
                 }
+                "vspace" => {
+                    let w = arg("vspace needs a size in bits")?;
+                    match number(w)? {
+                        b if (VSPACE_BITS as u64..=VSPACE_MAX_BITS as u64).contains(&b) => {
+                            c.vspace_bits = b as u8
+                        }
+                        _ => return Err(err("vspace must be 16 to 20 bits", w)),
+                    }
+                    None
+                }
                 "fault-injector" => {
                     c.injector = true;
                     None
@@ -446,6 +466,7 @@ component client   # comment after a directive
   untyped 16 4
   state 5
   cspace 8
+  vspace 18
   quota 10
   heap 4
   fault-injector
@@ -477,6 +498,7 @@ component memserver
         );
         assert!(client.injector && !echo.injector);
         assert_eq!(echo.cspace_bits, CSPACE_BITS);
+        assert_eq!((client.vspace_bits, echo.vspace_bits), (18, VSPACE_BITS));
         let caps: std::vec::Vec<_> = client.caps().collect();
         assert_eq!(
             caps,
@@ -626,6 +648,12 @@ component memserver
         assert_eq!(
             error("component a\n image a\n cspace 19"),
             (3, "cspace must be 6 to 18 bits")
+        );
+        assert_eq!(
+            error("component a
+ image a
+ vspace 21"),
+            (3, "vspace must be 16 to 20 bits")
         );
         assert_eq!(
             error("component a\n image a\n heap 0"),

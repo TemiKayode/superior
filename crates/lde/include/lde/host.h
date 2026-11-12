@@ -58,6 +58,8 @@ int lde_poll_weight(void);
 void lde_poll(void);
 /* Sends a frame: 0, 1 if the driver's queue is full for now, or -errno. */
 int lde_xmit(const void *frame, size_t len);
+/* Runs the driver's kernel timers and work that are due (lde.c). */
+void lde_run_timers(void);
 /* Runs the driver's timers and work that are due, and the transmit
  * watchdog; and how many ticks until it must be called again (0: only
  * when something else happens). */
@@ -66,5 +68,24 @@ unsigned long lde_next_timer(void);
 /* The interface's MAC address (6 bytes) and whether its link is up. */
 void lde_mac(u8 *mac);
 int lde_carrier(void);
+
+/* ---- lde-drm.c's, for a display driver's host */
+
+/* Asks the connector for its modes (the driver's get_modes, filtered by
+ * its mode_valid): how many, or -errno. */
+int lde_drm_probe(void);
+/* Whether the driver read the display's EDID. */
+int lde_drm_edid(void);
+/* Mode `i` (preferred first): 1, or 0 past the last. */
+int lde_drm_mode(unsigned int i, u32 *width, u32 *height, u32 *refresh, u32 *preferred);
+/* Makes two XRGB8888 framebuffers in video memory for mode `i` (the
+ * driver's fb_create) and commits the mode showing the first: its pitch,
+ * 0 or -errno. */
+int lde_drm_start(unsigned int i, u32 *pitch);
+/* Framebuffer `b`'s pixels (device memory) and offset in video memory. */
+void *lde_drm_buffer(int b);
+u64 lde_drm_buffer_offset(int b);
+/* Commits framebuffer `b` as the one shown: 0 or -errno. */
+int lde_drm_flip(int b);
 
 #endif

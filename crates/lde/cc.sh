@@ -1,5 +1,6 @@
 #!/bin/sh
-# Compiles the Linux Driver Environment's C half and one Linux driver for
+# Compiles the Linux Driver Environment's C half (its core, network and DRM
+# parts; every driver links all three) and one Linux driver for
 # an architecture, in the build container (cargo xtask runs this):
 #   cc.sh <x86_64|aarch64> <driver.c> <module name> <output directory>
 # Linux's own warnings policy: char signedness in pointers is not checked.
@@ -17,4 +18,6 @@ flags="-std=gnu11 -O2 -ffreestanding -fno-stack-protector -fno-common -fPIE -fvi
   -Wno-shift-count-overflow"
 mkdir -p "$out"
 clang $target $flags -DKBUILD_MODNAME="\"$name\"" -c "$driver" -o "$out/$name.o"
-clang $target $flags -c /work/crates/lde/c/lde.c -o "$out/lde.o"
+for half in lde lde-net lde-drm; do
+  clang $target $flags -c /work/crates/lde/c/$half.c -o "$out/$half.o"
+done

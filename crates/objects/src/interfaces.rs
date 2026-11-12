@@ -139,6 +139,11 @@ pub mod pci {
     /// `OPEN` (domain, BAR pages and interrupts revoked), and anyone's
     /// to open.
     pub const CLOSE: u64 = 12;
+    /// `[BAR_FRAME, bar]`: a capability to all of memory BAR `bar` as one
+    /// device frame, its pages in a row, in the call's accept slot: for a
+    /// BAR too large to take a page at a time (a video card's memory).
+    /// Reply: `[status, BAR size in bytes]`.
+    pub const BAR_FRAME: u64 = 13;
 }
 
 /// Block devices: what a storage driver serves.

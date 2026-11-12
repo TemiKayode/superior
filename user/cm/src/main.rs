@@ -280,7 +280,8 @@ impl<'a> Manager<'a> {
         // The CNode first: the largest object, aligned to its size, so a
         // big one (the Memory Server's) wastes none of the block.
         retype(ut, ObjectType::CNode, c.cspace_bits as u64, cnode).map_err(|e| ("CNode", e))?;
-        retype(ut, ObjectType::AddressSpace, 16, vspace).map_err(|e| ("address space", e))?;
+        retype(ut, ObjectType::AddressSpace, c.vspace_bits as u64, vspace)
+            .map_err(|e| ("address space", e))?;
         retype(ut, ObjectType::Thread, 0, tcb).map_err(|e| ("thread", e))?;
         let image = self
             .bundle

@@ -1,0 +1,34 @@
+# A display: what a display driver serves. The caller draws into a
+# surface of its own pages, lent to the driver a page at a time, and asks
+# for rectangles of it to be shown; the driver copies them into the
+# framebuffer it is not showing and flips to it, so the screen changes
+# whole. Pixels are XRGB8888, 32 bits each (blue in the low byte), rows
+# `pitch` bytes apart, in the surface as on the screen.
+interface display version 1
+
+# The most surface pages a caller may attach (4 MiB: 1024x768 at 32
+# bits).
+const SURFACE_PAGES = 1024
+
+# What the display offers: how many modes (`MODE` lists them, preferred
+# first), which of them is preferred, and whether the display's EDID was
+# read (the modes are then the display's own).
+op INFO = 1 (version) -> (modes, preferred, edid)
+
+# Mode `index`: its size in pixels and refresh rate in Hz.
+op MODE = 2 (index) -> (width, height, refresh)
+
+# Keeps page `page` of the caller's surface, which the call lends. Pages
+# come in order from 0; attaching page 0 again starts a new surface.
+op ATTACH = 3 (page)
+
+# Shows mode `index`, cleared to black, once enough of the surface is
+# attached for it (`pitch` times its height). Returns the pitch in bytes
+# and where the two framebuffers lie in video memory.
+op SET_MODE = 4 (index) -> (pitch, front_offset, back_offset)
+
+# Shows the surface's rectangle `rect` (x | y << 16 | width << 32 |
+# height << 48, in pixels): copied into the hidden framebuffer, which is
+# then flipped to. Returns which framebuffer is shown now and how many
+# flips there have been.
+op FLUSH = 5 (rect) -> (front, flips)

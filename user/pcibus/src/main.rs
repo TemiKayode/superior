@@ -1103,6 +1103,37 @@ impl Bus {
         Ok((slot, b.size))
     }
 
+    /// The original of the frame over all of BAR (i, bar), made if need
+    /// be: a power of two of pages, so it covers the BAR (at least a page).
+    fn bar_frame(&mut self, i: usize, bar: u64) -> Result<(u64, u64), Status> {
+        let b = self.funcs[i]
+            .unwrap()
+            .bars
+            .get(bar as usize)
+            .copied()
+            .flatten()
+            .filter(|b| !b.io)
+            .ok_or(Status::NotFound)?;
+        // A page number no BAR_PAGE can ask for marks the whole BAR.
+        let key = (i as u8, bar as u8, u16::MAX);
+        if let Some(p) = self.bar_pages.iter().position(|&k| k == Some(key)) {
+            return Ok((BAR_SLOTS + p as u64, b.size));
+        }
+        let p = self
+            .bar_pages
+            .iter()
+            .position(Option::is_none)
+            .ok_or(Status::Invalid)?;
+        let bits = (b.size.max(4096).next_power_of_two().trailing_zeros()) as u64;
+        let offset = b.addr - self.window_base;
+        let slot = BAR_SLOTS + p as u64;
+        if syscall(Syscall::DeviceFrame, WINDOW, [offset, slot, bits, 0]).status != 0 {
+            return Err(Status::Invalid);
+        }
+        self.bar_pages[p] = Some(key);
+        Ok((slot, b.size))
+    }
+
     /// Programs function `i`'s MSI capability with its vector 0's message
     /// and enables it (one vector), or disables it.
     fn msi(&mut self, i: usize, on: bool) -> Result<(), Status> {
@@ -1218,6 +1249,10 @@ impl Bus {
         };
         match m[0] {
             pci::BAR_PAGE => match self.bar_page(i, m[1], m[2]) {
+                Ok((slot, size)) => ([Status::Ok as u64, size, 0, 0], Some(slot)),
+                Err(s) => status(s),
+            },
+            pci::BAR_FRAME => match self.bar_frame(i, m[1]) {
                 Ok((slot, size)) => ([Status::Ok as u64, size, 0, 0], Some(slot)),
                 Err(s) => status(s),
             },

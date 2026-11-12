@@ -3,49 +3,53 @@
 //!
 //! The driver is Linux's source file, compiled as it is against this
 //! crate's headers (`include/`), which give it Linux's kernel API by
-//! name; `c/lde.c` implements that API for one PCI device and one network
-//! interface; and this file is the host under both: it holds the
+//! name; `c/` implements that API (`lde.c` for every driver, `lde-net.c`
+//! for a network driver's interface, `lde-drm.c` for a display driver's
+//! DRM device); and this crate is the host under them: it holds the
 //! component's capabilities and does what touches the system. The driver
 //! gets no more than a native one: the one function the PCI bus server
-//! gives it (found from the driver's own ID table), that function's BAR
-//! pages and interrupt line, and an IOMMU domain holding only this
-//! component's memory pool.
+//! gives it (found from the driver's own ID table), that function's BARs
+//! and interrupt line, and an IOMMU domain holding only this component's
+//! memory pool.
 //!
 //! - Memory: a fixed pool of pages, made at the start and mapped both
 //!   here and into the device's domain, so any buffer the driver hands
 //!   the device (`dma_map_single`) already has a device address. Blocks
 //!   of up to 2 KiB come from size classes and never cross a page; larger
 //!   ones are whole pages in a row.
+//! - Registers: a BAR of up to 16 pages is mapped a page at a time; a
+//!   larger one (a video card's memory) whole, as one frame (`pci::BAR_FRAME`).
 //! - Interrupts: the device's legacy line (`pci::INTX`), bound to the
 //!   component's notification. The loop calls the driver's handler, then
-//!   unmasks the line; the driver's NAPI poll runs from the loop, only
-//!   while the receive queue has room for what it may deliver.
-//! - One thread: handler, poll and transmit never run at once, so Linux's
-//!   locks are empty. The driver's kernel timers and work run from the
-//!   loop too: it sleeps no longer than until the next timer is due.
+//!   unmasks the line.
+//! - One thread: the driver's handler and every call into it run one
+//!   after another, so Linux's locks are empty. Its kernel timers and work
+//!   run from the loop too: it sleeps no longer than until the next timer
+//!   is due.
 //! - What there is none of fails as Linux would have it fail: firmware
-//!   files (`request_firmware` finds none), ethtool and MII ioctls.
+//!   files (`request_firmware` finds none), ethtool and MII ioctls, legacy
+//!   I/O ports.
 //!
-//! The component serves the `nic` interface: by calls (`RECV`, `SEND`),
-//! and through frame rings (`nic::ring`) once its caller has set them up.
-//! Then the frames the driver delivers go from the host's receive queue
-//! into the receive ring, and the frames the caller puts in the transmit
-//! ring go to the driver's transmit routine, with no call for either; the
-//! caller's doorbell is a badged copy of the component's notification, so
-//! it wakes the same loop the interrupt does. Slots: 0 the bus server, 1
-//! the `nic` endpoint (receive), 2 a notification, 3 untyped memory (1
-//! MiB), in a CSpace of 2^8 slots.
+//! What the component serves depends on the driver's class: a network
+//! driver serves `nic` ([`run`], in [`net`]), a display driver serves
+//! `display` ([`run_display`], in [`display`]). Slots: 0 the bus server, 1
+//! the endpoint it serves (receive), 2 a notification, 3 untyped memory
+//! (1 MiB); the rest are the host's.
 
 #![no_std]
 
+mod display;
+mod net;
+
+pub use display::run as run_display;
+pub use net::run;
+
 use core::cell::UnsafeCell;
 use core::ffi::{c_char, c_int, c_uint, c_ulong, c_void};
-use core::sync::atomic::{AtomicU32, Ordering, fence};
-use superior_driver::{DmaPage, Failure, Pci, dma_barrier, irq_ack};
-use superior_objects::abi::{CapTransfer, Error, Syscall, TICK_HZ};
-use superior_objects::interfaces::nic::ring;
-use superior_objects::interfaces::{Status, nic};
-use superior_sys::{USER_BASE, print_line, syscall, syscall_x};
+use superior_driver::{DmaPage, Failure, Pci, dma_barrier};
+use superior_objects::abi::TICK_HZ;
+use superior_objects::interfaces::Status;
+use superior_sys::{USER_BASE, print_line};
 
 const PCI: u64 = 0;
 const SERVICE: u64 = 1;
@@ -53,29 +57,30 @@ const NOTIFY: u64 = 2;
 const UNTYPED: u64 = 3;
 const IRQ: u64 = 4;
 const DOMAIN: u64 = 5;
-/// Where a caller's frame arrives.
+/// Where a caller's lent page or granted capability arrives.
 const LENT: u64 = 6;
-/// The notification the caller attached.
+/// The notification a caller attached.
 const LISTENER: u64 = 7;
 const BAR_SLOTS: u64 = 8;
 const MAX_BAR_PAGES: u64 = 16;
 const POOL: u64 = BAR_SLOTS + MAX_BAR_PAGES;
 /// Enough for a driver that keeps 256 receive buffers of 2 KiB (e100).
 const POOL_PAGES: usize = 192;
-/// The doorbell: this component's notification, to signal only, granted
-/// to the ring's caller.
-const DOORBELL: u64 = POOL + POOL_PAGES as u64;
-/// The caller's ring pages.
-const RING: u64 = DOORBELL + 1;
-const _: () = assert!(RING + ring::PAGES <= 256);
+/// A whole-BAR frame for each BAR mapped whole.
+const BIG_BARS: u64 = POOL + POOL_PAGES as u64;
+/// The first slot the class's host ([`net`], [`display`]) has to itself.
+const CLASS_SLOTS: u64 = BIG_BARS + 6;
 /// Every right, for keeping a granted capability.
 const ALL: u64 = 0x1f;
 const WRITE: u64 = 2;
 
 const BAR_VA: u64 = USER_BASE + 0x4000_0000;
 const POOL_VA: u64 = USER_BASE + 0x5000_0000;
+/// Where the class's host maps what it is lent.
 const LENT_VA: u64 = USER_BASE + 0x6000_0000;
-const RING_VA: u64 = USER_BASE + 0x7000_0000;
+const CLASS_VA: u64 = USER_BASE + 0x7000_0000;
+/// BARs mapped whole: 1 GiB apart, the largest a device frame may be.
+const BIG_BAR_VA: u64 = USER_BASE + 0x1_0000_0000;
 const PAGE: usize = 4096;
 
 /// Linux's `HZ` in the headers is the kernel's tick rate.
@@ -89,16 +94,9 @@ unsafe extern "C" {
     fn lde_module_init() -> c_int;
     fn lde_device_id(i: c_uint, vendor: *mut u16, device: *mut u16) -> c_int;
     fn lde_probe(vendor: u16, device: u16, bars: u32) -> c_int;
-    fn lde_open() -> c_int;
     fn lde_interrupt();
-    fn lde_poll_pending() -> c_int;
-    fn lde_poll_weight() -> c_int;
-    fn lde_poll();
-    fn lde_xmit(frame: *const c_void, len: usize) -> c_int;
-    fn lde_tick();
+    fn lde_run_timers();
     fn lde_next_timer() -> c_ulong;
-    fn lde_mac(mac: *mut u8);
-    fn lde_carrier() -> c_int;
 }
 
 /// Block sizes of the pool's classes: powers of two, so a block is
@@ -116,21 +114,17 @@ enum Use {
     RunMore,
 }
 
-/// Received frames waiting for the caller.
-const RX_FRAMES: usize = 32;
-const RX_BYTES: usize = 1536;
-const _: () = assert!(nic::MAX_FRAME as usize <= RX_BYTES);
-
 struct Host {
     name: &'static str,
     /// The device: where it is, its memory BARs.
     location: u32,
     bars: u64,
     /// Each BAR's size, and how many of its pages are mapped; pages
-    /// mapped in all.
+    /// mapped in all; the BARs mapped whole.
     bar_size: [u64; 6],
     bar_mapped: [u64; 6],
     bar_pages: u64,
+    bar_whole: u8,
     irq_taken: bool,
     /// What `udelay` counts: cycle-counter steps in a microsecond.
     cycles_per_usec: u64,
@@ -139,23 +133,6 @@ struct Host {
     dma: [u64; POOL_PAGES],
     used: [Use; POOL_PAGES],
     free: [*mut u8; CLASSES.len()],
-    /// The receive queue: frames `rx_head .. rx_tail`.
-    rx: [[u8; RX_BYTES]; RX_FRAMES],
-    rx_len: [u16; RX_FRAMES],
-    rx_head: usize,
-    rx_tail: usize,
-    rx_dropped: u64,
-    attached: bool,
-    /// The caller's ring: pages attached so far, whether it is started,
-    /// and this side's ends of the two rings.
-    ring_pages: u64,
-    ring: bool,
-    ring_rx_tail: u32,
-    ring_tx_head: u32,
-    /// Frames sent and received, and how many of them through the rings.
-    sent: u64,
-    received: u64,
-    by_ring: u64,
 }
 
 struct Cell(UnsafeCell<Host>);
@@ -168,36 +145,13 @@ static HOST: Cell = Cell(UnsafeCell::new(Host {
     bar_size: [0; 6],
     bar_mapped: [0; 6],
     bar_pages: 0,
+    bar_whole: 0,
     irq_taken: false,
     cycles_per_usec: 0,
     dma: [0; POOL_PAGES],
     used: [Use::Free; POOL_PAGES],
     free: [core::ptr::null_mut(); CLASSES.len()],
-    rx: [[0; RX_BYTES]; RX_FRAMES],
-    rx_len: [0; RX_FRAMES],
-    rx_head: 0,
-    rx_tail: 0,
-    rx_dropped: 0,
-    attached: false,
-    ring_pages: 0,
-    ring: false,
-    ring_rx_tail: 0,
-    ring_tx_head: 0,
-    sent: 0,
-    received: 0,
-    by_ring: 0,
 }));
-
-/// Word `off` of the ring's header page.
-fn hdr(off: usize) -> &'static AtomicU32 {
-    // SAFETY: only used while the ring is started, its header mapped.
-    unsafe { &*((RING_VA + off as u64) as *const AtomicU32) }
-}
-
-/// Where frame `i` of a ring whose slots start at page `page` lies.
-fn ring_slot(page: u64, i: u32, slots: u32) -> u64 {
-    RING_VA + page * PAGE as u64 + (i % slots) as u64 * ring::SLOT
-}
 
 /// The host's state. The driver calls back into the host while the host
 /// calls the driver, so no reference from here is held across a call into
@@ -209,8 +163,9 @@ fn host() -> &'static mut Host {
 }
 
 macro_rules! say {
-    ($($t:tt)*) => { print_line(format_args!("lde {}: {}", host().name, format_args!($($t)*))) };
+    ($($t:tt)*) => { $crate::print_line(format_args!("lde {}: {}", $crate::host().name, format_args!($($t)*))) };
 }
+pub(crate) use say;
 
 fn pci() -> Pci {
     Pci { slot: PCI }
@@ -303,10 +258,6 @@ impl Host {
         }
         Some(self.dma[first] + (p as u64 & (PAGE as u64 - 1)))
     }
-
-    fn rx_waiting(&self) -> usize {
-        self.rx_tail - self.rx_head
-    }
 }
 
 // ---- what lde.c asks of the host (lde/host.h)
@@ -349,7 +300,8 @@ fn bar_va(bar: usize) -> u64 {
 }
 
 /// Maps memory BAR `bar` as far as its page `upto` (to the end of the BAR
-/// with `None`), unless it is already. False if it cannot be.
+/// with `None`), a page at a time, unless it is already. False if it
+/// cannot be.
 fn map_bar(bar: usize, upto: Option<u64>) -> bool {
     if bar >= 6 || host().bars & 1 << bar == 0 {
         return false;
@@ -382,6 +334,32 @@ fn map_bar(bar: usize, upto: Option<u64>) -> bool {
     }
 }
 
+/// Where all of memory BAR `bar` is mapped, mapping it first: a page at
+/// a time if it is small, else whole, as one frame.
+fn bar_base(bar: usize) -> Option<u64> {
+    // Its first page tells the size.
+    if !map_bar(bar, Some(0)) {
+        return None;
+    }
+    if host().bar_size[bar] <= MAX_BAR_PAGES * PAGE as u64 {
+        return map_bar(bar, None).then(|| bar_va(bar));
+    }
+    let va = BIG_BAR_VA + ((bar as u64) << 30);
+    if host().bar_whole & 1 << bar == 0 {
+        match pci().map_bar(bar as u64, BIG_BARS + bar as u64, va) {
+            Ok(size) => {
+                host().bar_whole |= 1 << bar;
+                say!("BAR {bar} ({} KiB) mapped whole, as one frame", size / 1024);
+            }
+            Err((what, code)) => {
+                say!("[fail] BAR {bar}: {what} ({code:#x})");
+                return None;
+            }
+        }
+    }
+    Some(va)
+}
+
 #[unsafe(no_mangle)]
 extern "C" fn lde_host_bar_size(bar: c_uint) -> u64 {
     // Its first page tells the size; the rest is mapped when asked for.
@@ -390,11 +368,7 @@ extern "C" fn lde_host_bar_size(bar: c_uint) -> u64 {
 
 #[unsafe(no_mangle)]
 extern "C" fn lde_host_bar_map(bar: c_uint) -> *mut c_void {
-    if map_bar(bar as usize, None) {
-        bar_va(bar as usize) as *mut c_void
-    } else {
-        core::ptr::null_mut()
-    }
+    bar_base(bar as usize).map_or(core::ptr::null_mut(), |va| va as *mut c_void)
 }
 
 #[unsafe(no_mangle)]
@@ -453,20 +427,6 @@ extern "C" fn lde_host_wmb() {
     dma_barrier();
 }
 
-#[unsafe(no_mangle)]
-extern "C" fn lde_host_rx(frame: *const c_void, len: usize) {
-    let h = host();
-    if !(14..=nic::MAX_FRAME as usize).contains(&len) || h.rx_waiting() == RX_FRAMES {
-        h.rx_dropped += 1;
-        return;
-    }
-    let i = h.rx_tail % RX_FRAMES;
-    // SAFETY: lde.c passes `len` bytes of a socket buffer; they fit.
-    unsafe { core::ptr::copy_nonoverlapping(frame as *const u8, h.rx[i].as_mut_ptr(), len) };
-    h.rx_len[i] = len as u16;
-    h.rx_tail += 1;
-}
-
 // ---- the component
 
 /// Measures the cycle counter against the tick: from one tick's edge to
@@ -485,14 +445,15 @@ fn calibrate() {
     host().cycles_per_usec = c1.wrapping_sub(c0) / (2 * 1_000_000 / TICK_HZ);
 }
 
-fn start() -> Result<(), Failure> {
+/// Loads the driver and runs its probe on the first device the bus server
+/// has of those the driver's own table names.
+fn start(name: &'static str) -> Result<(), Failure> {
+    host().name = name;
     calibrate();
     // SAFETY: the driver's module initialisation, once, first.
     if unsafe { lde_module_init() } != 0 {
         return Err(("the driver's module initialisation failed", 0));
     }
-    // The device: the first the bus server has of those the driver's own
-    // table names.
     let mut found = None;
     for i in 0.. {
         let (mut vendor, mut device) = (0u16, 0u16);
@@ -546,355 +507,5 @@ fn start() -> Result<(), Failure> {
     if rc != 0 {
         return Err(("the driver's probe failed, errno", -rc as u64));
     }
-    // SAFETY: the interface the probe registered is brought up.
-    let rc = unsafe { lde_open() };
-    if rc != 0 {
-        return Err(("the driver could not bring the interface up, errno", -rc as u64));
-    }
-    if syscall(Syscall::CapMint, NOTIFY, [DOORBELL, WRITE, 2, 0]).status != 0 {
-        return Err(("making the doorbell", 0));
-    }
     Ok(())
-}
-
-fn mac() -> u64 {
-    let mut m = [0u8; 6];
-    // SAFETY: six bytes.
-    unsafe { lde_mac(m.as_mut_ptr()) };
-    m.iter().fold(0, |a, &b| a << 8 | b as u64)
-}
-
-/// Runs the driver's receive poll while it has work and the queue has
-/// room for all one poll may deliver, then tells the caller of frames.
-fn pump() {
-    let before = host().rx_waiting();
-    // SAFETY: lde.c's, from the one thread.
-    unsafe {
-        let weight = lde_poll_weight() as usize;
-        while lde_poll_pending() != 0 && host().rx_waiting() + weight <= RX_FRAMES {
-            lde_poll();
-        }
-    }
-    let h = host();
-    if !h.ring && h.attached && h.rx_waiting() > before {
-        syscall(Syscall::Signal, LISTENER, [0; 4]);
-    }
-}
-
-fn count_frame(sent: bool, by_ring: bool) {
-    let h = host();
-    if sent {
-        h.sent += 1;
-    } else {
-        h.received += 1;
-    }
-    h.by_ring += by_ring as u64;
-    let (s, r, b) = (h.sent, h.received, h.by_ring);
-    if sent && s.is_power_of_two() && s >= 64 {
-        say!("{s} frames sent, {r} received ({b} of them through the rings)");
-    }
-}
-
-/// `RING_ATTACH`: keeps and maps page `page` of the caller's ring.
-fn ring_attach(page: u64, lent: bool) -> Status {
-    if !lent || page >= ring::PAGES {
-        return Status::Invalid;
-    }
-    if page == 0 {
-        ring_drop();
-    }
-    if host().ring || page != host().ring_pages {
-        return Status::Invalid;
-    }
-    // A copy of what was lent: the lent capability goes after the call.
-    if syscall(Syscall::CapMint, LENT, [RING + page, ALL, 0, 0]).status != 0 {
-        return Status::Invalid;
-    }
-    let va = RING_VA + page * PAGE as u64;
-    if syscall(Syscall::FrameMap, RING + page, [va, 1, 0, 0]).status != 0 {
-        syscall(Syscall::CapDelete, RING + page, [0; 4]);
-        return Status::Invalid;
-    }
-    host().ring_pages += 1;
-    Status::Ok
-}
-
-/// Lets go of the ring: its pages, and the caller's doorbell.
-fn ring_drop() {
-    let h = host();
-    h.ring = false;
-    for p in 0..h.ring_pages {
-        // Deleting the capability unmaps the page.
-        syscall(Syscall::CapDelete, RING + p, [0; 4]);
-    }
-    h.ring_pages = 0;
-    syscall(Syscall::CapRevoke, DOORBELL, [0; 4]);
-}
-
-/// `RING_START`: the rings begin empty. The reply grants DOORBELL.
-fn ring_start() -> Status {
-    let h = host();
-    if h.ring || h.ring_pages != ring::PAGES {
-        return Status::Invalid;
-    }
-    for off in (0..PAGE).step_by(4) {
-        hdr(off).store(0, Ordering::Relaxed);
-    }
-    fence(Ordering::SeqCst);
-    (h.ring_rx_tail, h.ring_tx_head) = (0, 0);
-    h.ring = true;
-    say!("frame rings started");
-    Status::Ok
-}
-
-/// Moves received frames from the host's queue into the receive ring, as
-/// many as it has room for, and tells a sleeping caller.
-fn ring_pump_rx() {
-    let mut moved = false;
-    while host().ring && host().rx_waiting() > 0 {
-        let h = host();
-        let head = hdr(ring::RX_HEAD).load(Ordering::Acquire);
-        if ring::waiting(head, h.ring_rx_tail, ring::RX_SLOTS) == ring::RX_SLOTS {
-            // Full: the rest wait in the queue (`before_sleep` tells the
-            // caller).
-            break;
-        }
-        let i = h.rx_head % RX_FRAMES;
-        let len = h.rx_len[i] as usize;
-        let at = h.ring_rx_tail % ring::RX_SLOTS;
-        let to = ring_slot(ring::RX_PAGE, h.ring_rx_tail, ring::RX_SLOTS);
-        // SAFETY: the ring's pages are mapped; a queued frame fits a slot.
-        unsafe { core::ptr::copy_nonoverlapping(h.rx[i].as_ptr(), to as *mut u8, len) };
-        hdr(ring::RX_LEN + 4 * at as usize).store(len as u32, Ordering::Relaxed);
-        h.rx_head += 1;
-        h.ring_rx_tail = h.ring_rx_tail.wrapping_add(1);
-        hdr(ring::RX_TAIL).store(h.ring_rx_tail, Ordering::Release);
-        count_frame(false, true);
-        moved = true;
-    }
-    if moved {
-        fence(Ordering::SeqCst);
-        if hdr(ring::CALLER_SLEEPS).swap(0, Ordering::SeqCst) != 0 && host().attached {
-            syscall(Syscall::Signal, LISTENER, [0; 4]);
-        }
-    }
-}
-
-/// Sends the frames waiting in the transmit ring. True if some are left
-/// because the driver's transmit queue is full: its interrupt, when the
-/// device has sent some, wakes the loop.
-fn ring_pump_tx() -> bool {
-    while host().ring {
-        let head = host().ring_tx_head;
-        let tail = hdr(ring::TX_TAIL).load(Ordering::Acquire);
-        if ring::waiting(head, tail, ring::TX_SLOTS) == 0 {
-            break;
-        }
-        let at = head % ring::TX_SLOTS;
-        // Read once: the caller may change it at any time.
-        let len = hdr(ring::TX_LEN + 4 * at as usize).load(Ordering::Relaxed) as u64;
-        let from = ring_slot(ring::TX_PAGE, head, ring::TX_SLOTS);
-        if (14..=nic::MAX_FRAME).contains(&len) {
-            // SAFETY: the slot is mapped; lde.c copies the frame out
-            // before it returns.
-            match unsafe { lde_xmit(from as *const c_void, len as usize) } {
-                0 => count_frame(true, true),
-                1 => return true,
-                _ => {} // the interface is down: the frame is lost
-            }
-        }
-        // Only now is the slot the caller's again.
-        let h = host();
-        h.ring_tx_head = head.wrapping_add(1);
-        hdr(ring::TX_HEAD).store(h.ring_tx_head, Ordering::Release);
-    }
-    false
-}
-
-/// Before the component waits: runs the driver's poll, empties the rings
-/// as far as it can, says it sleeps, and looks once more, so that nothing
-/// put in a ring meanwhile is left there with nobody to signal.
-fn before_sleep() {
-    loop {
-        // SAFETY: lde.c's, from the one thread.
-        unsafe { lde_tick() };
-        pump();
-        if !host().ring {
-            return;
-        }
-        ring_pump_rx();
-        let stuck = ring_pump_tx();
-        hdr(ring::DRIVER_SLEEPS).store(1, Ordering::SeqCst);
-        // Frames kept from a full ring wait in the queue, and behind it
-        // in the driver: the caller rings the doorbell once it has taken
-        // some.
-        // SAFETY: lde.c's, from the one thread.
-        let held = host().rx_waiting() > 0 || unsafe { lde_poll_pending() } != 0;
-        hdr(ring::RX_STALLED).store(held as u32, Ordering::SeqCst);
-        fence(Ordering::SeqCst);
-        let h = host();
-        let tail = hdr(ring::TX_TAIL).load(Ordering::Acquire);
-        let to_send = ring::waiting(h.ring_tx_head, tail, ring::TX_SLOTS) != 0;
-        let head = hdr(ring::RX_HEAD).load(Ordering::Acquire);
-        let room = ring::waiting(head, h.ring_rx_tail, ring::RX_SLOTS) < ring::RX_SLOTS;
-        if !((to_send && !stuck) || (room && held)) {
-            return;
-        }
-        hdr(ring::DRIVER_SLEEPS).store(0, Ordering::SeqCst);
-    }
-}
-
-fn recv() -> [u64; 4] {
-    let attached = host().attached as u64;
-    if host().ring {
-        // Frames go to the ring, in order.
-        ring_pump_rx();
-        return [Status::Empty as u64, 0, attached, 1];
-    }
-    let h = host();
-    if h.rx_waiting() == 0 {
-        return [Status::Empty as u64, 0, attached, 0];
-    }
-    if syscall(Syscall::FrameMap, LENT, [LENT_VA, 1, 0, 0]).status != 0 {
-        return [Status::Invalid as u64, 0, attached, 0];
-    }
-    let i = h.rx_head % RX_FRAMES;
-    let len = h.rx_len[i] as usize;
-    // SAFETY: the lent page is mapped and a frame fits in it.
-    unsafe { core::ptr::copy_nonoverlapping(h.rx[i].as_ptr(), LENT_VA as *mut u8, len) };
-    h.rx_head += 1;
-    count_frame(false, false);
-    [Status::Ok as u64, len as u64, attached, 0]
-}
-
-fn send(len: u64) -> Status {
-    if !(14..=nic::MAX_FRAME).contains(&len) {
-        return Status::Invalid;
-    }
-    if syscall(Syscall::FrameMap, LENT, [LENT_VA, 0, 0, 0]).status != 0 {
-        return Status::Invalid;
-    }
-    for attempt in 0..2 {
-        // SAFETY: the lent page is mapped; lde.c copies the frame.
-        match unsafe { lde_xmit(LENT_VA as *const c_void, len as usize) } {
-            0 => {
-                count_frame(true, false);
-                return Status::Ok;
-            }
-            1 if attempt == 0 => {
-                // The driver's queue is full: let it see what the device
-                // has sent since its last interrupt, and try once more.
-                // SAFETY: lde.c's, from the one thread.
-                unsafe {
-                    lde_interrupt();
-                    lde_tick();
-                }
-                pump();
-            }
-            1 => return Status::NoSpace,
-            _ => return Status::DeviceError,
-        }
-    }
-    Status::NoSpace
-}
-
-fn serve(m: [u64; 4], lent: bool, cap: Option<u16>) -> [u64; 4] {
-    let status = |s: Status| [s as u64, 0, 0, 0];
-    match m[0] {
-        nic::INFO if m[1] == nic::VERSION => [Status::Ok as u64, mac(), nic::MAX_FRAME, 0],
-        nic::ATTACH if cap == Some(LISTENER as u16) => {
-            host().attached = true;
-            // Frames may already be waiting.
-            if host().rx_waiting() > 0 {
-                syscall(Syscall::Signal, LISTENER, [0; 4]);
-            }
-            status(Status::Ok)
-        }
-        nic::RECV if lent => recv(),
-        nic::SEND if lent => status(send(m[1])),
-        nic::RING_ATTACH => status(ring_attach(m[1], lent)),
-        nic::RING_START => status(ring_start()),
-        _ => status(Status::Invalid),
-    }
-}
-
-/// Runs the Linux driver linked into this component, serving `nic`.
-/// `name` is the driver's, for the log.
-pub fn run(name: &'static str) -> ! {
-    host().name = name;
-    if let Err((what, code)) = start() {
-        say!("[fail] {what} ({code:#x})");
-        superior_sys::park()
-    }
-    let m = mac();
-    say!(
-        "Linux's {name} driver runs the interface: MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}, link {}",
-        m >> 40 & 0xff,
-        m >> 32 & 0xff,
-        m >> 24 & 0xff,
-        m >> 16 & 0xff,
-        m >> 8 & 0xff,
-        m & 0xff,
-        // SAFETY: lde.c's, from the one thread.
-        if unsafe { lde_carrier() } != 0 { "up" } else { "down" }
-    );
-    // The interrupt wakes the same `Recv` that waits for calls.
-    if syscall(Syscall::NotificationBind, NOTIFY, [0; 4]).status != 0 {
-        say!("[fail] binding the interrupt's notification");
-    }
-    // A call may lend a frame (RECV, SEND) or grant a notification
-    // (ATTACH): either arrives in LENT.
-    let accept = CapTransfer {
-        grant: None,
-        accept: Some(LENT as u16),
-    };
-    let mut reply: Option<([u64; 4], bool)> = None;
-    loop {
-        before_sleep();
-        // The driver's next timer wakes the loop like an interrupt.
-        // SAFETY: lde.c's, from the one thread.
-        let wake = unsafe { lde_next_timer() } as u64;
-        syscall(Syscall::TimerSignal, NOTIFY, [wake, 0, 0, 0]);
-        let r = match reply.take() {
-            Some((m, doorbell)) => {
-                let x = CapTransfer {
-                    grant: doorbell.then_some(DOORBELL as u16),
-                    ..accept
-                };
-                syscall_x(Syscall::ReplyRecv, SERVICE, m, x)
-            }
-            None => syscall_x(Syscall::Recv, SERVICE, [0; 4], accept),
-        };
-        if r.status == Error::Notified.code() {
-            // The interrupt, or the doorbell (the handler then finds
-            // nothing to do). The driver's handler quiets the device (it
-            // masks what it leaves for the poll), so the line can be
-            // unmasked after.
-            // SAFETY: lde.c's, from the one thread.
-            unsafe { lde_interrupt() };
-            irq_ack(IRQ);
-            if host().ring {
-                hdr(ring::DRIVER_SLEEPS).store(0, Ordering::SeqCst);
-            }
-            continue;
-        }
-        if r.status != 0 {
-            continue;
-        }
-        let mut cap = r.cap;
-        if r.msg[0] == nic::ATTACH && cap == Some(LENT as u16) {
-            // Keep the notification (replacing an earlier one).
-            syscall(Syscall::CapDelete, LISTENER, [0; 4]);
-            let kept = syscall(Syscall::CapMint, LENT, [LISTENER, ALL, 0, 0]).status == 0;
-            syscall(Syscall::CapDelete, LENT, [0; 4]);
-            cap = kept.then_some(LISTENER as u16);
-        }
-        let lent = cap == Some(LENT as u16);
-        let m = serve(r.msg, lent, cap);
-        if lent {
-            // The caller's frame goes back before the reply.
-            syscall(Syscall::CapDelete, LENT, [0; 4]);
-        }
-        reply = Some((m, r.msg[0] == nic::RING_START && m[0] == 0));
-    }
 }

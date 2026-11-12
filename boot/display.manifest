@@ -1,0 +1,51 @@
+# The display test (cargo xtask display-test).
+#
+# Linux's own bochs DRM driver, built unmodified and hosted by the Linux
+# Driver Environment, drives QEMU's display (bochs-display on AArch64, the
+# standard VGA on x86, whose BIOS the bootloader needs; the same registers):
+# it reads the display's EDID, sets the mode and scans out of video memory. The client draws two
+# pictures, killing the driver in between, and the host checks every
+# pixel of the screen each time. Component numbers matter: the client
+# kills component 1.
+
+component pcibus
+  image pcibus
+  priority 12
+  cspace 7
+  provides pci 0
+  device pci-config 1
+  device pci-mmio 2
+  device pci-io 84
+  device msi 3
+  device iommu 11
+  untyped 18 12
+  device intx 80
+
+component lde-bochs
+  image lde-bochs
+  priority 11
+  # Its slots: the pool, the BARs and the client's surface (up to 1024
+  # pages).
+  cspace 11
+  # Page tables for 16 MiB of video memory, mapped whole, besides the
+  # surface and the pool.
+  vspace 18
+  uses pci 0
+  provides display 1
+  notification 2
+  # 1 MiB: the pool the driver's memory comes from (768 KiB), and its
+  # page tables.
+  memory 22
+  untyped 20 3
+
+component client
+  image testclient
+  arg 24
+  priority 8
+  uses display 0
+  control 1
+  fault-injector
+  cspace 10
+  # 2 MiB: the surface (800x600 at 32 bits is 469 pages).
+  memory 22
+  untyped 21 2
