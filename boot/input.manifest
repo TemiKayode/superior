@@ -1,11 +1,12 @@
 # The input test (cargo xtask input-test).
 #
 # The desktop of the desktop test with input: the HID driver serves a USB
-# keyboard and a USB mouse on QEMU's xHCI controller to the compositor,
-# which draws the pointer, gives the window under it pointer events, gives
-# the keyboard focus to the window clicked and its keys to the window with
-# the focus. The host moves the mouse, clicks and types through QEMU's
-# monitor and checks screenshots; the second client checks what its window
+# keyboard, a USB mouse and a USB tablet on QEMU's xHCI controller to the
+# compositor, which draws the pointer, gives the window under it pointer
+# and wheel events, gives the keyboard focus to the window clicked and its
+# keys to the window with the focus. The host moves the mouse and the
+# tablet, clicks, turns the wheel and types through QEMU's monitor and
+# checks screenshots; the second client checks what its window
 # got and kills the compositor and then the HID driver. Component numbers
 # matter: the second client kills components 2 and 4.
 

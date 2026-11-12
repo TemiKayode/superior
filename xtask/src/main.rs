@@ -114,7 +114,8 @@ struct Image {
     /// A USB keyboard on an xHCI controller, typed on through QEMU's
     /// monitor (the keyboard test).
     keyboard: bool,
-    /// A USB mouse on the same controller (the input test).
+    /// A USB mouse and a USB tablet on the same controller (the input
+    /// test).
     mouse: bool,
     /// An empty PCI Express root port, and QEMU's monitor to plug cards
     /// into it (the hot-plug test).
@@ -983,7 +984,7 @@ fn qemu_command(img: &Image) -> Command {
         // IOMMU), and the monitor the test types through.
         q.args(["-device", "qemu-xhci,id=xhci", "-device", "usb-kbd,id=kbd0,bus=xhci.0"]);
         if img.mouse {
-            q.args(["-device", "usb-mouse,id=mouse0,bus=xhci.0"]);
+            q.args(["-device", "usb-mouse,id=mouse0,bus=xhci.0", "-device", "usb-tablet,id=tablet0,bus=xhci.0"]);
         }
     }
     if img.hotplug {
@@ -2413,7 +2414,18 @@ fn input_pictures() -> Vec<(Vec<ShownWindow>, (usize, usize))> {
         (vec![a3, b_at(1)], (700, 450)),
         (vec![a3, b_at(2)], over_a),
         (vec![b_at(3), a3], over_a),
+        (vec![b_at(3), a3], TABLET_AT),
     ]
+}
+
+/// Where the input test's tablet puts the pointer: over window B alone.
+const TABLET_AT: (usize, usize) = (460, 300);
+
+/// The value of the tablet's axis (QEMU's 0..=0x7fff) that puts the
+/// pointer at pixel `at` of `size`: the HID driver scales it to
+/// 0..=0xffff over the axis's range, the compositor that to the screen.
+fn tablet_value(at: usize, size: usize) -> u64 {
+    (0..=0x7fffu64).find(|v| ((v * 0xffff / 0x7fff) * size as u64) >> 16 == at as u64).unwrap_or(0)
 }
 
 /// What the host does through QEMU's monitor at a step of the input test.
@@ -2424,6 +2436,10 @@ enum Act {
     Button(bool),
     /// Types these letters on the keyboard.
     Type(&'static str),
+    /// Puts the tablet where it puts the pointer at this pixel.
+    Tablet(usize, usize),
+    /// Turns the wheel one step up (1) or down (-1).
+    Wheel(i64),
     /// Takes screenshot `k` (from 1) and checks it.
     Shot(usize),
 }
@@ -2437,7 +2453,8 @@ fn input_script() -> Vec<(Vec<&'static str>, Vec<Act>)> {
     vec![
         (
             vec![
-                "hid: ready: a boot mouse",
+                "relative X and Y",
+                "absolute X and Y",
                 "compositor: input subscribed",
                 "window B shown over window A, with the focus",
             ],
@@ -2458,6 +2475,11 @@ fn input_script() -> Vec<(Vec<&'static str>, Vec<Act>)> {
         (vec!["input subscribed again"], vec![Type("f")]),
         (vec!["typed \"def\""], vec![Button(true), Button(false)]),
         (vec!["picture 6 on the screen"], vec![Shot(6)]),
+        // The tablet puts the pointer over window B, and the wheel turns.
+        (vec!["window B got only the keys typed to it"], vec![Tablet(TABLET_AT.0, TABLET_AT.1)]),
+        (vec!["the tablet put the pointer at (160, 100)"], vec![Wheel(1), Wheel(1)]),
+        (vec!["the wheel turned 2 steps up"], vec![Wheel(-1)]),
+        (vec!["picture 7 on the screen"], vec![Shot(7)]),
     ]
 }
 
@@ -2500,6 +2522,19 @@ fn input_act(act: &Act, arch: Arch) -> Result<Option<String>, String> {
         Act::Button(down) => qmp(&[send(format!(
             "{{\"type\":\"btn\",\"data\":{{\"down\":{down},\"button\":\"left\"}}}}"
         ))])?,
+        Act::Tablet(x, y) => qmp(&[send(format!(
+            "{{\"type\":\"abs\",\"data\":{{\"axis\":\"x\",\"value\":{}}}}},{{\"type\":\"abs\",\"data\":{{\"axis\":\"y\",\"value\":{}}}}}",
+            tablet_value(*x, SCREEN.0),
+            tablet_value(*y, SCREEN.1)
+        ))])?,
+        Act::Wheel(steps) => {
+            let button = if *steps > 0 { "wheel-up" } else { "wheel-down" };
+            for down in [true, false] {
+                qmp(&[send(format!(
+                    "{{\"type\":\"btn\",\"data\":{{\"down\":{down},\"button\":\"{button}\"}}}}"
+                ))])?;
+            }
+        }
         Act::Type(keys) => {
             for k in keys.chars() {
                 for down in [true, false] {
@@ -2530,7 +2565,8 @@ fn input_act(act: &Act, arch: Arch) -> Result<Option<String>, String> {
 /// (it is drawn anew at each key); presses on window B, holds the
 /// pointer off it and lets go, and types to B; then, after the second
 /// client kills the compositor and later the HID driver, types and points
-/// again. Six screenshots must show every pixel right, the pointer
+/// again; last, a USB tablet puts the pointer over window B and the wheel
+/// turns there. Seven screenshots must show every pixel right, the pointer
 /// included.
 fn input_test(arch: Arch) -> Result<(), String> {
     let img = image_with(false, arch, "input")?;
@@ -2575,7 +2611,8 @@ fn input_test(arch: Arch) -> Result<(), String> {
     }
     let log = [
         "hid: ready: a boot keyboard on device",
-        "hid: ready: a boot mouse on device",
+        "hid: ready: a pointer on device",
+        "hid: ready: a pointer on device",
         "compositor: ready: the desktop on a 800x600 screen",
         "compositor: input subscribed: keys and the pointer",
         "[pass] input: window A shown",
@@ -2604,6 +2641,9 @@ fn input_test(arch: Arch) -> Result<(), String> {
         "[pass] input: window A: clicked at (50, 30), so it has the focus and is in front (time 2)",
         "[pass] input: window B lost the focus to window A: picture 6 on the screen",
         "[pass] input: window B got only the keys typed to it (\"def\") and was told the pointer left it",
+        "input: window B: the tablet put the pointer at (160, 100)",
+        "input: window B: the wheel turned 2 steps up",
+        "[pass] input: window B: the wheel turned 2 steps up and 1 down, the pointer at (160, 100): picture 7 on the screen",
         "input: done (0 failed)",
         "[cm] second asked to shut down (pass)",
     ];

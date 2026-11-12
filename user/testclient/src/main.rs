@@ -4525,6 +4525,8 @@ enum WindowEvent {
     Pointer(i64, i64, u64),
     Focus(bool),
     Leave,
+    /// Where the pointer is in the window, and the steps up and right.
+    Wheel(i64, i64, i64, i64),
 }
 
 /// Makes the notification the compositor is to signal.
@@ -4552,6 +4554,12 @@ fn next_event(w: &TestWindow) -> Option<WindowEvent> {
         window::KEY => WindowEvent::Key(m[2], m[3] & 1 == 1),
         window::POINTER => WindowEvent::Pointer(m[2] as u16 as i16 as i64, (m[2] >> 16) as u16 as i16 as i64, m[3]),
         window::FOCUS => WindowEvent::Focus(m[2] == 1),
+        window::WHEEL => WindowEvent::Wheel(
+            m[2] as u16 as i16 as i64,
+            (m[2] >> 16) as u16 as i16 as i64,
+            m[3] as u32 as i32 as i64,
+            (m[3] >> 32) as u32 as i32 as i64,
+        ),
         _ => WindowEvent::Leave,
     })
 }
@@ -4650,9 +4658,14 @@ fn input_first() -> ! {
     }
 }
 
+/// Where the tablet puts the pointer in window B, at the end of the input
+/// test: (460, 300) on the screen, over B alone.
+const TABLET_AT: (i64, i64) = (160, 100);
+
 /// The second input client: shows window B over A and checks the pointer
 /// and keys it gets as the host moves the mouse, clicks and types; has
-/// the compositor and the input driver killed in turn.
+/// the compositor and the input driver killed in turn; then checks where
+/// the tablet puts the pointer and the steps the wheel turns.
 fn input_second() -> ! {
     let mut t = Checks(0, "input");
     let mut w = TestWindow { id: 1, size: (320, 240), at: (300, 200), phase: 0, window: None };
@@ -4665,6 +4678,9 @@ fn input_second() -> ! {
     let mut keys = 0;
     let (mut held, mut focused, mut leaves) = (0, false, 0);
     let (mut came, mut press_at, mut announced, mut made_again) = (false, None, false, None);
+    // The tablet and the wheel, last: whether they are next, whether the
+    // tablet put the pointer on B, and the steps up and down.
+    let (mut tablet, mut tablet_came, mut ups, mut downs, mut wheel_here) = (false, false, 0, 0, true);
     loop {
         wait_events(5);
         while let Some(e) = next_event(&w) {
@@ -4692,6 +4708,38 @@ fn input_second() -> ! {
                                 if leaves == 1 { "" } else { "s" }
                             ),
                         );
+                        tablet = true;
+                    }
+                }
+                WindowEvent::Pointer(x, y, b) if tablet => {
+                    if (x, y) == TABLET_AT && b == 0 && !tablet_came {
+                        tablet_came = true;
+                        settled();
+                        say!("input: window B: the tablet put the pointer at ({x}, {y})");
+                    }
+                }
+                WindowEvent::Wheel(x, y, up, right) if tablet_came => {
+                    if up > 0 {
+                        ups += up;
+                    } else {
+                        downs -= up;
+                    }
+                    wheel_here &= (x, y) == TABLET_AT;
+                    if right != 0 {
+                        t.check(false, format_args!("window B: the wheel turned {right} steps right"));
+                    }
+                    if ups == 2 && downs == 0 {
+                        say!("input: window B: the wheel turned 2 steps up");
+                    }
+                    if ups == 2 && downs == 1 {
+                        settled();
+                        t.check(
+                            wheel_here,
+                            format_args!(
+                                "window B: the wheel turned 2 steps up and 1 down, the pointer at ({x}, {y}): picture 7 on the screen"
+                            ),
+                        );
+                        superior_sys::sleep(SCREENSHOT_TICKS);
                         say!("input: done ({} failed)", t.0);
                         syscall(Syscall::Call, DESKTOP_CONTROL, [OP_SHUTDOWN, t.0, 0, 0]);
                         superior_sys::park()

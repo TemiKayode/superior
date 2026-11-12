@@ -1,6 +1,6 @@
 [package]
 name = "superior-hid"
-description = "A USB HID keyboard driver, serving the input interface."
+description = "A USB HID driver for keyboards, mice and tablets, serving the input interface."
 version.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -13,5 +13,6 @@ test = false
 bench = false
 
 [dependencies]
+superior-driver = { path = "../../crates/driver" }
 superior-objects = { path = "../../crates/objects" }
 superior-sys = { path = "../../crates/sys" }

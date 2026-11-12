@@ -15,7 +15,8 @@
 /// moves. The window under it gets pointer events; pressing a button over
 /// a window gives it the keyboard focus, puts it in front and holds the
 /// pointer to it (it keeps getting pointer events, wherever the pointer
-/// goes) until every button is let go. Keys go to the window with the
+/// goes) until every button is let go. The wheel turns for the window the
+/// pointer events go to. Keys go to the window with the
 /// focus; a newly shown window takes it, and when the window with it goes
 /// the front window gets it. Each window keeps its events until its client
 /// reads them (`NEXT`), and signals the notification its client lent with
@@ -23,7 +24,7 @@
 pub mod window {
     use crate::interfaces::Status;
 
-    pub const VERSION: u64 = 2;
+    pub const VERSION: u64 = 3;
 
     /// The most windows on the screen, all clients together.
     pub const MAX_WINDOWS: u64 = 8;
@@ -40,7 +41,8 @@ pub mod window {
     /// The pointer moved over the window (or anywhere, while it is held to the
     /// window), or a button went down or up: `a` is where it is in the window
     /// (x | y << 16, each a signed 16-bit number, negative off its left or
-    /// top), `b` the buttons held (bit 0 left, 1 right, 2 middle).
+    /// top), `b` the buttons held (bit 0 left, 1 right, 2 middle, then any
+    /// others the pointing device has, up to bit 7).
     pub const POINTER: u64 = 2;
 
     /// The window got the keyboard focus (`a` 1) or lost it (`a` 0).
@@ -48,6 +50,12 @@ pub mod window {
 
     /// The pointer left the window.
     pub const LEAVE: u64 = 4;
+
+    /// The wheel turned while the pointer's events went to the window: `a` is
+    /// where the pointer is (as for `POINTER`), `b` how far: up (away from the
+    /// user) in bits 0 to 31 and right in bits 32 to 63, each a signed 32-bit
+    /// number of steps.
+    pub const WHEEL: u64 = 5;
 
     /// Events a window keeps until they are read; past that the oldest go.
     pub const EVENTS: u64 = 32;

@@ -777,8 +777,8 @@ holds the rest):
   20,000 bytes each way, the accepted end giving its peer's IPv6 address. (QEMU
   forwards only IPv4 connections in from the host.) Segments must have been sent
   again, dropped and kept out of order.
-- USB: an xHCI host controller driver (`user/xhci/`) and a HID keyboard and mouse
-  driver (`user/hid/`).
+- USB: an xHCI host controller driver (`user/xhci/`) and a HID driver for
+  keyboards, mice and tablets (`user/hid/`).
   - The xHCI driver opens the first function of class 0c:03:30, resets the controller,
     sets up the command ring, one event ring and the device context array, and on each
     root port with a device resets the port, enables a slot, addresses the device and
@@ -789,10 +789,17 @@ holds the rest):
     client when reports arrive. The controller reaches only the driver's DMA pages,
     through the IOMMU domain; its MSI-X vector is bound to the driver's thread.
   - The HID driver finds the first boot-protocol keyboard (interface class 3, 1, 1)
-    and the first boot-protocol mouse (3, 1, 2), claims them, has their endpoints
-    polled, selects the boot protocol and turns each keyboard report into presses
-    and releases and each mouse report into button presses, releases and a motion.
-    It serves `input` (version 2): subscribers read events from a ring at their own
+    and up to two pointing devices: HID interfaces whose report descriptor has an
+    input report with X and Y in it. The Driver SDK reads report descriptors
+    (`crates/driver/src/hid.rs`): where the buttons (up to eight), X and Y
+    (relative, as a mouse's, or absolute, as a tablet's), the wheel and the
+    horizontal wheel are, and their ranges. It claims the devices, has their
+    endpoints polled, selects the boot protocol for the keyboard and the report
+    protocol for a mouse that has both, and turns each keyboard report into
+    presses and releases and each pointer report into button presses and
+    releases, a motion or a new position (scaled to 0..=65535 over the device's
+    range, sent when it changes), and the wheels' steps. It serves `input`
+    (version 3): subscribers read events from a ring at their own
     pace and are signalled when there are more, on a notification of the driver's
     or, for a server waiting for calls, a badged copy of its own that it lends. A
     100 ms timer drains reports and sets the devices up again after the xHCI driver
@@ -826,7 +833,7 @@ holds the rest):
   compositor, the first client (which stays stopped) and the display driver in
   turn. After each of those five steps QEMU's monitor takes a screenshot, and
   every pixel of the 800x600 screen must be the desktop's or the right window's.
-- Input in the compositor. It subscribes to the HID driver (`window` version 2),
+- Input in the compositor. It subscribes to the HID driver (`window` version 3),
   draws the pointer over everything once it first moves, and gives the window
   under it pointer events (where it is in the window, the buttons held, and when
   it leaves). A button pressed over a window gives it the keyboard focus, puts it
@@ -838,16 +845,18 @@ holds the rest):
   pointer in the middle again; a restarted HID driver refuses the compositor's
   next read, and it subscribes again (it reads every fifth of a second as well as
   when signalled). `cargo xtask input-test` boots `boot/input.manifest` on both
-  ISAs with a USB keyboard and mouse, and the host drives them through QEMU's
+  ISAs with a USB keyboard, mouse and tablet, and the host drives them through QEMU's
   monitor: it moves the pointer over window A, clicks it (A takes the focus and
   comes in front) and types "abc" to it (A is drawn anew at each key); presses on
   window B, holds the pointer off it and lets go (B gets the pointer outside
   itself, then is told it left) and types "d". The second client kills the
   compositor: both windows are made again, "e" goes to B, which has the focus,
   and the pointer comes to A again. It kills the HID driver: "f" still goes to B,
-  and a click gives A the focus. B must have got "def" and no other key. Six
-  screenshots, the pointer drawn by xtask from the same shape, must have every
-  pixel right.
+  and a click gives A the focus. B must have got "def" and no other key. Last, the
+  tablet puts the pointer over B (a tablet's position spans the whole screen) and
+  the wheel turns two steps up and one down there, which B must get as `WHEEL`
+  events (`window` version 3) at that spot. Seven screenshots, the pointer drawn by
+  xtask from the same shape, must have every pixel right.
 - The mixer (`user/mixer/`), the sound server. It is the sound driver's one
   client and serves the same `audio` interface to every component that plays
   sound: it adds their streams together, sample by sample and saturating, into a
@@ -917,8 +926,9 @@ Level Reset is exercised only by the NVMe controller (QEMU's virtio devices on
 these buses have none); more than one command per queue in the NVMe driver,
 more than two commands in flight per disk in the AHCI driver, ATAPI
 and port multipliers; in the xHCI driver isochronous and bulk endpoints, USB 3 streams,
-hubs and more than one interrupter, and HID devices other than boot keyboards and mice (no report
-descriptors are parsed, so no absolute pointers, wheels or extra buttons); in the network server
+hubs and more than one interrupter, and HID devices other than boot keyboards and pointing devices
+(keyboards in the report protocol, game controllers, touch screens with several contacts,
+devices with several interfaces of one kind); in the network server
 a second IPv6 router or a DHCPv6 server to test against (QEMU's network has one router and hands out no addresses, so the IPv6 route table and the DHCPv6 address client are proved by host tests alone), DNSSEC, DNS answers over TCP of more than a page, IPv4 routes beyond one gateway; the SDK's power callbacks (with suspend and resume, Phase 2); the IDL describing interfaces other than the bus server's; escalating a component
 given up on to a supervisor above it (today the
 manager is the only one), memory budgets from a policy service (Phase 3), sizing the Memory Server's CSpace
@@ -964,7 +974,7 @@ https://claude.ai/artifact/QKJS8qH5Dfbjzn58RStq1j
 | `user/net/` | The network server |
 | `user/dns/` | The DNS resolver |
 | `user/xhci/` | The xHCI (USB) host controller driver |
-| `user/hid/` | The USB HID keyboard and mouse driver |
+| `user/hid/` | The USB HID keyboard, mouse and tablet driver |
 | `user/echo/`, `user/counter/`, `user/testclient/` | Test components for the Component Manager, supervision and drivers |
 | `boot/` | Component manifests: `shell.manifest` (normal boot), `test.manifest` (`cm-test`), `supervise.manifest` (`supervise-test`) , `drivers.manifest` (`drivers-test`) , `memory.manifest` (`memory-test`), `reboot.manifest` (`reboot-test`), `fs.manifest` and `fs-verify.manifest` (`fs-test`), `net.manifest` (`net-test`), `tcp.manifest` (`tcp-test`), `keyboard.manifest` (`keyboard-test`), `display.manifest` (`display-test`), `desktop.manifest` (`desktop-test`), `input.manifest` (`input-test`), `audio.manifest` (`audio-test`) |
 | `sel4/` | Docker build of seL4 and rust-sel4's kernel loader, for running the shell on seL4 |
@@ -989,7 +999,7 @@ cargo xtask lde-test       # the network test over Linux's 8139cp driver (needs 
 cargo xtask lde-e100-test  # the same over Linux's e100 driver
 cargo xtask display-test   # Linux's bochs display driver: two pictures, checked pixel by pixel from QEMU screenshots
 cargo xtask desktop-test   # the compositor: two clients' windows through restarts, five screenshots checked pixel by pixel
-cargo xtask input-test     # the compositor's pointer, focus and keys from a USB mouse and keyboard, six screenshots checked
+cargo xtask input-test     # the compositor's pointer, focus, keys and wheel from a USB mouse, tablet and keyboard, seven screenshots checked
 cargo xtask audio-test     # Linux's ES1370 driver and the mixer: two clients' sounds through restarts, every recorded sample checked
 cargo xtask tcp-test       # just the TCP test (add aarch64 for that ISA)
 cargo xtask keyboard-test  # just the USB keyboard test (add aarch64 for that ISA)

@@ -603,7 +603,7 @@ pub mod usb {
 /// subscriber sees every event from when it subscribed; one that falls
 /// far behind loses the oldest.
 pub mod input {
-    pub const VERSION: u64 = 2;
+    pub const VERSION: u64 = 3;
 
     /// `[SUBSCRIBE, VERSION]`, optionally with a notification lent: reply
     /// `[status]`, and the driver's notification if none was lent.
@@ -619,9 +619,18 @@ pub mod input {
     /// The pointer moved: `a` and `b` are how far right and down, as
     /// signed 64-bit numbers.
     pub const MOTION: u64 = 2;
-    /// A pointer button: `a` is which (0 left, 1 right, 2 middle), `b`
-    /// is 1 if pressed, 0 if released.
+    /// A pointer button: `a` is which (0 left, 1 right, 2 middle, then
+    /// any others the device has, up to 7), `b` is 1 if pressed, 0 if
+    /// released.
     pub const BUTTON: u64 = 3;
+    /// An absolute pointing device (a tablet, a touch screen) is at `a`
+    /// across and `b` down, each from 0 to [`POSITION_MAX`] over all of
+    /// its range: the whole screen. Sent when it changes.
+    pub const POSITION: u64 = 4;
+    /// The wheel turned: `a` steps up (away from the user) and `b` steps
+    /// right, as signed 64-bit numbers.
+    pub const WHEEL: u64 = 5;
+    pub const POSITION_MAX: u64 = 0xffff;
 }
 
 /// Files: what the filesystem server serves.

@@ -15,6 +15,8 @@
 //! - [`virtq`]: split virtqueue rings (virtio 1.x).
 //! - [`pool`]: DMA buffer pools, taken from and given back to in
 //!   constant time.
+//! - [`hid`]: USB HID report descriptors: where a pointing device puts
+//!   its buttons, X and Y and wheels.
 //! - [`exec`]: an executor for `async` tasks on the driver's one thread,
 //!   woken by events (an interrupt, a call).
 //!
@@ -27,6 +29,7 @@
 #![no_std]
 
 pub mod exec;
+pub mod hid;
 pub mod pool;
 pub mod virtq;
 

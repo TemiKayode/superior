@@ -24,7 +24,9 @@
 //! is drawn over everything once it first moves. The window under it gets
 //! pointer events; a button pressed over a window gives it the keyboard
 //! focus, puts it in front and holds the pointer to it until every button
-//! is let go. Keys go to the window with the focus. Each window keeps its
+//! is let go. A tablet's absolute position spans the whole screen; the
+//! wheel turns for the window the pointer events go to. Keys go to the
+//! window with the focus. Each window keeps its
 //! events until its client reads them and signals the notification the
 //! client lent. A restarted input driver has forgotten the subscription:
 //! a read it refuses has the compositor subscribe again (and it reads
@@ -531,16 +533,22 @@ impl Compositor {
                 NONE
             }
             input::MOTION => {
-                let before = self.cursor_rect();
                 let to = |at: u32, d: u64, size: u32| (at as i64 + d as i64).clamp(0, size as i64 - 1) as u32;
-                self.pointer = (to(self.pointer.0, a, self.width), to(self.pointer.1, b, self.height));
-                self.cursor = true;
-                let target = self.grab.or_else(|| self.window_at());
-                self.hover_to(target);
-                self.post_pointer(target);
-                before.union(self.cursor_rect())
+                self.move_pointer((to(self.pointer.0, a, self.width), to(self.pointer.1, b, self.height)))
             }
-            input::BUTTON if a < 3 => {
+            input::POSITION => {
+                // From 0..=POSITION_MAX over the device to the screen's pixels.
+                let to = |v: u64, size: u32| ((v.min(input::POSITION_MAX) * size as u64) >> 16) as u32;
+                self.move_pointer((to(a, self.width), to(b, self.height)))
+            }
+            input::WHEEL => {
+                if let Some(i) = self.grab.or_else(|| self.window_at()) {
+                    let steps = (a as i32 as u32 as u64) | (b as i32 as u32 as u64) << 32;
+                    self.post(i, window::WHEEL, self.local(i), steps);
+                }
+                NONE
+            }
+            input::BUTTON if a < 8 => {
                 let held = self.buttons;
                 if b == 1 {
                     self.buttons |= 1 << a;
@@ -568,6 +576,18 @@ impl Compositor {
             }
             _ => NONE,
         }
+    }
+
+    /// The pointer moved to `to`: the window under it (or holding it) is
+    /// told. The part of the screen it changes.
+    fn move_pointer(&mut self, to: (u32, u32)) -> Rect {
+        let before = self.cursor_rect();
+        self.pointer = to;
+        self.cursor = true;
+        let target = self.grab.or_else(|| self.window_at());
+        self.hover_to(target);
+        self.post_pointer(target);
+        before.union(self.cursor_rect())
     }
 
     /// Every button is up: the window that held the pointer lets it go,

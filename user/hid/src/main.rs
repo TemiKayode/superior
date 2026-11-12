@@ -1,16 +1,19 @@
-//! A USB HID driver for boot keyboards and boot mice: uses the `usb`
+//! A USB HID driver for keyboards and pointing devices: uses the `usb`
 //! interface of a host controller driver and serves `input`
 //! (`superior_objects::interfaces::input`).
 //!
 //! It finds the first device with a boot-protocol keyboard interface
-//! (class 3, subclass 1, protocol 1) and the first with a boot-protocol
-//! mouse interface (protocol 2), claims them, has their interrupt-IN
-//! endpoints polled and selects the configuration and the boot protocol.
-//! Each 8-byte keyboard report becomes key presses and releases, by
-//! comparing it with the one before; each mouse report (buttons, then how
-//! far it moved right and down) becomes button presses and releases and a
-//! motion. Events go into a ring every subscriber reads from at its own
-//! pace.
+//! (class 3, subclass 1, protocol 1) and up to two pointing devices: HID
+//! interfaces whose report descriptor (`superior_driver::hid`) has an
+//! input report with X and Y in it, relative (a mouse) or absolute (a
+//! tablet), with buttons and a wheel or two. It claims them, has their
+//! interrupt-IN endpoints polled and selects the configuration: the boot
+//! protocol for the keyboard, the report protocol for a pointing device
+//! that also speaks the boot one. Each 8-byte keyboard report becomes key
+//! presses and releases, by comparing it with the one before; each
+//! pointer report becomes button presses and releases (against the
+//! last), a motion or a new position, and the wheels' steps. Events go
+//! into a ring every subscriber reads from at its own pace.
 //!
 //! One `Recv` waits for calls, the host controller driver's signal that
 //! reports have arrived, and a timer (`TimerSignal`), on which the driver
@@ -24,6 +27,7 @@
 #![no_std]
 #![no_main]
 
+use superior_driver::hid::{self, Pointer};
 use superior_objects::abi::{CapTransfer, Error, ObjectType, Syscall};
 use superior_objects::interfaces::{Status, input, usb};
 use superior_sys::{USER_BASE, print_line, syscall, syscall_x};
@@ -62,20 +66,27 @@ const ALL: u64 = 0x1f;
 
 const SUBSCRIBERS: usize = 4;
 const EVENTS: usize = 64;
+/// The longest report descriptor read.
+const MAX_DESCRIPTOR: u16 = 1024;
 
 macro_rules! say {
     ($($t:tt)*) => { print_line(format_args!("hid: {}", format_args!($($t)*))) };
 }
 
-/// The kinds of device, by their boot protocol number less one.
+/// The devices' slots: the keyboard, then the pointing devices.
 const KEYBOARD: usize = 0;
-const MOUSE: usize = 1;
-const KINDS: [&str; 2] = ["keyboard", "mouse"];
+const SLOTS: usize = 3;
 
 #[derive(Clone, Copy)]
 struct Device {
     device: u64,
     endpoint: u8,
+    /// Where its reports keep what they say, for a pointing device.
+    layout: Option<Pointer>,
+    /// The buttons held.
+    buttons: u8,
+    /// An absolute device's last position (each 0 to POSITION_MAX).
+    position: (u64, u64),
 }
 
 #[derive(Clone, Copy, Default)]
@@ -94,28 +105,25 @@ struct Subscriber {
 }
 
 struct Hid {
-    devices: [Option<Device>; 2],
+    devices: [Option<Device>; SLOTS],
     /// The last keyboard report: modifiers, then up to six keys.
     last: [u8; 8],
-    /// The mouse buttons held.
-    buttons: u8,
     events: [Event; EVENTS],
     /// Events ever added; event `n` is at `n % EVENTS`.
     added: u64,
     subscribers: [Option<Subscriber>; SUBSCRIBERS],
-    /// Times each kind was set up.
-    setups: [u64; 2],
+    /// Times each slot was set up.
+    setups: [u64; SLOTS],
     rounds: u64,
 }
 
 static mut HID: Hid = Hid {
-    devices: [None; 2],
+    devices: [None; SLOTS],
     last: [0; 8],
-    buttons: 0,
     events: [Event { kind: 0, a: 0, b: 0 }; EVENTS],
     added: 0,
     subscribers: [const { None }; SUBSCRIBERS],
-    setups: [0; 2],
+    setups: [0; SLOTS],
     rounds: 0,
 };
 
@@ -150,97 +158,173 @@ fn control(device: u64, request_type: u8, request: u8, value: u16, index: u16, l
     usb_call([usb::CONTROL, device, setup, 0], Some(PAGE)).map(|r| r[1])
 }
 
-/// Finds a boot interface of kind `kind` in device `device`'s
-/// configuration: (configuration value, interface number, endpoint
-/// descriptor).
-fn find_boot(device: u64, kind: usize) -> Result<Option<(u8, u8, u64)>, Status> {
+/// A HID interface of a device's configuration.
+#[derive(Clone, Copy)]
+struct Interface {
+    config: u8,
+    number: u8,
+    subclass: u8,
+    protocol: u8,
+    /// Its report descriptor's length (from its HID descriptor).
+    report_len: u16,
+    /// Its interrupt-IN endpoint descriptor: address | max packet << 8 |
+    /// interval << 24.
+    endpoint: u64,
+}
+
+impl Interface {
+    fn boot_keyboard(&self) -> bool {
+        self.subclass == 1 && self.protocol == 1
+    }
+}
+
+/// Device `device`'s HID interfaces with an interrupt-IN endpoint, up to
+/// four.
+fn interfaces(device: u64) -> Result<([Option<Interface>; 4], usize), Status> {
+    let mut found = [None; 4];
+    let mut n = 0;
     // The configuration descriptor's header, for its length, then all of it.
-    let n = control(device, 0x80, 6, 2 << 8, 0, 9)?;
-    if n < 9 {
-        return Ok(None);
+    if control(device, 0x80, 6, 2 << 8, 0, 9)? < 9 {
+        return Ok((found, 0));
     }
     let total = u16::from_le_bytes([page()[2], page()[3]]).min(1024);
-    let n = control(device, 0x80, 6, 2 << 8, 0, total)? as usize;
-    let d = &page()[..n];
+    let len = control(device, 0x80, 6, 2 << 8, 0, total)? as usize;
+    let d = &page()[..len];
     let config = d[5];
     let mut at = 0;
-    let mut interface: Option<u8> = None;
-    while at + 2 <= n && d[at] >= 2 {
-        let (len, what) = (d[at] as usize, d[at + 1]);
-        if at + len > n {
+    let mut current: Option<Interface> = None;
+    while at + 2 <= len && d[at] >= 2 {
+        let (l, what) = (d[at] as usize, d[at + 1]);
+        if at + l > len {
             break;
         }
         match what {
-            4 if len >= 9 => {
-                let boot = d[at + 5] == 3 && d[at + 6] == 1 && d[at + 7] as usize == kind + 1;
-                interface = boot.then_some(d[at + 2]);
+            4 if l >= 9 => {
+                current = (d[at + 5] == 3).then_some(Interface {
+                    config,
+                    number: d[at + 2],
+                    subclass: d[at + 6],
+                    protocol: d[at + 7],
+                    report_len: 0,
+                    endpoint: 0,
+                });
             }
-            5 if len >= 7 => {
-                if let Some(i) = interface {
-                    let (addr, attributes) = (d[at + 2], d[at + 3]);
-                    if addr & 0x80 != 0 && attributes & 3 == 3 {
-                        let mps = u16::from_le_bytes([d[at + 4], d[at + 5]]) as u64 & 0x7ff;
-                        let ep = addr as u64 | mps << 8 | (d[at + 6] as u64) << 24;
-                        return Ok(Some((config, i, ep)));
+            // The HID descriptor: the first class descriptor's type and
+            // length.
+            0x21 if l >= 9 => {
+                if let Some(i) = current.as_mut() {
+                    if d[at + 6] == 0x22 {
+                        i.report_len = u16::from_le_bytes([d[at + 7], d[at + 8]]);
+                    }
+                }
+            }
+            5 if l >= 7 => {
+                let (addr, attributes) = (d[at + 2], d[at + 3]);
+                if let Some(mut i) = current.take_if(|_| addr & 0x80 != 0 && attributes & 3 == 3) {
+                    let mps = u16::from_le_bytes([d[at + 4], d[at + 5]]) as u64 & 0x7ff;
+                    i.endpoint = addr as u64 | mps << 8 | (d[at + 6] as u64) << 24;
+                    if n < found.len() {
+                        found[n] = Some(i);
+                        n += 1;
                     }
                 }
             }
             _ => {}
         }
-        at += len;
+        at += l;
     }
-    Ok(None)
+    Ok((found, n))
+}
+
+/// Interface `i`'s report descriptor read and searched for a pointer.
+fn pointer_layout(device: u64, i: &Interface) -> Result<Option<Pointer>, Status> {
+    if i.report_len == 0 {
+        return Ok(None);
+    }
+    let len = control(device, 0x81, 6, 0x22 << 8, i.number as u16, i.report_len.min(MAX_DESCRIPTOR))? as usize;
+    Ok(hid::pointer(&page()[..len]))
 }
 
 impl Hid {
-    /// Finds and sets up every kind of device not set up yet (with
-    /// `again`, all of them, as after the host controller driver
-    /// restarted). Ok if any kind is set up after it.
+    /// Finds and sets up every slot not set up yet (with `again`, all of
+    /// them, as after the host controller driver restarted). Ok if any is
+    /// set up after it.
     fn setup(&mut self, again: bool) -> Result<(), Status> {
         if again {
-            self.devices = [None; 2];
+            // Whatever was held is let go; the next reports say what is
+            // held now.
+            let held: [u8; SLOTS] = core::array::from_fn(|s| self.devices[s].map_or(0, |d| d.buttons));
+            held.into_iter().for_each(|h| self.release(h));
+            self.devices = [None; SLOTS];
         }
         let info = usb_call([usb::INFO, usb::VERSION, 0, 0], None)?;
-        for kind in [KEYBOARD, MOUSE] {
-            if self.devices[kind].is_some() {
+        for device in 0..info[1] {
+            if self.devices.iter().all(Option::is_some) {
+                break;
+            }
+            if self.devices.iter().flatten().any(|d| d.device == device) {
                 continue;
             }
-            for device in 0..info[1] {
-                if self.devices.iter().flatten().any(|d| d.device == device) {
-                    continue;
-                }
-                let Some((config, interface, ep)) = find_boot(device, kind)? else {
-                    continue;
-                };
-                usb_call([usb::ATTACH, device, 0, 0], Some(REPORT_CAP))?;
-                usb_call([usb::ENDPOINT, device, ep, 0], None)?;
-                // SET_CONFIGURATION, SET_PROTOCOL (boot), SET_IDLE (only on change).
-                control(device, 0x00, 9, config as u16, 0, 0)?;
-                control(device, 0x21, 0x0b, 0, interface as u16, 0)?;
-                control(device, 0x21, 0x0a, 0, interface as u16, 0)?;
-                self.devices[kind] = Some(Device {
-                    device,
-                    endpoint: ep as u8,
-                });
-                self.setups[kind] += 1;
-                // Whatever was held before is let go; the next report says
-                // what is held now.
-                if kind == KEYBOARD {
-                    self.key_report([0; 8]);
+            let (found, n) = interfaces(device)?;
+            for i in found[..n].iter().flatten() {
+                let (slot, layout) = if i.boot_keyboard() {
+                    (KEYBOARD, None)
                 } else {
-                    self.mouse_report([0; 3]);
+                    let Some(layout) = pointer_layout(device, i)? else { continue };
+                    let Some(slot) = (1..SLOTS).find(|&s| self.devices[s].is_none()) else { continue };
+                    (slot, Some(layout))
+                };
+                if self.devices[slot].is_some() {
+                    continue;
                 }
-                if self.setups[kind] == 1 {
-                    say!(
-                        "ready: a boot {} on device {device}, interface {interface}, endpoint {:#04x}",
-                        KINDS[kind],
-                        ep as u8
-                    );
-                }
+                self.claim(device, i, slot, layout)?;
+                // One slot per device.
                 break;
             }
         }
         if self.devices.iter().any(Option::is_some) { Ok(()) } else { Err(Status::NotFound) }
+    }
+
+    /// Claims interface `i` of `device` for `slot`.
+    fn claim(&mut self, device: u64, i: &Interface, slot: usize, layout: Option<Pointer>) -> Result<(), Status> {
+        usb_call([usb::ATTACH, device, 0, 0], Some(REPORT_CAP))?;
+        usb_call([usb::ENDPOINT, device, i.endpoint, 0], None)?;
+        // SET_CONFIGURATION; SET_PROTOCOL, boot for the keyboard, report
+        // for a pointing device that has a boot protocol too; SET_IDLE
+        // (only on change).
+        control(device, 0x00, 9, i.config as u16, 0, 0)?;
+        if layout.is_none() || i.subclass == 1 {
+            control(device, 0x21, 0x0b, layout.is_some() as u16, i.number as u16, 0)?;
+        }
+        control(device, 0x21, 0x0a, 0, i.number as u16, 0)?;
+        self.devices[slot] = Some(Device {
+            device,
+            endpoint: i.endpoint as u8,
+            layout,
+            buttons: 0,
+            position: (0, 0),
+        });
+        if slot == KEYBOARD {
+            self.key_report([0; 8]);
+        }
+        self.setups[slot] += 1;
+        if self.setups[slot] > 1 {
+            return Ok(());
+        }
+        let ep = i.endpoint as u8;
+        match layout {
+            None => say!("ready: a boot keyboard on device {device}, interface {}, endpoint {ep:#04x}", i.number),
+            Some(p) => say!(
+                "ready: a pointer on device {device}, interface {}, endpoint {ep:#04x}: {} buttons, {} X and Y{}{}, in {}-byte reports",
+                i.number,
+                p.button_count(),
+                if p.x.relative { "relative" } else { "absolute" },
+                if p.wheel.is_some() { ", a wheel" } else { "" },
+                if p.pan.is_some() { ", a horizontal wheel" } else { "" },
+                p.bytes
+            ),
+        }
+        Ok(())
     }
 
     /// Takes every report the host controller driver has.
@@ -248,19 +332,20 @@ impl Hid {
         if self.devices.iter().all(Option::is_none) && self.setup(true).is_err() {
             return;
         }
-        for kind in [KEYBOARD, MOUSE] {
+        for slot in 0..SLOTS {
             for _ in 0..64 {
-                let Some(d) = self.devices[kind] else { break };
+                let Some(d) = self.devices[slot] else { break };
                 match usb_call([usb::READ, d.device, d.endpoint as u64, 0], Some(PAGE)) {
                     Ok(r) => {
-                        if kind == KEYBOARD && r[1] >= 8 {
+                        let n = (r[1] as usize).min(64);
+                        if slot == KEYBOARD && n >= 8 {
                             let mut b = [0; 8];
                             b.copy_from_slice(&page()[..8]);
                             self.key_report(b);
-                        } else if kind == MOUSE && r[1] >= 3 {
-                            let mut b = [0; 3];
-                            b.copy_from_slice(&page()[..3]);
-                            self.mouse_report(b);
+                        } else if let Some(layout) = d.layout {
+                            let mut b = [0; 64];
+                            b[..n].copy_from_slice(&page()[..n]);
+                            self.pointer_report(slot, &layout, &b[..n]);
                         }
                     }
                     Err(Status::Empty) => break,
@@ -325,22 +410,56 @@ impl Hid {
         }
     }
 
-    /// Turns a mouse boot report (buttons, how far right, how far down)
-    /// into events: the buttons against the last report's, then the motion.
-    fn mouse_report(&mut self, r: [u8; 3]) {
+    /// Releases the buttons in `held`.
+    fn release(&mut self, held: u8) {
+        for bit in 0..hid::BUTTONS {
+            if held >> bit & 1 != 0 {
+                self.push(input::BUTTON, bit as u64, 0);
+            }
+        }
+        if held != 0 {
+            self.tell();
+        }
+    }
+
+    /// Turns a pointer report into events: the buttons against the last
+    /// report's, then the motion or the new position, then the wheels.
+    fn pointer_report(&mut self, slot: usize, p: &Pointer, report: &[u8]) {
+        let Some(body) = p.body(report) else { return };
+        let Some(mut d) = self.devices[slot] else { return };
         let before = self.added;
-        let buttons = r[0] & 7;
-        for bit in 0..3 {
-            let (was, is) = (self.buttons >> bit & 1, buttons >> bit & 1);
+        let mut buttons = 0u8;
+        for (bit, f) in p.buttons.iter().enumerate() {
+            if f.and_then(|f| f.read(body)).is_some_and(|v| v != 0) {
+                buttons |= 1 << bit;
+            }
+        }
+        for bit in 0..hid::BUTTONS {
+            let (was, is) = (d.buttons >> bit & 1, buttons >> bit & 1);
             if was != is {
                 self.push(input::BUTTON, bit as u64, is as u64);
             }
         }
-        self.buttons = buttons;
-        let (dx, dy) = (r[1] as i8 as i64, r[2] as i8 as i64);
-        if dx != 0 || dy != 0 {
-            self.push(input::MOTION, dx as u64, dy as u64);
+        d.buttons = buttons;
+        if let (Some(x), Some(y)) = (p.x.read(body), p.y.read(body)) {
+            if p.x.relative {
+                if x != 0 || y != 0 {
+                    self.push(input::MOTION, x as i64 as u64, y as i64 as u64);
+                }
+            } else {
+                let at = (p.x.scale(x, input::POSITION_MAX), p.y.scale(y, input::POSITION_MAX));
+                if at != d.position {
+                    d.position = at;
+                    self.push(input::POSITION, at.0, at.1);
+                }
+            }
         }
+        let steps = |f: Option<hid::Field>| f.and_then(|f| f.read(body)).unwrap_or(0) as i64;
+        let (up, right) = (steps(p.wheel), steps(p.pan));
+        if up != 0 || right != 0 {
+            self.push(input::WHEEL, up as u64, right as u64);
+        }
+        self.devices[slot] = Some(d);
         if self.added != before {
             self.tell();
         }
@@ -447,7 +566,7 @@ pub extern "C" fn _start(_: u64) -> ! {
         superior_sys::sleep(1);
     }
     if h.devices.iter().all(Option::is_none) {
-        say!("no keyboard or mouse yet (status {})", h.setup(false).err().map_or(0, |s| s as u64));
+        say!("no keyboard or pointer yet (status {})", h.setup(false).err().map_or(0, |s| s as u64));
     }
     let accept = CapTransfer {
         grant: None,
