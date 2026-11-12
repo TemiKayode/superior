@@ -70,6 +70,12 @@ fn report_memory(mem: &memory::Summary) {
 
 /// Called by the architecture code once the machine is up.
 fn kernel_start(untyped_caps: usize) -> ! {
+    match task::init_tables(memory::ram_bytes()) {
+        Ok((slots, bytes)) => {
+            kprintln!("[ok] capability table: {slots} slots ({} KiB)", bytes >> 10)
+        }
+        Err(e) => panic!("{e}"),
+    }
     match arch::iommu_init() {
         Some(name) => kprintln!("[ok] IOMMU: {name}, all DMA blocked until bound"),
         None => kprintln!("[ok] no IOMMU"),

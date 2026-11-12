@@ -107,6 +107,12 @@ const MAX_RAM_RANGES: usize = 16;
 static RAM: Mutex<([(u64, u64); MAX_RAM_RANGES], usize)> =
     Mutex::new(([(0, 0); MAX_RAM_RANGES], 0));
 
+/// Bytes of usable RAM reported at boot.
+pub fn ram_bytes() -> u64 {
+    let ram = RAM.lock();
+    ram.0[..ram.1].iter().map(|&(s, e)| e - s).sum()
+}
+
 /// Whether the page at `pa` is usable RAM.
 pub fn is_ram(pa: u64) -> bool {
     let ram = RAM.lock();

@@ -417,7 +417,7 @@ pub const SERVICE_UNAVAILABLE: u64 = u64::MAX;
 pub const FRAME_BITS: u8 = 12;
 /// A CNode holds from 2^4 to 2^11 slots, each taking 2^5 bytes.
 pub const CNODE_MIN_BITS: u64 = 4;
-pub const CNODE_MAX_BITS: u64 = 11;
+pub const CNODE_MAX_BITS: u64 = 20;
 pub const CNODE_SLOT_BITS: u8 = 5;
 /// An address space takes from 2^14 to 2^20 bytes: one page for its
 /// top-level table, the rest a pool for the page tables under it.

@@ -17,7 +17,7 @@
 //!    its watermark is reset only when nothing made from it is left: by
 //!    revoking it, which destroys every object made from it, or at retype
 //!    once every object's capability has been deleted. Memory the kernel carved for itself
-//!    ([`CNode::retype`], no child capabilities) is never reset.
+//!    ([`Table::retype`], no child capabilities) is never reset.
 
 use core::fmt;
 
@@ -196,12 +196,13 @@ pub enum CapError {
     OutOfMemory,
 }
 
+/// No slot: the end of a list of children.
+const NONE: u32 = u32::MAX;
+
 #[derive(Clone, Copy)]
-struct Slot {
+pub struct Slot {
     cap: Option<Capability>,
     parent: Option<u32>,
-    /// Scratch mark used during revoke; always false between calls.
-    doomed: bool,
     /// For untyped caps: bytes already handed out from the block's start.
     free_index: u64,
     /// For untyped caps: the kernel carved memory from this block for its
@@ -211,20 +212,38 @@ struct Slot {
     /// Made by derive: refers to the same object as its parent, rather
     /// than being an object retyped from it.
     copy: bool,
+    /// The derivation tree's links: this slot's first child, and its
+    /// siblings (the other children of its parent), so finding, revoking
+    /// and re-parenting children never scans the table.
+    child: u32,
+    next: u32,
+    prev: u32,
+    /// How many of its children are copies.
+    copies: u32,
 }
 
 const EMPTY: Slot = Slot {
     cap: None,
     parent: None,
-    doomed: false,
     free_index: 0,
     raw: false,
     copy: false,
+    child: NONE,
+    next: NONE,
+    prev: NONE,
+    copies: 0,
 };
 
 /// One slot's full state: capability, parent, copy, raw, watermark.
 #[cfg(test)]
 pub(crate) type SlotState = (Option<Capability>, Option<u32>, bool, bool, u64);
+
+/// A table of capability slots, of any length: the slots of a
+/// [`CNode`], or memory the kernel set aside at boot ([`Table::init`]).
+#[repr(transparent)]
+pub struct Table {
+    slots: [Slot],
+}
 
 /// A fixed-size table of capability slots.
 #[derive(Clone)]
@@ -242,9 +261,57 @@ impl<const N: usize> CNode<N> {
     pub const fn new() -> Self {
         CNode { slots: [EMPTY; N] }
     }
+}
+
+impl<const N: usize> core::ops::Deref for CNode<N> {
+    type Target = Table;
+    fn deref(&self) -> &Table {
+        Table::of(&self.slots)
+    }
+}
+
+impl<const N: usize> core::ops::DerefMut for CNode<N> {
+    fn deref_mut(&mut self) -> &mut Table {
+        Table::of_mut(&mut self.slots)
+    }
+}
+
+impl Table {
+    /// Bytes one slot takes, for sizing a table made with [`Table::init`].
+    pub const SLOT_BYTES: usize = core::mem::size_of::<Slot>();
+
+    fn of(slots: &[Slot]) -> &Table {
+        // SAFETY: `Table` is a transparent wrapper around `[Slot]`.
+        unsafe { &*(slots as *const [Slot] as *const Table) }
+    }
+
+    fn of_mut(slots: &mut [Slot]) -> &mut Table {
+        // SAFETY: as above.
+        unsafe { &mut *(slots as *mut [Slot] as *mut Table) }
+    }
+
+    /// A table of `len` empty slots in the memory at `at`.
+    ///
+    /// # Safety
+    /// `at` must be valid for writes of `len * SLOT_BYTES` bytes, aligned
+    /// to 8, and used for nothing else for as long as the table lives.
+    pub unsafe fn init<'a>(at: *mut u8, len: usize) -> &'a mut Table {
+        let slots = at as *mut Slot;
+        for i in 0..len {
+            // SAFETY: inside the memory the caller vouched for.
+            unsafe { slots.add(i).write(EMPTY) };
+        }
+        // SAFETY: every slot was just written.
+        Table::of_mut(unsafe { core::slice::from_raw_parts_mut(slots, len) })
+    }
+
+    /// An empty table, of no slots.
+    pub fn empty<'a>() -> &'a mut Table {
+        Table::of_mut(&mut [])
+    }
 
     pub const fn capacity(&self) -> usize {
-        N
+        self.slots.len()
     }
 
     pub fn get(&self, slot: usize) -> Option<&Capability> {
@@ -271,7 +338,7 @@ impl<const N: usize> CNode<N> {
     }
 
     /// Places `cap`, an object made from the untyped capability in
-    /// `parent` (see [`CNode::carve`]), in the empty slot `dst` as a child
+    /// `parent` (see [`Table::carve`]), in the empty slot `dst` as a child
     /// of `parent`, so revoking `parent` destroys it.
     pub fn insert_child(
         &mut self,
@@ -283,9 +350,9 @@ impl<const N: usize> CNode<N> {
         let s = self.empty_slot(dst)?;
         *s = Slot {
             cap: Some(cap),
-            parent: Some(parent as u32),
             ..EMPTY
         };
+        self.link(parent, dst);
         Ok(())
     }
 
@@ -323,15 +390,15 @@ impl<const N: usize> CNode<N> {
         let s = self.empty_slot(dst)?;
         *s = Slot {
             cap: Some(child),
-            parent: Some(src as u32),
             copy: true,
             ..EMPTY
         };
+        self.link(src, dst);
         Ok(())
     }
 
     /// Carves memory for the kernel's own use (page tables, user pages):
-    /// like [`CNode::carve`], but no child capability will record it, so
+    /// like [`Table::carve`], but no child capability will record it, so
     /// this block's watermark is never reset.
     pub fn retype(&mut self, slot: usize, size_bits: u8) -> Result<u64, CapError> {
         let pa = self.carve(slot, size_bits)?;
@@ -341,7 +408,7 @@ impl<const N: usize> CNode<N> {
 
     /// Carves a naturally aligned `2^size_bits` byte region out of the
     /// untyped block in `slot` and returns its physical base address. The
-    /// caller records the object made from it with [`CNode::insert_child`].
+    /// caller records the object made from it with [`Table::insert_child`].
     ///
     /// Memory is handed out by a bump watermark, reset when the untyped
     /// capability is revoked. To guarantee no byte is handed out twice, an
@@ -386,15 +453,53 @@ impl<const N: usize> CNode<N> {
     }
 
     fn has_children(&self, slot: usize) -> bool {
-        self.slots
-            .iter()
-            .any(|s| s.cap.is_some() && s.parent == Some(slot as u32))
+        self.slots[slot].child != NONE
     }
 
     fn has_copies(&self, slot: usize) -> bool {
-        self.slots
-            .iter()
-            .any(|s| s.cap.is_some() && s.copy && s.parent == Some(slot as u32))
+        self.slots[slot].copies > 0
+    }
+
+    /// Makes slot `c`, on no list, the newest child of `parent`.
+    fn link(&mut self, parent: usize, c: usize) {
+        let head = self.slots[parent].child;
+        let s = &mut self.slots[c];
+        s.parent = Some(parent as u32);
+        s.prev = NONE;
+        s.next = head;
+        let copy = s.copy;
+        if head != NONE {
+            self.slots[head as usize].prev = c as u32;
+        }
+        let p = &mut self.slots[parent];
+        p.child = c as u32;
+        if copy {
+            p.copies += 1;
+        }
+    }
+
+    /// Takes slot `c` off its parent's list (it keeps its own children).
+    fn unlink(&mut self, c: usize) {
+        let Some(p) = self.slots[c].parent else {
+            return;
+        };
+        let p = p as usize;
+        let (prev, next, copy) = (self.slots[c].prev, self.slots[c].next, self.slots[c].copy);
+        if prev != NONE {
+            self.slots[prev as usize].next = next;
+        } else {
+            self.slots[p].child = next;
+        }
+        if next != NONE {
+            self.slots[next as usize].prev = prev;
+        }
+        if copy {
+            self.slots[p].copies -= 1;
+        }
+        let s = &mut self.slots[c];
+        s.parent = None;
+        s.prev = NONE;
+        s.next = NONE;
     }
 
     /// Removes every capability derived (directly or transitively) from
@@ -406,28 +511,38 @@ impl<const N: usize> CNode<N> {
         self.revoke_each(slot, |_, _| {})
     }
 
-    /// [`CNode::revoke`], calling `removed` with the slot and capability of
+    /// [`Table::revoke`], calling `removed` with the slot and capability of
     /// each one removed (before it is gone, so its slot can be cleaned up).
+    /// It takes time in proportion to what it removes, not to the table.
     pub fn revoke_each(
         &mut self,
         slot: usize,
         mut removed: impl FnMut(usize, Capability),
     ) -> Result<usize, CapError> {
         self.get(slot).ok_or(self.missing(slot))?;
-        // Mark first, then clear: clearing as we go would cut ancestor
-        // chains that later slots still need to walk.
-        for i in 0..N {
-            if i != slot && self.slots[i].cap.is_some() && self.descends_from(i, slot) {
-                self.slots[i].doomed = true;
-            }
-        }
+        // Leaves first: go down to a slot with no children, remove it, and
+        // carry on from its parent.
         let mut count = 0;
-        for (i, s) in self.slots.iter_mut().enumerate().filter(|(_, s)| s.doomed) {
-            if let Some(c) = s.cap {
-                removed(i, c);
+        let mut cur = slot;
+        loop {
+            let c = self.slots[cur].child;
+            if c != NONE {
+                cur = c as usize;
+                continue;
             }
-            *s = EMPTY;
+            if cur == slot {
+                break;
+            }
+            let Some(p) = self.slots[cur].parent else {
+                break;
+            };
+            if let Some(cap) = self.slots[cur].cap {
+                removed(cur, cap);
+            }
+            self.unlink(cur);
+            self.slots[cur] = EMPTY;
             count += 1;
+            cur = p as usize;
         }
         let s = &mut self.slots[slot];
         if !s.raw && s.cap.is_some_and(|c| c.object.untyped().is_some()) {
@@ -441,26 +556,19 @@ impl<const N: usize> CNode<N> {
     pub fn delete(&mut self, slot: usize) -> Result<(), CapError> {
         self.get(slot).ok_or(self.missing(slot))?;
         let grandparent = self.slots[slot].parent;
-        for s in self.slots.iter_mut() {
-            if s.parent == Some(slot as u32) {
-                s.parent = grandparent;
+        self.unlink(slot);
+        loop {
+            let c = self.slots[slot].child;
+            if c == NONE {
+                break;
+            }
+            self.unlink(c as usize);
+            if let Some(g) = grandparent {
+                self.link(g as usize, c as usize);
             }
         }
         self.slots[slot] = EMPTY;
         Ok(())
-    }
-
-    fn descends_from(&self, mut i: usize, ancestor: usize) -> bool {
-        // A chain can be no longer than N; the bound guards against a
-        // corrupted (cyclic) table rather than looping forever.
-        for _ in 0..N {
-            match self.slots[i].parent {
-                Some(p) if p as usize == ancestor => return true,
-                Some(p) => i = p as usize,
-                None => return false,
-            }
-        }
-        false
     }
 
     /// Whether `slot` holds a copy made by derive (for the model checker).
@@ -478,6 +586,51 @@ impl<const N: usize> CNode<N> {
             .collect()
     }
 
+    /// Checks the derivation links agree with the parents: each occupied
+    /// slot with a parent is on that parent's list exactly once, the lists
+    /// hold nothing else, and each copy count is right (for the model
+    /// checker).
+    #[cfg(test)]
+    pub(crate) fn check_links(&self) -> Result<(), std::string::String> {
+        use std::format;
+        let n = self.slots.len();
+        let mut seen = std::vec![0usize; n];
+        for (p, s) in self.slots.iter().enumerate() {
+            if s.cap.is_none() {
+                if s.child != NONE || s.parent.is_some() || s.copies != 0 {
+                    return Err(format!("empty slot {p} has links"));
+                }
+                continue;
+            }
+            let (mut c, mut prev, mut copies) = (s.child, NONE, 0);
+            let mut steps = 0;
+            while c != NONE {
+                let k = c as usize;
+                if self.slots[k].parent != Some(p as u32) || self.slots[k].prev != prev {
+                    return Err(format!("slot {k} is on the list of {p} with wrong links"));
+                }
+                seen[k] += 1;
+                copies += self.slots[k].copy as u32;
+                prev = c;
+                c = self.slots[k].next;
+                steps += 1;
+                if steps > n {
+                    return Err(format!("the children of slot {p} loop"));
+                }
+            }
+            if copies != s.copies {
+                return Err(format!("slot {p} counts {} copies, has {copies}", s.copies));
+            }
+        }
+        for (k, s) in self.slots.iter().enumerate() {
+            let want = s.parent.is_some() as usize;
+            if seen[k] != want {
+                return Err(format!("slot {k} is on {} lists, not {want}", seen[k]));
+            }
+        }
+        Ok(())
+    }
+
     fn empty_slot(&mut self, slot: usize) -> Result<&mut Slot, CapError> {
         let s = self.slots.get_mut(slot).ok_or(CapError::SlotOutOfRange)?;
         if s.cap.is_some() {
@@ -487,7 +640,7 @@ impl<const N: usize> CNode<N> {
     }
 
     fn missing(&self, slot: usize) -> CapError {
-        if slot < N {
+        if slot < self.slots.len() {
             CapError::SlotEmpty
         } else {
             CapError::SlotOutOfRange

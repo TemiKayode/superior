@@ -539,6 +539,7 @@ pub fn explore(max_depth: usize) -> Result<Report, String> {
                 )));
             }
             invariants(&rows).map_err(fail)?;
+            i2.check_links().map_err(fail)?;
             m2.memory_safe().map_err(fail)?;
             if seen.insert(i2.fingerprint()) {
                 if trace.len() + 1 >= max_depth {

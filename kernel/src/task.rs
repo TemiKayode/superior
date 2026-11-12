@@ -62,7 +62,7 @@ use superior_objects::abi::{
     CNODE_SLOT_BITS, CapTransfer, Error, FaultKind, FaultReply, MAP_EXEC, MAP_WRITE, ObjectType,
     Syscall,
 };
-use superior_objects::cap::{CNode, CapError, Capability, Object, Rights};
+use superior_objects::cap::{CapError, Capability, Object, Rights, Slot, Table};
 use superior_objects::ipc::{Ipc, Tid};
 
 /// Table sizes. Self-test builds keep them small: the self-test fills
@@ -77,7 +77,9 @@ pub const CSPACE_SLOTS: usize = 16;
 /// hidden slot per thread holding its CNode CSpace's capability (which keeps
 /// the CNode alive), then one hidden slot per thread holding its address
 /// space's capability (likewise), then the slots CNode objects are carved
-/// from.
+/// from. That pool is sized at boot to the machine's RAM ([`init_tables`]):
+/// a slot for every page, so the Memory Server can hold a capability to
+/// each, plus [`BASE_CHUNKS`] chunks for everything else.
 const WINDOW_SLOTS: usize = MAX_THREADS * CSPACE_SLOTS;
 const ROOT_SLOTS: usize = WINDOW_SLOTS;
 const VSPACE_SLOTS: usize = ROOT_SLOTS + MAX_THREADS;
@@ -85,10 +87,10 @@ const CNODE_POOL: usize = VSPACE_SLOTS + MAX_THREADS;
 /// CNodes are made of 16-slot chunks, aligned to their own size.
 const CNODE_CHUNK: usize = 16;
 #[cfg(not(feature = "selftest"))]
-const CNODE_CHUNKS: usize = 256;
+const BASE_CHUNKS: usize = 256;
+/// Self-test builds keep the pool this small, so the self-test can fill it.
 #[cfg(feature = "selftest")]
-const CNODE_CHUNKS: usize = 16;
-const CAP_TABLE_SLOTS: usize = CNODE_POOL + CNODE_CHUNK * CNODE_CHUNKS;
+const BASE_CHUNKS: usize = 16;
 #[cfg(not(feature = "selftest"))]
 const MAX_ENDPOINTS: usize = 32;
 #[cfg(feature = "selftest")]
@@ -184,12 +186,16 @@ struct Kernel {
     /// The address space each thread runs in.
     spaces: [Option<u16>; MAX_THREADS],
     /// Every capability: thread windows, CSpace roots and CNode objects.
-    caps: CNode<CAP_TABLE_SLOTS>,
+    caps: BootTable<Table>,
     /// Each thread's CSpace as (first table index, slot count). Empty if
     /// its CNode was destroyed under it.
-    cspace: [(u16, u16); MAX_THREADS],
+    cspace: [(u32, u32); MAX_THREADS],
     /// Live CNode objects, by first pool chunk: their slot-count bits.
-    cnodes: [Option<u8>; CNODE_CHUNKS],
+    cnodes: BootTable<[Option<u8>]>,
+    /// Pool chunks some CNode covers.
+    chunk_used: BootTable<[bool]>,
+    /// Scratch for [`reap`]: pool chunks a capability names as a CNode.
+    cnode_live: BootTable<[bool]>,
     /// Notification (and badge) each interrupt line signals.
     irq_ntfn: [Option<(u16, u64)>; MAX_IRQS],
     /// The capability this thread last called through had Grant or
@@ -204,12 +210,12 @@ struct Kernel {
     sleep_until: [Option<u64>; MAX_THREADS],
     /// Where the frame capability in each capability-table slot is mapped:
     /// (address space, user address).
-    mapped: [Option<(u16, u64)>; CAP_TABLE_SLOTS],
+    mapped: BootTable<[Option<(u16, u64)>]>,
     /// I/O address spaces by id.
     io_spaces: [Option<IoDomain>; MAX_IO_SPACES],
     /// Where the frame capability in each capability-table slot is mapped
     /// for DMA: (I/O address space, I/O address).
-    io_mapped: [Option<(u8, u64)>; CAP_TABLE_SLOTS],
+    io_mapped: BootTable<[Option<(u8, u64)>]>,
     /// Each thread's fault handler: endpoint and badge.
     fault_ep: [Option<(u16, u64)>; MAX_THREADS],
     /// Blocked in a fault call: the reply says how to resume.
@@ -236,12 +242,88 @@ struct Kernel {
     stats: Stats,
 }
 
+/// A table the kernel sets aside at boot, sized to the machine's RAM
+/// ([`init_tables`]). A pointer, so the kernel's statics hold none of it
+/// and need no memory before boot; empty until then.
+struct BootTable<T: ?Sized>(*mut T);
+
+// SAFETY: a boot table is reached only through the kernel, under its lock.
+unsafe impl<T: ?Sized> Send for BootTable<T> {}
+
+impl<T: ?Sized> Deref for BootTable<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        // SAFETY: an empty slice, or memory `init_tables` set aside and
+        // initialised for this table alone.
+        unsafe { &*self.0 }
+    }
+}
+
+impl<T: ?Sized> DerefMut for BootTable<T> {
+    fn deref_mut(&mut self) -> &mut T {
+        // SAFETY: as above; `&mut self` makes this the only reference.
+        unsafe { &mut *self.0 }
+    }
+}
+
+const fn no_slice<T>() -> BootTable<[T]> {
+    BootTable(core::ptr::slice_from_raw_parts_mut(
+        core::ptr::NonNull::dangling().as_ptr(),
+        0,
+    ))
+}
+
+/// Sets aside the capability table and the tables that go with it, sized
+/// to the machine's RAM, from the kernel's own untyped memory. Called once,
+/// at boot, before any capability is placed. Returns the table's slots and
+/// the bytes it all took.
+pub fn init_tables(ram_bytes: u64) -> Result<(usize, u64), &'static str> {
+    let pages = (ram_bytes / 4096) as usize;
+    let chunks = if cfg!(feature = "selftest") {
+        BASE_CHUNKS
+    } else {
+        BASE_CHUNKS + pages.next_power_of_two() / CNODE_CHUNK
+    };
+    let slots = CNODE_POOL + chunks * CNODE_CHUNK;
+    let align8 = |n: usize| (n + 7) & !7;
+    let caps_at = 0;
+    let mapped_at = align8(caps_at + slots * Table::SLOT_BYTES);
+    let io_at = align8(mapped_at + slots * size_of::<Option<(u16, u64)>>());
+    let cnodes_at = align8(io_at + slots * size_of::<Option<(u8, u64)>>());
+    let used_at = align8(cnodes_at + chunks * size_of::<Option<u8>>());
+    let live_at = used_at + chunks;
+    let bytes = (live_at + chunks) as u64;
+    let bits = bytes.next_power_of_two().trailing_zeros().max(12) as u8;
+    let pa = crate::memory::carve(bits).ok_or("no memory for the capability table")?;
+    let p = vm::phys_ptr(pa);
+    fn fill<T: Copy>(at: *mut u8, len: usize, v: T) -> BootTable<[T]> {
+        let t = at as *mut T;
+        for i in 0..len {
+            // SAFETY: inside the block carved for these tables.
+            unsafe { t.add(i).write(v) };
+        }
+        BootTable(core::ptr::slice_from_raw_parts_mut(t, len))
+    }
+    let mut k = KERNEL.lock();
+    // SAFETY: the block was just carved for these tables alone, and is
+    // RAM the kernel maps; every offset is 8-aligned and inside it.
+    unsafe {
+        k.caps = BootTable(Table::init(p.add(caps_at), slots) as *mut Table);
+        k.mapped = fill(p.add(mapped_at), slots, None);
+        k.io_mapped = fill(p.add(io_at), slots, None);
+        k.cnodes = fill(p.add(cnodes_at), chunks, None);
+        k.chunk_used = fill(p.add(used_at), chunks, false);
+        k.cnode_live = fill(p.add(live_at), chunks, false);
+    }
+    Ok((slots, 1 << bits))
+}
+
 static KERNEL: Mutex<Kernel> = Mutex::new(Kernel {
     ipc: Ipc::new(),
     frames: [UserFrame::ZERO; MAX_THREADS],
     vspaces: [None; MAX_SPACES],
     spaces: [None; MAX_THREADS],
-    caps: CNode::new(),
+    caps: BootTable(no_slice::<Slot>().0 as *mut Table),
     cspace: {
         let mut c = [(0, 0); MAX_THREADS];
         let mut t = 0;
@@ -251,15 +333,17 @@ static KERNEL: Mutex<Kernel> = Mutex::new(Kernel {
         }
         c
     },
-    cnodes: [None; CNODE_CHUNKS],
+    cnodes: no_slice(),
+    chunk_used: no_slice(),
+    cnode_live: no_slice(),
     irq_ntfn: [None; MAX_IRQS],
     timers: [None; MAX_TIMERS],
     sleep_until: [None; MAX_THREADS],
     reply_grant: [false; MAX_THREADS],
     ep_used: [false; MAX_ENDPOINTS],
-    mapped: [None; CAP_TABLE_SLOTS],
+    mapped: no_slice(),
     io_spaces: [None; MAX_IO_SPACES],
-    io_mapped: [None; CAP_TABLE_SLOTS],
+    io_mapped: no_slice(),
     fault_ep: [None; MAX_THREADS],
     in_fault: [false; MAX_THREADS],
     thread_used: [false; MAX_THREADS],
@@ -404,7 +488,7 @@ pub fn give_cnode(t: Tid, bits: u8, self_slot: usize) -> Result<(), &'static str
     let mut k = KERNEL.lock();
     let k = &mut *k;
     let c = alloc_cnode(k, bits).ok_or("CNode pool full")?;
-    k.cnodes[c] = Some(bits);
+    claim_cnode(k, c, bits);
     let base = CNODE_POOL + c * CNODE_CHUNK;
     let cap = Capability::new(
         Object::CNode {
@@ -417,7 +501,7 @@ pub fn give_cnode(t: Tid, bits: u8, self_slot: usize) -> Result<(), &'static str
     k.caps
         .insert_root(root, cap)
         .map_err(|_| "CSpace root slot in use")?;
-    k.cspace[t as usize] = (base as u16, 1 << bits);
+    k.cspace[t as usize] = (base as u32, 1 << bits);
     k.caps
         .derive(root, base + self_slot, Rights::ALL, None)
         .map_err(|_| "CNode self slot")?;
@@ -431,8 +515,8 @@ fn cap_slot(k: &Kernel, t: Tid, slot: usize) -> Option<usize> {
 }
 
 /// Thread `t`'s own window of the capability table.
-const fn window(t: usize) -> (u16, u16) {
-    ((t * CSPACE_SLOTS) as u16, CSPACE_SLOTS as u16)
+const fn window(t: usize) -> (u32, u32) {
+    ((t * CSPACE_SLOTS) as u32, CSPACE_SLOTS as u32)
 }
 
 /// Runs the highest-priority thread this CPU can, idling until there is
@@ -1311,15 +1395,40 @@ fn cap_revoke(k: &mut Kernel, cur: Tid, slot: u64) -> Result<(), u64> {
 
 /// Revokes table slot `s`: see [`cap_revoke`].
 fn revoke_index(k: &mut Kernel, s: usize) -> Result<(), u64> {
-    let mut gone = [false; CAP_TABLE_SLOTS];
-    k.caps
-        .revoke_each(s, |i, _| gone[i] = true)
-        .map_err(cap_error)?;
-    for (i, _) in gone.iter().enumerate().filter(|(_, g)| **g) {
-        unmap_slot(k, i);
+    let mut objects = false;
+    let Kernel {
+        caps,
+        mapped,
+        io_mapped,
+        vspaces,
+        io_spaces,
+        ..
+    } = k;
+    caps.revoke_each(s, |i, c| {
+        objects |= reapable(&c.object);
+        unmap_parts(mapped, io_mapped, vspaces, io_spaces, i);
+    })
+    .map_err(cap_error)?;
+    // Revoking only frames and memory (the Memory Server's pages) leaves
+    // no object behind to free: no pass over the table.
+    if objects {
+        reap(k);
     }
-    reap(k);
     Ok(())
+}
+
+/// Whether the object a capability names is freed with its last
+/// capability (by [`reap`]).
+fn reapable(o: &Object) -> bool {
+    matches!(
+        o,
+        Object::Thread { .. }
+            | Object::CNode { .. }
+            | Object::AddressSpace { .. }
+            | Object::IoSpace { .. }
+            | Object::Endpoint { .. }
+            | Object::Notification { .. }
+    )
 }
 
 /// `CapDelete`: empties the caller's slot, unmapping a frame first.
@@ -1330,24 +1439,38 @@ fn cap_delete(k: &mut Kernel, cur: Tid, slot: u64) -> Result<(), u64> {
 
 /// Deletes table slot `s`: see [`cap_delete`].
 fn delete_index(k: &mut Kernel, s: usize) -> Result<(), u64> {
-    k.caps.get(s).ok_or(Error::InvalidCapability.code())?;
+    let c = *k.caps.get(s).ok_or(Error::InvalidCapability.code())?;
     unmap_slot(k, s);
     k.caps.delete(s).map_err(cap_error)?;
-    reap(k);
+    if reapable(&c.object) {
+        reap(k);
+    }
     Ok(())
 }
 
 /// Unmaps the frame whose capability is in table slot `s`, if mapped,
 /// from its address space and from its I/O address space.
 fn unmap_slot(k: &mut Kernel, s: usize) {
-    if let Some((id, va)) = k.mapped[s].take() {
-        if let Some(v) = k.vspaces[id as usize] {
+    unmap_parts(&mut k.mapped, &mut k.io_mapped, &k.vspaces, &k.io_spaces, s);
+}
+
+/// [`unmap_slot`], on the parts of the kernel it needs (so it can run
+/// while the capability table is borrowed).
+fn unmap_parts(
+    mapped: &mut [Option<(u16, u64)>],
+    io_mapped: &mut [Option<(u8, u64)>],
+    vspaces: &[Option<VSpace>],
+    io_spaces: &[Option<IoDomain>],
+    s: usize,
+) {
+    if let Some((id, va)) = mapped[s].take() {
+        if let Some(v) = vspaces[id as usize] {
             v.root.unmap(va);
             smp::shootdown(v.root.root_pa(), false);
         }
     }
-    if let Some((id, iova)) = k.io_mapped[s].take() {
-        if let Some(d) = k.io_spaces[id as usize] {
+    if let Some((id, iova)) = io_mapped[s].take() {
+        if let Some(d) = io_spaces[id as usize] {
             crate::iommu::unmap(d.root(), iova);
             iommu::flush();
         }
@@ -1612,11 +1735,12 @@ fn reap(k: &mut Kernel) {
     // the capability table marking what is still referred to.
     loop {
         let live = Live::of(k);
+        let chunks = k.cnodes.len();
         if let Some(t) = (0..MAX_THREADS).find(|&t| k.thread_object[t] && !live.threads[t]) {
             destroy_thread(k, t as Tid);
             continue;
         }
-        if let Some(c) = (0..CNODE_CHUNKS).find(|&c| k.cnodes[c].is_some() && !live.cnodes[c]) {
+        if let Some(c) = (0..chunks).find(|&c| k.cnodes[c].is_some() && !k.cnode_live[c]) {
             destroy_cnode(k, c);
             continue;
         }
@@ -1677,9 +1801,9 @@ fn reap(k: &mut Kernel) {
 }
 
 /// Which table entries some capability still refers to.
+/// (Which CNodes, it leaves in `Kernel::cnode_live`.)
 struct Live {
     threads: [bool; MAX_THREADS],
-    cnodes: [bool; CNODE_CHUNKS],
     spaces: [bool; MAX_SPACES],
     io_spaces: [bool; MAX_IO_SPACES],
     endpoints: [bool; MAX_ENDPOINTS],
@@ -1687,10 +1811,11 @@ struct Live {
 }
 
 impl Live {
-    fn of(k: &Kernel) -> Live {
+    fn of(k: &mut Kernel) -> Live {
+        let cnodes = &mut *k.cnode_live;
+        cnodes.iter_mut().for_each(|c| *c = false);
         let mut l = Live {
             threads: [false; MAX_THREADS],
-            cnodes: [false; CNODE_CHUNKS],
             spaces: [false; MAX_SPACES],
             io_spaces: [false; MAX_IO_SPACES],
             endpoints: [false; MAX_ENDPOINTS],
@@ -1701,7 +1826,7 @@ impl Live {
                 Object::Thread { id } => l.threads.get_mut(id as usize),
                 Object::CNode { base, .. } => (base as usize)
                     .checked_sub(CNODE_POOL)
-                    .and_then(|o| l.cnodes.get_mut(o / CNODE_CHUNK)),
+                    .and_then(|o| cnodes.get_mut(o / CNODE_CHUNK)),
                 Object::AddressSpace { id } => l.spaces.get_mut(id as usize),
                 Object::IoSpace { id } => l.io_spaces.get_mut(id as usize),
                 Object::Endpoint { id } => l.endpoints.get_mut(id as usize),
@@ -1889,24 +2014,28 @@ fn thread_set_space(k: &mut Kernel, cur: Tid, f: &Args) -> Result<(), u64> {
     k.caps
         .derive(src, root, Rights::ALL, None)
         .map_err(cap_error)?;
-    k.cspace[t as usize] = (base as u16, size as u16);
+    k.cspace[t as usize] = (base as u32, size as u32);
     reap(k);
     Ok(())
 }
 
-/// First pool chunk of `1 << bits` free slots, aligned to their size.
+/// A pool chunk starting `1 << bits` free slots, aligned to their size.
+/// Taken from the top of the pool down, so the bottom stays free for a
+/// CNode as large as the pool's RAM-sized part (the Memory Server's).
 fn alloc_cnode(k: &Kernel, bits: u8) -> Option<usize> {
-    let n = (1usize << bits) / CNODE_CHUNK;
-    let mut used = [false; CNODE_CHUNKS];
-    for (c, b) in k.cnodes.iter().enumerate() {
-        if let Some(b) = b {
-            let len = (1usize << b) / CNODE_CHUNK;
-            used[c..c + len].iter_mut().for_each(|u| *u = true);
-        }
-    }
-    (0..CNODE_CHUNKS)
-        .step_by(n)
+    let n = ((1usize << bits) / CNODE_CHUNK).max(1);
+    let used = &*k.chunk_used;
+    (0..used.len() / n)
+        .rev()
+        .map(|i| i * n)
         .find(|&c| used[c..c + n].iter().all(|u| !u))
+}
+
+/// Records a CNode of `1 << bits` slots at pool chunk `c`.
+fn claim_cnode(k: &mut Kernel, c: usize, bits: u8) {
+    k.cnodes[c] = Some(bits);
+    let n = ((1usize << bits) / CNODE_CHUNK).max(1);
+    k.chunk_used[c..c + n].iter_mut().for_each(|u| *u = true);
 }
 
 /// Destroys the CNode starting at pool chunk `c`: empties its slots and
@@ -1915,6 +2044,8 @@ fn destroy_cnode(k: &mut Kernel, c: usize) {
     let Some(bits) = k.cnodes[c].take() else {
         return;
     };
+    let n = ((1usize << bits) / CNODE_CHUNK).max(1);
+    k.chunk_used[c..c + n].iter_mut().for_each(|u| *u = false);
     let base = CNODE_POOL + c * CNODE_CHUNK;
     for s in base..base + (1 << bits) {
         if k.caps.get(s).is_some() {
@@ -2026,7 +2157,7 @@ fn retype(k: &mut Kernel, cur: Tid, f: &Args) -> Result<(), u64> {
         }
         (ObjectType::CNode, Some(c)) => {
             let slot_bits = bits - CNODE_SLOT_BITS;
-            k.cnodes[c] = Some(slot_bits);
+            claim_cnode(k, c, slot_bits);
             Capability::new(
                 Object::CNode {
                     base: (CNODE_POOL + c * CNODE_CHUNK) as u32,
