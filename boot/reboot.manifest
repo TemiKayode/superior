@@ -14,8 +14,8 @@ component memserver
   restart never
   memory 22
   cspace 9
-  # CSpace of 2^9 slots, pool of 2^21 bytes: 9 | 21 << 8.
-  arg 5385
+  # The CSpace's size in bits.
+  arg 9
   provides mem 0
   untyped 21 1
 

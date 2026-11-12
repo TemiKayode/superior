@@ -102,7 +102,7 @@ const TOMB_STACK: u64 = TOMB_TCB + MAX_SERVICES as u64;
 /// Pages components share with servers (`shared`): made once, handed out
 /// from here in manifest order, outliving every instance on both sides.
 const SHARED_PAGES: u64 = TOMB_STACK + 2 * MAX_SERVICES as u64;
-const SHARED_SLOTS: u64 = 160;
+const SHARED_SLOTS: u64 = 128;
 const _: () = assert!(SHARED_PAGES + SHARED_SLOTS <= BLOCKS);
 /// Each component's block of slots: its untyped memory, then the objects
 /// of its current instance.
@@ -277,8 +277,10 @@ impl<'a> Manager<'a> {
             }
             self.made[i] = true;
         }
-        retype(ut, ObjectType::AddressSpace, 16, vspace).map_err(|e| ("address space", e))?;
+        // The CNode first: the largest object, aligned to its size, so a
+        // big one (the Memory Server's) wastes none of the block.
         retype(ut, ObjectType::CNode, c.cspace_bits as u64, cnode).map_err(|e| ("CNode", e))?;
+        retype(ut, ObjectType::AddressSpace, 16, vspace).map_err(|e| ("address space", e))?;
         retype(ut, ObjectType::Thread, 0, tcb).map_err(|e| ("thread", e))?;
         let image = self
             .bundle
@@ -330,6 +332,17 @@ impl<'a> Manager<'a> {
                 CapKind::State => cnode_copy(cnode, slot, root::STATE_STORE + i as u64, ALL, 0),
                 CapKind::Shared(n) => (0..n as u64)
                     .try_for_each(|p| cnode_copy(cnode, slot + p, self.shared[i] + p, ALL, 0)),
+                // Each spare block the kernel gave, made over whole as a
+                // child of the manager's, so stopping the component takes
+                // it all back (`stop`).
+                CapKind::Spare => (0..root::SPARE_COUNT)
+                    .map_while(|k| {
+                        let r = syscall(Syscall::UntypedInfo, root::SPARE + k, [0; 4]);
+                        (r.status == 0).then_some((k, r.msg[0]))
+                    })
+                    .try_for_each(|(k, bits)| {
+                        retype_into(root::SPARE + k, ObjectType::Untyped, bits, cnode, slot + k)
+                    }),
             };
             r.map_err(|e| ("placing a capability", e))?;
         }
@@ -438,6 +451,11 @@ impl<'a> Manager<'a> {
         if self.made[i] {
             let ut = BLOCKS + i as u64 * BLOCK + B_UNTYPED;
             let _ = sys(Syscall::CapRevoke, ut, [0; 4]);
+            if self.component(i).caps().any(|c| c.kind == CapKind::Spare) {
+                for k in 0..root::SPARE_COUNT {
+                    let _ = sys(Syscall::CapRevoke, root::SPARE + k, [0; 4]);
+                }
+            }
         }
         self.status[i] = Status::Stopped;
     }

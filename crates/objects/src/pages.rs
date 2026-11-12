@@ -3,9 +3,9 @@
 //! sequences of requests, as the kernel's own IPC engine is.
 //!
 //! The server keeps one frame capability per page in its own CSpace, slots
-//! [`FIRST_PAGE`] to `end`. A page it gives away is always reachable from
-//! the original it keeps, so revoking the original takes back every copy
-//! and every mapping. What it asks of the kernel is the [`Frames`] trait.
+//! `first` to `end`. A page it gives away is always reachable from the
+//! original it keeps, so revoking the original takes back every copy and
+//! every mapping. What it asks of the kernel is the [`Frames`] trait.
 //!
 //! Copy-on-write: [`Server::share`] makes a component's heap pages
 //! read-only and shared; [`Server::clone`] maps them, read-only, at the same
@@ -14,12 +14,22 @@
 //! the writer its own copy, or the frame itself once no one else maps it.
 //! Each mapping is charged to its holder, so breaking the sharing never
 //! needs more quota.
+//!
+//! The books scale to all of RAM (a slot per page, over a hundred
+//! thousand): each slot's [`Book`] is in memory the server is handed, free
+//! and unmade slots are on lists, and a hash index finds the slot mapping
+//! a component's heap at an address. So a fault, a grant or a free takes
+//! the same time however many pages there are; only whole-component
+//! requests (release, share, clone) walk every slot.
 
 use crate::interfaces::{Status, mem};
 
-/// The first slot holding a page; the ones below are the server's own.
+/// The first slot holding a page by default; the ones below are the
+/// server's own.
 pub const FIRST_PAGE: u64 = 8;
 const PAGE: u64 = 4096;
+/// No slot: the end of a list, an empty place in the index.
+const NONE: u32 = u32::MAX;
 
 /// What the server asks of the kernel. Slots are in the server's CSpace;
 /// "lent" is the address space the current request lent it.
@@ -64,86 +74,269 @@ pub enum Page {
     Retired,
 }
 
-pub struct Server<F: Frames, const SLOTS: usize, const CLIENTS: usize> {
-    pub frames: F,
-    pages: [Page; SLOTS],
+/// One slot's books.
+#[derive(Clone, Copy, Debug)]
+pub struct Book {
+    page: Page,
     /// Where a `Heap` or `Cow` slot is mapped.
-    va: [u64; SLOTS],
+    va: u64,
     /// For a `Cow` slot: the slot of the frame's original.
-    base: [u16; SLOTS],
+    base: u32,
     /// For an original: how many `Cow` slots map its frame.
-    refs: [u16; SLOTS],
-    /// Slots in use for pages: FIRST_PAGE..end.
-    end: u64,
+    refs: u32,
+    /// The next slot on the free or the unmade list (counted from
+    /// `first`).
+    next: u32,
+}
+
+impl Book {
+    pub const EMPTY: Book = Book {
+        page: Page::Unmade,
+        va: 0,
+        base: 0,
+        refs: 0,
+        next: NONE,
+    };
+}
+
+pub struct Server<'a, F: Frames, const CLIENTS: usize> {
+    pub frames: F,
+    /// Slot `first + i`'s books.
+    books: &'a mut [Book],
+    /// The slots mapping heaps, by (owner, address): open addressing with
+    /// linear probing, a power of two at least twice the slots.
+    index: &'a mut [u32],
+    first: u64,
+    /// Heads of the free and unmade lists, and their lengths.
+    free: u32,
+    unmade: u32,
+    free_count: u64,
+    unmade_count: u64,
     /// Pages the pool can still make.
     pool_left: u64,
     used: [u64; CLIENTS],
 }
 
-impl<F: Frames, const SLOTS: usize, const CLIENTS: usize> Server<F, SLOTS, CLIENTS> {
-    /// A server with slots `FIRST_PAGE..end` for pages and a pool that can
-    /// make `pool` of them.
-    pub fn new(frames: F, end: u64, pool: u64) -> Self {
+impl<'a, F: Frames, const CLIENTS: usize> Server<'a, F, CLIENTS> {
+    /// Bytes of books one slot takes.
+    pub const BOOK_BYTES: usize = core::mem::size_of::<Book>();
+
+    /// Entries the index needs for `slots` slots.
+    pub const fn index_len(slots: usize) -> usize {
+        (2 * slots).next_power_of_two()
+    }
+
+    /// A server with a slot for each of `books`, from `first`, and a pool
+    /// that can make `pool` pages. `index` has [`Server::index_len`]
+    /// entries (any beyond the largest power of two are left unused).
+    pub fn new(
+        frames: F,
+        books: &'a mut [Book],
+        index: &'a mut [u32],
+        first: u64,
+        pool: u64,
+    ) -> Self {
+        let n = books.len();
+        for (i, b) in books.iter_mut().enumerate() {
+            *b = Book {
+                next: if i + 1 < n { (i + 1) as u32 } else { NONE },
+                ..Book::EMPTY
+            };
+        }
+        let len = match index.len() {
+            0 => 0,
+            l => 1 << l.ilog2(),
+        };
+        let index = &mut index[..len];
+        index.iter_mut().for_each(|e| *e = NONE);
         Server {
             frames,
-            pages: [Page::Unmade; SLOTS],
-            va: [0; SLOTS],
-            base: [0; SLOTS],
-            refs: [0; SLOTS],
-            end: end.min(SLOTS as u64),
+            books,
+            index,
+            first,
+            free: NONE,
+            unmade: if n > 0 { 0 } else { NONE },
+            free_count: 0,
+            unmade_count: n as u64,
             pool_left: pool,
             used: [0; CLIENTS],
         }
     }
 
     pub fn slots(&self) -> core::ops::Range<u64> {
-        FIRST_PAGE..self.end
+        self.first..self.first + self.books.len() as u64
+    }
+
+    fn book(&self, s: u64) -> &Book {
+        &self.books[(s - self.first) as usize]
+    }
+
+    fn book_mut(&mut self, s: u64) -> &mut Book {
+        &mut self.books[(s - self.first) as usize]
     }
 
     pub fn page(&self, s: u64) -> Page {
-        self.pages[s as usize]
+        self.book(s).page
     }
 
     pub fn va(&self, s: u64) -> u64 {
-        self.va[s as usize]
+        self.book(s).va
     }
 
     pub fn base(&self, s: u64) -> u64 {
-        self.base[s as usize] as u64
+        self.book(s).base as u64
     }
 
     pub fn refs(&self, s: u64) -> u64 {
-        self.refs[s as usize] as u64
+        self.book(s).refs as u64
     }
 
     pub fn used(&self, client: u64) -> u64 {
         self.used.get(client as usize).copied().unwrap_or(0)
     }
 
-    /// A zeroed page nobody holds, made if need be.
+    // ---- the free and unmade lists ----
+
+    fn push(&mut self, s: u64, free: bool) {
+        let i = (s - self.first) as u32;
+        let head = if free { self.free } else { self.unmade };
+        self.book_mut(s).next = head;
+        if free {
+            self.free = i;
+            self.free_count += 1;
+        } else {
+            self.unmade = i;
+            self.unmade_count += 1;
+        }
+    }
+
+    fn pop(&mut self, free: bool) -> Option<u64> {
+        let head = if free { self.free } else { self.unmade };
+        if head == NONE {
+            return None;
+        }
+        let next = core::mem::replace(&mut self.books[head as usize].next, NONE);
+        if free {
+            self.free = next;
+            self.free_count -= 1;
+        } else {
+            self.unmade = next;
+            self.unmade_count -= 1;
+        }
+        Some(self.first + head as u64)
+    }
+
+    // ---- the index of heap mappings ----
+
+    /// What the index files slot `s` under, if anything.
+    fn key(&self, s: u64) -> Option<(u16, u64)> {
+        match self.page(s) {
+            Page::Heap(o) | Page::Cow(o) => Some((o, self.va(s))),
+            _ => None,
+        }
+    }
+
+    fn home(&self, (owner, va): (u16, u64)) -> usize {
+        let x = ((va >> 12) ^ (owner as u64) << 52).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        (x >> 32) as usize & (self.index.len() - 1)
+    }
+
+    /// Where in the index the slot filed under `key` is, and the slot.
+    fn find(&self, key: (u16, u64)) -> Option<(usize, u64)> {
+        if self.index.is_empty() {
+            return None;
+        }
+        let mut i = self.home(key);
+        loop {
+            let e = self.index[i];
+            if e == NONE {
+                return None;
+            }
+            let s = self.first + e as u64;
+            if self.key(s) == Some(key) {
+                return Some((i, s));
+            }
+            i = (i + 1) & (self.index.len() - 1);
+        }
+    }
+
+    fn file(&mut self, s: u64) {
+        let Some(key) = self.key(s) else { return };
+        let mask = self.index.len() - 1;
+        let mut i = self.home(key);
+        while self.index[i] != NONE {
+            i = (i + 1) & mask;
+        }
+        self.index[i] = (s - self.first) as u32;
+    }
+
+    /// Takes slot `s` out of the index, moving later entries back so no
+    /// lookup stops short at the hole.
+    fn unfile(&mut self, s: u64) {
+        let Some(key) = self.key(s) else { return };
+        let Some((mut i, found)) = self.find(key) else { return };
+        debug_assert_eq!(found, s);
+        let mask = self.index.len() - 1;
+        let mut j = i;
+        loop {
+            j = (j + 1) & mask;
+            let e = self.index[j];
+            if e == NONE {
+                break;
+            }
+            let k = self.home(self.key(self.first + e as u64).unwrap_or((0, 0)));
+            // An entry whose home lies cyclically in (i, j] is reachable
+            // already; any other must move into the hole.
+            let stays = if i <= j { i < k && k <= j } else { i < k || k <= j };
+            if !stays {
+                self.index[i] = e;
+                i = j;
+            }
+        }
+        self.index[i] = NONE;
+    }
+
+    /// Puts slot `s` in state `page` (mapped at `va`), keeping the lists
+    /// and the index right. A slot going `Free` or `Unmade` must be on
+    /// no list.
+    fn set(&mut self, s: u64, page: Page, va: u64) {
+        self.unfile(s);
+        let b = self.book_mut(s);
+        b.page = page;
+        b.va = va;
+        match page {
+            Page::Heap(_) | Page::Cow(_) => self.file(s),
+            Page::Free => self.push(s, true),
+            Page::Unmade => self.push(s, false),
+            _ => {}
+        }
+    }
+
+    /// A zeroed page nobody holds, made if need be. It is on no list: the
+    /// caller puts it in its next state with [`Server::set`].
     fn take(&mut self) -> Option<u64> {
-        if let Some(s) = self.slots().find(|&s| self.page(s) == Page::Free) {
+        if let Some(s) = self.pop(true) {
             return Some(s);
         }
         if self.pool_left == 0 {
             return None;
         }
-        let s = self.slots().find(|&s| self.page(s) == Page::Unmade)?;
+        let s = self.pop(false)?;
         // Fresh frames come zeroed from the kernel.
         if !self.frames.make(s) {
             self.pool_left = 0;
+            self.push(s, false);
             return None;
         }
         self.pool_left -= 1;
-        self.pages[s as usize] = Page::Free;
+        self.book_mut(s).page = Page::Free;
         Some(s)
     }
 
     /// Pages that can still be handed out: free ones, and ones the pool
     /// can make into the slots left (copy-on-write copies use slots too).
     pub fn free_pages(&self) -> u64 {
-        let count = |p: Page| self.slots().filter(|&s| self.page(s) == p).count() as u64;
-        count(Page::Free) + self.pool_left.min(count(Page::Unmade))
+        self.free_count + self.pool_left.min(self.unmade_count)
     }
 
     /// Takes page `s` back from whoever has it: every copy and mapping
@@ -151,9 +344,9 @@ impl<F: Frames, const SLOTS: usize, const CLIENTS: usize> Server<F, SLOTS, CLIEN
     fn reclaim(&mut self, s: u64) -> bool {
         self.frames.unmap(s);
         self.frames.revoke(s);
-        self.refs[s as usize] = 0;
+        self.book_mut(s).refs = 0;
         let zeroed = self.frames.zero(s);
-        self.pages[s as usize] = if zeroed { Page::Free } else { Page::Retired };
+        self.set(s, if zeroed { Page::Free } else { Page::Retired }, 0);
         zeroed
     }
 
@@ -163,14 +356,14 @@ impl<F: Frames, const SLOTS: usize, const CLIENTS: usize> Server<F, SLOTS, CLIEN
     fn drop_cow(&mut self, s: u64) {
         let b = self.base(s);
         self.frames.unmap(s);
-        self.refs[b as usize] -= 1;
+        self.book_mut(b).refs -= 1;
         if s == b {
-            self.pages[s as usize] = Page::Backing;
+            self.set(s, Page::Backing, 0);
         } else {
             self.frames.delete(s);
-            self.pages[s as usize] = Page::Unmade;
+            self.set(s, Page::Unmade, 0);
         }
-        if self.refs[b as usize] == 0 && self.page(b) == Page::Backing {
+        if self.refs(b) == 0 && self.page(b) == Page::Backing {
             self.reclaim(b);
         }
     }
@@ -197,7 +390,7 @@ impl<F: Frames, const SLOTS: usize, const CLIENTS: usize> Server<F, SLOTS, CLIEN
     /// `[FRAME]`: a page granted to `client`; its slot.
     pub fn frame(&mut self, client: u64, quota: u64) -> Result<u64, Status> {
         let s = self.charge(client, quota)?;
-        self.pages[s as usize] = Page::Given(client as u16);
+        self.set(s, Page::Given(client as u16), 0);
         Ok(s)
     }
 
@@ -213,10 +406,8 @@ impl<F: Frames, const SLOTS: usize, const CLIENTS: usize> Server<F, SLOTS, CLIEN
 
     /// The slot mapping `client`'s heap at `va`, if any.
     pub fn mapping(&self, client: u64, va: u64) -> Option<u64> {
-        let o = client as u16;
-        self.slots().find(|&s| {
-            matches!(self.page(s), Page::Heap(x) | Page::Cow(x) if x == o) && self.va(s) == va
-        })
+        let c = u16::try_from(client).ok()?;
+        self.find((c, va)).map(|(_, s)| s)
     }
 
     /// `[FAULT]`: `client`'s heap faulted at `addr`. A zeroed page if
@@ -238,10 +429,10 @@ impl<F: Frames, const SLOTS: usize, const CLIENTS: usize> Server<F, SLOTS, CLIEN
         };
         if !self.frames.map_lent(s, va, true) {
             self.used[client as usize] -= 1;
+            self.set(s, Page::Free, 0);
             return Status::Invalid;
         }
-        self.pages[s as usize] = Page::Heap(client as u16);
-        self.va[s as usize] = va;
+        self.set(s, Page::Heap(client as u16), va);
         Status::Ok
     }
 
@@ -250,22 +441,21 @@ impl<F: Frames, const SLOTS: usize, const CLIENTS: usize> Server<F, SLOTS, CLIEN
     fn unshare(&mut self, client: u64, s: u64, va: u64) -> Status {
         let b = self.base(s);
         let owner = Page::Heap(client as u16);
-        if self.refs[b as usize] == 1 {
+        if self.refs(b) == 1 {
             // The last mapping: the frame is the writer's alone. It keeps
             // the original, so taking it back later revokes the right one.
             self.frames.unmap(s);
             if s != b {
                 self.frames.delete(s);
-                self.pages[s as usize] = Page::Unmade;
+                self.set(s, Page::Unmade, 0);
             }
-            self.refs[b as usize] = 0;
+            self.book_mut(b).refs = 0;
             if !self.frames.map_lent(b, va, true) {
                 self.reclaim(b);
                 self.used[client as usize] -= 1;
                 return Status::Invalid;
             }
-            self.pages[b as usize] = owner;
-            self.va[b as usize] = va;
+            self.set(b, owner, va);
             return Status::Ok;
         }
         let Some(n) = self.take() else {
@@ -278,8 +468,7 @@ impl<F: Frames, const SLOTS: usize, const CLIENTS: usize> Server<F, SLOTS, CLIEN
             self.reclaim(n);
             return Status::Invalid;
         }
-        self.pages[n as usize] = owner;
-        self.va[n as usize] = va;
+        self.set(n, owner, va);
         self.drop_cow(s);
         Status::Ok
     }
@@ -302,9 +491,10 @@ impl<F: Frames, const SLOTS: usize, const CLIENTS: usize> Server<F, SLOTS, CLIEN
                 let _ = self.frames.map_lent(s, va, true);
                 return Err(Status::Invalid);
             }
-            self.pages[s as usize] = Page::Cow(client as u16);
-            self.base[s as usize] = s as u16;
-            self.refs[s as usize] = 1;
+            self.set(s, Page::Cow(client as u16), va);
+            let b = self.book_mut(s);
+            b.base = s as u32;
+            b.refs = 1;
             n += 1;
         }
         Ok(n)
@@ -323,31 +513,31 @@ impl<F: Frames, const SLOTS: usize, const CLIENTS: usize> Server<F, SLOTS, CLIEN
         if self.used[c] + n > quota {
             return Err(Status::Denied);
         }
-        let room = self.slots().filter(|&s| self.page(s) == Page::Unmade).count() as u64;
-        if room < n {
+        if self.unmade_count < n {
             return Err(Status::InUse);
         }
         for s in self.slots() {
             if self.page(s) != shared {
                 continue;
             }
-            let b = self.base[s as usize];
+            let b = self.base(s);
             let va = self.va(s);
-            let Some(k) = self.slots().find(|&k| self.page(k) == Page::Unmade) else {
+            let Some(k) = self.pop(false) else {
                 return Err(Status::InUse);
             };
             // A copy of the original, so revoking the original takes it.
-            if !self.frames.copy_cap(b as u64, k) {
+            if !self.frames.copy_cap(b, k) {
+                self.push(k, false);
                 return Err(Status::InUse);
             }
             if !self.frames.map_lent(k, va, false) {
                 self.frames.delete(k);
+                self.push(k, false);
                 return Err(Status::Invalid);
             }
-            self.pages[k as usize] = Page::Cow(child as u16);
-            self.base[k as usize] = b;
-            self.va[k as usize] = va;
-            self.refs[b as usize] += 1;
+            self.set(k, Page::Cow(child as u16), va);
+            self.book_mut(k).base = b as u32;
+            self.book_mut(b).refs += 1;
             self.used[c] += 1;
         }
         Ok(n)
@@ -399,6 +589,52 @@ impl<F: Frames, const SLOTS: usize, const CLIENTS: usize> Server<F, SLOTS, CLIEN
             mem::FAULT | mem::RELEASE | mem::SHARE | mem::CLONE => status(Status::Denied),
             _ => status(Status::Invalid),
         }
+    }
+
+    /// Checks the lists, counts and index agree with the books (for the
+    /// tests): every free slot on the free list and every unmade one on
+    /// the unmade list, nothing else on either, and every heap or shared
+    /// slot found by the index under its owner and address.
+    #[cfg(test)]
+    pub(crate) fn check_books(&self) -> Result<(), std::string::String> {
+        use std::format;
+        let walk = |mut head: u32, want: Page| -> Result<u64, std::string::String> {
+            let mut n = 0;
+            while head != NONE {
+                let s = self.first + head as u64;
+                if self.page(s) != want {
+                    return Err(format!("slot {s} on the {want:?} list is {:?}", self.page(s)));
+                }
+                n += 1;
+                if n > self.books.len() as u64 {
+                    return Err(format!("the {want:?} list loops"));
+                }
+                head = self.book(s).next;
+            }
+            Ok(n)
+        };
+        let count = |p: Page| self.slots().filter(|&s| self.page(s) == p).count() as u64;
+        let (free, unmade) = (walk(self.free, Page::Free)?, walk(self.unmade, Page::Unmade)?);
+        if (free, self.free_count) != (count(Page::Free), count(Page::Free)) {
+            return Err(format!("{free} on the free list, {} counted", self.free_count));
+        }
+        if (unmade, self.unmade_count) != (count(Page::Unmade), count(Page::Unmade)) {
+            return Err(format!("{unmade} on the unmade list, {} counted", self.unmade_count));
+        }
+        let mut filed = 0;
+        for s in self.slots() {
+            if let Some(key) = self.key(s) {
+                filed += 1;
+                if self.find(key).map(|(_, x)| x) != Some(s) {
+                    return Err(format!("slot {s} not found under {key:?}"));
+                }
+            }
+        }
+        let entries = self.index.iter().filter(|&&e| e != NONE).count();
+        if entries != filed {
+            return Err(format!("{entries} index entries for {filed} mapped slots"));
+        }
+        Ok(())
     }
 }
 
@@ -531,7 +767,24 @@ mod tests {
         }
     }
 
-    type S = Server<Model, SLOTS, CLIENTS>;
+    type S = Server<'static, Model, CLIENTS>;
+
+    /// A server with slots `FIRST_PAGE..SLOTS` (books on the heap, kept for
+    /// the test's life) and a pool of `pool` pages.
+    fn server(pool: u64) -> S {
+        server_with(SLOTS - FIRST_PAGE as usize, pool)
+    }
+
+    /// The same with `n` slots.
+    fn server_with(n: usize, pool: u64) -> S {
+        let model = Model {
+            pool,
+            ..Default::default()
+        };
+        let books = std::vec![Book::EMPTY; n].leak();
+        let index = std::vec![0u32; S::index_len(n)].leak();
+        S::new(model, books, index, FIRST_PAGE, pool)
+    }
 
     /// What each component should see: page address to value.
     type Expect = [BTreeMap<u64, u64>; CLIENTS];
@@ -614,6 +867,9 @@ mod tests {
                 assert_eq!(s.refs(slot), n, "refs of {slot}: {}", ctx());
             }
         }
+        if let Err(e) = s.check_books() {
+            panic!("{e}: {}", ctx());
+        }
         // No frame lost: each one made is in exactly one original slot.
         let originals = s.frames.caps.values().filter(|(_, from)| from.is_none()).count();
         assert_eq!(originals, s.frames.frames.len(), "a frame leaked: {}", ctx());
@@ -621,11 +877,7 @@ mod tests {
 
     fn run(seed: u64, steps: usize) {
         let mut rng = Rng(seed);
-        let model = Model {
-            pool: 40,
-            ..Default::default()
-        };
-        let mut s = S::new(model, SLOTS as u64, 40);
+        let mut s = server(40);
         let mut want: Expect = Default::default();
         for step in 0..steps {
             let c = 1 + rng.below(CLIENTS as u64 - 1);
@@ -720,11 +972,7 @@ mod tests {
 
     #[test]
     fn a_clone_shares_until_written_then_each_side_has_its_own() {
-        let model = Model {
-            pool: 16,
-            ..Default::default()
-        };
-        let mut s = S::new(model, SLOTS as u64, 16);
+        let mut s = server(16);
         assert!(write(&mut s, 1, va(0), 7));
         assert!(write(&mut s, 1, va(1), 8));
         s.frames.lent = 1;
@@ -753,5 +1001,174 @@ mod tests {
         s.frames.lent = 3;
         assert_eq!(s.clone(2, 3, 1, true), Err(Status::Denied));
         assert_eq!(s.used(3), 0);
+    }
+
+    #[test]
+    fn the_index_finds_every_mapping_through_many_collisions() {
+        // Far more mappings than a small index's home places, filed and
+        // taken out in a scrambled order, the books checked each step.
+        let mut s = server(48);
+        let mut rng = Rng(7);
+        let mut live: Vec<(u64, u64)> = Vec::new();
+        for _ in 0..2_000 {
+            let c = 1 + rng.below(CLIENTS as u64 - 1);
+            if live.len() < 40 && rng.below(3) != 0 {
+                let v = va(rng.below(64));
+                s.frames.lent = c;
+                if s.mapping(c, v).is_none() && s.fault(c, 64, v, true) == Status::Ok {
+                    live.push((c, v));
+                }
+            } else if !live.is_empty() {
+                let (c, v) = live.swap_remove(rng.below(live.len() as u64) as usize);
+                let slot = s.mapping(c, v).expect("a live mapping is found");
+                s.frames.unmap(slot);
+                s.reclaim(slot);
+                s.used[c as usize] -= 1;
+                assert_eq!(s.mapping(c, v), None);
+            }
+            for &(c, v) in &live {
+                assert!(s.mapping(c, v).is_some(), "lost {c}:{v:#x}");
+            }
+            s.check_books().unwrap();
+        }
+    }
+
+    // ---- bounded exhaustive exploration, as the kernel's capability
+    // derivation is model-checked: every sequence of requests up to a
+    // depth, on a machine small enough to reach every refusal (two
+    // clients, two heap pages each, few slots, a tiny pool) ----
+
+    #[derive(Clone, Copy, Debug)]
+    enum Op {
+        /// Client, page, and whether the copy a write needs fails.
+        Write(u64, u64, bool),
+        /// A read that faults the page in.
+        Touch(u64, u64),
+        /// Clone the client into the other.
+        Clone(u64),
+        Release(u64),
+        /// A granted frame, freed again.
+        Frame(u64),
+    }
+
+    fn alphabet() -> Vec<Op> {
+        let mut ops = Vec::new();
+        for c in 1..=2 {
+            for p in 0..2 {
+                ops.push(Op::Write(c, p, false));
+                ops.push(Op::Write(c, p, true));
+                ops.push(Op::Touch(c, p));
+            }
+            ops.extend([Op::Clone(c), Op::Release(c), Op::Frame(c)]);
+        }
+        ops
+    }
+
+    fn apply(s: &mut S, want: &mut Expect, op: Op) {
+        match op {
+            Op::Write(c, p, fail) => {
+                let v = va(p);
+                // The same value for the same client and page, so equal
+                // states reached two ways look equal.
+                let x = 1 + 10 * c + p;
+                s.frames.fail_copies = fail as u32;
+                let before = want[c as usize].get(&v).copied();
+                if write(s, c, v, x) {
+                    want[c as usize].insert(v, x);
+                } else if let Some(b) = before {
+                    assert_eq!(read(s, c, v).map(|r| r.0), Some(b));
+                }
+                s.frames.fail_copies = 0;
+            }
+            Op::Touch(c, p) => {
+                let v = va(p);
+                if read(s, c, v).is_none() {
+                    s.frames.lent = c;
+                    if s.fault(c, QUOTA, v, true) == Status::Ok {
+                        want[c as usize].insert(v, 0);
+                    }
+                }
+            }
+            Op::Clone(c) => {
+                let child = 3 - c;
+                s.release(child);
+                want[child as usize].clear();
+                s.frames.lent = c;
+                s.share(c, true).unwrap();
+                s.frames.lent = child;
+                if s.clone(c, child, QUOTA, true).is_ok() {
+                    want[child as usize] = want[c as usize].clone();
+                }
+            }
+            Op::Release(c) => {
+                s.release(c);
+                want[c as usize].clear();
+            }
+            Op::Frame(c) => {
+                if let Ok(h) = s.frame(c, QUOTA) {
+                    assert_eq!(s.free(c, h), Status::Ok);
+                }
+            }
+        }
+    }
+
+    fn fingerprint(s: &S, want: &Expect) -> u64 {
+        use std::hash::{DefaultHasher, Hash, Hasher};
+        let text = std::format!(
+            "{:?}|{:?}|{}|{:?}|{:?}|{:?}|{:?}",
+            s.books,
+            s.used,
+            s.pool_left,
+            s.frames.caps,
+            s.frames.maps,
+            s.frames.frames,
+            want
+        );
+        let mut h = DefaultHasher::new();
+        text.hash(&mut h);
+        h.finish()
+    }
+
+    /// Explores every sequence of up to `depth` requests from the empty
+    /// server, pruning states already seen; every step is checked as the
+    /// randomized runs check them. Returns the states reached.
+    fn explore(depth: usize, slots: usize, pool: u64) -> usize {
+        let ops = alphabet();
+        let mut seen = std::collections::HashSet::new();
+        let mut stack: Vec<Vec<Op>> = std::vec![Vec::new()];
+        while let Some(seq) = stack.pop() {
+            let mut s = server_with(slots, pool);
+            let mut want: Expect = Default::default();
+            for (step, &op) in seq.iter().enumerate() {
+                apply(&mut s, &mut want, op);
+                check(&s, &want, step, 0);
+            }
+            if !seen.insert(fingerprint(&s, &want)) {
+                continue;
+            }
+            if seq.len() < depth {
+                for &op in &ops {
+                    let mut next = seq.clone();
+                    next.push(op);
+                    stack.push(next);
+                }
+            }
+        }
+        seen.len()
+    }
+
+    #[test]
+    fn every_short_request_sequence_keeps_the_books() {
+        // Six slots and a pool of three: clones run out of slots, faults
+        // out of pages.
+        let states = explore(8, 6, 3);
+        assert!(states > 1_000, "only {states} states");
+    }
+
+    #[test]
+    #[ignore = "long: cargo test -p superior-objects --release -- --ignored"]
+    fn every_request_sequence_to_depth_20_keeps_the_books() {
+        let states = explore(20, 6, 3);
+        assert!(states > 100_000, "only {states} states");
     }
 }

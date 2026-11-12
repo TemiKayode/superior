@@ -87,7 +87,7 @@ const CNODE_POOL: usize = VSPACE_SLOTS + MAX_THREADS;
 /// CNodes are made of 16-slot chunks, aligned to their own size.
 const CNODE_CHUNK: usize = 16;
 #[cfg(not(feature = "selftest"))]
-const BASE_CHUNKS: usize = 256;
+const BASE_CHUNKS: usize = 512;
 /// Self-test builds keep the pool this small, so the self-test can fill it.
 #[cfg(feature = "selftest")]
 const BASE_CHUNKS: usize = 16;
@@ -210,12 +210,12 @@ struct Kernel {
     sleep_until: [Option<u64>; MAX_THREADS],
     /// Where the frame capability in each capability-table slot is mapped:
     /// (address space, user address).
-    mapped: BootTable<[Option<(u16, u64)>]>,
+    mapped: BootTable<[Mapping]>,
     /// I/O address spaces by id.
     io_spaces: [Option<IoDomain>; MAX_IO_SPACES],
     /// Where the frame capability in each capability-table slot is mapped
     /// for DMA: (I/O address space, I/O address).
-    io_mapped: BootTable<[Option<(u8, u64)>]>,
+    io_mapped: BootTable<[Mapping]>,
     /// Each thread's fault handler: endpoint and badge.
     fault_ep: [Option<(u16, u64)>; MAX_THREADS],
     /// Blocked in a fault call: the reply says how to resume.
@@ -240,6 +240,40 @@ struct Kernel {
     /// ring indexed by the reboot count.
     reboot_ticks: [u64; MAX_REBOOTS],
     stats: Stats,
+}
+
+/// Where a frame capability is mapped: (space id, page-aligned address),
+/// packed in one word (the id, plus one, in the address's low 12 bits;
+/// 0 for nowhere), so a table of them takes 8 bytes a slot.
+#[derive(Clone, Copy)]
+struct Mapping(u64);
+
+impl Mapping {
+    const NONE: Mapping = Mapping(0);
+
+    fn new(id: u16, addr: u64) -> Mapping {
+        debug_assert!(addr & 0xfff == 0 && (id as u64) < 0xfff);
+        Mapping(addr | (id as u64 + 1))
+    }
+
+    fn is_some(self) -> bool {
+        self.0 != 0
+    }
+
+    fn is_none(self) -> bool {
+        self.0 == 0
+    }
+
+    /// The space it is mapped in, if any.
+    fn space(self) -> Option<u16> {
+        (self.0 != 0).then(|| ((self.0 & 0xfff) - 1) as u16)
+    }
+
+    /// The mapping, leaving none.
+    fn take(&mut self) -> Option<(u16, u64)> {
+        let m = core::mem::replace(self, Mapping::NONE).0;
+        (m != 0).then(|| (((m & 0xfff) - 1) as u16, m & !0xfff))
+    }
 }
 
 /// A table the kernel sets aside at boot, sized to the machine's RAM
@@ -288,8 +322,8 @@ pub fn init_tables(ram_bytes: u64) -> Result<(usize, u64), &'static str> {
     let align8 = |n: usize| (n + 7) & !7;
     let caps_at = 0;
     let mapped_at = align8(caps_at + slots * Table::SLOT_BYTES);
-    let io_at = align8(mapped_at + slots * size_of::<Option<(u16, u64)>>());
-    let cnodes_at = align8(io_at + slots * size_of::<Option<(u8, u64)>>());
+    let io_at = align8(mapped_at + slots * size_of::<Mapping>());
+    let cnodes_at = align8(io_at + slots * size_of::<Mapping>());
     let used_at = align8(cnodes_at + chunks * size_of::<Option<u8>>());
     let live_at = used_at + chunks;
     let bytes = (live_at + chunks) as u64;
@@ -309,8 +343,8 @@ pub fn init_tables(ram_bytes: u64) -> Result<(usize, u64), &'static str> {
     // RAM the kernel maps; every offset is 8-aligned and inside it.
     unsafe {
         k.caps = BootTable(Table::init(p.add(caps_at), slots) as *mut Table);
-        k.mapped = fill(p.add(mapped_at), slots, None);
-        k.io_mapped = fill(p.add(io_at), slots, None);
+        k.mapped = fill(p.add(mapped_at), slots, Mapping::NONE);
+        k.io_mapped = fill(p.add(io_at), slots, Mapping::NONE);
         k.cnodes = fill(p.add(cnodes_at), chunks, None);
         k.chunk_used = fill(p.add(used_at), chunks, false);
         k.cnode_live = fill(p.add(live_at), chunks, false);
@@ -650,6 +684,7 @@ pub fn handle_syscall(frame: &mut UserFrame) -> Exit {
         Some(Syscall::TimerSignal) => timer_signal(k, cur, a.a0, a.a1),
         Some(Syscall::Sleep) => sleep(k, cur, a.a0),
         Some(Syscall::IoFaults) => io_faults(k, cur, a.a0),
+        Some(Syscall::UntypedInfo) => untyped_info(k, cur, a.a0),
         Some(Syscall::IoFaultNotify) => io_fault_notify(k, cur, a.a0, a.a1),
         Some(Syscall::ThreadSetVSpace) => thread_set_vspace(k, cur, &a),
         Some(Syscall::ThreadSetFaultHandler) => thread_set_fault_handler(k, cur, &a),
@@ -857,10 +892,14 @@ fn fast_reboot(mut guard: KernelGuard, why: &str) -> KernelGuard {
 
 /// Destroys the root task and everything made from its memory.
 fn tear_down_root(k: &mut Kernel) {
+    use superior_objects::abi::root;
     let t = ROOT_TID;
-    if let Some(s) = cap_slot(k, t, superior_objects::abi::root::UNTYPED as usize) {
-        if k.caps.get(s).is_some() {
-            let _ = revoke_index(k, s);
+    let memory = [root::UNTYPED].into_iter().chain(root::SPARE..root::SPARE + root::SPARE_COUNT);
+    for slot in memory {
+        if let Some(s) = cap_slot(k, t, slot as usize) {
+            if k.caps.get(s).is_some() {
+                let _ = revoke_index(k, s);
+            }
         }
     }
     let space = k.spaces[t as usize];
@@ -1155,6 +1194,24 @@ fn io_fault_notify(k: &mut Kernel, cur: Tid, space: u64, ntfn: u64) -> Result<()
 
 /// `IoFaults`: rdi = I/O address space (Read). Returns the requests the
 /// IOMMU blocked since the last call, and the first one's page and kind.
+/// `UntypedInfo`: rdi = an untyped capability.
+fn untyped_info(k: &mut Kernel, cur: Tid, slot: u64) -> Result<(), u64> {
+    let s = own_slot(k, cur, slot).ok_or(Error::InvalidCapability.code())?;
+    let (_, bits) = k
+        .caps
+        .get(s)
+        .and_then(|c| c.object.untyped())
+        .ok_or(Error::InvalidCapability.code())?;
+    // What carving would find free: all of it once nothing made from it
+    // is left, as `carve` resets.
+    let free = match k.caps.has_children(s) {
+        false => 1u64 << bits,
+        true => k.caps.untyped_free(s).unwrap_or(0),
+    };
+    k.ipc.set_msg_of(cur, [bits as u64, free, 0, 0]);
+    Ok(())
+}
+
 fn io_faults(k: &mut Kernel, cur: Tid, slot: u64) -> Result<(), u64> {
     let s = own_slot(k, cur, slot).ok_or(Error::InvalidCapability.code())?;
     let cap = *k.caps.get(s).ok_or(Error::InvalidCapability.code())?;
@@ -1457,8 +1514,8 @@ fn unmap_slot(k: &mut Kernel, s: usize) {
 /// [`unmap_slot`], on the parts of the kernel it needs (so it can run
 /// while the capability table is borrowed).
 fn unmap_parts(
-    mapped: &mut [Option<(u16, u64)>],
-    io_mapped: &mut [Option<(u8, u64)>],
+    mapped: &mut [Mapping],
+    io_mapped: &mut [Mapping],
     vspaces: &[Option<VSpace>],
     io_spaces: &[Option<IoDomain>],
     s: usize,
@@ -1558,7 +1615,7 @@ fn io_map(k: &mut Kernel, cur: Tid, f: &Args) -> Result<(), u64> {
         crate::iommu::IoMapError::TooHigh => Error::InvalidArgument.code(),
     })?;
     iommu::flush();
-    k.io_mapped[s] = Some((id as u8, paddr));
+    k.io_mapped[s] = Mapping::new(id as u16, paddr);
     k.ipc.set_msg_of(cur, [paddr, 0, 0, 0]);
     Ok(())
 }
@@ -1583,8 +1640,8 @@ fn destroy_io_space(k: &mut Kernel, id: usize) {
         iommu::detach(sid);
     }
     for m in k.io_mapped.iter_mut() {
-        if matches!(m, Some((s, _)) if *s as usize == id) {
-            *m = None;
+        if m.space() == Some(id as u16) {
+            *m = Mapping::NONE;
         }
     }
     k.io_spaces[id] = None;
@@ -1642,7 +1699,7 @@ fn map_into(k: &mut Kernel, cur: Tid, slot: u64, va: u64, flags: u64, id: u16) -
             MapError::InUse => Error::AlreadyMapped.code(),
             MapError::OutOfMemory => Error::NotEnoughMemory.code(),
         })?;
-    k.mapped[s] = Some((id, va));
+    k.mapped[s] = Mapping::new(id, va);
     Ok(())
 }
 
@@ -1685,8 +1742,8 @@ fn thread_set_vspace(k: &mut Kernel, cur: Tid, f: &Args) -> Result<(), u64> {
 /// thread still running in it.
 fn destroy_vspace(k: &mut Kernel, id: u16) {
     for m in k.mapped.iter_mut() {
-        if matches!(m, Some((s, _)) if *s == id) {
-            *m = None;
+        if m.space() == Some(id) {
+            *m = Mapping::NONE;
         }
     }
     for t in 0..MAX_THREADS {

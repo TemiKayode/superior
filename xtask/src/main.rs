@@ -2170,8 +2170,10 @@ fn memory_test(img: &Image) -> Result<(), String> {
     println!("== Memory Server test on {}", img.path.display());
     let out = run_to_exit(img, Duration::from_secs(60))?;
     let steps = [
-        "[cm] manifest: 4 components",
-        "mem: pool of 512 pages",
+        "[cm] manifest: 5 components",
+        "spare RAM in",
+        "mem: pool of",
+        "room for 130",
         "hog: touching 12 heap pages with a quota of 8",
         "mem: client 2: heap page refused (8 pages is its quota)",
         "[cm] hog is out of memory: heap page at",
@@ -2201,6 +2203,11 @@ fn memory_test(img: &Image) -> Result<(), String> {
         "[cm] clone exited",
         "[pass] memory: the clone exited and the pool is back to",
         "[pass] memory: the clone's write to page 1 never reached the client",
+        "[pass] big: the pool holds",
+        "[pass] big: 4096 heap pages (16 MiB) appeared on first touch, each zeroed",
+        "[pass] big: and kept what was written",
+        "[pass] big: 4096 pages charged to it; the pool has 4096 fewer",
+        "[pass] memory: the big client paged in 4096 heap pages, all from spare RAM",
         "[cm] client asked to shut down (pass)",
     ];
     if let Err(step) = find_in_order(&out, &steps) {

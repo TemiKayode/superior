@@ -452,8 +452,9 @@ impl Table {
         self.slots[slot].copy
     }
 
-    fn has_children(&self, slot: usize) -> bool {
-        self.slots[slot].child != NONE
+    /// Whether anything was made or copied from the capability in `slot`.
+    pub fn has_children(&self, slot: usize) -> bool {
+        self.slots.get(slot).is_some_and(|s| s.child != NONE)
     }
 
     fn has_copies(&self, slot: usize) -> bool {

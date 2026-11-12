@@ -76,11 +76,27 @@ holds the rest):
   `ThreadResume` and `ThreadSuspend` start and stop it (a blocked call is cancelled with
   `Interrupted`). Deleting the last capability destroys the thread and empties its CSpace.
   Threads live in the kernel's fixed thread table (32).
-- CNodes as objects: retype makes a CNode of 16 to 2048 slots. `CNodeCopy`, `CNodeDelete`
+- CNodes as objects: retype makes a CNode of 16 to 2^20 slots. `CNodeCopy`, `CNodeDelete`
   and `CNodeRevoke` work on its slots, and `ThreadSetSpace` makes it a thread's CSpace.
   The thread holds its own copy of the CNode capability, so the CNode lives while any
   capability or thread refers to it; revoking the untyped it came from destroys it.
-  CNode slots come from a fixed pool of 4096 in the kernel's capability table.
+  CNode slots come from a pool in the kernel's capability table, which the kernel
+  sets aside at boot from its own memory, sized to RAM: a slot for every page plus
+  8,192 (139,840 slots, 88 bytes each with the records of where each frame is
+  mapped, 16 MiB on the 512 MiB QEMU machines). Each slot links to its first child
+  and its siblings and counts its copies, so revoke, delete and retype take time
+  in proportion to the capabilities they touch, never to the table; the model
+  checker also checks the links agree with the parents in every state it reaches.
+  Revoking or deleting only frames and memory skips the pass that frees orphaned
+  objects. Small CNodes are taken from the top of the pool, so one as large as its
+  RAM-sized part (the Memory Server's) still fits at the bottom.
+- Spare RAM: at the first boot the kernel keeps 16 MiB for itself (page tables of
+  address spaces it builds, IOMMU and interrupt tables made as devices appear) and
+  hands everything else to the Component Manager as up to 32 untyped blocks
+  (`root::SPARE`), revoked and handed over again on each fast reboot. The manager
+  gives them to the component whose manifest says `untyped spare`, each made over
+  whole as a child of its own, so stopping that component takes them all back.
+  `UntypedInfo` tells a holder an untyped block's size and how much is uncarved.
 - User faults as messages: a thread names a fault endpoint (`SetFaultHandler`); a page
   fault, general-protection fault, invalid opcode or divide error in user mode becomes a
   `Call` to it (kind, address, rip, error code). The handler's reply retries the
@@ -389,8 +405,9 @@ holds the rest):
   bus server resets the NVMe controller with a Function Level Reset on every
   restart; under the filesystem test's fault injection a controller still writing
   for a killed driver is blocked by the IOMMU.
-- The Memory Server, v1 (`user/memserver/`). It holds a pool of RAM and hands
-  out pages under per-component quotas, which the Component Manager puts in the
+- The Memory Server (`user/memserver/`). It holds all spare RAM (`untyped spare`,
+  435 MiB on the 512 MiB x86-64 machine, 382 MiB on AArch64, plus a block of its
+  own) and hands out pages under per-component quotas, which the Component Manager puts in the
   badge of each component's `mem` capability (manifest `quota`), so they cannot be
   forged. It keeps the original of every page it gives, so it can always take one
   back: revoking the original removes every copy and mapping. Pages that come back
@@ -413,6 +430,22 @@ holds the rest):
     randomized requests (300 seeds of 400 steps each run; 20,000 on demand), checking
     every component's view of every page after each step; it found both bugs planted
     to test it.
+  - Its books scale to all of RAM, a CSpace slot for every page (2^17 slots in the
+    test, room for 130,008 pages at once): each slot's books live in pages it makes
+    from the pool at start (1,024 pages), free and unmade slots are on lists, and a
+    hash index finds the slot mapping a component's heap at an address, so a fault,
+    grant or free costs the same however many pages there are. The randomized tests
+    also check the lists, counts and index against the books after every step, and
+    a further test files and removes mappings through many collisions. And, as the
+    kernel's capability derivation is model-checked, the books are explored
+    exhaustively: every sequence of requests (writes, failed copies, faults, clones,
+    releases, grants) from the empty server up to depth 8 on each test run and
+    depth 20 on demand (over 100,000 distinct states), on a machine small enough to
+    reach every refusal (two clients, six slots, three pages), with every check
+    after every step. A page whose
+    slot is past what a transfer can name (16 bits) is granted through a copy in a
+    low slot, deleted once the grant has gone, so revoking the original still
+    reaches the client's copy.
   - Fast reboot (spec section 4): the Component Manager and the Memory Server are
     not restarted in place. If either fails (a fault, a panic, or the manager
     asking with the new `Reboot` call), the kernel revokes the manager's untyped
@@ -422,7 +455,9 @@ holds the rest):
     zeroed once at first boot, is handed to each new manager, which gives components
     their state pages from it, so they outlive the reboot. At most five reboots in
     60 s, then the system stops.
-  - Components may have larger CSpaces (manifest `cspace`, up to 2^10 slots).
+  - Components may have larger CSpaces (manifest `cspace`, up to 2^18 slots). The
+    manager makes a component's CNode first from its block, so a large one, aligned
+    to its size, wastes none of it.
   `cargo xtask memory-test` boots `boot/memory.manifest`:
   - a client pages its heap in by touching it, and every page arrives zeroed;
   - it takes frames up to its quota and is refused one more;
@@ -430,7 +465,11 @@ holds the rest):
   - a hog touches more heap than its quota and is restarted, with all 8 pages back
     in the pool; its next instance gets those same pages, zeroed;
   - a clone of the client starts sharing its heap pages; each side writes some,
-    gets its own copies, and still sees the other's unwritten pages as they were.
+    gets its own copies, and still sees the other's unwritten pages as they were;
+  - last, the client calls a big client into being, which pages in a 16 MiB heap
+    (4,096 pages, eight times the server's own block and four times the slots it
+    once had), every page zeroed and kept, all from spare RAM, and gives them back
+    when it exits.
   `cargo xtask reboot-test` boots `boot/reboot.manifest`: a client with a state
   page has the injector kill the Memory Server and then the manager itself; each
   time the system reboots fast, the client starts again, its heap pages zeroed,
@@ -778,8 +817,8 @@ and port multipliers; in the xHCI driver isochronous and bulk endpoints, USB 3 s
 hubs and more than one interrupter, and HID devices other than boot keyboards; in the network server
 a second IPv6 router or a DHCPv6 server to test against (QEMU's network has one router and hands out no addresses, so the IPv6 route table and the DHCPv6 address client are proved by host tests alone), DNSSEC, DNS answers over TCP of more than a page, IPv4 routes beyond one gateway; the SDK's power callbacks (with suspend and resume, Phase 2); the IDL describing interfaces other than the bus server's; escalating a component
 given up on to a supervisor above it (today the
-manager is the only one), memory budgets from a policy service, giving the Memory Server all spare
-RAM (today it gets a fixed pool from its manifest), page tables for boot processes paid for from user memory,
+manager is the only one), memory budgets from a policy service (Phase 3), sizing the Memory Server's CSpace
+from the RAM it gets (its manifest names the size, 2^17 slots on the test machines), page tables for boot processes paid for from user memory,
 multi-level CSpaces, the first call's capability forwarded by a lazy-start watcher, scheduling-context capabilities (budgets are set at boot), sporadic refills,
 timeout faults, per-CPU ready queues and thread affinity (one lock and shared queues
 today), device interrupts spread over CPUs, more than four CPUs, an IPC benchmark on bare

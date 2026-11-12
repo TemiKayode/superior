@@ -803,6 +803,13 @@ const STATE_VA: u64 = USER_BASE + 0x5000_0000;
 /// The memory client's heap and quota (`boot/memory.manifest`).
 const CLIENT_HEAP: u64 = 32;
 const CLIENT_QUOTA: u64 = 40;
+/// The big client's heap (and quota): far more than the Memory Server's
+/// own block of 512 pages, so it comes out of the spare RAM it was given.
+const BIG_HEAP: u64 = 4096;
+/// The big client's service, which the memory client calls last
+/// (`boot/memory.manifest`): in the client, and in the big client.
+const BIG_CLIENT: u64 = 12;
+const BIG_SERVICE: u64 = 2;
 /// The hog's quota, and how many heap pages it touches the first time.
 const HOG_QUOTA: u64 = 8;
 const HOG_TOUCH: u64 = 12;
@@ -919,7 +926,56 @@ fn memory_client() -> ! {
         format_args!("a component may not release another's pages"),
     );
     clone_parent(&mut t);
+    // Last, the big client: started by this call, it answers once it has
+    // paged in its whole heap.
+    let r = syscall(Syscall::Call, BIG_CLIENT, [0; 4]);
+    t.check(
+        r.status == 0 && r.msg[0] == 0 && r.msg[1] == BIG_HEAP,
+        format_args!("the big client paged in {} heap pages, all from spare RAM", r.msg[1]),
+    );
     syscall(Syscall::Call, MEM_CONTROL, [OP_SHUTDOWN, t.0, 0, 0]);
+    superior_sys::park()
+}
+
+/// Started (lazily) by the memory client's call: pages in a heap of
+/// [`BIG_HEAP`] pages, more than the Memory Server's own block and more
+/// than its CSpace once had slots for, so it must come from the spare
+/// RAM the kernel handed over. Answers with its failures and its heap,
+/// then exits (its pages go back).
+fn big() -> ! {
+    let call = syscall(Syscall::Recv, BIG_SERVICE, [0; 4]);
+    let mut t = Checks(0, "big");
+    let r = info();
+    t.check(
+        r[0] == 0 && r[1] == BIG_HEAP && r[3] >= 4 * BIG_HEAP,
+        format_args!(
+            "the pool holds {} pages ({} MiB), far more than the server's own 512",
+            r[3],
+            r[3] * 4096 >> 20
+        ),
+    );
+    let free_before = r[3];
+    let zeroed = (0..BIG_HEAP).all(touch);
+    t.check(
+        zeroed,
+        format_args!("{BIG_HEAP} heap pages ({} MiB) appeared on first touch, each zeroed", BIG_HEAP * 4096 >> 20),
+    );
+    let intact = (0..BIG_HEAP).all(|p| {
+        // SAFETY: as in `touch`; every page is mapped now.
+        let page = unsafe { core::slice::from_raw_parts((HEAP + p * 4096) as *const u64, 512) };
+        page.iter()
+            .enumerate()
+            .all(|(k, &w)| w == heap_word(p, k as u64))
+    });
+    t.check(intact, format_args!("and kept what was written"));
+    let r = info();
+    t.check(
+        r[2] == BIG_HEAP && r[3] == free_before - BIG_HEAP,
+        format_args!("{} pages charged to it; the pool has {} fewer", r[2], free_before - r[3]),
+    );
+    let pages = if call.status == 0 { BIG_HEAP } else { 0 };
+    syscall(Syscall::Reply, 0, [t.0, pages, 0, 0]);
+    syscall(Syscall::Call, MEM_CONTROL, [OP_EXIT, t.0, 0, 0]);
     superior_sys::park()
 }
 
@@ -4154,6 +4210,7 @@ pub extern "C" fn _start(role: u64) -> ! {
         5 => memory_client(),
         6 => hog(),
         19 => clone_child(),
+        23 => big(),
         20 => reboot_client(),
         22 => hotplug_client(),
         7 => fs_client(),

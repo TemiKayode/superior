@@ -23,6 +23,8 @@
 //!   device uart 2           # a device capability the CM was given
 //!   notification 3          # a fresh notification
 //!   untyped 16 4            # a fresh 2^16-byte untyped block
+//!   untyped spare 8         # the rest of RAM: every block the kernel
+//!                           # handed the manager as spare, slots 8 on
 //!   state 5                 # a page the manager keeps across restarts
 //!   shared 9 16             # 9 pages (slots 16-24) kept across restarts,
 //!                           # to share with a server (rings, buffers)
@@ -45,7 +47,7 @@ pub const MAX_CAPS: usize = 12;
 pub const CSPACE_BITS: u8 = 6;
 pub const CSPACE_SLOTS: usize = 1 << CSPACE_BITS;
 /// Bounds on a component's CSpace, in bits.
-pub const CSPACE_MAX_BITS: u8 = 10;
+pub const CSPACE_MAX_BITS: u8 = 18;
 /// Most pages a heap may span.
 pub const MAX_HEAP_PAGES: u64 = 4096;
 /// Bounds on the per-instance untyped block, in bits.
@@ -91,6 +93,11 @@ pub enum CapKind<'a> {
     /// manager holds the originals, so when either side is restarted only
     /// its own copies go, and the other side's mappings stay.
     Shared(u8),
+    /// The rest of RAM: the untyped blocks the kernel gave the manager as
+    /// spare (`root::SPARE`), each made over whole into the component's
+    /// slots from this one on, as many as there are. For the Memory
+    /// Server.
+    Spare,
 }
 
 /// Most pages one `shared` directive may ask for.
@@ -288,7 +295,7 @@ impl<'a> Manifest<'a> {
                         b if (CSPACE_BITS as u64..=CSPACE_MAX_BITS as u64).contains(&b) => {
                             c.cspace_bits = b as u8
                         }
-                        _ => return Err(err("cspace must be 6 to 10 bits", w)),
+                        _ => return Err(err("cspace must be 6 to 18 bits", w)),
                     }
                     None
                 }
@@ -341,11 +348,18 @@ impl<'a> Manifest<'a> {
                 }
                 "untyped" => {
                     let w = arg("untyped needs a size in bits")?;
+                    if w == "spare" {
+                        if c.caps().any(|x| x.kind == CapKind::Spare) {
+                            return Err(err("untyped spare given twice", w));
+                        }
+                        Some((CapKind::Spare, arg("untyped spare needs a slot")?))
+                    } else {
                     let bits = match number(w)? {
                         b @ 12..=MEMORY_MAX_BITS_U64 => b as u8,
                         _ => return Err(err("untyped must be 12 to 24 bits", w)),
                     };
                     Some((CapKind::Untyped(bits), arg("untyped needs a slot")?))
+                    }
                 }
                 _ => return Err(err("unknown directive", key)),
             };
@@ -503,6 +517,34 @@ component memserver
     }
 
     #[test]
+    fn untyped_spare_names_its_first_slot_once() {
+        let m = Manifest::parse(
+            "component mem
+ image memserver
+ cspace 17
+ provides mem 0
+ untyped spare 8",
+        )
+        .unwrap();
+        let c = m.components[0].as_ref().unwrap();
+        assert_eq!(c.cspace_bits, 17);
+        assert!(c.caps().any(|x| x.kind == CapKind::Spare && x.slot == 8));
+        assert_eq!(
+            error("component a
+ image a
+ untyped spare 8
+ untyped spare 9"),
+            (4, "untyped spare given twice")
+        );
+        assert_eq!(
+            error("component a
+ image a
+ untyped spare"),
+            (3, "untyped spare needs a slot")
+        );
+    }
+
+    #[test]
     fn rejects_bad_manifests() {
         assert_eq!(error("image x"), (1, "directive before any component"));
         assert_eq!(
@@ -582,8 +624,8 @@ component memserver
                 .any(|c| c.kind == CapKind::Shared(9) && c.slot == 16)
         );
         assert_eq!(
-            error("component a\n image a\n cspace 11"),
-            (3, "cspace must be 6 to 10 bits")
+            error("component a\n image a\n cspace 19"),
+            (3, "cspace must be 6 to 18 bits")
         );
         assert_eq!(
             error("component a\n image a\n heap 0"),

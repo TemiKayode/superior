@@ -109,6 +109,10 @@ fn kernel_start(untyped_caps: usize) -> ! {
     task::start()
 }
 
+/// RAM the kernel keeps for itself when it hands the rest to the Component
+/// Manager.
+const KERNEL_KEEPS: u64 = 16 << 20;
+
 /// The Component Manager: the root task, and the only process the kernel
 /// starts. It gets every capability the system has to give (memory, the
 /// timer, the console UART and its interrupt, QEMU's exit device, PCI
@@ -140,6 +144,30 @@ fn start_component_manager() -> Result<(), &'static str> {
         };
         UNTYPED.store(base, Ordering::SeqCst);
         STATE_STORE.store(store, Ordering::SeqCst);
+    }
+    // Then the rest of RAM, but for what the kernel keeps for itself (the
+    // page tables of address spaces it builds, IOMMU and interrupt
+    // tables made as devices appear).
+    static SPARE: spin::Mutex<([(u64, u8); root::SPARE_COUNT as usize], usize)> =
+        spin::Mutex::new(([(0, 0); root::SPARE_COUNT as usize], 0));
+    {
+        let mut spare = SPARE.lock();
+        if spare.1 == 0 {
+            let given = memory::take_spare(KERNEL_KEEPS, |base, bits| {
+                let n = spare.1;
+                if n == spare.0.len() {
+                    return false;
+                }
+                spare.0[n] = (base, bits);
+                spare.1 = n + 1;
+                true
+            });
+            kprintln!(
+                "[ok] {} MiB of spare RAM in {} blocks for the Component Manager",
+                given >> 20,
+                spare.1
+            );
+        }
     }
     let base = UNTYPED.load(Ordering::SeqCst);
     let store = STATE_STORE.load(Ordering::SeqCst);
@@ -217,9 +245,16 @@ fn start_component_manager() -> Result<(), &'static str> {
         )
     });
     let intx = intx.chain([(root::PCI_IO as usize, arch::pci_io_cap())]);
-    let mut all = [(0, caps[0].1); 48];
+    let spare = *SPARE.lock();
+    let spare = spare.0[..spare.1].iter().enumerate().map(|(k, &(base, size_bits))| {
+        (
+            root::SPARE as usize + k,
+            Capability::new(Object::Untyped { base, size_bits }, Rights::ALL),
+        )
+    });
+    let mut all = [(0, caps[0].1); 48 + root::SPARE_COUNT as usize];
     let mut n = 0;
-    for c in caps.into_iter().chain(pci).chain(iommu).chain(state).chain(intx) {
+    for c in caps.into_iter().chain(pci).chain(iommu).chain(state).chain(intx).chain(spare) {
         all[n] = c;
         n += 1;
     }

@@ -248,6 +248,10 @@ pub enum Syscall {
     /// Answers the caller set aside in place `rdi` with the message (no
     /// capability may go with it). A place with nobody in it is a no-op.
     ReplyTo = 47,
+    /// What the untyped capability in slot `rdi` holds: message word 0 is
+    /// its size in bits, word 1 the bytes not yet carved from it (all of
+    /// it once nothing made from it is left).
+    UntypedInfo = 48,
     /// Maps the frame in slot `rdi` at page-aligned `rsi` in the address
     /// space in slot `r8` (Write right). `rdx` = [`MAP_WRITE`] and/or
     /// [`MAP_EXEC`], never both. Needs the frame's Map right, plus Write
@@ -320,6 +324,7 @@ impl Syscall {
             45 => Syscall::IoFaultNotify,
             46 => Syscall::ReplySave,
             47 => Syscall::ReplyTo,
+            48 => Syscall::UntypedInfo,
             42 => Syscall::IoFaults,
             0x100 => Syscall::DebugPutStr,
             0x101 => Syscall::DebugSelftestDone,
@@ -586,8 +591,14 @@ pub mod root {
     /// I/O ports for PCI BARs: a range of ports on x86-64, on AArch64 the
     /// window of device memory that stands for them.
     pub const PCI_IO: u64 = INTX + INTX_COUNT;
+    /// The rest of RAM, all the kernel does not keep for itself: up to
+    /// [`SPARE_COUNT`] untyped blocks in consecutive slots, from the first
+    /// (the rest empty). The Component Manager gives them to the Memory
+    /// Server (`untyped spare` in the manifest).
+    pub const SPARE: u64 = PCI_IO + 1;
+    pub const SPARE_COUNT: u64 = 32;
     /// The first slot with nothing in it.
-    pub const FIRST_FREE: u64 = PCI_IO + 1;
+    pub const FIRST_FREE: u64 = SPARE + SPARE_COUNT;
     /// The root task's argument: the bundle's length, and in the bits from
     /// [`REBOOTS_SHIFT`] how many fast reboots came before this start.
     pub const REBOOTS_SHIFT: u32 = 32;

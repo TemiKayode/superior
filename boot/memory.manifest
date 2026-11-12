@@ -6,20 +6,25 @@
 # more heap than its quota: the manager restarts it, every page it held
 # goes back to the pool, and its next instance finds them zeroed. Last,
 # the client clones itself: the clone starts with a copy-on-write copy of
-# its heap, and neither sees the other's writes.
+# its heap, and neither sees the other's writes. Last, the client calls
+# the big client, which pages in 16 MiB of heap: more than the server's
+# own block, so it comes from the spare RAM the server was given.
 
 component memserver
   image memserver
   priority 12
   # Cannot be restarted in place (spec section 4).
   restart never
-  memory 22
-  cspace 10
-  # CSpace of 2^10 slots, pool of 2^21 bytes: 10 | 21 << 8. More slots
-  # than pages, so copy-on-write copies never crowd out the pool.
-  arg 5386
+  # Its CSpace of 2^17 slots (a page each, for all of RAM) is a CNode of
+  # 4 MiB, from this block.
+  memory 23
+  cspace 17
+  # The CSpace's size in bits.
+  arg 17
   provides mem 0
   untyped 21 1
+  # The rest of RAM.
+  untyped spare 8
 
 component hog
   image testclient
@@ -36,6 +41,7 @@ component client
   arg 5
   uses mem 0
   control 1
+  uses big 12
   quota 40
   heap 32
 
@@ -50,3 +56,15 @@ component clone
   control 1
   quota 40
   heap 32
+
+# Started by the client's call, last.
+component big
+  image testclient
+  arg 23
+  start lazy
+  uses mem 0
+  control 1
+  provides big 2
+  restart never
+  quota 4096
+  heap 4096

@@ -152,6 +152,41 @@ pub fn add_region(s: &mut Summary, start: u64, end: u64) {
     });
 }
 
+/// Hands out what is left of RAM: every untyped block's uncarved part,
+/// cut into naturally aligned blocks, each carved (so the kernel never
+/// uses it) and passed to `out`, which says whether it took it. The first
+/// blocks, `keep` bytes or more, stay with the kernel for its own later
+/// needs. Returns the bytes handed out.
+pub fn take_spare(keep: u64, mut out: impl FnMut(u64, u8) -> bool) -> u64 {
+    let mut cnode = ROOT_CNODE.lock();
+    let (mut kept, mut given, mut full) = (0, 0, false);
+    for slot in 0..ROOT_CNODE_SLOTS {
+        let Some((base, bits)) = cnode.get(slot).and_then(|c| c.object.untyped()) else {
+            continue;
+        };
+        let free = cnode.untyped_free(slot).unwrap_or(0);
+        if free < 4096 || full {
+            continue;
+        }
+        if kept < keep {
+            kept += free;
+            continue;
+        }
+        let end = base + (1u64 << bits);
+        split_region(end - free, end, |block| {
+            if full || block.size_bits < 12 {
+                return;
+            }
+            // Carved in order, so each lands exactly on its block.
+            match cnode.retype(slot, block.size_bits) {
+                Ok(pa) if pa == block.base && out(pa, block.size_bits) => given += block.size(),
+                _ => full = true,
+            }
+        });
+    }
+    given
+}
+
 /// Where an address space's page tables come from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TablePool {
