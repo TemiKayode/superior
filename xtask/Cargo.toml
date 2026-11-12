@@ -9,3 +9,4 @@ publish = false
 
 [dependencies]
 bootloader = "0.11"
+superior-idl = { path = "../crates/idl" }

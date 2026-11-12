@@ -18,8 +18,11 @@
 //! - [`exec`]: an executor for `async` tasks on the driver's one thread,
 //!   woken by events (an interrupt, a call).
 //!
+//! Its calls to the bus server are built with the code the IDL compiler
+//! generates from `interfaces/pci.idl` (`superior_objects::idl::pci`).
+//!
 //! Still to come, per the spec: power-state callbacks (with suspend and
-//! resume).
+//! resume), in Phase 2.
 
 #![no_std]
 
@@ -28,7 +31,8 @@ pub mod pool;
 pub mod virtq;
 
 use superior_objects::abi::{CapTransfer, ObjectType, Syscall};
-use superior_objects::interfaces::{Status, pci};
+use superior_objects::idl::pci;
+use superior_objects::interfaces::Status;
 use superior_sys::{Ret, syscall, syscall_x};
 
 /// A failed step: what, and the status or kernel error code.
@@ -76,7 +80,7 @@ impl Pci {
         domain: u64,
     ) -> Result<(u64, u64), Failure> {
         let ids = (vendor as u64) << 16 | device as u64;
-        self.open_with(pci::OPEN, ids, instance, domain)
+        self.open_with(pci::open(ids, instance), domain)
     }
 
     /// As [`Pci::open`], for the `instance`th function of a class
@@ -87,26 +91,21 @@ impl Pci {
         instance: u64,
         domain: u64,
     ) -> Result<(u64, u64), Failure> {
-        self.open_with(pci::OPEN_CLASS, class as u64, instance, domain)
+        self.open_with(pci::open_class(class as u64, instance), domain)
     }
 
-    fn open_with(
-        &self,
-        op: u64,
-        what: u64,
-        instance: u64,
-        domain: u64,
-    ) -> Result<(u64, u64), Failure> {
-        let r = self.call([op, pci::VERSION, what, instance], Some(domain))?;
+    fn open_with(&self, msg: [u64; 4], domain: u64) -> Result<(u64, u64), Failure> {
+        let r = self.call(msg, Some(domain))?;
         if r.cap != Some(domain as u16) {
             return Err(("no IOMMU domain arrived (no IOMMU?)", 0));
         }
-        Ok((r.msg[1], r.msg[2]))
+        let o = pci::open_reply(r.msg).map_err(|s| ("the PCI bus server refused", s as u64))?;
+        Ok((o.location, o.memory_bars))
     }
 
     /// A dword of the function's configuration space.
     pub fn config_read(&self, offset: u64) -> Result<u32, Failure> {
-        let r = self.call([pci::CONFIG_READ, offset, 0, 0], None)?;
+        let r = self.call(pci::config_read(offset), None)?;
         Ok(r.msg[1] as u32)
     }
 
@@ -118,7 +117,7 @@ impl Pci {
     /// Takes page `page` of BAR `bar` into `slot` and maps it at `va`.
     /// Returns the BAR's size.
     pub fn map_bar_page(&self, bar: u64, page: u64, slot: u64, va: u64) -> Result<u64, Failure> {
-        let r = self.call([pci::BAR_PAGE, bar, page, 0], Some(slot))?;
+        let r = self.call(pci::bar_page(bar, page), Some(slot))?;
         if r.cap != Some(slot as u16) {
             return Err(("no BAR page arrived", 0));
         }
@@ -127,18 +126,18 @@ impl Pci {
     }
 
     pub fn bus_master(&self, on: bool) -> Result<(), Failure> {
-        self.call([pci::BUS_MASTER, on as u64, 0, 0], None)
+        self.call(pci::bus_master(on as u64), None)
             .map(drop)
     }
 
     pub fn msix(&self, on: bool) -> Result<(), Failure> {
-        self.call([pci::MSIX, on as u64, 0, 0], None).map(drop)
+        self.call(pci::msix(on as u64), None).map(drop)
     }
 
     /// For a function with plain MSI: has the bus server program vector 0
     /// (take it first with [`Pci::msi_vector`]) and enable it.
     pub fn msi(&self, on: bool) -> Result<(), Failure> {
-        self.call([pci::MSI, on as u64, 0, 0], None).map(drop)
+        self.call(pci::msi(on as u64), None).map(drop)
     }
 
     /// Takes MSI vector `n` into `slot`, binds it to the notification in
@@ -161,18 +160,18 @@ impl Pci {
 
     /// Reads `width` bytes (1, 2 or 4) at `offset` in I/O BAR `bar`.
     pub fn io_read(&self, bar: u64, offset: u64, width: u64) -> Result<u64, Failure> {
-        self.call([pci::IO_READ, bar, offset, width], None).map(|r| r.msg[1])
+        self.call(pci::io_read(bar, offset, width), None).map(|r| r.msg[1])
     }
 
     /// Writes `width` bytes of `value` at `offset` in I/O BAR `bar`.
     pub fn io_write(&self, bar: u64, offset: u64, width: u64, value: u64) -> Result<(), Failure> {
-        self.call([pci::IO_WRITE, bar | width << 8, offset, value], None)
+        self.call(pci::io_write(bar | width << 8, offset, value), None)
             .map(drop)
     }
 
     /// Gives the function back to the bus server.
     pub fn close(&self) -> Result<(), Failure> {
-        self.call([pci::CLOSE, 0, 0, 0], None).map(drop)
+        self.call(pci::close(), None).map(drop)
     }
 
     /// For a function with no MSI: takes its legacy interrupt line into
@@ -181,7 +180,7 @@ impl Pci {
     /// the device no longer asserts it. Returns which of the bus's four
     /// interrupt wires it is.
     pub fn intx(&self, slot: u64, notification: u64) -> Result<u64, Failure> {
-        let r = self.call([pci::INTX, 0, 0, 0], Some(slot))?;
+        let r = self.call(pci::intx(), Some(slot))?;
         if r.cap != Some(slot as u16) {
             return Err(("no interrupt line arrived", 0));
         }
@@ -193,7 +192,7 @@ impl Pci {
     /// Takes MSI vector `n` into `slot` and nothing more: the vector is
     /// routed for no device until [`msi_message`] says otherwise.
     pub fn take_msi_vector(&self, n: u64, slot: u64) -> Result<(), Failure> {
-        let r = self.call([pci::MSI_VECTOR, n, 0, 0], Some(slot))?;
+        let r = self.call(pci::msi_vector(n), Some(slot))?;
         if r.cap != Some(slot as u16) {
             return Err(("no MSI vector arrived", 0));
         }

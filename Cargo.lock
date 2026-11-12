@@ -457,6 +457,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "superior-idl"
+version = "0.1.0"
+
+[[package]]
 name = "superior-inet"
 version = "0.1.0"
 
@@ -785,6 +789,7 @@ name = "xtask"
 version = "0.1.0"
 dependencies = [
  "bootloader",
+ "superior-idl",
 ]
 
 [[package]]

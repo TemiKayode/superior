@@ -1,0 +1,11 @@
+[package]
+name = "superior-idl"
+description = "The interface description language's compiler: Rust for both sides of an IPC interface."
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+edition = "2024"
+publish = false
+
+[lib]
+bench = false

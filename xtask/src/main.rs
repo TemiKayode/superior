@@ -138,6 +138,7 @@ fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
     let arch = Arch::parse(args.get(1).map(String::as_str));
     let result = arch.and_then(|arch| match args.first().map(String::as_str) {
+        Some("idl") => idl(false),
         Some("image") => image(false, arch).map(|i| println!("image: {}", i.path.display())),
         Some("run") => image(false, arch).and_then(|img| boot(&img, false)),
         Some("test") => host_tests()
@@ -197,7 +198,7 @@ fn main() -> ExitCode {
         }
         Some("bench") => image(false, Arch::X86_64).and_then(|img| bench(&img)),
         _ => Err(
-            "usage: cargo xtask <image | run | test | boot-test | shell-test | cm-test | supervise-test | drivers-test | memory-test | reboot-test | fs-test | nvme-test | ahci-test | net-test | lde-test | lde-e100-test | tcp-test | keyboard-test | hotplug-test | bench | sel4-test> [x86_64 | aarch64]"
+            "usage: cargo xtask <idl | image | run | test | boot-test | shell-test | cm-test | supervise-test | drivers-test | memory-test | reboot-test | fs-test | nvme-test | ahci-test | net-test | lde-test | lde-e100-test | tcp-test | keyboard-test | hotplug-test | bench | sel4-test> [x86_64 | aarch64]"
                 .into(),
         ),
     });
@@ -234,7 +235,44 @@ fn run(cmd: &mut Command) -> Result<(), String> {
     }
 }
 
+/// Compiles every interface description in `interfaces/` to Rust in
+/// `crates/objects/src/idl/` (`cargo xtask idl`). With `check`, writes
+/// nothing: the generated files must already be what the descriptions
+/// give, so a description changed without generating again fails the
+/// tests.
+fn idl(check: bool) -> Result<(), String> {
+    let dir = root().join("interfaces");
+    let mut names: Vec<String> = std::fs::read_dir(&dir)
+        .map_err(|e| format!("reading {}: {e}", dir.display()))?
+        .flatten()
+        .filter_map(|e| e.file_name().to_string_lossy().strip_suffix(".idl").map(String::from))
+        .collect();
+    names.sort();
+    for name in names {
+        let source = format!("interfaces/{name}.idl");
+        let text = std::fs::read_to_string(root().join(&source)).map_err(|e| format!("{source}: {e}"))?;
+        let rust = superior_idl::compile(&text.replace("\r\n", "\n"), &source)
+            .map_err(|e| format!("{source}: {e}"))?;
+        let out = root().join("crates/objects/src/idl").join(format!("{name}.rs"));
+        if check {
+            let have = std::fs::read_to_string(&out).unwrap_or_default().replace("\r\n", "\n");
+            if have != rust {
+                return Err(format!(
+                    "{} is not what {source} gives: run `cargo xtask idl`",
+                    out.display()
+                ));
+            }
+        } else {
+            std::fs::write(&out, rust).map_err(|e| format!("writing {}: {e}", out.display()))?;
+            println!("{source} -> {}", out.display());
+        }
+    }
+    Ok(())
+}
+
 fn host_tests() -> Result<(), String> {
+    println!("== interface descriptions against their generated Rust");
+    idl(true)?;
     println!("== host unit tests");
     run(cargo().args([
         "test",
@@ -245,6 +283,8 @@ fn host_tests() -> Result<(), String> {
         "superior-inet",
         "-p",
         "superior-driver",
+        "-p",
+        "superior-idl",
     ]))?;
     println!("== model check and long simulation (release)");
     run(cargo().args([

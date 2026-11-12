@@ -1,0 +1,49 @@
+# The PCI bus server's interface: what a driver asks of it for the one
+# function it opens. The capabilities that travel with some of these (an
+# IOMMU domain with OPEN, a BAR page, an interrupt line) arrive in the
+# slot the caller names as the call's accept slot.
+interface pci version 1
+
+# Claims the `instance`th function (from 0) with these IDs (`ids`:
+# vendor << 16 | device), resets it, assigns its BARs and enables
+# decoding (bus mastering stays off). Its IOMMU domain, empty, comes with
+# the reply. `location`: bus << 8 | device << 3 | function; the BARs are
+# bitmasks.
+op OPEN = 1 (version, ids, instance) -> (location, memory_bars, io_bars)
+
+# A capability to page `page` of memory BAR `bar` (a device frame).
+op BAR_PAGE = 2 (bar, page) -> (size)
+
+# A dword of the function's configuration space.
+op CONFIG_READ = 3 (offset) -> (value)
+
+# Lets the device do DMA (or stops it).
+op BUS_MASTER = 4 (on)
+
+# Enables MSI-X (the driver programs the table in its BAR) and disables
+# legacy interrupts.
+op MSIX = 5 (on)
+
+# The function's `n`th MSI vector (an IRQ capability).
+op MSI_VECTOR = 6 (n)
+
+# As OPEN, for the `instance`th function of a class (`class`: class << 16
+# | subclass << 8 | interface), whoever made it.
+op OPEN_CLASS = 7 (version, class, instance) -> (location, memory_bars, io_bars)
+
+# For a function with plain MSI: has the bus server write vector 0's
+# message into its MSI capability and enable it, or disable it.
+op MSI = 8 (on)
+
+# For a function with no MSI: its legacy interrupt line (an IRQ
+# capability), and which of the bus's four wires it is.
+op INTX = 9 -> (wire)
+
+# Reads `width` bytes (1, 2 or 4) at `offset` in I/O BAR `bar`.
+op IO_READ = 10 (bar, offset, width) -> (value)
+
+# Writes likewise (`bar_and_width`: bar | width << 8).
+op IO_WRITE = 11 (bar_and_width, offset, value)
+
+# Gives the function back: reset as for OPEN, and anyone's to open.
+op CLOSE = 12

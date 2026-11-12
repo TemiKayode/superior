@@ -284,6 +284,16 @@ holds the rest):
     driver blocks in as the idle step; no allocation). The virtio-net driver is
     written with both: its buffers are two pools, and its loop is an interrupt
     task and a service task. Both are tested on the host as well (12 tests).
+  - An IDL compiler (`crates/idl/`): an interface is described once, in a small
+    text format (`interfaces/pci.idl`: a version, then each operation's number,
+    arguments, results and documentation), and `cargo xtask idl` generates Rust from
+    it (`crates/objects/src/idl/`): the operation numbers, a function building each
+    call's message (the version filled in where the call carries it) and a reader
+    for each reply that gives its results or the status it failed with. The Driver
+    SDK makes every call to the bus server through it. `cargo xtask test` first
+    checks the generated file matches its description (so neither drifts), tests the
+    compiler (malformed descriptions are refused with their line) and checks the
+    generated numbers against the hand-written interface the bus server answers.
   - Legacy PCI interrupts, for devices with no MSI: the kernel hands the root task
     an IRQ capability for each of the bus's four interrupt wires (on QEMU's q35 it
     steers the ICH9's PIRQ[E-H] to PIC lines 10, 11, 5 and 9 and marks them
@@ -766,7 +776,7 @@ these buses have none); more than one command per queue in the NVMe driver,
 more than two commands in flight per disk in the AHCI driver, ATAPI
 and port multipliers; in the xHCI driver isochronous and bulk endpoints, USB 3 streams,
 hubs and more than one interrupter, and HID devices other than boot keyboards; in the network server
-a second IPv6 router or a DHCPv6 server to test against (QEMU's network has one router and hands out no addresses, so the IPv6 route table and the DHCPv6 address client are proved by host tests alone), DNSSEC, DNS answers over TCP of more than a page, IPv4 routes beyond one gateway; the SDK's power callbacks (with suspend and resume, Phase 2); an IDL compiler for the interfaces; escalating a component
+a second IPv6 router or a DHCPv6 server to test against (QEMU's network has one router and hands out no addresses, so the IPv6 route table and the DHCPv6 address client are proved by host tests alone), DNSSEC, DNS answers over TCP of more than a page, IPv4 routes beyond one gateway; the SDK's power callbacks (with suspend and resume, Phase 2); the IDL describing interfaces other than the bus server's; escalating a component
 given up on to a supervisor above it (today the
 manager is the only one), memory budgets from a policy service, giving the Memory Server all spare
 RAM (today it gets a fixed pool from its manifest), page tables for boot processes paid for from user memory,
@@ -791,7 +801,9 @@ https://claude.ai/artifact/QKJS8qH5Dfbjzn58RStq1j
 | `user/pingpong/` | Boot self-test program (IPC server, client and spinner) |
 | `user/cm/` | The Component Manager: the root task, which starts every component from the boot manifest |
 | `user/shell/` | The boot shell and COM1 driver, started as a component |
-| `crates/driver/` | The Driver SDK: PCI access through the bus server, MMIO, DMA pages, virtqueues |
+| `crates/driver/` | The Driver SDK: PCI access through the bus server, MMIO, DMA pages, virtqueues, DMA buffer pools, an executor |
+| `crates/idl/` | The IDL compiler: interface descriptions to Rust |
+| `interfaces/` | Interface descriptions (`pci.idl`, the PCI bus server's) |
 | `crates/lde/` | The Linux Driver Environment: Linux's kernel API for hosted drivers (`include/`, `c/lde.c`) and its host (`src/lib.rs`) |
 | `user/lde-8139cp/` | Linux's 8139cp network driver, unmodified, in the Linux Driver Environment |
 | `user/lde-e100/` | Linux's e100 network driver, likewise |
@@ -833,6 +845,7 @@ cargo xtask keyboard-test  # just the USB keyboard test (add aarch64 for that IS
 cargo xtask hotplug-test   # just the PCI hot-plug test (add aarch64 for that ISA)
 cargo xtask run            # boot the shell in QEMU (x86-64), its console on this terminal
 cargo xtask run aarch64    # the same on QEMU's AArch64 virt machine
+cargo xtask idl    # generate Rust from the interface descriptions in interfaces/
 cargo xtask image  # just build target/superior.img
 cargo xtask bench  # IPC timing under WHPX or KVM, checked against seL4's figures
 cargo xtask sel4-test      # the shell session on seL4 (needs Docker the first time)
