@@ -32,6 +32,15 @@ impl Queue {
         }
     }
 
+    /// Empties the queue for a device starting afresh (after a reset):
+    /// zeroes its page and starts its counts again.
+    pub fn reset(&mut self) {
+        // SAFETY: the queue owns its whole page, mapped at `page.va`.
+        unsafe { core::ptr::write_bytes(self.page.va as *mut u8, 0, 4096) };
+        self.next_avail = 0;
+        self.last_used = 0;
+    }
+
     /// The addresses to give the device: (descriptors, driver ring,
     /// device ring).
     pub fn addresses(&self) -> (u64, u64, u64) {

@@ -111,6 +111,42 @@ pub fn init_ap() {
     write(INITIAL_COUNT, per_tick);
 }
 
+/// Stops this CPU's tick.
+pub fn tick_stop() {
+    write(LVT_TIMER, LVT_MASKED | TIMER_VECTOR as u32);
+    write(INITIAL_COUNT, 0);
+}
+
+/// Starts this CPU's tick again after [`tick_stop`] or an [`alarm`].
+pub fn tick_start() {
+    // SAFETY: written once at boot.
+    let per_tick = unsafe { (&raw const PER_TICK).read() };
+    write(LVT_TIMER, LVT_PERIODIC | TIMER_VECTOR as u32);
+    write(INITIAL_COUNT, per_tick);
+}
+
+/// Has the timer interrupt this CPU once, `ticks` ticks from now, instead
+/// of every tick, until [`tick_start`]. Returns the ticks it will wait
+/// (the count is 32 bits).
+pub fn alarm(ticks: u64) -> u64 {
+    // SAFETY: written once at boot.
+    let per_tick = unsafe { (&raw const PER_TICK).read() } as u64;
+    let ticks = ticks.clamp(1, u32::MAX as u64 / per_tick);
+    write(LVT_TIMER, TIMER_VECTOR as u32);
+    write(INITIAL_COUNT, (ticks * per_tick) as u32);
+    ticks
+}
+
+/// Keeps the alarm after a tick from before it arrived: the alarm is
+/// untouched here, as a one-shot count is not reloaded by its interrupt.
+pub fn alarm_keep() {}
+
+/// Has the alarm [`alarm`] set come due (rather than a tick from before)?
+/// A one-shot count stays at zero once it has run out.
+pub fn alarm_fired() -> bool {
+    read(LVT_TIMER) & LVT_PERIODIC == 0 && read(CURRENT_COUNT) == 0
+}
+
 /// This CPU's APIC ID (0 before the APIC is mapped: only CPU 0 runs then).
 pub fn id() -> usize {
     // SAFETY: BASE is written once at boot.

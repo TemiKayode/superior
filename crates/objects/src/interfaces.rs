@@ -633,6 +633,30 @@ pub mod input {
     pub const POSITION_MAX: u64 = 0xffff;
 }
 
+/// Suspend and resume: what the Component Manager asks of a `power`
+/// component (manifest), on that component's first service, unbadged
+/// (badge 0, which no client is given). Before suspending the machine it
+/// sends `SUSPEND` to every such component, last in the manifest first
+/// (consumers before the drivers they use); after, `RESUME` in manifest
+/// order. A driver quiesces its device on `SUSPEND` (finishing or
+/// failing what it had in flight, then resetting it) and brings it up
+/// again on `RESUME`. In between it answers its clients' calls with
+/// `Unreachable`, and they retry after the resume.
+///
+/// A `power-control` component asks for a suspend through its `control`
+/// capability: `[cm OP_SUSPEND, ticks]`, answered after the resume.
+pub mod power {
+    pub const VERSION: u64 = 1;
+
+    /// `[SUSPEND]`: quiesce. Reply `[status]`.
+    pub const SUSPEND: u64 = 0x5050;
+    /// `[RESUME]`: work again. Reply `[status]`.
+    pub const RESUME: u64 = 0x5051;
+    /// `[OP_SUSPEND, ticks]` on the control capability: suspend the
+    /// machine for `ticks` ticks. Reply `[status]`.
+    pub const OP_SUSPEND: u64 = 7;
+}
+
 /// Files: what the filesystem server serves.
 ///
 /// There is no global namespace: each component sees only its own

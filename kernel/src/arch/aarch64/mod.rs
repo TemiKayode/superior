@@ -23,7 +23,7 @@ pub mod vm;
 
 pub use exceptions::{enter_user, Args, Exit, UserFrame};
 #[cfg_attr(not(feature = "selftest"), allow(unused_imports))]
-pub use timer::TICK_HZ;
+pub use timer::{alarm, alarm_fired, alarm_keep, tick_start, tick_stop, TICK_HZ};
 
 use crate::kprintln;
 use crate::memory::{add_region, Summary};

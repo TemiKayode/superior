@@ -178,6 +178,7 @@ fn main() -> ExitCode {
                         .and_then(|_| tcp_test(a))
                         .and_then(|_| keyboard_test(a))
                         .and_then(|_| hotplug_test(a))
+                        .and_then(|_| suspend_test(a))
                         .and_then(|_| image(false, a))
                         .and_then(|img| shell_session(&img))
                 })
@@ -207,6 +208,7 @@ fn main() -> ExitCode {
         Some("tcp-test") => tcp_test(arch),
         Some("keyboard-test") => keyboard_test(arch),
         Some("hotplug-test") => hotplug_test(arch),
+        Some("suspend-test") => suspend_test(arch),
         Some("memory-test") => {
             image_with(false, arch, "memory").and_then(|img| memory_test(&img))
         }
@@ -215,7 +217,7 @@ fn main() -> ExitCode {
         }
         Some("bench") => image(false, Arch::X86_64).and_then(|img| bench(&img)),
         _ => Err(
-            "usage: cargo xtask <idl | image | run | test | boot-test | shell-test | cm-test | supervise-test | drivers-test | memory-test | reboot-test | fs-test | nvme-test | ahci-test | net-test | lde-test | lde-e100-test | display-test | desktop-test | input-test | audio-test | tcp-test | keyboard-test | hotplug-test | bench | sel4-test> [x86_64 | aarch64]"
+            "usage: cargo xtask <idl | image | run | test | boot-test | shell-test | cm-test | supervise-test | drivers-test | memory-test | reboot-test | fs-test | nvme-test | ahci-test | net-test | lde-test | lde-e100-test | display-test | desktop-test | input-test | audio-test | tcp-test | keyboard-test | hotplug-test | suspend-test | bench | sel4-test> [x86_64 | aarch64]"
                 .into(),
         ),
     });
@@ -673,7 +675,7 @@ fn image_for(
         }
     };
     let fs = manifest.starts_with("fs");
-    let disk = if manifest == "drivers" {
+    let disk = if matches!(manifest, "drivers" | "suspend") {
         Some(test_disk()?)
     } else if fs {
         Some(fs_disk())
@@ -2771,6 +2773,68 @@ fn check_recording(bytes: &[u8]) -> Result<String, String> {
         ms(d),
         gaps
     ))
+}
+
+/// Boots `boot/suspend.manifest` and checks that the client's two
+/// suspends each quiesce the virtio-blk driver (which resets its disk),
+/// park every CPU with its tick stopped for the 200 ticks asked (2 s, which
+/// pass on the host's clock but not on the guest's), and bring the disk
+/// back so that it reads right after.
+fn suspend_test(arch: Arch) -> Result<(), String> {
+    let img = image_with(false, arch, "suspend")?;
+    println!("== suspend test on {}", img.path.display());
+    // When each suspend began and ended, on the host's clock.
+    let marks: Arc<Mutex<Vec<(usize, Instant)>>> = Arc::default();
+    let seen = marks.clone();
+    let out = run_to_exit_watching(&img, Duration::from_secs(60), move |all| {
+        let n = all.matches("[power] suspending").count() + all.matches("[power] resumed").count();
+        let mut m = seen.lock().unwrap();
+        while m.len() < n {
+            let k = m.len();
+            m.push((k, Instant::now()));
+        }
+    })?;
+    let mut steps = vec![
+        "[cm] manifest: 3 components",
+        "virtio-blk: ready:",
+        "[pass] suspend: read 8 sectors before suspending: every word right",
+        "[pass] suspend: the driver refuses SUSPEND from a client",
+    ];
+    for _ in 1..=2 {
+        steps.extend([
+            "virtio-blk: suspended: device reset, bus mastering off",
+            "[cm] every power component quiesced; suspending for 200 ticks",
+            "[power] suspending to idle for 200 ticks",
+            "[power] resumed at tick",
+            "[cm] resumed",
+            "virtio-blk: ready:",
+            "virtio-blk: resumed: device initialized again",
+        ]);
+    }
+    steps.extend([
+        "[pass] suspend: suspend 1: suspended to idle for 200 ticks and resumed",
+        "[pass] suspend: suspend 1: the disk reads after the resume: every word right",
+        "[pass] suspend: suspend 1: the ticks run again: a 10-tick sleep took",
+        "[pass] suspend: suspend 2: suspended to idle for 200 ticks and resumed",
+        "[pass] suspend: suspend 2: the disk reads after the resume: every word right",
+        "[pass] suspend: suspend 2: the ticks run again: a 10-tick sleep took",
+        "[cm] client asked to shut down (pass)",
+    ]);
+    check_log("suspend", &out, &steps)?;
+    // Each suspend lasted about 2 s of real time.
+    let m = marks.lock().unwrap();
+    if m.len() != 4 {
+        return Err(format!("suspend: saw {} suspend and resume lines, not 4", m.len()));
+    }
+    for (k, pair) in m.chunks(2).enumerate() {
+        let took = pair[1].1 - pair[0].1;
+        println!("suspend {}: {:.2} s on the host's clock", k + 1, took.as_secs_f64());
+        if took < Duration::from_millis(1500) {
+            return Err(format!("suspend {}: over after {took:?}, not 2 s", k + 1));
+        }
+    }
+    println!("suspend test passed");
+    Ok(())
 }
 
 /// Boots `boot/audio.manifest`: Linux's ES1370 driver in the Linux Driver

@@ -254,6 +254,14 @@ pub enum Syscall {
     /// its size in bits, word 1 the bytes not yet carved from it (all of
     /// it once nothing made from it is left).
     UntypedInfo = 48,
+    /// Suspends the machine to idle for `rsi` ticks (at least 1): every
+    /// CPU stops its tick and halts, no thread runs, and time (`Ticks`)
+    /// stands still, until a one-shot alarm ends it; then the ticks start
+    /// again and the caller continues. Interrupts that arrive meanwhile
+    /// are kept for afterwards. Only the root task may, naming its
+    /// untyped capability in `rdi` (as for `Reboot`); `InvalidCapability`
+    /// otherwise. Devices are the drivers' to quiesce first.
+    Suspend = 49,
     /// Maps the frame in slot `rdi` at page-aligned `rsi` in the address
     /// space in slot `r8` (Write right). `rdx` = [`MAP_WRITE`] and/or
     /// [`MAP_EXEC`], never both. Needs the frame's Map right, plus Write
@@ -327,6 +335,7 @@ impl Syscall {
             46 => Syscall::ReplySave,
             47 => Syscall::ReplyTo,
             48 => Syscall::UntypedInfo,
+            49 => Syscall::Suspend,
             42 => Syscall::IoFaults,
             0x100 => Syscall::DebugPutStr,
             0x101 => Syscall::DebugSelftestDone,

@@ -14,7 +14,7 @@ pub mod syscall;
 pub mod vm;
 
 #[cfg_attr(not(feature = "selftest"), allow(unused_imports))]
-pub use apic::TICK_HZ;
+pub use apic::{alarm, alarm_fired, alarm_keep, tick_start, tick_stop, TICK_HZ};
 pub use syscall::{enter_user, Args, Exit, UserFrame};
 
 use crate::kprintln;

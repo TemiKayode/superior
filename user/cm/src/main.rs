@@ -69,7 +69,7 @@ use superior_objects::abi::{
 };
 use superior_objects::bundle::{Bundle, BundleError};
 use superior_objects::elf::{Elf, Machine};
-use superior_objects::interfaces::{Status as Reply, mem};
+use superior_objects::interfaces::{Status as Reply, mem, power};
 use superior_objects::manifest::{CapKind, Component, MAX_COMPONENTS, Manifest, Restart, Start};
 use superior_sys::{Ret, USER_BASE, syscall, syscall_x};
 
@@ -567,6 +567,60 @@ impl<'a> Manager<'a> {
         }
     }
 
+    /// Calls `power` component `i`'s first service, unbadged, with `op`.
+    fn power_call(&self, i: usize, op: u64) -> Reply {
+        let Some(s) = self.services.iter().position(|x| matches!(x, Some((_, o)) if *o == i)) else {
+            return Reply::Unreachable;
+        };
+        let r = syscall(Syscall::Call, SERVICES + s as u64, [op, 0, 0, 0]);
+        if r.status != 0 { Reply::Unreachable } else { Reply::from_u64(r.msg[0]) }
+    }
+
+    /// `[OP_SUSPEND, ticks]` from a `power-control` component: tells
+    /// every running `power` component to quiesce, last in the manifest
+    /// first, has the kernel suspend the machine to idle for `ticks`,
+    /// then tells them to resume in manifest order. A component that
+    /// refuses to suspend calls the suspend off (those already suspended
+    /// resume); one that fails to resume is restarted.
+    fn suspend(&mut self, ticks: u64) -> Reply {
+        let mut quiet = [false; MAX_COMPONENTS];
+        let mut result = Reply::Ok;
+        for i in (0..MAX_COMPONENTS).rev() {
+            if self.status[i] != Status::Running || !self.component(i).power {
+                continue;
+            }
+            let r = self.power_call(i, power::SUSPEND);
+            if r != Reply::Ok {
+                say!("{} refused to suspend (status {}); suspend called off", self.component(i).name, r as u64);
+                result = r;
+                break;
+            }
+            quiet[i] = true;
+        }
+        if result == Reply::Ok {
+            say!("every power component quiesced; suspending for {ticks} ticks");
+            let r = syscall(Syscall::Suspend, root::UNTYPED, [ticks, 0, 0, 0]);
+            if r.status != 0 {
+                say!("the kernel refused to suspend (error {})", r.status);
+                result = Reply::Denied;
+            } else {
+                say!("resumed");
+            }
+        }
+        for i in 0..MAX_COMPONENTS {
+            if !quiet[i] {
+                continue;
+            }
+            let r = self.power_call(i, power::RESUME);
+            if r != Reply::Ok {
+                say!("{} failed to resume (status {}); restarting it", self.component(i).name, r as u64);
+                self.status[i] = Status::Stopped;
+                self.supervise(i, false);
+            }
+        }
+        result
+    }
+
     /// Answers every service of component `i` with `SERVICE_UNAVAILABLE`
     /// from now on.
     fn tombstone(&mut self, i: usize) {
@@ -993,6 +1047,13 @@ pub extern "C" fn _start(arg: u64) -> ! {
                 say!("{} exited", m.component(i).name);
                 m.stop(i);
                 None
+            }
+            BADGE_REPORT
+                if i < MAX_COMPONENTS
+                    && msg.msg[0] == power::OP_SUSPEND
+                    && m.component(i).power_control =>
+            {
+                Some([m.suspend(msg.msg[1]) as u64, 0, 0, 0])
             }
             BADGE_REPORT if i < MAX_COMPONENTS && msg.msg[0] == OP_SHUTDOWN => {
                 let name = m.component(i).name;

@@ -208,6 +208,11 @@ struct Kernel {
     timers: [Option<(u64, u16, u64)>; MAX_TIMERS],
     /// When each sleeping thread wakes (`Sleep`).
     sleep_until: [Option<u64>; MAX_THREADS],
+    /// While the machine is suspended (`Suspend`): who asked, and the ticks
+    /// still to wait beyond the alarm now set.
+    suspend: Option<Suspended>,
+    /// Which CPUs have stopped their tick and halted for the suspend.
+    parked: [bool; MAX_CPUS],
     /// Where the frame capability in each capability-table slot is mapped:
     /// (address space, user address).
     mapped: BootTable<[Mapping]>,
@@ -373,6 +378,8 @@ static KERNEL: Mutex<Kernel> = Mutex::new(Kernel {
     irq_ntfn: [None; MAX_IRQS],
     timers: [None; MAX_TIMERS],
     sleep_until: [None; MAX_THREADS],
+    suspend: None,
+    parked: [false; MAX_CPUS],
     reply_grant: [false; MAX_THREADS],
     ep_used: [false; MAX_ENDPOINTS],
     mapped: no_slice(),
@@ -683,6 +690,7 @@ pub fn handle_syscall(frame: &mut UserFrame) -> Exit {
         Some(Syscall::NotificationBind) => notification_bind(k, cur, a.a0),
         Some(Syscall::TimerSignal) => timer_signal(k, cur, a.a0, a.a1),
         Some(Syscall::Sleep) => sleep(k, cur, a.a0),
+        Some(Syscall::Suspend) => suspend(k, cur, a.a0, a.a1),
         Some(Syscall::IoFaults) => io_faults(k, cur, a.a0),
         Some(Syscall::UntypedInfo) => untyped_info(k, cur, a.a0),
         Some(Syscall::IoFaultNotify) => io_fault_notify(k, cur, a.a0, a.a1),
@@ -734,6 +742,16 @@ pub fn handle_timer(frame: &mut UserFrame) -> Exit {
     let mut guard = lock_kernel();
     let k = &mut *guard;
     let global = arch::cpu_id() == 0;
+    if k.suspend.is_some() {
+        // Time stands still: this is the alarm, or a tick from before
+        // this CPU parked.
+        suspended_timer(k);
+        if !frame.is_user_mode() {
+            return Exit::Iret;
+        }
+        save_running(k, frame, false);
+        return resume(guard, frame);
+    }
     if global {
         k.stats.ticks += 1;
         collect_io_faults(k);
@@ -1091,6 +1109,96 @@ fn sleep(k: &mut Kernel, cur: Tid, ticks: u64) -> Result<(), u64> {
     k.ipc.wait(n).map_err(|e| e.status())
 }
 
+/// A suspend under way: the thread that asked, and ticks left to wait.
+#[derive(Clone, Copy)]
+struct Suspended {
+    caller: Tid,
+    left: u64,
+}
+
+/// `Suspend`: rdi = the root task's untyped capability, rsi = ticks.
+/// The caller waits on its own notification, as in `Sleep`, and every CPU
+/// parks the next time it would pick a thread ([`park`]); the CPUs in user
+/// mode are kicked into the kernel to do so.
+fn suspend(k: &mut Kernel, cur: Tid, slot: u64, ticks: u64) -> Result<(), u64> {
+    let root = cap_slot(k, ROOT_TID, superior_objects::abi::root::UNTYPED as usize);
+    let own = own_slot(k, cur, slot);
+    let untyped = own.and_then(|s| k.caps.get(s)).is_some_and(|c| c.object.untyped().is_some());
+    if cur != ROOT_TID || own.is_none() || own != root || !untyped {
+        return Err(Error::InvalidCapability.code());
+    }
+    if ticks == 0 || k.suspend.is_some() {
+        return Err(Error::InvalidArgument.code());
+    }
+    let n = sleep_ntfn(cur);
+    let _ = k.ipc.clear_notification(n);
+    k.ipc.wait(n).map_err(|e| e.status())?;
+    k.suspend = Some(Suspended { caller: cur, left: ticks });
+    kprintln!("[power] suspending to idle for {ticks} ticks at tick {}", k.stats.ticks);
+    let me = arch::cpu_id();
+    for x in 0..smp::online() {
+        if x != me {
+            smp::kick(x);
+        }
+    }
+    Ok(())
+}
+
+/// This CPU stops its tick and halts until the suspend ends; CPU 0 sets
+/// the alarm that ends it.
+fn park(k: &mut Kernel) {
+    let me = arch::cpu_id();
+    if core::mem::replace(&mut k.parked[me], true) {
+        return;
+    }
+    arch::tick_stop();
+    if me == 0 {
+        if let Some(s) = k.suspend.as_mut() {
+            s.left -= arch::alarm(s.left);
+        }
+    }
+}
+
+/// The suspend is over: this CPU starts its tick again.
+fn unpark(k: &mut Kernel) {
+    let me = arch::cpu_id();
+    if core::mem::take(&mut k.parked[me]) {
+        arch::tick_start();
+    }
+}
+
+/// The timer interrupted while suspended. On parked CPU 0 the alarm may
+/// have come: set the next, or end the suspend (waking the caller and
+/// every CPU). A tick from before a CPU parked changes nothing, but on
+/// some machines its handler started the tick again; stop it.
+fn suspended_timer(k: &mut Kernel) {
+    let me = arch::cpu_id();
+    if !k.parked[me] {
+        return;
+    }
+    if me != 0 {
+        arch::tick_stop();
+        return;
+    }
+    if !arch::alarm_fired() {
+        arch::alarm_keep();
+        return;
+    }
+    let Some(s) = k.suspend.as_mut() else { return };
+    if s.left > 0 {
+        s.left -= arch::alarm(s.left);
+        return;
+    }
+    let caller = s.caller;
+    k.suspend = None;
+    unpark(k);
+    kprintln!("[power] resumed at tick {}", k.stats.ticks);
+    let _ = k.ipc.signal_irq(sleep_ntfn(caller), 1);
+    for x in 1..smp::online() {
+        smp::kick(x);
+    }
+}
+
 fn fire_timers(k: &mut Kernel) {
     let now = k.stats.ticks;
     for t in 0..MAX_THREADS {
@@ -1372,6 +1480,15 @@ fn kick_others(k: &Kernel) {
 /// thread can run, halts until an interrupt makes one runnable.
 fn resume(mut guard: KernelGuard, frame: &mut UserFrame) -> Exit {
     let next = loop {
+        if guard.suspend.is_some() {
+            // No thread runs until the alarm ends the suspend.
+            park(&mut guard);
+            drop(guard);
+            arch::idle_wait();
+            guard = lock_kernel();
+            continue;
+        }
+        unpark(&mut guard);
         guard.ipc.reschedule();
         kick_others(&guard);
         if let Some(next) = guard.ipc.current() {

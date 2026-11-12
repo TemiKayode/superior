@@ -34,6 +34,9 @@
 //!   quota 64                # pages the Memory Server may give it
 //!   heap 32                 # a demand-zero heap of 32 pages
 //!   fault-injector          # may ask the manager to kill components
+//!   power                   # hears SUSPEND and RESUME (`power`) on its
+//!                           # first service when the machine suspends
+//!   power-control           # may ask the manager to suspend the machine
 //! ```
 //!
 //! Slots are in the component's own CSpace, a CNode of [`CSPACE_SLOTS`]
@@ -136,6 +139,11 @@ pub struct Component<'a> {
     /// May ask the manager (through its `control` capability) to kill
     /// other components: for fault-injection tests.
     pub injector: bool,
+    /// Takes part in suspend and resume: the manager calls its first
+    /// service, unbadged, with `power::SUSPEND` and `power::RESUME`.
+    pub power: bool,
+    /// May ask the manager to suspend the machine.
+    pub power_control: bool,
     pub caps: [Option<CapSpec<'a>>; MAX_CAPS],
 }
 
@@ -154,6 +162,8 @@ impl<'a> Component<'a> {
             quota_pages: 0,
             heap_pages: 0,
             injector: false,
+            power: false,
+            power_control: false,
             caps: [None; MAX_CAPS],
         }
     }
@@ -323,6 +333,14 @@ impl<'a> Manifest<'a> {
                     c.injector = true;
                     None
                 }
+                "power" => {
+                    c.power = true;
+                    None
+                }
+                "power-control" => {
+                    c.power_control = true;
+                    None
+                }
                 "quota" => {
                     c.quota_pages = number(arg("quota needs a page count")?)?;
                     None
@@ -417,6 +435,9 @@ impl<'a> Manifest<'a> {
             if c.start == Start::Lazy && c.provides().next().is_none() {
                 return Err(err("a lazy component must provide a service", c.name));
             }
+            if c.power && c.provides().next().is_none() {
+                return Err(err("a power component must provide a service", c.name));
+            }
             // Its heap arrives from the component it is cloned from.
             if c.start == Start::Clone && c.heap_pages == 0 {
                 return Err(err("a clone needs a heap", c.name));
@@ -470,6 +491,7 @@ component client   # comment after a directive
   quota 10
   heap 4
   fault-injector
+  power-control
 component memserver
   image memserver
   provides mem 0
@@ -497,6 +519,7 @@ component memserver
             (8, 10, 4)
         );
         assert!(client.injector && !echo.injector);
+        assert!(client.power_control && !client.power && !echo.power_control);
         assert_eq!(echo.cspace_bits, CSPACE_BITS);
         assert_eq!((client.vspace_bits, echo.vspace_bits), (18, VSPACE_BITS));
         let caps: std::vec::Vec<_> = client.caps().collect();
@@ -671,6 +694,10 @@ component memserver
         assert_eq!(
             error("component a\n image a\n start lazy"),
             (0, "a lazy component must provide a service")
+        );
+        assert_eq!(
+            error("component a\n image a\n power"),
+            (0, "a power component must provide a service")
         );
         assert_eq!(
             error("component a\n image a\n provides s 0\ncomponent b\n image b\n provides s 0"),

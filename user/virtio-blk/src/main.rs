@@ -14,6 +14,10 @@
 //! virtio requires, after the bus server has already turned its decoding
 //! and bus mastering off.
 //!
+//! Suspend (`power`, from the Component Manager): it resets the device and
+//! turns bus mastering off, answers clients `Unreachable` meanwhile, and on
+//! resume runs the whole initialization again on the same pages.
+//!
 //! Slots: 0 the bus server, 1 the `block` endpoint (receive), 2 a
 //! notification, 3 untyped memory. `arg 1` turns on fault-injection
 //! operations for tests: a crash, and a read aimed at memory outside the
@@ -25,7 +29,7 @@
 use superior_driver::virtq::{self, Queue};
 use superior_driver::{DmaPage, Failure, Mmio, Pci, dma_address, dma_barrier, io_map};
 use superior_objects::abi::{CapTransfer, Syscall};
-use superior_objects::interfaces::{Status, block};
+use superior_objects::interfaces::{Status, block, power};
 use superior_sys::{USER_BASE, print_line, syscall, syscall_x};
 
 const PCI: u64 = 0;
@@ -110,6 +114,14 @@ macro_rules! say {
 }
 
 struct Device {
+    pci: Pci,
+    bdf: u64,
+    /// The common and device-specific register blocks, and where queue
+    /// notifications go (base, multiplier).
+    common: Mmio,
+    device: Mmio,
+    notify_base: u64,
+    multiplier: u64,
     /// The device has a write cache, emptied by a flush.
     flush: bool,
     notify: u64,
@@ -190,31 +202,6 @@ fn start(faults: bool) -> Result<Device, Failure> {
     };
     let (common, device) = (Mmio { base: common }, Mmio { base: device });
 
-    // Reset, then the initialization sequence (virtio 1.x, 3.1.1).
-    common.write8(DEVICE_STATUS, 0);
-    while common.read8(DEVICE_STATUS) != 0 {
-        syscall(Syscall::Yield, 0, [0; 4]);
-    }
-    common.write8(DEVICE_STATUS, ACKNOWLEDGE);
-    common.write8(DEVICE_STATUS, ACKNOWLEDGE | DRIVER);
-    common.write32(DEVICE_FEATURE_SELECT, 1);
-    if common.read32(DEVICE_FEATURE) & 1 == 0 {
-        return Err(("the device does not offer VERSION_1", 0));
-    }
-    // VERSION_1 (feature 32), ACCESS_PLATFORM (33) if offered (the
-    // device's DMA goes through the IOMMU) and FLUSH (9) if offered.
-    let high = common.read32(DEVICE_FEATURE) & ACCESS_PLATFORM;
-    common.write32(DEVICE_FEATURE_SELECT, 0);
-    let low = common.read32(DEVICE_FEATURE) & F_FLUSH;
-    common.write32(DRIVER_FEATURE_SELECT, 0);
-    common.write32(DRIVER_FEATURE, low);
-    common.write32(DRIVER_FEATURE_SELECT, 1);
-    common.write32(DRIVER_FEATURE, 1 | high);
-    common.write8(DEVICE_STATUS, ACKNOWLEDGE | DRIVER | FEATURES_OK);
-    if common.read8(DEVICE_STATUS) & FEATURES_OK == 0 {
-        return Err(("the device refused the features", 0));
-    }
-
     // One MSI-X vector, for queue 0.
     let msix = pci.find_capability(CAP_MSIX, 0)?.ok_or(("no MSI-X", 0))?;
     let table = pci.config_read(msix + 4)? as u64;
@@ -223,55 +210,28 @@ fn start(faults: bool) -> Result<Device, Failure> {
     };
     let (address, data) = pci.msi_vector(0, MSI, NOTIFY, DOMAIN)?;
     let forged = if faults { Some(forge_vector(&pci)?) } else { None };
-    entry.write32(0, address as u32);
-    entry.write32(4, (address >> 32) as u32);
-    entry.write32(8, data as u32);
-    entry.write32(12, 0); // unmasked
-    pci.msix(true)?;
-    common.write16(CONFIG_MSIX_VECTOR, NO_VECTOR);
 
     // Queue 0, in one DMA page; requests' headers and status in another.
     let queue = Queue::new(DmaPage::new(UNTYPED, QUEUE, QUEUE_VA, DOMAIN)?);
     let request = DmaPage::new(UNTYPED, REQUEST, REQUEST_VA, DOMAIN)?;
-    common.write16(QUEUE_SELECT, 0);
-    let max = common.read16(QUEUE_SIZE);
-    // The rings are laid out for exactly virtq::SIZE entries.
-    if max < virtq::SIZE {
-        return Err(("queue 0 is too small", max as u64));
-    }
-    common.write16(QUEUE_SIZE, virtq::SIZE);
-    common.write16(QUEUE_MSIX_VECTOR, 0);
-    if common.read16(QUEUE_MSIX_VECTOR) != 0 {
-        return Err(("the device refused the MSI-X vector", 0));
-    }
-    let (desc, driver, used) = queue.addresses();
-    common.write64(QUEUE_DESC, desc);
-    common.write64(QUEUE_DRIVER, driver);
-    common.write64(QUEUE_DEVICE, used);
-    let notify = notify_base + common.read16(QUEUE_NOTIFY_OFF) as u64 * multiplier;
-    common.write16(QUEUE_ENABLE, 1);
-    pci.bus_master(true)?;
-    common.write8(
-        DEVICE_STATUS,
-        ACKNOWLEDGE | DRIVER | FEATURES_OK | DRIVER_OK,
-    );
-    let capacity = device.read64(0);
-    say!(
-        "ready: {:02x}:{:02x}.{}, {capacity} sectors, interrupts on MSI-X vector 0 (message data {data:#x})",
-        bdf >> 8,
-        bdf >> 3 & 0x1f,
-        bdf & 7
-    );
-    Ok(Device {
-        flush: low != 0,
-        notify,
+    let mut dev = Device {
+        pci,
+        bdf: bdf as u64,
+        common,
+        device,
+        notify_base,
+        multiplier,
+        flush: false,
+        notify: 0,
         queue,
         request,
-        capacity,
+        capacity: 0,
         msix: entry,
         message: (address, data),
         forged,
-    })
+    };
+    dev.init()?;
+    Ok(dev)
 }
 
 /// Takes a second MSI vector, bound to the notification with its own bit
@@ -291,6 +251,85 @@ fn forge_vector(pci: &Pci) -> Result<(u64, u64), Failure> {
 }
 
 impl Device {
+    /// Resets the device and brings it up (virtio 1.x, 3.1.1): at start,
+    /// and again on `power::RESUME`.
+    fn init(&mut self) -> Result<(), Failure> {
+        let common = self.common;
+        common.write8(DEVICE_STATUS, 0);
+        while common.read8(DEVICE_STATUS) != 0 {
+            syscall(Syscall::Yield, 0, [0; 4]);
+        }
+        common.write8(DEVICE_STATUS, ACKNOWLEDGE);
+        common.write8(DEVICE_STATUS, ACKNOWLEDGE | DRIVER);
+        common.write32(DEVICE_FEATURE_SELECT, 1);
+        if common.read32(DEVICE_FEATURE) & 1 == 0 {
+            return Err(("the device does not offer VERSION_1", 0));
+        }
+        // VERSION_1 (feature 32), ACCESS_PLATFORM (33) if offered (the
+        // device's DMA goes through the IOMMU) and FLUSH (9) if offered.
+        let high = common.read32(DEVICE_FEATURE) & ACCESS_PLATFORM;
+        common.write32(DEVICE_FEATURE_SELECT, 0);
+        let low = common.read32(DEVICE_FEATURE) & F_FLUSH;
+        common.write32(DRIVER_FEATURE_SELECT, 0);
+        common.write32(DRIVER_FEATURE, low);
+        common.write32(DRIVER_FEATURE_SELECT, 1);
+        common.write32(DRIVER_FEATURE, 1 | high);
+        common.write8(DEVICE_STATUS, ACKNOWLEDGE | DRIVER | FEATURES_OK);
+        if common.read8(DEVICE_STATUS) & FEATURES_OK == 0 {
+            return Err(("the device refused the features", 0));
+        }
+        self.flush = low != 0;
+
+        self.program_msix(self.message);
+        self.pci.msix(true)?;
+        common.write16(CONFIG_MSIX_VECTOR, NO_VECTOR);
+
+        self.queue.reset();
+        common.write16(QUEUE_SELECT, 0);
+        let max = common.read16(QUEUE_SIZE);
+        // The rings are laid out for exactly virtq::SIZE entries.
+        if max < virtq::SIZE {
+            return Err(("queue 0 is too small", max as u64));
+        }
+        common.write16(QUEUE_SIZE, virtq::SIZE);
+        common.write16(QUEUE_MSIX_VECTOR, 0);
+        if common.read16(QUEUE_MSIX_VECTOR) != 0 {
+            return Err(("the device refused the MSI-X vector", 0));
+        }
+        let (desc, driver, used) = self.queue.addresses();
+        common.write64(QUEUE_DESC, desc);
+        common.write64(QUEUE_DRIVER, driver);
+        common.write64(QUEUE_DEVICE, used);
+        self.notify = self.notify_base + common.read16(QUEUE_NOTIFY_OFF) as u64 * self.multiplier;
+        common.write16(QUEUE_ENABLE, 1);
+        self.pci.bus_master(true)?;
+        common.write8(
+            DEVICE_STATUS,
+            ACKNOWLEDGE | DRIVER | FEATURES_OK | DRIVER_OK,
+        );
+        self.capacity = self.device.read64(0);
+        let (bdf, data) = (self.bdf, self.message.1);
+        say!(
+            "ready: {:02x}:{:02x}.{}, {} sectors, interrupts on MSI-X vector 0 (message data {data:#x})",
+            bdf >> 8,
+            bdf >> 3 & 0x1f,
+            bdf & 7,
+            self.capacity
+        );
+        Ok(())
+    }
+
+    /// `power::SUSPEND`: requests are run to completion one at a time, so
+    /// none is in flight; reset the device (it forgets its queue) and
+    /// stop its DMA.
+    fn quiesce(&mut self) -> Result<(), Failure> {
+        self.common.write8(DEVICE_STATUS, 0);
+        while self.common.read8(DEVICE_STATUS) != 0 {
+            syscall(Syscall::Yield, 0, [0; 4]);
+        }
+        self.pci.bus_master(false)
+    }
+
     /// Starts reading `count` sectors from `sector` into the frame at
     /// `buffer` (a device address).
     fn submit(&mut self, sector: u64, count: u64, buffer: u64) {
@@ -552,10 +591,45 @@ pub extern "C" fn _start(arg: u64) -> ! {
         grant: None,
         accept: Some(BUFFER as u16),
     };
+    let mut suspended = false;
     let mut r = syscall_x(Syscall::Recv, SERVICE, [0; 4], accept);
     loop {
         let lent = r.cap == Some(BUFFER as u16);
-        let reply = dev.serve(r.msg, lent, arg == 1);
+        // Badge 0 is the Component Manager's own (manifest `power`).
+        let manager = r.badge == 0;
+        let reply = match r.msg[0] {
+            power::SUSPEND if manager => {
+                let s = match dev.quiesce() {
+                    Ok(()) => {
+                        suspended = true;
+                        say!("suspended: device reset, bus mastering off");
+                        Status::Ok
+                    }
+                    Err((what, code)) => {
+                        say!("could not suspend: {what} ({code})");
+                        Status::DeviceError
+                    }
+                };
+                [s as u64, 0, 0, 0]
+            }
+            power::RESUME if manager => {
+                let s = match dev.init() {
+                    Ok(()) => {
+                        suspended = false;
+                        say!("resumed: device initialized again");
+                        Status::Ok
+                    }
+                    Err((what, code)) => {
+                        say!("could not resume: {what} ({code})");
+                        Status::DeviceError
+                    }
+                };
+                [s as u64, 0, 0, 0]
+            }
+            // Asleep: the client retries after the resume.
+            _ if suspended => [Status::Unreachable as u64, 0, 0, 0],
+            _ => dev.serve(r.msg, lent, arg == 1),
+        };
         if lent {
             // The caller's frame goes back (and out of the domain) before
             // the reply.

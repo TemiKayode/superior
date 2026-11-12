@@ -69,7 +69,7 @@ use core::sync::atomic::{AtomicU32, Ordering, fence};
 use superior_objects::abi::{CapTransfer, Error, ObjectType, Syscall, root};
 use superior_objects::idl::{display, window};
 use superior_objects::interfaces::fs::ring;
-use superior_objects::interfaces::{Status, block, dns, fs, input, mem, net, pci};
+use superior_objects::interfaces::{Status, block, dns, fs, input, mem, net, pci, power};
 use superior_sys::{Called, USER_BASE, call_retry, print_line, syscall, syscall_x};
 
 const ECHO: u64 = 0;
@@ -5096,6 +5096,62 @@ fn crasher() -> ! {
     superior_sys::park()
 }
 
+/// Ticks the suspend test sleeps for.
+const SUSPEND_TICKS: u64 = 200;
+
+/// The suspend test (`boot/suspend.manifest`): reads the disk, has the
+/// manager suspend the machine (the driver resets its device first, and
+/// brings it up again after), then reads it again. Time stands still while
+/// suspended: hardly a tick may pass across the whole round trip.
+fn suspend_client() -> ! {
+    let mut t = Checks(0, "suspend");
+    let made = syscall(Syscall::Retype, BLOCK_MEMORY, [ObjectType::Frame as u64, 0, BUFFER, 0]);
+    let mapped = syscall(Syscall::FrameMap, BUFFER, [BUFFER_VA, 1, 0, 0]);
+    let r = read_and_check(0, 8);
+    t.check(
+        made.status == 0 && mapped.status == 0 && r.is_ok(),
+        format_args!("read 8 sectors before suspending: {}", r.err().unwrap_or("every word right")),
+    );
+    // Only the manager's badge may suspend the driver.
+    let r = syscall(Syscall::Call, BLOCK, [power::SUSPEND, 0, 0, 0]);
+    t.check(
+        r.status == 0 && r.msg[0] == Status::Invalid as u64,
+        format_args!("the driver refuses SUSPEND from a client"),
+    );
+    for round in 1..=2 {
+        let before = ticks();
+        let r = syscall(Syscall::Call, BLOCK_CONTROL, [power::OP_SUSPEND, SUSPEND_TICKS, 0, 0]);
+        let passed = ticks() - before;
+        t.check(
+            r.status == 0 && r.msg[0] == Status::Ok as u64 && passed < SUSPEND_TICKS / 4,
+            format_args!(
+                "suspend {round}: suspended to idle for {SUSPEND_TICKS} ticks and resumed, {passed} ticks passed meanwhile (status {})",
+                r.msg[0]
+            ),
+        );
+        let mut bad = None;
+        for (sector, count) in [(0, 8), (100, 8), (127, 1)] {
+            if let Err(e) = read_and_check(sector, count) {
+                bad = Some(e);
+            }
+        }
+        t.check(
+            bad.is_none(),
+            format_args!(
+                "suspend {round}: the disk reads after the resume: {}",
+                bad.unwrap_or("every word right")
+            ),
+        );
+        // The ticks run again: a sleep ends.
+        let before = ticks();
+        superior_sys::sleep(10);
+        let slept = ticks() - before;
+        t.check(slept >= 10, format_args!("suspend {round}: the ticks run again: a 10-tick sleep took {slept}"));
+    }
+    syscall(Syscall::Call, BLOCK_CONTROL, [OP_SHUTDOWN, t.0, 0, 0]);
+    superior_sys::park()
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(role: u64) -> ! {
     match role {
@@ -5132,6 +5188,7 @@ pub extern "C" fn _start(role: u64) -> ! {
         28 => input_second(),
         29 => audio_first(),
         30 => audio_second(),
+        31 => suspend_client(),
         _ => probe(),
     }
 }

@@ -872,6 +872,22 @@ holds the rest):
   second kills the mixer and plays another, then kills the driver and plays a last
   one. Every sample of the recording must be the clients' triangle waves, the
   overlapping two summed, with only silence between the sounds.
+- Suspend to idle. The kernel's `Suspend` call (the root task's alone, like
+  `Reboot`) stops every CPU's tick and halts them all, running no thread, until
+  a one-shot alarm on CPU 0 ends it; time (`Ticks`) stands still meanwhile, and
+  interrupts that arrive are kept for after. The Component Manager runs the power
+  protocol around it (`power` in `superior_objects::interfaces`): a
+  `power-control` component asks it to suspend, and it calls every running
+  `power` component's first service, unbadged (a badge no client has), with
+  `SUSPEND`, last in the manifest first so consumers quiesce before the drivers
+  under them, then `RESUME` in manifest order after. One that refuses calls the
+  suspend off; one that fails to resume is restarted. The virtio-blk driver
+  resets its disk and turns bus mastering off on `SUSPEND`, answers clients
+  `Unreachable` until `RESUME`, and then runs its whole initialization again on
+  the same pages. `cargo xtask suspend-test` boots `boot/suspend.manifest` on both
+  ISAs: the client reads the disk, suspends the machine twice for 200 ticks,
+  each time 2 seconds on the host's clock and almost no ticks on the guest's,
+  and reads it right after each resume.
 - Interrupt and exception entries clear the direction flag. User code may be
   interrupted mid-way through a backward copy, with the flag set; the kernel's own
   copies need it clear, and without the `cld` they ran backwards, wrecking saved
@@ -929,7 +945,11 @@ and port multipliers; in the xHCI driver isochronous and bulk endpoints, USB 3 s
 hubs and more than one interrupter, and HID devices other than boot keyboards and pointing devices
 (keyboards in the report protocol, game controllers, touch screens with several contacts,
 devices with several interfaces of one kind); in the network server
-a second IPv6 router or a DHCPv6 server to test against (QEMU's network has one router and hands out no addresses, so the IPv6 route table and the DHCPv6 address client are proved by host tests alone), DNSSEC, DNS answers over TCP of more than a page, IPv4 routes beyond one gateway; the SDK's power callbacks (with suspend and resume, Phase 2); the IDL describing interfaces other than the bus server's; escalating a component
+a second IPv6 router or a DHCPv6 server to test against (QEMU's network has one router and hands out no addresses, so the IPv6 route table and the DHCPv6 address client are proved by host tests alone), DNSSEC, DNS answers over TCP of more than a page, IPv4 routes beyond one gateway; in suspend and resume real sleep states (ACPI S3 with the CPUs' state saved
+and restored by firmware; QEMU's q35 has it, its AArch64 `virt` machine no
+equivalent), wake sources other than the alarm (a key, the network), power
+handling in drivers other than virtio-blk and in the servers above them, and a
+timeout on a component that never answers `SUSPEND`; the IDL describing interfaces other than the bus server's; escalating a component
 given up on to a supervisor above it (today the
 manager is the only one), memory budgets from a policy service (Phase 3), sizing the Memory Server's CSpace
 from the RAM it gets (its manifest names the size, 2^17 slots on the test machines), page tables for boot processes paid for from user memory,
@@ -976,7 +996,7 @@ https://claude.ai/artifact/QKJS8qH5Dfbjzn58RStq1j
 | `user/xhci/` | The xHCI (USB) host controller driver |
 | `user/hid/` | The USB HID keyboard, mouse and tablet driver |
 | `user/echo/`, `user/counter/`, `user/testclient/` | Test components for the Component Manager, supervision and drivers |
-| `boot/` | Component manifests: `shell.manifest` (normal boot), `test.manifest` (`cm-test`), `supervise.manifest` (`supervise-test`) , `drivers.manifest` (`drivers-test`) , `memory.manifest` (`memory-test`), `reboot.manifest` (`reboot-test`), `fs.manifest` and `fs-verify.manifest` (`fs-test`), `net.manifest` (`net-test`), `tcp.manifest` (`tcp-test`), `keyboard.manifest` (`keyboard-test`), `display.manifest` (`display-test`), `desktop.manifest` (`desktop-test`), `input.manifest` (`input-test`), `audio.manifest` (`audio-test`) |
+| `boot/` | Component manifests: `shell.manifest` (normal boot), `test.manifest` (`cm-test`), `supervise.manifest` (`supervise-test`) , `drivers.manifest` (`drivers-test`) , `memory.manifest` (`memory-test`), `reboot.manifest` (`reboot-test`), `fs.manifest` and `fs-verify.manifest` (`fs-test`), `net.manifest` (`net-test`), `tcp.manifest` (`tcp-test`), `keyboard.manifest` (`keyboard-test`), `display.manifest` (`display-test`), `desktop.manifest` (`desktop-test`), `input.manifest` (`input-test`), `audio.manifest` (`audio-test`), `suspend.manifest` (`suspend-test`) |
 | `sel4/` | Docker build of seL4 and rust-sel4's kernel loader, for running the shell on seL4 |
 | `xtask/` | Build driver: user program, kernel, disk image, QEMU boot |
 
@@ -1004,6 +1024,7 @@ cargo xtask audio-test     # Linux's ES1370 driver and the mixer: two clients' s
 cargo xtask tcp-test       # just the TCP test (add aarch64 for that ISA)
 cargo xtask keyboard-test  # just the USB keyboard test (add aarch64 for that ISA)
 cargo xtask hotplug-test   # just the PCI hot-plug test (add aarch64 for that ISA)
+cargo xtask suspend-test   # suspend to idle twice around the virtio-blk driver, then read the disk (add aarch64 for that ISA)
 cargo xtask run            # boot the shell in QEMU (x86-64), its console on this terminal
 cargo xtask run aarch64    # the same on QEMU's AArch64 virt machine
 cargo xtask idl    # generate Rust from the interface descriptions in interfaces/
