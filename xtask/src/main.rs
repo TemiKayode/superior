@@ -114,6 +114,8 @@ struct Image {
     /// A USB keyboard on an xHCI controller, typed on through QEMU's
     /// monitor (the keyboard test).
     keyboard: bool,
+    /// A USB mouse on the same controller (the input test).
+    mouse: bool,
     /// An empty PCI Express root port, and QEMU's monitor to plug cards
     /// into it (the hot-plug test).
     hotplug: bool,
@@ -167,6 +169,7 @@ fn main() -> ExitCode {
                         .and_then(|_| net_test(a, "lde-e100"))
                         .and_then(|_| display_test(a))
                         .and_then(|_| desktop_test(a))
+                        .and_then(|_| input_test(a))
                         .and_then(|_| tcp_test(a))
                         .and_then(|_| keyboard_test(a))
                         .and_then(|_| hotplug_test(a))
@@ -194,6 +197,7 @@ fn main() -> ExitCode {
         Some("lde-e100-test") => net_test(arch, "lde-e100"),
         Some("display-test") => display_test(arch),
         Some("desktop-test") => desktop_test(arch),
+        Some("input-test") => input_test(arch),
         Some("tcp-test") => tcp_test(arch),
         Some("keyboard-test") => keyboard_test(arch),
         Some("hotplug-test") => hotplug_test(arch),
@@ -205,7 +209,7 @@ fn main() -> ExitCode {
         }
         Some("bench") => image(false, Arch::X86_64).and_then(|img| bench(&img)),
         _ => Err(
-            "usage: cargo xtask <idl | image | run | test | boot-test | shell-test | cm-test | supervise-test | drivers-test | memory-test | reboot-test | fs-test | nvme-test | ahci-test | net-test | lde-test | lde-e100-test | display-test | desktop-test | tcp-test | keyboard-test | hotplug-test | bench | sel4-test> [x86_64 | aarch64]"
+            "usage: cargo xtask <idl | image | run | test | boot-test | shell-test | cm-test | supervise-test | drivers-test | memory-test | reboot-test | fs-test | nvme-test | ahci-test | net-test | lde-test | lde-e100-test | display-test | desktop-test | input-test | tcp-test | keyboard-test | hotplug-test | bench | sel4-test> [x86_64 | aarch64]"
                 .into(),
         ),
     });
@@ -333,7 +337,7 @@ const LINUX_SOURCES: [(&str, &str, &str); 3] = [
 /// a network test's, or the display test's.
 fn linux_driver(manifest: &str) -> Option<&'static str> {
     match manifest {
-        "display" | "desktop" => Some("bochs"),
+        "display" | "desktop" | "input" => Some("bochs"),
         _ => linux_nic(manifest).map(|l| l.0),
     }
 }
@@ -652,9 +656,10 @@ fn image_for(
         driver,
         net: matches!(manifest, "net" | "tcp") || linux_nic(manifest).is_some(),
         linux_nic: linux_nic(manifest).map(|l| l.1),
-        keyboard: manifest == "keyboard",
+        keyboard: matches!(manifest, "keyboard" | "input"),
+        mouse: manifest == "input",
         hotplug: manifest == "hotplug",
-        display: manifest == "display" || manifest == "desktop",
+        display: matches!(manifest, "display" | "desktop" | "input"),
     })
 }
 
@@ -749,6 +754,7 @@ fn sel4_image() -> Result<Image, String> {
         net: false,
         linux_nic: None,
         keyboard: false,
+        mouse: false,
         hotplug: false,
         display: false,
     })
@@ -941,14 +947,10 @@ fn qemu_command(img: &Image) -> Command {
     if img.keyboard {
         // A USB keyboard on an xHCI controller (its DMA through the
         // IOMMU), and the monitor the test types through.
-        q.args([
-            "-device",
-            "qemu-xhci,id=xhci",
-            "-device",
-            "usb-kbd,id=kbd0,bus=xhci.0",
-            "-qmp",
-        ])
-        .arg(format!("tcp:127.0.0.1:{QMP_PORT},server=on,wait=off"));
+        q.args(["-device", "qemu-xhci,id=xhci", "-device", "usb-kbd,id=kbd0,bus=xhci.0"]);
+        if img.mouse {
+            q.args(["-device", "usb-mouse,id=mouse0,bus=xhci.0"]);
+        }
     }
     if img.hotplug {
         // An empty root port to plug cards into, and the monitor that
@@ -958,8 +960,7 @@ fn qemu_command(img: &Image) -> Command {
         if img.arch == Arch::X86_64 {
             q.args(["-global", "ICH9-LPC.acpi-pci-hotplug-with-bridge-support=off"]);
         }
-        q.args(["-device", "pcie-root-port,id=hp0,chassis=1", "-qmp"])
-            .arg(format!("tcp:127.0.0.1:{QMP_PORT},server=on,wait=off"));
+        q.args(["-device", "pcie-root-port,id=hp0,chassis=1"]);
     }
     if img.display {
         // One display, which the Linux bochs driver drives, its EDID giving
@@ -975,9 +976,11 @@ fn qemu_command(img: &Image) -> Command {
             q.args(["-vga", "none"]);
         }
         q.arg("-device")
-            .arg(format!("{card},xres={},yres={},edid=on", SCREEN.0, SCREEN.1))
-            .arg("-qmp")
-            .arg(format!("tcp:127.0.0.1:{QMP_PORT},server=on,wait=off"));
+            .arg(format!("{card},xres={},yres={},edid=on", SCREEN.0, SCREEN.1));
+    }
+    if img.keyboard || img.hotplug || img.display {
+        // QEMU's monitor, to type, plug cards and take screenshots through.
+        q.arg("-qmp").arg(format!("tcp:127.0.0.1:{QMP_PORT},server=on,wait=off"));
     }
     q.args(["-serial", "stdio", "-no-reboot"]);
     q
@@ -2209,8 +2212,19 @@ fn read_screenshot(path: &Path) -> Result<Vec<u8>, String> {
 
 /// Checks desktop screenshot `k` pixel by pixel.
 fn check_desktop(path: &Path, k: usize) -> Result<String, String> {
+    check_windows(path, k + 1, &desktop_pictures()[k], None)
+}
+
+/// Checks screenshot `k` (from 1) pixel by pixel: the desktop, `windows`
+/// over it back to front, and the pointer over everything if it is
+/// shown.
+fn check_windows(
+    path: &Path,
+    k: usize,
+    windows: &[ShownWindow],
+    pointer: Option<(usize, usize)>,
+) -> Result<String, String> {
     let pixels = read_screenshot(path)?;
-    let windows = &desktop_pictures()[k];
     let mut wrong = 0;
     let mut first = None;
     for y in 0..SCREEN.1 {
@@ -2219,6 +2233,15 @@ fn check_desktop(path: &Path, k: usize) -> Result<String, String> {
             for w in windows {
                 if (w.at.0..w.at.0 + w.size.0).contains(&x) && (w.at.1..w.at.1 + w.size.1).contains(&y) {
                     want = window_pixel(x - w.at.0, y - w.at.1, w.id, w.phase);
+                }
+            }
+            if let Some((px, py)) = pointer {
+                if x >= px && y >= py && y - py < CURSOR.len() && x - px < CURSOR[0].len() {
+                    match CURSOR[y - py].as_bytes()[x - px] {
+                        b'#' => want = [0, 0, 0],
+                        b'o' => want = [0xff, 0xff, 0xff],
+                        _ => {}
+                    }
                 }
             }
             let i = (y * SCREEN.0 + x) * 3;
@@ -2231,15 +2254,14 @@ fn check_desktop(path: &Path, k: usize) -> Result<String, String> {
     }
     match first {
         None => Ok(format!(
-            "screenshot {}: all {} pixels are the desktop and its {} window{}",
-            k + 1,
+            "screenshot {k}: all {} pixels are the desktop and its {} window{}{}",
             SCREEN.0 * SCREEN.1,
             windows.len(),
-            if windows.len() == 1 { "" } else { "s" }
+            if windows.len() == 1 { "" } else { "s" },
+            pointer.map_or(String::new(), |(x, y)| format!(", the pointer at ({x}, {y})"))
         )),
         Some((x, y, have, want)) => Err(format!(
-            "screenshot {}: {wrong} pixels wrong, the first at ({x}, {y}): {have:?}, not {want:?}",
-            k + 1
+            "screenshot {k}: {wrong} pixels wrong, the first at ({x}, {y}): {have:?}, not {want:?}"
         )),
     }
 }
@@ -2306,6 +2328,245 @@ fn desktop_test(arch: Arch) -> Result<(), String> {
         println!("== {}", s.clone()?);
     }
     println!("== desktop test passed ({})", arch.name());
+    Ok(())
+}
+
+/// The pointer the compositor draws (user/compositor: `CURSOR`), its tip
+/// at the top left: `#` black, `o` white, a space what is under it.
+const CURSOR: [&str; 17] = [
+    "#           ",
+    "##          ",
+    "#o#         ",
+    "#oo#        ",
+    "#ooo#       ",
+    "#oooo#      ",
+    "#ooooo#     ",
+    "#oooooo#    ",
+    "#ooooooo#   ",
+    "#oooooooo#  ",
+    "#ooooo##### ",
+    "#oo#oo#     ",
+    "#o# #oo#    ",
+    "##  #oo#    ",
+    "#    #oo#   ",
+    "     #oo#   ",
+    "      ##    ",
+];
+
+/// What each of the input test's screenshots must show: the windows,
+/// back to front, and where the pointer is.
+fn input_pictures() -> Vec<(Vec<ShownWindow>, (usize, usize))> {
+    let a = ShownWindow { id: 0, at: (100, 100), size: (300, 200), phase: 0 };
+    let b = ShownWindow { id: 1, at: (300, 200), size: (320, 240), phase: 0 };
+    let a3 = ShownWindow { phase: 3, ..a };
+    let b_at = |phase| ShownWindow { phase, ..b };
+    let over_a = (150, 130);
+    vec![
+        (vec![a, b], over_a),
+        (vec![b, a], over_a),
+        (vec![b, a3], over_a),
+        (vec![a3, b_at(1)], (700, 450)),
+        (vec![a3, b_at(2)], over_a),
+        (vec![b_at(3), a3], over_a),
+    ]
+}
+
+/// What the host does through QEMU's monitor at a step of the input test.
+enum Act {
+    /// Moves the mouse this far right and down.
+    Move(i64, i64),
+    /// Presses (true) or lets go of the left button.
+    Button(bool),
+    /// Types these letters on the keyboard.
+    Type(&'static str),
+    /// Takes screenshot `k` (from 1) and checks it.
+    Shot(usize),
+}
+
+/// The input test's script: at each step, what must be in the output
+/// first, then what the host does. The pointer starts in the middle of
+/// the screen (400, 300) whenever the compositor starts, and every move
+/// stays on the screen, so where it ends is known.
+fn input_script() -> Vec<(Vec<&'static str>, Vec<Act>)> {
+    use Act::*;
+    vec![
+        (
+            vec![
+                "hid: ready: a boot mouse",
+                "compositor: input subscribed",
+                "window B shown over window A, with the focus",
+            ],
+            // To (150, 130), over window A alone.
+            vec![Move(-250, -170)],
+        ),
+        (vec!["the pointer came to (50, 30) (time 1)"], vec![Shot(1), Button(true), Button(false)]),
+        (vec!["so it has the focus and is in front (time 1)"], vec![Shot(2), Type("abc")]),
+        // To (500, 350), over window B alone.
+        (vec!["typed \"abc\""], vec![Shot(3), Move(350, 220)]),
+        // Pressed there, held to (700, 450), off window B, and let go.
+        (vec!["window B: the pointer came to (200, 150)"], vec![Button(true), Move(200, 100), Button(false)]),
+        (vec!["window B: held the pointer from"], vec![Type("d")]),
+        (vec!["typed \"d\", the first key"], vec![Shot(4)]),
+        // The compositor restarted: from (400, 300) to (150, 130) again.
+        (vec!["window B made again after the compositor's restart"], vec![Type("e"), Move(-250, -170)]),
+        (vec!["typed \"de\"", "the pointer came to (50, 30) (time 2)"], vec![Shot(5)]),
+        (vec!["input subscribed again"], vec![Type("f")]),
+        (vec!["typed \"def\""], vec![Button(true), Button(false)]),
+        (vec!["picture 6 on the screen"], vec![Shot(6)]),
+    ]
+}
+
+/// Sends QMP commands (one JSON object a line) through QEMU's monitor,
+/// each answered before the next.
+fn qmp(commands: &[String]) -> Result<(), String> {
+    use std::io::{BufRead, BufReader};
+    use std::net::TcpStream;
+    let s = TcpStream::connect(("127.0.0.1", QMP_PORT)).map_err(|e| format!("QMP: {e}"))?;
+    s.set_read_timeout(Some(Duration::from_secs(20))).map_err(|e| e.to_string())?;
+    let mut w = s.try_clone().map_err(|e| e.to_string())?;
+    let mut r = BufReader::new(s);
+    let mut line = String::new();
+    let all = std::iter::once("{\"execute\":\"qmp_capabilities\"}".to_string()).chain(commands.iter().cloned());
+    for c in all {
+        w.write_all(c.as_bytes()).and_then(|()| w.write_all(b"\n")).map_err(|e| format!("QMP: {e}"))?;
+        loop {
+            line.clear();
+            if r.read_line(&mut line).map_err(|e| format!("QMP: {e}"))? == 0 {
+                return Err("QMP: the monitor hung up".into());
+            }
+            if line.contains("\"error\"") {
+                return Err(format!("QMP: {} answered {}", c, line.trim()));
+            }
+            if line.contains("\"return\"") {
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Does one act of the input test's script.
+fn input_act(act: &Act, arch: Arch) -> Result<Option<String>, String> {
+    let send = |events: String| format!("{{\"execute\":\"input-send-event\",\"arguments\":{{\"events\":[{events}]}}}}");
+    match act {
+        Act::Move(dx, dy) => qmp(&[send(format!(
+            "{{\"type\":\"rel\",\"data\":{{\"axis\":\"x\",\"value\":{dx}}}}},{{\"type\":\"rel\",\"data\":{{\"axis\":\"y\",\"value\":{dy}}}}}"
+        ))])?,
+        Act::Button(down) => qmp(&[send(format!(
+            "{{\"type\":\"btn\",\"data\":{{\"down\":{down},\"button\":\"left\"}}}}"
+        ))])?,
+        Act::Type(keys) => {
+            for k in keys.chars() {
+                for down in [true, false] {
+                    qmp(&[send(format!(
+                        "{{\"type\":\"key\",\"data\":{{\"down\":{down},\"key\":{{\"type\":\"qcode\",\"data\":\"{k}\"}}}}}}"
+                    ))])?;
+                    std::thread::sleep(Duration::from_millis(KEY_GAP_MS));
+                }
+            }
+        }
+        Act::Shot(k) => {
+            let path = root().join("target").join(format!("input-{}-{k}.ppm", arch.name()));
+            let _ = std::fs::remove_file(&path);
+            screendump(&path)?;
+            let (windows, pointer) = &input_pictures()[k - 1];
+            return check_windows(&path, *k, windows, Some(*pointer)).map(Some);
+        }
+    }
+    // Long enough for the mouse to be polled, so separate acts are separate
+    // reports.
+    std::thread::sleep(Duration::from_millis(60));
+    Ok(None)
+}
+
+/// Boots `boot/input.manifest`: the compositor with a USB keyboard and
+/// mouse. Through QEMU's monitor the host moves the pointer over window
+/// A, clicks it (it takes the focus and comes in front) and types to it
+/// (it is drawn anew at each key); presses on window B, holds the
+/// pointer off it and lets go, and types to B; then, after the second
+/// client kills the compositor and later the HID driver, types and points
+/// again. Six screenshots must show every pixel right, the pointer
+/// included.
+fn input_test(arch: Arch) -> Result<(), String> {
+    let img = image_with(false, arch, "input")?;
+    println!("== input test on {}", img.path.display());
+    let results: Arc<Mutex<(usize, Vec<Result<String, String>>)>> = Arc::default();
+    let done = results.clone();
+    let script = input_script();
+    let steps = script.len();
+    let out = run_to_exit_watching(&img, Duration::from_secs(180), move |all| {
+        let mut done = done.lock().unwrap();
+        while done.0 < script.len() && done.1.iter().all(Result::is_ok) {
+            let (wait, acts) = &script[done.0];
+            if !wait.iter().all(|w| all.contains(w)) {
+                return;
+            }
+            for act in acts {
+                match input_act(act, arch) {
+                    Ok(Some(shot)) => done.1.push(Ok(shot)),
+                    Ok(None) => {}
+                    Err(e) => {
+                        done.1.push(Err(e));
+                        return;
+                    }
+                }
+            }
+            done.0 += 1;
+        }
+    });
+    let (at, shots) = {
+        let r = results.lock().unwrap();
+        (r.0, r.1.clone())
+    };
+    for s in &shots {
+        match s {
+            Ok(s) => println!("== {s}"),
+            Err(e) => return Err(format!("input test: {e}")),
+        }
+    }
+    let out = out?;
+    if at != steps {
+        return Err(format!("input test: the script stopped at step {} of {steps}", at + 1));
+    }
+    let log = [
+        "hid: ready: a boot keyboard on device",
+        "hid: ready: a boot mouse on device",
+        "compositor: ready: the desktop on a 800x600 screen",
+        "compositor: input subscribed: keys and the pointer",
+        "[pass] input: window A shown",
+        "[pass] input: window A is on the screen",
+        "[pass] input: window B shown",
+        "[pass] input: window B shown over window A, with the focus",
+        "input: window A: the pointer came to (50, 30) (time 1)",
+        "[pass] input: window A: clicked at (50, 30), so it has the focus and is in front (time 1)",
+        "[pass] input: window A: typed \"abc\", drawn anew at each key",
+        "input: window B: the pointer came to (200, 150)",
+        "[pass] input: window B: held the pointer from (200, 150) to (400, 250), outside it, and let it go",
+        "[pass] input: window B: typed \"d\", the first key it got: picture 4 on the screen",
+        "input: killing the compositor",
+        "[cm] fault injection: killing compositor",
+        "compositor: ready: the desktop on a 800x600 screen",
+        "input: window A: the compositor restarted; making the window again",
+        "[pass] input: window A made again after the compositor's restart",
+        "[pass] input: window B made again",
+        "[pass] input: window B made again after the compositor's restart, with the focus",
+        "[pass] input: window B: typed \"de\"",
+        "input: window A: the pointer came to (50, 30) (time 2)",
+        "input: killing the input driver",
+        "[cm] fault injection: killing hid",
+        "compositor: the input driver restarted; input subscribed again",
+        "[pass] input: window B: typed \"def\" after the input driver's restart",
+        "[pass] input: window A: clicked at (50, 30), so it has the focus and is in front (time 2)",
+        "[pass] input: window B lost the focus to window A: picture 6 on the screen",
+        "[pass] input: window B got only the keys typed to it (\"def\") and was told the pointer left it",
+        "input: done (0 failed)",
+        "[cm] second asked to shut down (pass)",
+    ];
+    check_log("input test", &out, &log)?;
+    if shots.len() != input_pictures().len() {
+        return Err(format!("input test: {} screenshots taken, want {}", shots.len(), input_pictures().len()));
+    }
+    println!("== input test passed ({})", arch.name());
     Ok(())
 }
 

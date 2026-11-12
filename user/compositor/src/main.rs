@@ -19,27 +19,47 @@
 //! before it reads the window and every fifth of a second, and takes away
 //! the window whose page is gone.
 //!
+//! Input comes from an input driver (`input`), which signals a badged
+//! copy of the compositor's notification when events arrive. The pointer
+//! is drawn over everything once it first moves. The window under it gets
+//! pointer events; a button pressed over a window gives it the keyboard
+//! focus, puts it in front and holds the pointer to it until every button
+//! is let go. Keys go to the window with the focus. Each window keeps its
+//! events until its client reads them and signals the notification the
+//! client lent. A restarted input driver has forgotten the subscription:
+//! a read it refuses has the compositor subscribe again (and it reads
+//! every fifth of a second as well as when signalled).
+//!
 //! Slots: 0 the display, 1 the receive side of `window`, 2 a notification
-//! (its timer), 3 memory for the screen.
+//! (its timer and input), 3 memory for the screen, 6 the input driver (if
+//! any).
 
 #![no_std]
 #![no_main]
 
 use superior_objects::abi::{CapTransfer, Error, ObjectType, Syscall};
 use superior_objects::idl::{display, window};
-use superior_objects::interfaces::Status;
+use superior_objects::interfaces::{Status, input};
 use superior_sys::{USER_BASE, print_line, syscall, syscall_x};
 
 const DISPLAY: u64 = 0;
 const SERVICE: u64 = 1;
 const NOTIFY: u64 = 2;
 const MEMORY: u64 = 3;
-/// Where a lent page arrives.
+/// Where a lent page or notification arrives.
 const LENT: u64 = 4;
 /// Where a window's first page is copied to see if it is still there.
 const PROBE: u64 = 5;
+const INPUT: u64 = 6;
+/// A copy of the notification badged `INPUT_BADGE`, lent to the input
+/// driver.
+const INPUT_CAP: u64 = 7;
+const INPUT_BADGE: u64 = 1;
 /// The screen's pages.
 const SCREEN: u64 = 16;
+/// The notification each window's client lent (`LISTEN`).
+const LISTENERS: u64 = SCREEN + SCREEN_PAGES;
+const _: () = assert!(LISTENERS + window::MAX_WINDOWS <= WINDOW_SLOTS);
 /// Each window's pages: window `i` from `WINDOW_SLOTS + i *
 /// window::WINDOW_PAGES`.
 const WINDOW_SLOTS: u64 = 1056;
@@ -73,6 +93,48 @@ fn ticks() -> u64 {
 fn desktop(x: u32, y: u32) -> u32 {
     if ((x >> 4) + (y >> 4)) & 1 == 0 { 0x0028_3040 } else { 0x0030_3848 }
 }
+
+/// The pointer, its tip at the top left: `#` black, `o` white, a space
+/// what is under it. `cargo xtask input-test` draws the same to check
+/// screenshots.
+const CURSOR: [&[u8; 12]; 17] = [
+    b"#           ",
+    b"##          ",
+    b"#o#         ",
+    b"#oo#        ",
+    b"#ooo#       ",
+    b"#oooo#      ",
+    b"#ooooo#     ",
+    b"#oooooo#    ",
+    b"#ooooooo#   ",
+    b"#oooooooo#  ",
+    b"#ooooo##### ",
+    b"#oo#oo#     ",
+    b"#o# #oo#    ",
+    b"##  #oo#    ",
+    b"#    #oo#   ",
+    b"     #oo#   ",
+    b"      ##    ",
+];
+const CURSOR_W: u32 = 12;
+const CURSOR_H: u32 = 17;
+
+/// A window's events not yet read.
+#[derive(Clone, Copy)]
+struct Queue {
+    events: [(u64, u64, u64); window::EVENTS as usize],
+    head: usize,
+    len: usize,
+    /// Whether its client lent a notification.
+    listening: bool,
+}
+
+const EMPTY_QUEUE: Queue = Queue {
+    events: [(0, 0, 0); window::EVENTS as usize],
+    head: 0,
+    len: 0,
+    listening: false,
+};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct Rect {
@@ -161,6 +223,21 @@ struct Compositor {
     /// screen they leave to repaint.
     reaped: u64,
     pending: Rect,
+    queues: [Queue; window::MAX_WINDOWS as usize],
+    /// Where the pointer is, and whether it is drawn (once it has moved).
+    pointer: (u32, u32),
+    cursor: bool,
+    /// The buttons held.
+    buttons: u64,
+    /// The window under the pointer (or holding it), the one holding it
+    /// while buttons are held, and the one with the keyboard focus.
+    hover: Option<usize>,
+    grab: Option<usize>,
+    focus: Option<usize>,
+    /// Whether the input driver has this compositor as a subscriber, and
+    /// how many times it subscribed.
+    subscribed: bool,
+    subscriptions: u64,
 }
 
 /// A call to the display driver; while it restarts, tried again until the
@@ -294,6 +371,28 @@ impl Compositor {
                 }
             }
         }
+        let c = self.cursor_rect();
+        let part = c.intersect(r);
+        for y in part.y..part.y + part.h {
+            for x in part.x..part.x + part.w {
+                let p = match CURSOR[(y - c.y) as usize][(x - c.x) as usize] {
+                    b'#' => 0,
+                    b'o' => 0x00ff_ffff,
+                    _ => continue,
+                };
+                // SAFETY: as above.
+                unsafe { screen.add(y as usize * pitch + x as usize).write(p) };
+            }
+        }
+    }
+
+    /// Where the pointer is drawn (nothing before it first moves).
+    fn cursor_rect(&self) -> Rect {
+        if !self.cursor {
+            return NONE;
+        }
+        let (x, y) = self.pointer;
+        Rect { x, y, w: CURSOR_W, h: CURSOR_H }.intersect(self.whole())
     }
 
     /// Repaints `r` and has the driver show it. A driver that refuses (it
@@ -337,7 +436,225 @@ impl Compositor {
         for p in 0..w.pages {
             syscall(Syscall::CapDelete, WINDOW_SLOTS + i as u64 * window::WINDOW_PAGES + p, [0; 4]);
         }
+        syscall(Syscall::CapDelete, LISTENERS + i as u64, [0; 4]);
+        self.queues[i] = EMPTY_QUEUE;
         self.unstack(i);
+        if self.grab == Some(i) {
+            self.grab = None;
+        }
+        if self.hover == Some(i) {
+            self.hover = None;
+        }
+        if self.focus == Some(i) {
+            // The front window takes the focus.
+            self.focus = None;
+            self.set_focus(self.front());
+        }
+    }
+
+    fn front(&self) -> Option<usize> {
+        self.shown.checked_sub(1).map(|k| self.order[k])
+    }
+
+    /// Gives window `i` an event, and signals its client.
+    fn post(&mut self, i: usize, kind: u64, a: u64, b: u64) {
+        let q = &mut self.queues[i];
+        let n = q.events.len();
+        if q.len == n {
+            // The oldest goes.
+            q.head = (q.head + 1) % n;
+            q.len -= 1;
+        }
+        q.events[(q.head + q.len) % n] = (kind, a, b);
+        q.len += 1;
+        if q.listening {
+            syscall(Syscall::Signal, LISTENERS + i as u64, [0; 4]);
+        }
+    }
+
+    fn set_focus(&mut self, to: Option<usize>) {
+        if to == self.focus {
+            return;
+        }
+        if let Some(o) = self.focus {
+            self.post(o, window::FOCUS, 0, 0);
+        }
+        self.focus = to;
+        if let Some(n) = to {
+            say!("window {n} has the focus");
+            self.post(n, window::FOCUS, 1, 0);
+        }
+    }
+
+    /// The front window under the pointer.
+    fn window_at(&self) -> Option<usize> {
+        let (x, y) = self.pointer;
+        self.order[..self.shown].iter().rev().copied().find(|&i| {
+            self.windows[i].is_some_and(|w| x >= w.at.x && x < w.at.x + w.at.w && y >= w.at.y && y < w.at.y + w.at.h)
+        })
+    }
+
+    /// The pointer in window `i`'s pixels (x | y << 16, each a signed
+    /// 16-bit number).
+    fn local(&self, i: usize) -> u64 {
+        let Some(w) = self.windows[i] else { return 0 };
+        let x = (self.pointer.0 as i32 - w.at.x as i32) as i16 as u16 as u64;
+        let y = (self.pointer.1 as i32 - w.at.y as i32) as i16 as u16 as u64;
+        x | y << 16
+    }
+
+    /// Tells window `i` (if any) where the pointer is.
+    fn post_pointer(&mut self, i: Option<usize>) {
+        if let Some(i) = i {
+            self.post(i, window::POINTER, self.local(i), self.buttons);
+        }
+    }
+
+    /// The window under the pointer changed to `to`: the one it left is
+    /// told so.
+    fn hover_to(&mut self, to: Option<usize>) {
+        if self.hover != to {
+            if let Some(h) = self.hover {
+                self.post(h, window::LEAVE, 0, 0);
+            }
+            self.hover = to;
+        }
+    }
+
+    /// One event from the input driver: the part of the screen it changes.
+    fn input_event(&mut self, kind: u64, a: u64, b: u64) -> Rect {
+        match kind {
+            input::KEY => {
+                if let Some(f) = self.focus {
+                    self.post(f, window::KEY, a, b);
+                }
+                NONE
+            }
+            input::MOTION => {
+                let before = self.cursor_rect();
+                let to = |at: u32, d: u64, size: u32| (at as i64 + d as i64).clamp(0, size as i64 - 1) as u32;
+                self.pointer = (to(self.pointer.0, a, self.width), to(self.pointer.1, b, self.height));
+                self.cursor = true;
+                let target = self.grab.or_else(|| self.window_at());
+                self.hover_to(target);
+                self.post_pointer(target);
+                before.union(self.cursor_rect())
+            }
+            input::BUTTON if a < 3 => {
+                let held = self.buttons;
+                if b == 1 {
+                    self.buttons |= 1 << a;
+                } else {
+                    self.buttons &= !(1 << a);
+                }
+                let mut damage = NONE;
+                if held == 0 && self.buttons != 0 {
+                    let under = self.window_at();
+                    self.grab = under;
+                    self.hover_to(under);
+                    if let Some(i) = under {
+                        self.set_focus(Some(i));
+                        if self.front() != Some(i) {
+                            self.to_front(i);
+                            damage = self.windows[i].map_or(NONE, |w| w.at);
+                        }
+                    }
+                }
+                self.post_pointer(self.grab.or(self.hover));
+                if self.buttons == 0 && held != 0 {
+                    self.let_go();
+                }
+                damage
+            }
+            _ => NONE,
+        }
+    }
+
+    /// Every button is up: the window that held the pointer lets it go,
+    /// and the one under it gets it.
+    fn let_go(&mut self) {
+        self.grab = None;
+        let under = self.window_at();
+        if under != self.hover {
+            self.hover_to(under);
+            self.post_pointer(under);
+        }
+    }
+
+    /// Subscribes to the input driver, lending it the badged notification.
+    fn subscribe(&mut self) {
+        let x = CapTransfer { grant: Some(INPUT_CAP as u16), accept: None };
+        let r = syscall_x(Syscall::Call, INPUT, [input::SUBSCRIBE, input::VERSION, 0, 0], x);
+        if r.status != 0 || r.msg[0] != Status::Ok as u64 {
+            return;
+        }
+        self.subscribed = true;
+        self.subscriptions += 1;
+        if self.subscriptions == 1 {
+            say!("input subscribed: keys and the pointer");
+        } else {
+            say!("the input driver restarted; input subscribed again");
+        }
+        // Buttons held then are up now.
+        if self.buttons != 0 {
+            self.buttons = 0;
+            self.post_pointer(self.grab.or(self.hover));
+            self.let_go();
+        }
+    }
+
+    /// Reads every event the input driver has.
+    fn read_input(&mut self) {
+        if !self.subscribed {
+            self.subscribe();
+            if !self.subscribed {
+                return;
+            }
+        }
+        let mut damage = NONE;
+        for _ in 0..256 {
+            let r = syscall(Syscall::Call, INPUT, [input::READ, 0, 0, 0]);
+            if r.status != 0 || (r.msg[0] != Status::Ok as u64 && r.msg[0] != Status::Empty as u64) {
+                // Restarted: it no longer knows this subscriber.
+                self.subscribed = false;
+                break;
+            }
+            if r.msg[0] == Status::Empty as u64 {
+                break;
+            }
+            damage = damage.union(self.input_event(r.msg[1], r.msg[2], r.msg[3]));
+        }
+        if !damage.empty() {
+            self.show(damage);
+        }
+    }
+
+    fn listen(&mut self, i: usize, lent: bool) -> Status {
+        if !lent {
+            return Status::Invalid;
+        }
+        let slot = LISTENERS + i as u64;
+        syscall(Syscall::CapDelete, slot, [0; 4]);
+        if syscall(Syscall::CapMint, LENT, [slot, ALL, 0, 0]).status != 0 {
+            self.queues[i].listening = false;
+            return Status::Invalid;
+        }
+        self.queues[i].listening = true;
+        if self.queues[i].len > 0 {
+            syscall(Syscall::Signal, slot, [0; 4]);
+        }
+        Status::Ok
+    }
+
+    fn next(&mut self, i: usize) -> [u64; 4] {
+        let q = &mut self.queues[i];
+        if q.len == 0 {
+            return [Status::Empty as u64, 0, 0, 0];
+        }
+        let (kind, a, b) = q.events[q.head];
+        q.head = (q.head + 1) % q.events.len();
+        q.len -= 1;
+        [Status::Ok as u64, kind, a, b]
     }
 
     fn unstack(&mut self, i: usize) {
@@ -384,6 +701,7 @@ impl Compositor {
             return [Status::InUse as u64, 0, 0, 0];
         };
         self.windows[i] = Some(w);
+        self.queues[i] = EMPTY_QUEUE;
         [Status::Ok as u64, i as u64, 0, 0]
     }
 
@@ -421,6 +739,7 @@ impl Compositor {
             w.shown = true;
             self.windows[i] = Some(w);
             self.to_front(i);
+            self.set_focus(Some(i));
             w.at
         };
         self.show(damage);
@@ -455,7 +774,13 @@ impl Compositor {
                 [Status::Ok as u64, self.width as u64, self.height as u64, self.shown as u64]
             }
             window::CREATE => self.create(m[1], m[2], badge),
-            op @ (window::ATTACH | window::COMMIT | window::MOVE_TO | window::RAISE | window::DESTROY) => {
+            op @ (window::ATTACH
+            | window::COMMIT
+            | window::MOVE_TO
+            | window::RAISE
+            | window::DESTROY
+            | window::LISTEN
+            | window::NEXT) => {
                 let Some(i) = self.own(m[1], badge) else {
                     return status(Status::NotFound);
                 };
@@ -463,6 +788,8 @@ impl Compositor {
                     window::ATTACH => status(self.attach(i, m[2], lent)),
                     window::COMMIT => self.commit(i, m[2]),
                     window::MOVE_TO => status(self.move_to(i, m[2])),
+                    window::LISTEN => status(self.listen(i, lent)),
+                    window::NEXT => self.next(i),
                     window::RAISE => {
                         if let Some(w) = self.windows[i].filter(|w| w.shown) {
                             self.to_front(i);
@@ -490,6 +817,9 @@ impl Compositor {
         if self.reap() {
             self.show(NONE);
         }
+        // An input driver that restarted refuses the read (or there is
+        // none yet to subscribe to).
+        self.read_input();
         if ticks() >= self.last_flush + KEEPALIVE_TICKS {
             // One pixel, repainted as it is: shows nothing new, but a
             // driver that lost the screen refuses it.
@@ -514,10 +844,21 @@ pub extern "C" fn _start(_: u64) -> ! {
         last_flush: 0,
         reaped: 0,
         pending: NONE,
+        queues: [EMPTY_QUEUE; window::MAX_WINDOWS as usize],
+        pointer: (0, 0),
+        cursor: false,
+        buttons: 0,
+        hover: None,
+        grab: None,
+        focus: None,
+        subscribed: false,
+        subscriptions: 0,
     };
     if !c.set_up_display() {
         superior_sys::park()
     }
+    // The pointer starts in the middle of the screen.
+    c.pointer = (c.width / 2, c.height / 2);
     let all = c.whole();
     c.paint(all);
     c.flush(all);
@@ -526,6 +867,10 @@ pub extern "C" fn _start(_: u64) -> ! {
     if syscall(Syscall::NotificationBind, NOTIFY, [0; 4]).status != 0 {
         say!("[fail] binding the notification");
     }
+    if syscall(Syscall::CapMint, NOTIFY, [INPUT_CAP, ALL, INPUT_BADGE, 0]).status != 0 {
+        say!("[fail] minting the input driver's copy of the notification");
+    }
+    c.read_input();
     let accept = CapTransfer { grant: None, accept: Some(LENT as u16) };
     let mut reply: Option<[u64; 4]> = None;
     let mut next_check = ticks() + CHECK_TICKS;
@@ -540,7 +885,13 @@ pub extern "C" fn _start(_: u64) -> ! {
             Some(m) => syscall_x(Syscall::ReplyRecv, SERVICE, m, accept),
             None => syscall_x(Syscall::Recv, SERVICE, [0; 4], accept),
         };
-        if r.status == Error::Notified.code() || r.status != 0 {
+        if r.status == Error::Notified.code() {
+            if r.badge & INPUT_BADGE != 0 {
+                c.read_input();
+            }
+            continue;
+        }
+        if r.status != 0 {
             continue;
         }
         let lent = r.cap == Some(LENT as u16);

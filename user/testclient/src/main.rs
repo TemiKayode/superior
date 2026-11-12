@@ -4149,7 +4149,11 @@ fn keyboard_client() -> ! {
             if r.msg[0] == Status::Empty as u64 {
                 break;
             }
-            let (key, pressed) = (r.msg[1], r.msg[2] == 1);
+            let (key, pressed) = (r.msg[2], r.msg[3] & 1 == 1);
+            if r.msg[1] != input::KEY {
+                strays += 1;
+                continue;
+            }
             if !pressed {
                 continue;
             }
@@ -4504,6 +4508,258 @@ fn desktop_second() -> ! {
     superior_sys::park()
 }
 
+// ---- the input clients (`arg 27` and `arg 28`, boot/input.manifest) ----
+
+/// The notification the compositor signals when a window has events.
+const WINDOW_NTFN: u64 = 5;
+/// Components the second input client kills: the input driver and the
+/// compositor.
+const INPUT_DRIVER_INDEX: u64 = 2;
+const INPUT_COMPOSITOR_INDEX: u64 = 4;
+
+/// An event the compositor gave a window.
+enum WindowEvent {
+    /// A key's usage, and whether it went down.
+    Key(u64, bool),
+    /// Where the pointer is in the window, and the buttons held.
+    Pointer(i64, i64, u64),
+    Focus(bool),
+    Leave,
+}
+
+/// Makes the notification the compositor is to signal.
+fn make_window_ntfn() {
+    syscall(Syscall::Retype, WINDOW_MEMORY, [ObjectType::Notification as u64, 0, WINDOW_NTFN, 0]);
+}
+
+/// Lends the compositor the notification to signal when window `w` has
+/// events; whether it took it.
+fn listen(w: &TestWindow) -> bool {
+    let Some(n) = w.window else { return false };
+    let x = CapTransfer {
+        grant: Some(WINDOW_NTFN as u16),
+        accept: None,
+    };
+    let r = syscall_x(Syscall::Call, WINDOWS, window::listen(n), x);
+    r.status == 0 && r.msg[0] == OK
+}
+
+/// Window `w`'s next event, if it has one.
+fn next_event(w: &TestWindow) -> Option<WindowEvent> {
+    let n = w.window?;
+    let m = window_call(window::next(n), None).ok().filter(|m| m[0] == OK)?;
+    Some(match m[1] {
+        window::KEY => WindowEvent::Key(m[2], m[3] & 1 == 1),
+        window::POINTER => WindowEvent::Pointer(m[2] as u16 as i16 as i64, (m[2] >> 16) as u16 as i16 as i64, m[3]),
+        window::FOCUS => WindowEvent::Focus(m[2] == 1),
+        _ => WindowEvent::Leave,
+    })
+}
+
+/// Sleeps until the compositor signals or `ticks` pass.
+fn wait_events(ticks: u64) {
+    syscall(Syscall::TimerSignal, WINDOW_NTFN, [ticks, 0, 0, 0]);
+    syscall(Syscall::Wait, WINDOW_NTFN, [0; 4]);
+}
+
+/// The letter a key's usage stands for (`?` for any other key).
+fn letter(usage: u64) -> u8 {
+    if (4..=29).contains(&usage) { b'a' + (usage - 4) as u8 } else { b'?' }
+}
+
+/// Draws the window in its next phase and shows all of it.
+fn draw_next(w: &mut TestWindow) {
+    w.phase += 1;
+    draw_window(w);
+    let full = w.size.0 << 32 | w.size.1 << 48;
+    if let Some(n) = w.window {
+        let _ = window_call(window::commit(n, full), None);
+    }
+}
+
+/// Waits until the compositor has done everything it was doing (it does
+/// one thing at a time): what the client says next is on the screen.
+fn settled() {
+    window_info();
+}
+
+/// The first input client: shows window A, draws it anew at each key it
+/// gets, and says where the pointer came and when it was clicked; makes
+/// its window again whenever the compositor restarts.
+fn input_first() -> ! {
+    let mut t = Checks(0, "input");
+    let mut w = TestWindow { id: 0, size: (300, 200), at: (100, 100), phase: 0, window: None };
+    make_window_pages(&mut t, &w);
+    make_window_ntfn();
+    let r = open_window(&mut w);
+    t.check(r[0] == 0 && listen(&w), format_args!("window A shown"));
+    let mut typed = [0u8; 8];
+    let mut keys = 0;
+    let (mut arrivals, mut clicks, mut held, mut focused) = (0, 0, 0, false);
+    loop {
+        wait_events(5);
+        while let Some(e) = next_event(&w) {
+            match e {
+                WindowEvent::Key(k, true) => {
+                    if keys < typed.len() {
+                        typed[keys] = letter(k);
+                    }
+                    keys += 1;
+                    draw_next(&mut w);
+                    if keys == 3 && &typed[..3] == b"abc" {
+                        settled();
+                        t.check(true, format_args!("window A: typed \"abc\", drawn anew at each key"));
+                    } else if keys > 3 || typed[keys - 1] != b"abc"[keys - 1] {
+                        t.check(false, format_args!("window A got key '{}', not typed to it", letter(k) as char));
+                    }
+                }
+                WindowEvent::Pointer(x, y, b) => {
+                    if (x, y) == (50, 30) && b == 0 && held == 0 {
+                        arrivals += 1;
+                        settled();
+                        say!("input: window A: the pointer came to (50, 30) (time {arrivals})");
+                    }
+                    if (x, y) == (50, 30) && b == 0 && held & 1 != 0 {
+                        clicks += 1;
+                        settled();
+                        t.check(
+                            focused,
+                            format_args!(
+                                "window A: clicked at (50, 30), so it has the focus and is in front (time {clicks})"
+                            ),
+                        );
+                    }
+                    held = b;
+                }
+                WindowEvent::Focus(f) => focused = f,
+                _ => {}
+            }
+        }
+        // Moving it where it is changes nothing, but a compositor that
+        // restarted knows no such window.
+        let here = w.window.map(|n| window_call(window::move_to(n, w.at.0 | w.at.1 << 16), None));
+        if here != Some(Ok([0; 4])) {
+            say!("input: window A: the compositor restarted; making the window again");
+            let r = open_window(&mut w);
+            t.check(
+                r[0] == 0 && listen(&w),
+                format_args!("window A made again after the compositor's restart"),
+            );
+            (held, focused) = (0, false);
+        }
+    }
+}
+
+/// The second input client: shows window B over A and checks the pointer
+/// and keys it gets as the host moves the mouse, clicks and types; has
+/// the compositor and the input driver killed in turn.
+fn input_second() -> ! {
+    let mut t = Checks(0, "input");
+    let mut w = TestWindow { id: 1, size: (320, 240), at: (300, 200), phase: 0, window: None };
+    make_window_pages(&mut t, &w);
+    make_window_ntfn();
+    t.check(wait_shown(1), format_args!("window A is on the screen"));
+    let r = open_window(&mut w);
+    t.check(r[0] == 0 && listen(&w), format_args!("window B shown"));
+    let mut typed = [0u8; 8];
+    let mut keys = 0;
+    let (mut held, mut focused, mut leaves) = (0, false, 0);
+    let (mut came, mut press_at, mut announced, mut made_again) = (false, None, false, None);
+    loop {
+        wait_events(5);
+        while let Some(e) = next_event(&w) {
+            match e {
+                WindowEvent::Focus(f) => {
+                    focused = f;
+                    if f && !announced {
+                        announced = true;
+                        settled();
+                        t.check(true, format_args!("window B shown over window A, with the focus"));
+                    }
+                    if f && made_again.take().is_some() {
+                        settled();
+                        t.check(true, format_args!("window B made again after the compositor's restart, with the focus"));
+                    }
+                    if !f && keys == 3 {
+                        settled();
+                        t.check(true, format_args!("window B lost the focus to window A: picture 6 on the screen"));
+                        superior_sys::sleep(SCREENSHOT_TICKS);
+                        t.check(
+                            &typed[..3] == b"def" && leaves > 0,
+                            format_args!(
+                                "window B got only the keys typed to it (\"{}\") and was told the pointer left it {leaves} time{}",
+                                core::str::from_utf8(&typed[..3]).unwrap_or("?"),
+                                if leaves == 1 { "" } else { "s" }
+                            ),
+                        );
+                        say!("input: done ({} failed)", t.0);
+                        syscall(Syscall::Call, DESKTOP_CONTROL, [OP_SHUTDOWN, t.0, 0, 0]);
+                        superior_sys::park()
+                    }
+                }
+                WindowEvent::Pointer(x, y, b) => {
+                    if (x, y) == (200, 150) && b == 0 && held == 0 && !came {
+                        came = true;
+                        say!("input: window B: the pointer came to (200, 150)");
+                    }
+                    if b & 1 != 0 && held == 0 {
+                        press_at = Some((x, y));
+                    }
+                    if b == 0 && held & 1 != 0 {
+                        let outside = !(0..320).contains(&x) || !(0..240).contains(&y);
+                        let from = press_at.take().unwrap_or((-1, -1));
+                        t.check(
+                            from == (200, 150) && (x, y) == (400, 250) && outside && focused,
+                            format_args!(
+                                "window B: held the pointer from ({}, {}) to ({x}, {y}), outside it, and let it go",
+                                from.0, from.1
+                            ),
+                        );
+                    }
+                    held = b;
+                }
+                WindowEvent::Leave => leaves += 1,
+                WindowEvent::Key(k, true) => {
+                    if keys < typed.len() {
+                        typed[keys] = letter(k);
+                    }
+                    keys += 1;
+                    draw_next(&mut w);
+                    settled();
+                    match keys {
+                        1 => {
+                            t.check(
+                                typed[0] == b'd',
+                                format_args!("window B: typed \"d\", the first key it got: picture 4 on the screen"),
+                            );
+                            superior_sys::sleep(SCREENSHOT_TICKS);
+                            say!("input: killing the compositor");
+                            syscall(Syscall::Call, DESKTOP_CONTROL, [OP_KILL, INPUT_COMPOSITOR_INDEX, 0, 0]);
+                            // Window A first, so it is behind again.
+                            let back = wait_shown(1);
+                            let r = open_window(&mut w);
+                            t.check(back && r[0] == 0 && listen(&w), format_args!("window B made again"));
+                            (held, focused, made_again) = (0, false, Some(()));
+                        }
+                        2 => {
+                            t.check(&typed[..2] == b"de", format_args!("window B: typed \"de\""));
+                            superior_sys::sleep(SCREENSHOT_TICKS);
+                            say!("input: killing the input driver");
+                            syscall(Syscall::Call, DESKTOP_CONTROL, [OP_KILL, INPUT_DRIVER_INDEX, 0, 0]);
+                        }
+                        3 => t.check(
+                            &typed[..3] == b"def",
+                            format_args!("window B: typed \"def\" after the input driver's restart"),
+                        ),
+                        _ => t.check(false, format_args!("window B got key '{}', not typed to it", letter(k) as char)),
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
 fn display_client() -> ! {
     let mut t = Checks(0, "display");
     let pages = (SCREEN.0 * SCREEN.1 * 4).div_ceil(4096);
@@ -4590,6 +4846,8 @@ pub extern "C" fn _start(role: u64) -> ! {
         24 => display_client(),
         25 => desktop_first(),
         26 => desktop_second(),
+        27 => input_first(),
+        28 => input_second(),
         _ => probe(),
     }
 }

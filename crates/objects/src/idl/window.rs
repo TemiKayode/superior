@@ -10,16 +10,47 @@
 /// own windows (the capability's badge says whose); a window goes when its
 /// client does. Crash-only: when the compositor restarts, calls fail once
 /// with `PeerRestarted` and the client makes its windows again.
+///
+/// Input: the compositor draws the pointer over everything once it first
+/// moves. The window under it gets pointer events; pressing a button over
+/// a window gives it the keyboard focus, puts it in front and holds the
+/// pointer to it (it keeps getting pointer events, wherever the pointer
+/// goes) until every button is let go. Keys go to the window with the
+/// focus; a newly shown window takes it, and when the window with it goes
+/// the front window gets it. Each window keeps its events until its client
+/// reads them (`NEXT`), and signals the notification its client lent with
+/// `LISTEN` when one arrives.
 pub mod window {
     use crate::interfaces::Status;
 
-    pub const VERSION: u64 = 1;
+    pub const VERSION: u64 = 2;
 
     /// The most windows on the screen, all clients together.
     pub const MAX_WINDOWS: u64 = 8;
 
     /// The most pages one window may have (1.5 MiB: 640x600 at 32 bits).
     pub const WINDOW_PAGES: u64 = 384;
+
+    /// The kinds of event `NEXT` gives, and what `a` and `b` say.
+    /// A key went down or up while the window had the focus: `a` is its USB
+    /// HID usage, `b` is 1 if pressed and 0 if released, with the modifier
+    /// byte in bits 8 to 15.
+    pub const KEY: u64 = 1;
+
+    /// The pointer moved over the window (or anywhere, while it is held to the
+    /// window), or a button went down or up: `a` is where it is in the window
+    /// (x | y << 16, each a signed 16-bit number, negative off its left or
+    /// top), `b` the buttons held (bit 0 left, 1 right, 2 middle).
+    pub const POINTER: u64 = 2;
+
+    /// The window got the keyboard focus (`a` 1) or lost it (`a` 0).
+    pub const FOCUS: u64 = 3;
+
+    /// The pointer left the window.
+    pub const LEAVE: u64 = 4;
+
+    /// Events a window keeps until they are read; past that the oldest go.
+    pub const EVENTS: u64 = 32;
 
     /// The screen's size, and how many windows are shown on it (every
     /// client's).
@@ -123,5 +154,39 @@ pub mod window {
     /// The message of a `DESTROY` call.
     pub const fn destroy(window: u64) -> [u64; 4] {
         [DESTROY, window, 0, 0]
+    }
+
+    /// Has the compositor signal the notification the call lends whenever an
+    /// event for the window arrives (in place of one lent before).
+    pub const LISTEN: u64 = 8;
+    /// The message of a `LISTEN` call.
+    pub const fn listen(window: u64) -> [u64; 4] {
+        [LISTEN, window, 0, 0]
+    }
+
+    /// The window's oldest event not yet read: its kind and what it says.
+    /// `Empty` if there is none.
+    pub const NEXT: u64 = 9;
+    /// The message of a `NEXT` call.
+    pub const fn next(window: u64) -> [u64; 4] {
+        [NEXT, window, 0, 0]
+    }
+    /// What a `NEXT` call answers.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct NextReply {
+        pub kind: u64,
+        pub a: u64,
+        pub b: u64,
+    }
+    /// Reads a `NEXT` reply: its results, or the status it failed with.
+    pub fn next_reply(m: [u64; 4]) -> Result<NextReply, Status> {
+        match Status::from_u64(m[0]) {
+            Status::Ok => Ok(NextReply {
+                kind: m[1],
+                a: m[2],
+                b: m[3],
+            }),
+            s => Err(s),
+        }
     }
 }

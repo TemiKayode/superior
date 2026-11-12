@@ -592,22 +592,36 @@ pub mod usb {
     pub const READ: u64 = 6;
 }
 
-/// Input: what an input driver (a HID keyboard) serves.
+/// Input: what an input driver (a HID keyboard and mouse) serves.
 ///
-/// A subscriber gets a notification of the driver's, signalled when
-/// events arrive; a driver restart deletes it, which wakes the
-/// subscriber to subscribe again. Every subscriber sees every event from
-/// when it subscribed; one that falls far behind loses the oldest.
+/// A subscriber is signalled when events arrive: on a notification it
+/// lends with `SUBSCRIBE` (a server waiting for calls lends a badged copy
+/// of the one bound to its thread), or else on one of the driver's,
+/// granted in the reply, which a driver restart deletes, waking the
+/// subscriber to subscribe again. A subscriber that lent its own finds
+/// out about a restart when `READ` fails or answers `Denied`. Every
+/// subscriber sees every event from when it subscribed; one that falls
+/// far behind loses the oldest.
 pub mod input {
-    pub const VERSION: u64 = 1;
+    pub const VERSION: u64 = 2;
 
-    /// `[SUBSCRIBE, VERSION]`: reply `[status]` and the notification.
+    /// `[SUBSCRIBE, VERSION]`, optionally with a notification lent: reply
+    /// `[status]`, and the driver's notification if none was lent.
     pub const SUBSCRIBE: u64 = 1;
-    /// `[READ]`: the subscriber's next event. Reply `[status, key, pressed,
-    /// modifiers]`: `key` is a USB HID usage (keyboard page: 4 is `a`, 0x2c
-    /// space; 0xe0 to 0xe7 the modifiers), `pressed` 1 or 0, `modifiers`
-    /// the modifier byte after it. `Empty` if there is none.
+    /// `[READ]`: the subscriber's next event. Reply `[status, kind, a,
+    /// b]`, `Empty` if there is none.
     pub const READ: u64 = 2;
+
+    /// A key: `a` is its USB HID usage (keyboard page: 4 is `a`, 0x2c
+    /// space; 0xe0 to 0xe7 the modifiers), `b` is 1 if pressed, 0 if
+    /// released, with the modifier byte after it in bits 8 to 15.
+    pub const KEY: u64 = 1;
+    /// The pointer moved: `a` and `b` are how far right and down, as
+    /// signed 64-bit numbers.
+    pub const MOTION: u64 = 2;
+    /// A pointer button: `a` is which (0 left, 1 right, 2 middle), `b`
+    /// is 1 if pressed, 0 if released.
+    pub const BUTTON: u64 = 3;
 }
 
 /// Files: what the filesystem server serves.

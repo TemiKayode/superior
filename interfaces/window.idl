@@ -7,7 +7,17 @@
 # own windows (the capability's badge says whose); a window goes when its
 # client does. Crash-only: when the compositor restarts, calls fail once
 # with `PeerRestarted` and the client makes its windows again.
-interface window version 1
+#
+# Input: the compositor draws the pointer over everything once it first
+# moves. The window under it gets pointer events; pressing a button over
+# a window gives it the keyboard focus, puts it in front and holds the
+# pointer to it (it keeps getting pointer events, wherever the pointer
+# goes) until every button is let go. Keys go to the window with the
+# focus; a newly shown window takes it, and when the window with it goes
+# the front window gets it. Each window keeps its events until its client
+# reads them (`NEXT`), and signals the notification its client lent with
+# `LISTEN` when one arrives.
+interface window version 2
 
 # The most windows on the screen, all clients together.
 const MAX_WINDOWS = 8
@@ -44,3 +54,29 @@ op RAISE = 6 (window)
 
 # Takes the window off the screen and gives its pages back.
 op DESTROY = 7 (window)
+
+# The kinds of event `NEXT` gives, and what `a` and `b` say.
+# A key went down or up while the window had the focus: `a` is its USB
+# HID usage, `b` is 1 if pressed and 0 if released, with the modifier
+# byte in bits 8 to 15.
+const KEY = 1
+# The pointer moved over the window (or anywhere, while it is held to the
+# window), or a button went down or up: `a` is where it is in the window
+# (x | y << 16, each a signed 16-bit number, negative off its left or
+# top), `b` the buttons held (bit 0 left, 1 right, 2 middle).
+const POINTER = 2
+# The window got the keyboard focus (`a` 1) or lost it (`a` 0).
+const FOCUS = 3
+# The pointer left the window.
+const LEAVE = 4
+
+# Events a window keeps until they are read; past that the oldest go.
+const EVENTS = 32
+
+# Has the compositor signal the notification the call lends whenever an
+# event for the window arrives (in place of one lent before).
+op LISTEN = 8 (window)
+
+# The window's oldest event not yet read: its kind and what it says.
+# `Empty` if there is none.
+op NEXT = 9 (window) -> (kind, a, b)
