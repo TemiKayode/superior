@@ -1,0 +1,71 @@
+# The desktop test (cargo xtask desktop-test).
+#
+# Linux's bochs driver runs the display, as in the display test, and the
+# compositor is its one client: it puts two clients' windows together over
+# the desktop. The second client moves its window, then kills the
+# compositor, the first client and the display driver in turn; after each
+# step the host checks every pixel of the screen. Component numbers
+# matter: the second client kills components 1, 2 and 3.
+
+component pcibus
+  image pcibus
+  priority 12
+  cspace 7
+  provides pci 0
+  device pci-config 1
+  device pci-mmio 2
+  device pci-io 84
+  device msi 3
+  device iommu 11
+  untyped 18 12
+  device intx 80
+
+component lde-bochs
+  image lde-bochs
+  priority 11
+  cspace 11
+  vspace 18
+  uses pci 0
+  provides display 1
+  notification 2
+  memory 22
+  untyped 20 3
+
+component compositor
+  image compositor
+  priority 10
+  # Its slots: the screen (up to 1024 pages) and 8 windows of up to 384
+  # pages each.
+  cspace 13
+  # Page tables for the screen and the windows.
+  vspace 17
+  uses display 0
+  provides window 1
+  notification 2
+  # 2 MiB for the screen (800x600 at 32 bits is 469 pages).
+  memory 22
+  untyped 21 3
+
+component first
+  image testclient
+  arg 25
+  priority 8
+  # Stopped for good when the second client kills it: its window must go.
+  restart never
+  uses window 0
+  cspace 8
+  # Its window: 300x200 at 32 bits is 59 pages.
+  memory 21
+  untyped 19 2
+
+component second
+  image testclient
+  arg 26
+  priority 8
+  uses window 0
+  control 1
+  fault-injector
+  cspace 8
+  # Its window: 320x240 at 32 bits is 75 pages.
+  memory 21
+  untyped 19 2

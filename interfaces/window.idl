@@ -1,0 +1,46 @@
+# Windows: what the compositor serves. A client draws a window into pages
+# of its own, lends them to the compositor a page at a time and asks for
+# rectangles of it to be shown; the compositor puts every client's
+# windows together over the desktop, front to back, and has the display
+# driver show the result. Pixels are XRGB8888, 32 bits each, rows the
+# window's width times 4 bytes apart. A client sees and changes only its
+# own windows (the capability's badge says whose); a window goes when its
+# client does. Crash-only: when the compositor restarts, calls fail once
+# with `PeerRestarted` and the client makes its windows again.
+interface window version 1
+
+# The most windows on the screen, all clients together.
+const MAX_WINDOWS = 8
+
+# The most pages one window may have (1.5 MiB: 640x600 at 32 bits).
+const WINDOW_PAGES = 384
+
+# The screen's size, and how many windows are shown on it (every
+# client's).
+op INFO = 1 (version) -> (width, height, shown)
+
+# Makes a window `size` (width | height << 16) at `position` (x | y << 16
+# on the screen), which must lie wholly on the screen. It is hidden until
+# its first `COMMIT`. `InUse` if there are `MAX_WINDOWS` already.
+op CREATE = 2 (size, position) -> (window)
+
+# Keeps page `page` of window `window`, which the call lends. Pages come
+# in order from 0.
+op ATTACH = 3 (window, page)
+
+# Shows the window's rectangle `rect` (x | y << 16 | width << 32 | height
+# << 48, in the window's pixels), once all its pages are attached. The
+# first commit shows the window, in front of every other. Returns how
+# many times the screen has changed.
+op COMMIT = 4 (window, rect) -> (frames)
+
+# Moves the window to `position` (x | y << 16), wholly on the screen. A
+# move to where it is changes nothing, so a client can ask whether the
+# compositor still has its window.
+op MOVE_TO = 5 (window, position)
+
+# Puts the window in front of every other.
+op RAISE = 6 (window)
+
+# Takes the window off the screen and gives its pages back.
+op DESTROY = 7 (window)

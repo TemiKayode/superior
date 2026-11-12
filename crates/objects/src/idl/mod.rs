@@ -5,7 +5,7 @@
 //! not what its description gives.
 //!
 //! The first is the PCI bus server's, which the Driver SDK calls through
-//! these; the display interface was described this way from the start.
+//! these; the display and window interfaces were described this way from the start.
 //! The hand-written modules in [`crate::interfaces`] describe the
 //! rest (and what travels with each call) until they are moved over.
 
@@ -15,6 +15,9 @@ pub use pci_file::pci;
 #[path = "display.rs"]
 mod display_file;
 pub use display_file::display;
+#[path = "window.rs"]
+mod window_file;
+pub use window_file::window;
 
 #[cfg(test)]
 mod tests {

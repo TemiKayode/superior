@@ -792,6 +792,26 @@ holds the rest):
   come through whole, and never a key that was not typed (a word cut by a restart
   counts as broken, not wrong); each driver must have been killed at least 10 times,
   20 of them while words came through. A run sees about 45 kills of each.
+- The compositor (`user/compositor/`), the display server. It is the display
+  driver's one client and serves `window` (`interfaces/window.idl`) to every
+  component that draws. Its screen is a surface of its own pages, lent to the
+  driver; a client draws a window into pages of its own and lends them, and each
+  commit of a rectangle has the compositor repaint that part of the screen (the
+  desktop, then every shown window back to front) and the driver show it. A
+  client sees and changes only its own windows (the badge says whose): moving,
+  raising, destroying. Crash-only throughout: a restarted compositor knows no
+  windows and clients make theirs again (moving a window where it is changes
+  nothing, so a client can ask whether its window is still known); a restarted
+  driver refuses the next flush, and the compositor lends it the screen again and
+  shows all of it (it asks every half second while nothing is drawn); a client
+  that goes takes its pages with it (the manager revokes its memory, and with it
+  the compositor's copies), and the compositor, which checks a window's first page
+  before reading it and every fifth of a second, takes the window off the screen.
+  `cargo xtask desktop-test` boots `boot/desktop.manifest` on both ISAs: one
+  client shows window A, another shows window B over it, moves it, then kills the
+  compositor, the first client (which stays stopped) and the display driver in
+  turn. After each of those five steps QEMU's monitor takes a screenshot, and
+  every pixel of the 800x600 screen must be the desktop's or the right window's.
 - Interrupt and exception entries clear the direction flag. User code may be
   interrupted mid-way through a backward copy, with the flag set; the kernel's own
   copies need it clear, and without the `cld` they ran backwards, wrecking saved
@@ -825,7 +845,10 @@ holds the rest):
   notifications, a 256-slot CNode pool) so filling them stays quick; normal kernels have
   32 of each, 32 address spaces and a 4096-slot pool.
 
-Not yet: in the Linux Driver Environment drivers of a class other than network
+Not yet: in the compositor input (keyboard focus and pointer), transparency,
+window decorations, the toolkit and the shell above it, and surviving a client
+that dies at the very moment its window is read (the compositor then faults and
+is restarted, which its clients survive); in the Linux Driver Environment drivers of a class other than network
 and simple display (GPUs with command submission, so Mesa's Vulkan drivers, which
 also need a POSIX environment), cursor planes and dirty-rectangle damage,
 ethtool and the MII ioctls, firmware files, more than one interrupt or one
@@ -866,11 +889,12 @@ https://claude.ai/artifact/QKJS8qH5Dfbjzn58RStq1j
 | `user/shell/` | The boot shell and COM1 driver, started as a component |
 | `crates/driver/` | The Driver SDK: PCI access through the bus server, MMIO, DMA pages, virtqueues, DMA buffer pools, an executor |
 | `crates/idl/` | The IDL compiler: interface descriptions to Rust |
-| `interfaces/` | Interface descriptions (`pci.idl`, the PCI bus server's; `display.idl`) |
+| `interfaces/` | Interface descriptions (`pci.idl`, the PCI bus server's; `display.idl`; `window.idl`) |
 | `crates/lde/` | The Linux Driver Environment: Linux's kernel API for hosted drivers (`include/`, `c/lde.c`, `c/lde-net.c`, `c/lde-drm.c`) and its host (`src/lib.rs`, `src/net.rs`, `src/display.rs`) |
 | `user/lde-8139cp/` | Linux's 8139cp network driver, unmodified, in the Linux Driver Environment |
 | `user/lde-e100/` | Linux's e100 network driver, likewise |
 | `user/lde-bochs/` | Linux's bochs DRM display driver, likewise |
+| `user/compositor/` | The display server: windows from every client over the desktop |
 | `user/pcibus/` | The PCI bus server |
 | `user/memserver/` | The Memory Server |
 | `user/fs/` | The filesystem server |
@@ -905,6 +929,7 @@ cargo xtask net-test       # just the network test (add aarch64 for that ISA)
 cargo xtask lde-test       # the network test over Linux's 8139cp driver (needs Docker; fetches the driver from kernel.org the first time)
 cargo xtask lde-e100-test  # the same over Linux's e100 driver
 cargo xtask display-test   # Linux's bochs display driver: two pictures, checked pixel by pixel from QEMU screenshots
+cargo xtask desktop-test   # the compositor: two clients' windows through restarts, five screenshots checked pixel by pixel
 cargo xtask tcp-test       # just the TCP test (add aarch64 for that ISA)
 cargo xtask keyboard-test  # just the USB keyboard test (add aarch64 for that ISA)
 cargo xtask hotplug-test   # just the PCI hot-plug test (add aarch64 for that ISA)

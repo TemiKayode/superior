@@ -166,6 +166,7 @@ fn main() -> ExitCode {
                         .and_then(|_| net_test(a, "lde"))
                         .and_then(|_| net_test(a, "lde-e100"))
                         .and_then(|_| display_test(a))
+                        .and_then(|_| desktop_test(a))
                         .and_then(|_| tcp_test(a))
                         .and_then(|_| keyboard_test(a))
                         .and_then(|_| hotplug_test(a))
@@ -192,6 +193,7 @@ fn main() -> ExitCode {
         Some("lde-test") => net_test(arch, "lde"),
         Some("lde-e100-test") => net_test(arch, "lde-e100"),
         Some("display-test") => display_test(arch),
+        Some("desktop-test") => desktop_test(arch),
         Some("tcp-test") => tcp_test(arch),
         Some("keyboard-test") => keyboard_test(arch),
         Some("hotplug-test") => hotplug_test(arch),
@@ -203,7 +205,7 @@ fn main() -> ExitCode {
         }
         Some("bench") => image(false, Arch::X86_64).and_then(|img| bench(&img)),
         _ => Err(
-            "usage: cargo xtask <idl | image | run | test | boot-test | shell-test | cm-test | supervise-test | drivers-test | memory-test | reboot-test | fs-test | nvme-test | ahci-test | net-test | lde-test | lde-e100-test | display-test | tcp-test | keyboard-test | hotplug-test | bench | sel4-test> [x86_64 | aarch64]"
+            "usage: cargo xtask <idl | image | run | test | boot-test | shell-test | cm-test | supervise-test | drivers-test | memory-test | reboot-test | fs-test | nvme-test | ahci-test | net-test | lde-test | lde-e100-test | display-test | desktop-test | tcp-test | keyboard-test | hotplug-test | bench | sel4-test> [x86_64 | aarch64]"
                 .into(),
         ),
     });
@@ -331,7 +333,7 @@ const LINUX_SOURCES: [(&str, &str, &str); 3] = [
 /// a network test's, or the display test's.
 fn linux_driver(manifest: &str) -> Option<&'static str> {
     match manifest {
-        "display" => Some("bochs"),
+        "display" | "desktop" => Some("bochs"),
         _ => linux_nic(manifest).map(|l| l.0),
     }
 }
@@ -518,6 +520,7 @@ fn bundle(arch: Arch, manifest: &str, driver: &str) -> Result<PathBuf, String> {
         ("memserver", "superior-memserver"),
         ("fs", "superior-fs"),
         ("testclient", "superior-testclient"),
+        ("compositor", "superior-compositor"),
         // Need Linux's source and the build container: only where used.
         ("lde-8139cp", "superior-lde-8139cp"),
         ("lde-e100", "superior-lde-e100"),
@@ -651,7 +654,7 @@ fn image_for(
         linux_nic: linux_nic(manifest).map(|l| l.1),
         keyboard: manifest == "keyboard",
         hotplug: manifest == "hotplug",
-        display: manifest == "display",
+        display: manifest == "display" || manifest == "desktop",
     })
 }
 
@@ -2136,6 +2139,174 @@ fn check_screenshot(path: &Path, k: usize) -> Result<String, String> {
             k + 1
         )),
     }
+}
+
+/// The desktop behind the windows (user/compositor: `desktop`).
+fn desktop_pixel(x: usize, y: usize) -> [u8; 3] {
+    if ((x >> 4) + (y >> 4)) & 1 == 0 { [0x28, 0x30, 0x40] } else { [0x30, 0x38, 0x48] }
+}
+
+/// A desktop client's window pixel at (x, y) of it (user/testclient:
+/// `window_pixel`).
+fn window_pixel(x: usize, y: usize, id: usize, phase: usize) -> [u8; 3] {
+    [
+        ((2 * x + 80 * id + 40 * phase) & 0xff) as u8,
+        ((2 * y + 50 * id) & 0xff) as u8,
+        (((x ^ y) + 30 * phase) & 0xff) as u8,
+    ]
+}
+
+/// A window on a desktop screenshot: its number in the picture, where it
+/// is, its size and phase. Listed back to front.
+#[derive(Clone, Copy)]
+struct ShownWindow {
+    id: usize,
+    at: (usize, usize),
+    size: (usize, usize),
+    phase: usize,
+}
+
+/// What each of the desktop test's screenshots must show.
+fn desktop_pictures() -> Vec<Vec<ShownWindow>> {
+    let a = ShownWindow { id: 0, at: (100, 100), size: (300, 200), phase: 0 };
+    let b = ShownWindow { id: 1, at: (250, 180), size: (320, 240), phase: 0 };
+    let moved = ShownWindow { at: (420, 300), ..b };
+    vec![
+        vec![a, b],
+        vec![a, moved],
+        vec![a, moved],
+        vec![moved],
+        vec![ShownWindow { phase: 1, ..moved }],
+    ]
+}
+
+/// Reads a screenshot (a P6 PPM file of `SCREEN`'s size): its pixels.
+fn read_screenshot(path: &Path) -> Result<Vec<u8>, String> {
+    let data = std::fs::read(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
+    let mut fields = Vec::new();
+    let mut at = 0;
+    while fields.len() < 4 && at < data.len() {
+        while at < data.len() && data[at].is_ascii_whitespace() {
+            at += 1;
+        }
+        let start = at;
+        while at < data.len() && !data[at].is_ascii_whitespace() {
+            at += 1;
+        }
+        fields.push(String::from_utf8_lossy(&data[start..at]).into_owned());
+    }
+    at += 1;
+    let size = (fields.get(1).and_then(|f| f.parse().ok()), fields.get(2).and_then(|f| f.parse().ok()));
+    if fields.first().map(String::as_str) != Some("P6") || size != (Some(SCREEN.0), Some(SCREEN.1)) {
+        return Err(format!("{}: {:?}, not an {}x{} PPM", path.display(), fields, SCREEN.0, SCREEN.1));
+    }
+    let pixels = data[at.min(data.len())..].to_vec();
+    if pixels.len() < SCREEN.0 * SCREEN.1 * 3 {
+        return Err(format!("{}: {} bytes of pixels, too few", path.display(), pixels.len()));
+    }
+    Ok(pixels)
+}
+
+/// Checks desktop screenshot `k` pixel by pixel.
+fn check_desktop(path: &Path, k: usize) -> Result<String, String> {
+    let pixels = read_screenshot(path)?;
+    let windows = &desktop_pictures()[k];
+    let mut wrong = 0;
+    let mut first = None;
+    for y in 0..SCREEN.1 {
+        for x in 0..SCREEN.0 {
+            let mut want = desktop_pixel(x, y);
+            for w in windows {
+                if (w.at.0..w.at.0 + w.size.0).contains(&x) && (w.at.1..w.at.1 + w.size.1).contains(&y) {
+                    want = window_pixel(x - w.at.0, y - w.at.1, w.id, w.phase);
+                }
+            }
+            let i = (y * SCREEN.0 + x) * 3;
+            let have = [pixels[i], pixels[i + 1], pixels[i + 2]];
+            if have != want {
+                wrong += 1;
+                first.get_or_insert((x, y, have, want));
+            }
+        }
+    }
+    match first {
+        None => Ok(format!(
+            "screenshot {}: all {} pixels are the desktop and its {} window{}",
+            k + 1,
+            SCREEN.0 * SCREEN.1,
+            windows.len(),
+            if windows.len() == 1 { "" } else { "s" }
+        )),
+        Some((x, y, have, want)) => Err(format!(
+            "screenshot {}: {wrong} pixels wrong, the first at ({x}, {y}): {have:?}, not {want:?}",
+            k + 1
+        )),
+    }
+}
+
+/// Boots `boot/desktop.manifest`: the compositor over Linux's bochs
+/// driver, with two clients' windows. At each picture the second client
+/// announces, QEMU's monitor takes a screenshot and every pixel must be
+/// the desktop's or the right window's: window B over A, B moved (what it
+/// covered painted again), both made again after the compositor's
+/// restart, A gone with its client, and B drawn anew after the display
+/// driver's restart.
+fn desktop_test(arch: Arch) -> Result<(), String> {
+    let img = image_with(false, arch, "desktop")?;
+    println!("== desktop test on {}", img.path.display());
+    let shots: Arc<Mutex<Vec<Result<String, String>>>> = Arc::default();
+    let markers: Vec<String> = (1..=desktop_pictures().len())
+        .map(|k| format!("[pass] desktop: picture {k} on the screen"))
+        .collect();
+    let taken = shots.clone();
+    let watched = markers.clone();
+    let out = run_to_exit_watching(&img, Duration::from_secs(150), move |all| {
+        let mut taken = taken.lock().unwrap();
+        let k = taken.len();
+        if k < watched.len() && all.contains(&watched[k]) {
+            let path = root().join("target").join(format!("desktop-{}-{}.ppm", arch.name(), k + 1));
+            let _ = std::fs::remove_file(&path);
+            taken.push(screendump(&path).and_then(|()| check_desktop(&path, k)));
+        }
+    })?;
+    let steps = [
+        "compositor: ready: the desktop on a 800x600 screen",
+        "[pass] desktop: 59 pages for a 300x200 window",
+        "[pass] desktop: window A shown (window 0)",
+        "[pass] desktop: 75 pages for a 320x240 window",
+        "[pass] desktop: the screen is 800x600",
+        "[pass] desktop: window A is on the screen",
+        "[pass] desktop: another client's window cannot be moved, raised, destroyed or drawn (32 calls refused)",
+        "[pass] desktop: picture 1 on the screen: window B over window A",
+        "[pass] desktop: picture 2 on the screen: window B moved",
+        "desktop: killing the compositor",
+        "[cm] fault injection: killing compositor",
+        "compositor: ready: the desktop on a 800x600 screen",
+        "desktop: window A: the compositor restarted; making the window again",
+        "[pass] desktop: window A made again after the compositor's restart",
+        "[pass] desktop: picture 3 on the screen after the compositor's restart",
+        "desktop: killing window A's client",
+        "[cm] fault injection: killing first",
+        "compositor: window 0 is gone with its client; taken off the screen",
+        "[pass] desktop: picture 4 on the screen: window A gone with its client",
+        "desktop: killing the display driver",
+        "[cm] fault injection: killing lde-bochs",
+        "compositor: the display lost the screen; lending it again",
+        "compositor: the whole screen shown again (1 window)",
+        "[pass] desktop: picture 5 on the screen after the display driver's restart",
+        "desktop: done (0 failed)",
+        "[cm] second asked to shut down (pass)",
+    ];
+    check_log("desktop test", &out, &steps)?;
+    let shots = shots.lock().unwrap();
+    if shots.len() != markers.len() {
+        return Err(format!("desktop test: {} screenshots taken, want {}", shots.len(), markers.len()));
+    }
+    for s in shots.iter() {
+        println!("== {}", s.clone()?);
+    }
+    println!("== desktop test passed ({})", arch.name());
+    Ok(())
 }
 
 /// Boots `boot/display.manifest`: Linux's bochs driver in the Linux

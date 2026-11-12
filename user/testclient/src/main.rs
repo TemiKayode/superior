@@ -52,6 +52,12 @@
 //!   1) and has the next shown by its restarted instance; `cargo xtask
 //!   display-test` checks every pixel of the screen each time. Memory in
 //!   slot 2.
+//! - `arg 25` and `arg 26`, the desktop clients (`boot/desktop.manifest`):
+//!   each draws a window in pages of its own and has the compositor (slot
+//!   0) show it; the second moves its window and kills the compositor, the
+//!   first client and the display driver in turn (control, slot 1). `cargo
+//!   xtask desktop-test` checks every pixel of the screen after each step.
+//!   Memory in slot 2.
 //! - `arg 10`, the fault injector: asks the manager (control, slot 0) to
 //!   kill the filesystem server and the disk driver at pseudo-random
 //!   moments, then blocks on the notification in slot 1.
@@ -61,7 +67,7 @@
 
 use core::sync::atomic::{AtomicU32, Ordering, fence};
 use superior_objects::abi::{CapTransfer, Error, ObjectType, Syscall, root};
-use superior_objects::idl::display;
+use superior_objects::idl::{display, window};
 use superior_objects::interfaces::fs::ring;
 use superior_objects::interfaces::{Status, block, dns, fs, input, mem, net, pci};
 use superior_sys::{Called, USER_BASE, call_retry, print_line, syscall, syscall_x};
@@ -4279,6 +4285,225 @@ fn display_set_up(t: &mut Checks, pages: u64, first: bool) -> Option<u64> {
     (r[0] == 0).then_some(preferred)
 }
 
+// ---- the desktop clients (`arg 25` and `arg 26`, boot/desktop.manifest) ----
+
+const WINDOWS: u64 = 0;
+const DESKTOP_CONTROL: u64 = 1;
+const WINDOW_MEMORY: u64 = 2;
+/// The window's pages, mapped in a row.
+const WINDOW_PAGE_SLOTS: u64 = 8;
+const WINDOW_VA: u64 = USER_BASE + 0x4000_0000;
+/// Components the second client kills: the display driver, the
+/// compositor and the first client.
+const DESKTOP_DRIVER_INDEX: u64 = 1;
+const COMPOSITOR_INDEX: u64 = 2;
+const FIRST_CLIENT_INDEX: u64 = 3;
+/// The screen `cargo xtask desktop-test` gives QEMU's display.
+const DESKTOP_SCREEN: (u64, u64) = (800, 600);
+
+/// A window of the test: its number in the picture, size, position and
+/// phase, and the compositor's number for it while it has one.
+struct TestWindow {
+    id: u64,
+    size: (u64, u64),
+    at: (u64, u64),
+    phase: u64,
+    window: Option<u64>,
+}
+
+impl TestWindow {
+    fn pages(&self) -> u64 {
+        (self.size.0 * self.size.1 * 4).div_ceil(4096)
+    }
+}
+
+/// Window `id`'s pixel at (x, y) of it in phase `phase` (XRGB8888). `cargo
+/// xtask desktop-test` computes the same to check the screenshots.
+fn window_pixel(x: u64, y: u64, id: u64, phase: u64) -> u32 {
+    let r = (2 * x + 80 * id + 40 * phase) & 0xff;
+    let g = (2 * y + 50 * id) & 0xff;
+    let b = ((x ^ y) + 30 * phase) & 0xff;
+    (r << 16 | g << 8 | b) as u32
+}
+
+fn draw_window(w: &TestWindow) {
+    for y in 0..w.size.1 {
+        for x in 0..w.size.0 {
+            // SAFETY: the window's pages are mapped, writable, and hold it.
+            unsafe {
+                ((WINDOW_VA as *mut u32).add((y * w.size.0 + x) as usize)).write(window_pixel(x, y, w.id, w.phase))
+            };
+        }
+    }
+}
+
+/// A call to the compositor: `Err` if it failed (the compositor
+/// restarted), else the reply.
+fn window_call(m: [u64; 4], page: Option<u64>) -> Result<[u64; 4], ()> {
+    let x = CapTransfer {
+        grant: page.map(|p| (WINDOW_PAGE_SLOTS + p) as u16),
+        accept: None,
+    };
+    let r = syscall_x(Syscall::Call, WINDOWS, m, x);
+    if r.status == 0 { Ok(r.msg) } else { Err(()) }
+}
+
+/// The compositor's `INFO`, tried again while it restarts.
+fn window_info() -> [u64; 4] {
+    for _ in 0..200 {
+        if let Ok(m) = window_call(window::info(), None) {
+            return m;
+        }
+        superior_sys::sleep(5);
+    }
+    [u64::MAX; 4]
+}
+
+/// Waits until `shown` windows are on the screen; whether they came.
+fn wait_shown(shown: u64) -> bool {
+    for _ in 0..500 {
+        if window_info()[3] == shown {
+            return true;
+        }
+        superior_sys::sleep(2);
+    }
+    false
+}
+
+/// Makes the window, lends its pages and shows all of it; again from the
+/// start if the compositor restarts on the way. The reply to the commit.
+fn open_window(w: &mut TestWindow) -> [u64; 4] {
+    for _ in 0..50 {
+        w.window = None;
+        let size = w.size.0 | w.size.1 << 16;
+        let Ok(r) = window_call(window::create(size, w.at.0 | w.at.1 << 16), None) else {
+            superior_sys::sleep(5);
+            continue;
+        };
+        if r[0] != 0 {
+            return r;
+        }
+        let n = r[1];
+        let lent = (0..w.pages()).try_for_each(|p| match window_call(window::attach(n, p), Some(p)) {
+            Ok(m) if m[0] == 0 => Ok(()),
+            _ => Err(()),
+        });
+        if lent.is_err() {
+            continue;
+        }
+        let full = w.size.0 << 32 | w.size.1 << 48;
+        if let Ok(m) = window_call(window::commit(n, full), None) {
+            if m[0] == 0 {
+                w.window = Some(n);
+            }
+            return m;
+        }
+    }
+    [u64::MAX; 4]
+}
+
+fn make_window_pages(t: &mut Checks, w: &TestWindow) {
+    let mut made = true;
+    for p in 0..w.pages() {
+        made &= syscall(Syscall::Retype, WINDOW_MEMORY, [ObjectType::Frame as u64, 0, WINDOW_PAGE_SLOTS + p, 0]).status
+            == 0
+            && syscall(Syscall::FrameMap, WINDOW_PAGE_SLOTS + p, [WINDOW_VA + p * 4096, 1, 0, 0]).status == 0;
+    }
+    t.check(made, format_args!("{} pages for a {}x{} window", w.pages(), w.size.0, w.size.1));
+    draw_window(w);
+}
+
+/// The first client: shows window A and keeps it shown, making it again
+/// whenever the compositor restarts, until the second client kills it.
+fn desktop_first() -> ! {
+    let mut t = Checks(0, "desktop");
+    let mut w = TestWindow { id: 0, size: (300, 200), at: (100, 100), phase: 0, window: None };
+    make_window_pages(&mut t, &w);
+    let r = open_window(&mut w);
+    t.check(
+        r[0] == 0 && w.window.is_some(),
+        format_args!("window A shown (window {})", w.window.unwrap_or(u64::MAX)),
+    );
+    loop {
+        superior_sys::sleep(5);
+        // Moving it where it is changes nothing, but a compositor that
+        // restarted (whether or not this call saw it) knows no such window.
+        let here = w.window.map(|n| window_call(window::move_to(n, w.at.0 | w.at.1 << 16), None));
+        if here != Some(Ok([0; 4])) {
+            say!("desktop: window A: the compositor restarted; making the window again");
+            let r = open_window(&mut w);
+            t.check(r[0] == 0, format_args!("window A made again after the compositor's restart"));
+        }
+    }
+}
+
+/// The second client: shows window B over A, moves it, and has the
+/// compositor, the first client and the display driver killed in turn;
+/// the host checks a screenshot of each picture.
+fn desktop_second() -> ! {
+    let mut t = Checks(0, "desktop");
+    let mut w = TestWindow { id: 1, size: (320, 240), at: (250, 180), phase: 0, window: None };
+    make_window_pages(&mut t, &w);
+    let info = window_info();
+    t.check(
+        info[0] == 0 && (info[1], info[2]) == DESKTOP_SCREEN,
+        format_args!("the screen is {}x{}", info[1], info[2]),
+    );
+    t.check(wait_shown(1), format_args!("window A is on the screen"));
+    // No window but its own is the client's, whichever number it tries.
+    let mut refused = 0;
+    for n in 0..window::MAX_WINDOWS {
+        for m in [window::move_to(n, 0), window::raise(n), window::destroy(n), window::commit(n, 1 << 32 | 1 << 48)] {
+            refused += (window_call(m, None) == Ok([Status::NotFound as u64, 0, 0, 0])) as u64;
+        }
+    }
+    t.check(
+        refused == 4 * window::MAX_WINDOWS,
+        format_args!("another client's window cannot be moved, raised, destroyed or drawn ({refused} calls refused)"),
+    );
+    let r = open_window(&mut w);
+    t.check(
+        r[0] == 0 && window_info()[3] == 2,
+        format_args!("picture 1 on the screen: window B over window A (frame {})", r[1]),
+    );
+    superior_sys::sleep(SCREENSHOT_TICKS);
+    w.at = (420, 300);
+    let moved = w.window.map(|n| window_call(window::move_to(n, w.at.0 | w.at.1 << 16), None));
+    t.check(
+        moved == Some(Ok([0; 4])),
+        format_args!("picture 2 on the screen: window B moved, and what it covered painted again"),
+    );
+    superior_sys::sleep(SCREENSHOT_TICKS);
+    say!("desktop: killing the compositor");
+    syscall(Syscall::Call, DESKTOP_CONTROL, [OP_KILL, COMPOSITOR_INDEX, 0, 0]);
+    // Window A first, so it is behind again.
+    let back = wait_shown(1);
+    let r = open_window(&mut w);
+    t.check(
+        back && r[0] == 0 && window_info()[3] == 2,
+        format_args!("picture 3 on the screen after the compositor's restart: both windows made again"),
+    );
+    superior_sys::sleep(SCREENSHOT_TICKS);
+    say!("desktop: killing window A's client");
+    syscall(Syscall::Call, DESKTOP_CONTROL, [OP_KILL, FIRST_CLIENT_INDEX, 0, 0]);
+    t.check(wait_shown(1), format_args!("picture 4 on the screen: window A gone with its client"));
+    superior_sys::sleep(SCREENSHOT_TICKS);
+    say!("desktop: killing the display driver");
+    syscall(Syscall::Call, DESKTOP_CONTROL, [OP_KILL, DESKTOP_DRIVER_INDEX, 0, 0]);
+    w.phase = 1;
+    draw_window(&w);
+    let full = w.size.0 << 32 | w.size.1 << 48;
+    let r = w.window.map(|n| window_call(window::commit(n, full), None));
+    t.check(
+        matches!(r, Some(Ok(m)) if m[0] == 0),
+        format_args!("picture 5 on the screen after the display driver's restart: window B drawn anew"),
+    );
+    superior_sys::sleep(SCREENSHOT_TICKS);
+    say!("desktop: done ({} failed)", t.0);
+    syscall(Syscall::Call, DESKTOP_CONTROL, [OP_SHUTDOWN, t.0, 0, 0]);
+    superior_sys::park()
+}
+
 fn display_client() -> ! {
     let mut t = Checks(0, "display");
     let pages = (SCREEN.0 * SCREEN.1 * 4).div_ceil(4096);
@@ -4363,6 +4588,8 @@ pub extern "C" fn _start(role: u64) -> ! {
         16 => injector(&[1, 2, 3], false),
         18 => tcp_client(),
         24 => display_client(),
+        25 => desktop_first(),
+        26 => desktop_second(),
         _ => probe(),
     }
 }

@@ -1,0 +1,17 @@
+[package]
+name = "superior-compositor"
+description = "The display server: puts every client's windows together over the desktop and has the display driver show them."
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "superior-compositor"
+test = false
+bench = false
+
+[dependencies]
+superior-objects = { path = "../../crates/objects" }
+superior-sys = { path = "../../crates/sys" }
