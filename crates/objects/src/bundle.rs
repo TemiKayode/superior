@@ -11,6 +11,12 @@
 //! | 12 | 4 | reserved, 0 |
 //! | 16 | 40 × count | entries: name (32 bytes, NUL-padded), offset (4), length (4) |
 //! | ... | | file data; each offset is from the start of the bundle |
+//!
+//! A signed bundle (what the kernel boots) is a bundle followed by a
+//! trailer of [`TRAILER`] bytes: magic `SUPSIG01` (8), the bundle's
+//! version (8; rollback protection compares it), and an Ed25519 signature
+//! (64) of everything before the signature. Its measurement is the
+//! SHA-256 of all of it, signature included.
 
 pub const MAGIC: &[u8; 8] = b"SUPBNDL1";
 pub const HEADER: usize = 16;
@@ -90,6 +96,48 @@ impl<'a> Bundle<'a> {
     }
 }
 
+pub const SIG_MAGIC: &[u8; 8] = b"SUPSIG01";
+pub const TRAILER: usize = 8 + 8 + 64;
+
+/// A signed bundle, split into its parts; nothing checked yet.
+#[derive(Clone, Copy, Debug)]
+pub struct Signed<'a> {
+    /// The bundle itself.
+    pub payload: &'a [u8],
+    pub version: u64,
+    pub signature: &'a [u8; 64],
+    /// What the signature covers: the bundle, the magic and the version.
+    signed: &'a [u8],
+    all: &'a [u8],
+}
+
+impl<'a> Signed<'a> {
+    /// Splits `bytes` into bundle and trailer; `None` without a trailer.
+    pub fn split(bytes: &'a [u8]) -> Option<Signed<'a>> {
+        let t = bytes.len().checked_sub(TRAILER)?;
+        if &bytes[t..t + 8] != SIG_MAGIC {
+            return None;
+        }
+        Some(Signed {
+            payload: &bytes[..t],
+            version: u64::from_le_bytes(bytes[t + 8..t + 16].try_into().unwrap()),
+            signature: bytes[t + 16..].try_into().unwrap(),
+            signed: &bytes[..t + 16],
+            all: bytes,
+        })
+    }
+
+    /// Whether `key` signed it.
+    pub fn verify(&self, key: &[u8; 32]) -> bool {
+        crate::crypto::ed25519::verify(key, &[self.signed], self.signature)
+    }
+
+    /// Its measurement: the SHA-256 of all of it.
+    pub fn measure(&self) -> [u8; 32] {
+        crate::crypto::sha2::sha256(self.all)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -140,5 +188,40 @@ mod tests {
         let mut bytes = build(&[]);
         bytes[8] = 3;
         assert_eq!(Bundle::parse(&bytes).unwrap_err(), BundleError::Truncated);
+    }
+
+    fn sign(bundle: &[u8], version: u64, key: &ed25519_dalek::SigningKey) -> Vec<u8> {
+        use ed25519_dalek::Signer;
+        let mut out = bundle.to_vec();
+        out.extend_from_slice(SIG_MAGIC);
+        out.extend_from_slice(&version.to_le_bytes());
+        let signature = key.sign(&out).to_bytes();
+        out.extend_from_slice(&signature);
+        out
+    }
+
+    #[test]
+    fn signed_bundles() {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[3; 32]);
+        let public = key.verifying_key().to_bytes();
+        let bundle = build(&[("manifest", b"component a
+")]);
+        let bytes = sign(&bundle, 7, &key);
+        let s = Signed::split(&bytes).unwrap();
+        assert_eq!((s.payload, s.version), (&bundle[..], 7));
+        assert!(s.verify(&public));
+        assert_eq!(s.measure(), crate::crypto::sha2::sha256(&bytes));
+        assert!(Bundle::parse(s.payload).is_ok());
+        // Another key's signature, a changed byte or version: refused.
+        let other = ed25519_dalek::SigningKey::from_bytes(&[4; 32]);
+        assert!(!s.verify(&other.verifying_key().to_bytes()));
+        let mut changed = bytes.clone();
+        changed[HEADER + ENTRY] ^= 1;
+        assert!(!Signed::split(&changed).unwrap().verify(&public));
+        let mut changed = bytes.clone();
+        changed[bundle.len() + 8] = 8;
+        assert!(!Signed::split(&changed).unwrap().verify(&public));
+        // No trailer at all.
+        assert!(Signed::split(&bundle).is_none());
     }
 }

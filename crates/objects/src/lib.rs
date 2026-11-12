@@ -13,6 +13,7 @@ extern crate std;
 pub mod abi;
 pub mod bundle;
 pub mod cap;
+pub mod crypto;
 pub mod elf;
 pub mod idl;
 pub mod interfaces;

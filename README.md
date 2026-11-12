@@ -888,6 +888,21 @@ holds the rest):
   ISAs: the client reads the disk, suspends the machine twice for 200 ticks,
   each time 2 seconds on the host's clock and almost no ticks on the guest's,
   and reads it right after each resume.
+- Verified boot, first part. The boot bundle is signed: a trailer after it holds
+  its version and an Ed25519 signature of the bundle and version
+  (`superior_objects::bundle::Signed`). The kernel is built with the public key
+  it trusts and the oldest version it accepts, and before it starts the
+  Component Manager (at boot and after every fast reboot) it checks both and
+  measures the bundle, printing the SHA-256 of all of it. A bundle that is
+  unsigned, signed by another key, changed after signing or older than allowed
+  runs nothing: the kernel says why and stops the machine. SHA-256, SHA-512 and
+  Ed25519 verification are written here (`superior_objects::crypto`), `no_std`,
+  and checked against the FIPS and RFC 8032 vectors and against ed25519-dalek on
+  the host. `cargo xtask` signs every bundle with a development key it makes from
+  the OS's random source in `target/keys` the first time. `cargo xtask
+  verified-boot-test` boots a properly signed bundle on both ISAs, checking the
+  kernel's measurement against one computed on the host, then the four bad ones,
+  each of which must be refused.
 - Interrupt and exception entries clear the direction flag. User code may be
   interrupted mid-way through a backward copy, with the flag set; the kernel's own
   copies need it clear, and without the `cld` they ran backwards, wrecking saved
@@ -949,7 +964,12 @@ a second IPv6 router or a DHCPv6 server to test against (QEMU's network has one 
 and restored by firmware; QEMU's q35 has it, its AArch64 `virt` machine no
 equivalent), wake sources other than the alarm (a key, the network), power
 handling in drivers other than virtio-blk and in the servers above them, and a
-timeout on a component that never answers `SUSPEND`; the IDL describing interfaces other than the bus server's; escalating a component
+timeout on a component that never answers `SUSPEND`; in verified boot the
+firmware's part (the bootloader and kernel checked by UEFI Secure Boot, or on
+AArch64 by the firmware), measurements extended into a TPM and attestation,
+the bundle in A/B slots on disk apart from the kernel, a rollback counter kept
+in tamper-resistant storage (today the oldest version is built into the
+kernel), signed app packages and release keys kept off the build machine; the IDL describing interfaces other than the bus server's; escalating a component
 given up on to a supervisor above it (today the
 manager is the only one), memory budgets from a policy service (Phase 3), sizing the Memory Server's CSpace
 from the RAM it gets (its manifest names the size, 2^17 slots on the test machines), page tables for boot processes paid for from user memory,
@@ -1025,6 +1045,7 @@ cargo xtask tcp-test       # just the TCP test (add aarch64 for that ISA)
 cargo xtask keyboard-test  # just the USB keyboard test (add aarch64 for that ISA)
 cargo xtask hotplug-test   # just the PCI hot-plug test (add aarch64 for that ISA)
 cargo xtask suspend-test   # suspend to idle twice around the virtio-blk driver, then read the disk (add aarch64 for that ISA)
+cargo xtask verified-boot-test  # a signed boot bundle verified and measured; changed, foreign-key, unsigned and old ones refused
 cargo xtask run            # boot the shell in QEMU (x86-64), its console on this terminal
 cargo xtask run aarch64    # the same on QEMU's AArch64 virt machine
 cargo xtask idl    # generate Rust from the interface descriptions in interfaces/

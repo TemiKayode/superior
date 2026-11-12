@@ -179,6 +179,7 @@ fn main() -> ExitCode {
                         .and_then(|_| keyboard_test(a))
                         .and_then(|_| hotplug_test(a))
                         .and_then(|_| suspend_test(a))
+                        .and_then(|_| verified_boot_test(a))
                         .and_then(|_| image(false, a))
                         .and_then(|img| shell_session(&img))
                 })
@@ -209,6 +210,7 @@ fn main() -> ExitCode {
         Some("keyboard-test") => keyboard_test(arch),
         Some("hotplug-test") => hotplug_test(arch),
         Some("suspend-test") => suspend_test(arch),
+        Some("verified-boot-test") => verified_boot_test(arch),
         Some("memory-test") => {
             image_with(false, arch, "memory").and_then(|img| memory_test(&img))
         }
@@ -217,7 +219,7 @@ fn main() -> ExitCode {
         }
         Some("bench") => image(false, Arch::X86_64).and_then(|img| bench(&img)),
         _ => Err(
-            "usage: cargo xtask <idl | image | run | test | boot-test | shell-test | cm-test | supervise-test | drivers-test | memory-test | reboot-test | fs-test | nvme-test | ahci-test | net-test | lde-test | lde-e100-test | display-test | desktop-test | input-test | audio-test | tcp-test | keyboard-test | hotplug-test | suspend-test | bench | sel4-test> [x86_64 | aarch64]"
+            "usage: cargo xtask <idl | image | run | test | boot-test | shell-test | cm-test | supervise-test | drivers-test | memory-test | reboot-test | fs-test | nvme-test | ahci-test | net-test | lde-test | lde-e100-test | display-test | desktop-test | input-test | audio-test | tcp-test | keyboard-test | hotplug-test | suspend-test | verified-boot-test | bench | sel4-test> [x86_64 | aarch64]"
                 .into(),
         ),
     });
@@ -617,10 +619,90 @@ fn image_for(
     manifest: &str,
     driver: &'static str,
 ) -> Result<Image, String> {
+    image_sealed(selftest, arch, manifest, driver, Seal::Good)
+}
+
+/// The version every boot bundle is signed with, and the oldest a kernel
+/// built here boots.
+const BUNDLE_VERSION: u64 = 2;
+
+/// How a boot bundle is signed: properly, or (for the verified boot test)
+/// in one of the ways the kernel must refuse.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Seal {
+    Good,
+    /// Signed, then a byte of a component's image changed.
+    Tampered,
+    /// Signed with a key the kernel does not trust.
+    OtherKey,
+    /// No signature at all.
+    Unsigned,
+    /// Properly signed, but an older version than the kernel accepts.
+    Old,
+}
+
+/// The development signing key: made from the OS's random source the
+/// first time and kept in `target/keys` (never in the repository). A
+/// release would be signed with a key kept off the build machine.
+fn signing_key() -> Result<ed25519_dalek::SigningKey, String> {
+    let path = root().join("target").join("keys").join("dev-signing.seed");
+    let seed: [u8; 32] = match std::fs::read(&path) {
+        Ok(b) if b.len() == 32 => b.try_into().unwrap(),
+        _ => {
+            let mut seed = [0u8; 32];
+            getrandom::getrandom(&mut seed).map_err(|e| format!("no random source: {e}"))?;
+            std::fs::create_dir_all(path.parent().unwrap()).map_err(|e| e.to_string())?;
+            std::fs::write(&path, seed).map_err(|e| format!("writing {}: {e}", path.display()))?;
+            println!("== made a development signing key in {}", path.display());
+            seed
+        }
+    };
+    Ok(ed25519_dalek::SigningKey::from_bytes(&seed))
+}
+
+/// Signs the bundle at `path` (see `superior_objects::bundle`) as `seal`
+/// says, writing the signed bundle beside it; returns its path and the
+/// trusted public key's path.
+fn seal_bundle(path: &Path, seal: Seal) -> Result<(PathBuf, PathBuf), String> {
+    use ed25519_dalek::Signer;
+    use superior_objects::bundle::SIG_MAGIC;
+    let key = signing_key()?;
+    let public = root().join("target").join("keys").join("dev-signing.pub");
+    std::fs::write(&public, key.verifying_key().to_bytes()).map_err(|e| e.to_string())?;
+    let mut out = std::fs::read(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
+    let payload = out.len();
+    if seal != Seal::Unsigned {
+        let signer = if seal == Seal::OtherKey {
+            ed25519_dalek::SigningKey::from_bytes(&[0x5a; 32])
+        } else {
+            key
+        };
+        out.extend_from_slice(SIG_MAGIC);
+        let version = if seal == Seal::Old { BUNDLE_VERSION - 1 } else { BUNDLE_VERSION };
+        out.extend_from_slice(&version.to_le_bytes());
+        let signature = signer.sign(&out).to_bytes();
+        out.extend_from_slice(&signature);
+    }
+    if seal == Seal::Tampered {
+        // A byte in the middle of the last component's image.
+        out[payload - 1000] ^= 0x40;
+    }
+    let signed = path.with_extension("signed");
+    std::fs::write(&signed, &out).map_err(|e| format!("writing {}: {e}", signed.display()))?;
+    Ok((signed, public))
+}
+
+fn image_sealed(
+    selftest: bool,
+    arch: Arch,
+    manifest: &str,
+    driver: &'static str,
+    seal: Seal,
+) -> Result<Image, String> {
     let user = user_program("superior-pingpong", arch)?;
     let shell = user_program("superior-shell", arch)?;
     let cm = user_program("superior-cm", arch)?;
-    let bundle = bundle(arch, manifest, driver)?;
+    let (bundle, trust) = seal_bundle(&bundle(arch, manifest, driver)?, seal)?;
     println!(
         "== building kernel ({}{})",
         arch.name(),
@@ -631,6 +713,8 @@ fn image_for(
     build.env("SUPERIOR_SHELL_ELF", &shell);
     build.env("SUPERIOR_CM_ELF", &cm);
     build.env("SUPERIOR_BUNDLE", &bundle);
+    build.env("SUPERIOR_TRUST_KEY", &trust);
+    build.env("SUPERIOR_MIN_VERSION", BUNDLE_VERSION.to_string());
     build.args([
         "build",
         "--quiet",
@@ -2775,6 +2859,53 @@ fn check_recording(bytes: &[u8]) -> Result<String, String> {
     ))
 }
 
+/// Verified boot: boots `boot/test.manifest` signed properly and checks
+/// the kernel verified it and printed its measurement (the SHA-256 of the
+/// signed bundle, computed here too); then signed in each way it must
+/// refuse (a changed byte, an untrusted key, no signature, an older
+/// version) and checks it stopped the machine before running anything.
+fn verified_boot_test(arch: Arch) -> Result<(), String> {
+    let img = image_sealed(false, arch, "test", "virtio-blk", Seal::Good)?;
+    println!("== verified boot test on {}", img.path.display());
+    let signed = root().join("target").join(format!("bundle-{}-test.signed", arch.name()));
+    let bytes = std::fs::read(&signed).map_err(|e| format!("reading {}: {e}", signed.display()))?;
+    let measurement: String = superior_objects::crypto::sha2::sha256(&bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let public = signing_key()?.verifying_key().to_bytes();
+    let line = format!(
+        "[boot] bundle verified: version {BUNDLE_VERSION}, signed by key {:02x}{:02x}{:02x}{:02x}..., measurement sha256:{measurement}",
+        public[0], public[1], public[2], public[3]
+    );
+    let out = run_to_exit(&img, Duration::from_secs(60))?;
+    check_log("verified boot (signed)", &out, &[&line, "[ok] Component Manager loaded", "[cm] manifest:"])?;
+    println!("verified: the kernel measured {measurement}, as computed here");
+    for (seal, why) in [
+        (Seal::Tampered, "its signature does not verify against the built-in key"),
+        (Seal::OtherKey, "its signature does not verify against the built-in key"),
+        (Seal::Unsigned, "it is not signed"),
+        (Seal::Old, "it is older than this kernel accepts (a rollback)"),
+    ] {
+        let img = image_sealed(false, arch, "test", "virtio-blk", seal)?;
+        println!("== verified boot test: a bundle {seal:?}");
+        let (code, out) = run_capture(&img, Duration::from_secs(60), |_| {})?;
+        let refused = format!("[boot] boot bundle REFUSED: {why}");
+        if !out.contains(&refused) {
+            return Err(format!("verified boot ({seal:?}): missing {refused:?}"));
+        }
+        if out.contains("Component Manager loaded") || out.contains("[cm]") {
+            return Err(format!("verified boot ({seal:?}): something from the bundle ran"));
+        }
+        if code.is_none() || code == Some(QEMU_PASS) {
+            return Err(format!("verified boot ({seal:?}): QEMU exit {code:?}, not the failure code"));
+        }
+        println!("refused ({seal:?}): {why}");
+    }
+    println!("verified boot test passed");
+    Ok(())
+}
+
 /// Boots `boot/suspend.manifest` and checks that the client's two
 /// suspends each quiesce the virtio-blk driver (which resets its disk),
 /// park every CPU with its tick stopped for the 200 ticks asked (2 s, which
@@ -3236,8 +3367,24 @@ fn run_to_exit(img: &Image, limit: Duration) -> Result<String, String> {
 fn run_to_exit_watching(
     img: &Image,
     limit: Duration,
-    mut watch: impl FnMut(&str) + Send + 'static,
+    watch: impl FnMut(&str) + Send + 'static,
 ) -> Result<String, String> {
+    let (code, out) = run_capture(img, limit, watch)?;
+    match code {
+        Some(QEMU_PASS) => Ok(out),
+        code => Err(format!(
+            "QEMU did not exit with the pass code (exit {code:?})"
+        )),
+    }
+}
+
+/// Runs `img` until QEMU exits or `limit` passes (then kills it): QEMU's
+/// exit code (`None` if killed) and all the output.
+fn run_capture(
+    img: &Image,
+    limit: Duration,
+    mut watch: impl FnMut(&str) + Send + 'static,
+) -> Result<(Option<i32>, String), String> {
     let mut child = qemu_command(img)
         .args(["-display", "none"])
         .stdin(Stdio::null())
@@ -3272,12 +3419,7 @@ fn run_to_exit_watching(
     };
     let out = String::from_utf8_lossy(&reader.join().unwrap_or_default()).into_owned();
     println!();
-    match status.and_then(|s| s.code()) {
-        Some(QEMU_PASS) => Ok(out),
-        code => Err(format!(
-            "QEMU did not exit with the pass code (exit {code:?})"
-        )),
-    }
+    Ok((status.and_then(|s| s.code()), out))
 }
 
 /// Boots the normal image and drives the shell over the serial port as a

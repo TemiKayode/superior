@@ -7,3 +7,7 @@ repository.workspace = true
 edition = "2024"
 
 [dependencies]
+
+[dev-dependencies]
+# Signs test messages for the Ed25519 verifier to check (host tests only).
+ed25519-dalek = "2"

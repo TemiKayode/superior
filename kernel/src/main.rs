@@ -40,8 +40,53 @@ static USER_IMAGE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/user.elf"))
 static SHELL_IMAGE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shell.elf"));
 /// The Component Manager, the root task (empty if none).
 static CM_IMAGE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/cm.elf"));
-/// The boot bundle: the component manifest and every component's image.
+/// The boot bundle: the component manifest and every component's image,
+/// signed (`superior_objects::bundle::Signed`).
 static BUNDLE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/bundle.bin"));
+/// The Ed25519 public key the boot bundle must be signed with.
+static TRUST_KEY: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/trust.key"));
+
+/// The oldest bundle version this kernel boots: an older one, however
+/// well signed, is a rollback.
+fn min_version() -> u64 {
+    match u64::from_str_radix(env!("SUPERIOR_MIN_VERSION"), 10) {
+        Ok(v) => v,
+        Err(_) => u64::MAX,
+    }
+}
+
+/// Verified boot: checks the boot bundle's signature against the key built
+/// into the kernel and its version against the oldest allowed, and
+/// measures it (SHA-256 of all of it). Returns the bundle itself; nothing
+/// from it runs otherwise.
+fn verified_bundle() -> Result<&'static [u8], &'static str> {
+    use superior_objects::bundle::Signed;
+    let key: &[u8; 32] = TRUST_KEY.try_into().map_err(|_| "no trust key built in")?;
+    let s = Signed::split(BUNDLE).ok_or("it is not signed")?;
+    if !s.verify(key) {
+        return Err("its signature does not verify against the built-in key");
+    }
+    if s.version < min_version() {
+        kprintln!("[boot] bundle version {} is older than {}", s.version, min_version());
+        return Err("it is older than this kernel accepts (a rollback)");
+    }
+    let m = s.measure();
+    let mut hex = [0u8; 64];
+    for (i, b) in m.iter().enumerate() {
+        hex[2 * i] = b"0123456789abcdef"[(b >> 4) as usize];
+        hex[2 * i + 1] = b"0123456789abcdef"[(b & 15) as usize];
+    }
+    kprintln!(
+        "[boot] bundle verified: version {}, signed by key {:02x}{:02x}{:02x}{:02x}..., measurement sha256:{}",
+        s.version,
+        key[0],
+        key[1],
+        key[2],
+        key[3],
+        core::str::from_utf8(&hex).unwrap_or("?")
+    );
+    Ok(s.payload)
+}
 
 fn banner() {
     kprintln!();
@@ -126,6 +171,14 @@ const KERNEL_KEEPS: u64 = 16 << 20;
 /// arena again. Nothing leaks, however many times it runs.
 fn start_component_manager() -> Result<(), &'static str> {
     use superior_objects::abi::root;
+    let bundle = match verified_bundle() {
+        Ok(b) => b,
+        Err(why) => {
+            // Nothing from it may run: stop the machine.
+            kprintln!("[boot] boot bundle REFUSED: {why}");
+            arch::qemu_exit(false);
+        }
+    };
     // Made once, at the first start.
     static UNTYPED: AtomicU64 = AtomicU64::new(0);
     static STATE_STORE: AtomicU64 = AtomicU64::new(0);
@@ -264,20 +317,20 @@ fn start_component_manager() -> Result<(), &'static str> {
     if !memory::arena_on() {
         return Err("no memory for the Component Manager's arena");
     }
-    let arg = BUNDLE.len() as u64 | task::reboots() << root::REBOOTS_SHIFT;
+    let arg = bundle.len() as u64 | task::reboots() << root::REBOOTS_SHIFT;
     let r = task::spawn_process_with(
         task::ROOT_TID,
         CM_IMAGE,
         root::PRIORITY,
         arg,
         caps,
-        &[(bundle_va, BUNDLE)],
+        &[(bundle_va, bundle)],
     );
     memory::arena_off();
     r?;
     kprintln!(
         "[ok] Component Manager loaded; boot bundle of {} KiB",
-        BUNDLE.len() >> 10
+        bundle.len() >> 10
     );
     Ok(())
 }

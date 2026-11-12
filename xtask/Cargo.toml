@@ -10,3 +10,7 @@ publish = false
 [dependencies]
 bootloader = "0.11"
 superior-idl = { path = "../crates/idl" }
+# Signs boot bundles (verified boot), with a key from the OS random source.
+ed25519-dalek = "2"
+getrandom = "0.2"
+superior-objects = { path = "../crates/objects" }
