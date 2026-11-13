@@ -181,6 +181,7 @@ fn main() -> ExitCode {
                         .and_then(|_| suspend_test(a))
                         .and_then(|_| verified_boot_test(a))
                         .and_then(|_| ab_test(a))
+                        .and_then(|_| packages_test(a))
                         .and_then(|_| image(false, a))
                         .and_then(|img| shell_session(&img))
                 })
@@ -213,6 +214,7 @@ fn main() -> ExitCode {
         Some("suspend-test") => suspend_test(arch),
         Some("verified-boot-test") => verified_boot_test(arch),
         Some("ab-test") => ab_test(arch),
+        Some("packages-test") => packages_test(arch),
         Some("memory-test") => {
             image_with(false, arch, "memory").and_then(|img| memory_test(&img))
         }
@@ -221,7 +223,7 @@ fn main() -> ExitCode {
         }
         Some("bench") => image(false, Arch::X86_64).and_then(|img| bench(&img)),
         _ => Err(
-            "usage: cargo xtask <idl | image | run | test | boot-test | shell-test | cm-test | supervise-test | drivers-test | memory-test | reboot-test | fs-test | nvme-test | ahci-test | net-test | lde-test | lde-e100-test | display-test | desktop-test | input-test | audio-test | tcp-test | keyboard-test | hotplug-test | suspend-test | verified-boot-test | ab-test | bench | sel4-test> [x86_64 | aarch64]"
+            "usage: cargo xtask <idl | image | run | test | boot-test | shell-test | cm-test | supervise-test | drivers-test | memory-test | reboot-test | fs-test | nvme-test | ahci-test | net-test | lde-test | lde-e100-test | display-test | desktop-test | input-test | audio-test | tcp-test | keyboard-test | hotplug-test | suspend-test | verified-boot-test | ab-test | packages-test | bench | sel4-test> [x86_64 | aarch64]"
                 .into(),
         ),
     });
@@ -582,6 +584,11 @@ fn bundle(arch: Arch, manifest: &str, driver: &str) -> Result<PathBuf, String> {
     // The key a system in the A/B slots must be signed with (the kernel
     // verifies this bundle; the Component Manager trusts what it holds).
     files.push(("trust.key".to_string(), signing_key()?.verifying_key().to_bytes().to_vec()));
+    // The key app packages must be signed with (`superior_objects::package`).
+    files.push((
+        superior_objects::package::KEY_FILE.to_string(),
+        publisher_key()?.verifying_key().to_bytes().to_vec(),
+    ));
     let out = pack(&files);
     let path = root()
         .join("target")
@@ -667,7 +674,19 @@ enum Seal {
 /// first time and kept in `target/keys` (never in the repository). A
 /// release would be signed with a key kept off the build machine.
 fn signing_key() -> Result<ed25519_dalek::SigningKey, String> {
-    let path = root().join("target").join("keys").join("dev-signing.seed");
+    dev_key("dev-signing.seed")
+}
+
+/// The development publisher key app packages are signed with, made like
+/// [`signing_key`] in `target/keys` the first time.
+fn publisher_key() -> Result<ed25519_dalek::SigningKey, String> {
+    dev_key("dev-packages.seed")
+}
+
+/// A development key: its seed in `target/keys/<file>`, made from the
+/// OS's random source the first time.
+fn dev_key(file: &str) -> Result<ed25519_dalek::SigningKey, String> {
+    let path = root().join("target").join("keys").join(file);
     let seed: [u8; 32] = match std::fs::read(&path) {
         Ok(b) if b.len() == 32 => b.try_into().unwrap(),
         _ => {
@@ -675,7 +694,7 @@ fn signing_key() -> Result<ed25519_dalek::SigningKey, String> {
             getrandom::getrandom(&mut seed).map_err(|e| format!("no random source: {e}"))?;
             std::fs::create_dir_all(path.parent().unwrap()).map_err(|e| e.to_string())?;
             std::fs::write(&path, seed).map_err(|e| format!("writing {}: {e}", path.display()))?;
-            println!("== made a development signing key in {}", path.display());
+            println!("== made a development key in {}", path.display());
             seed
         }
     };
@@ -782,6 +801,8 @@ fn image_sealed(
         Some(fs_disk())
     } else if manifest == "ab" {
         Some(ab_disk(arch))
+    } else if manifest == "packages" {
+        Some(packages_disk(arch))
     } else {
         None
     };
@@ -790,7 +811,7 @@ fn image_sealed(
         arch,
         sel4: false,
         disk,
-        writable: fs || manifest == "ab",
+        writable: fs || manifest == "ab" || manifest == "packages",
         driver,
         net: matches!(manifest, "net" | "tcp") || linux_nic(manifest).is_some(),
         linux_nic: linux_nic(manifest).map(|l| l.1),
@@ -3010,6 +3031,127 @@ fn ab_test(arch: Arch) -> Result<(), String> {
         return Err(format!("A/B boot 5: something booted, or QEMU exit {code:?}"));
     }
     println!("A/B test passed");
+    Ok(())
+}
+
+/// The package test's system disk.
+fn packages_disk(arch: Arch) -> PathBuf {
+    root().join("target").join(format!("packages-test-disk-{}.img", arch.name()))
+}
+
+/// The app the package test installs: the test client in role 36, which
+/// calls the installer's `report` service.
+const APP_MANIFEST: &str = "component app\n  image app\n  arg 36\n  uses report 0\n";
+
+/// A package holding `manifest` and the test client as `app`, signed with
+/// `key`.
+fn app_package(arch: Arch, manifest: &str, key: &ed25519_dalek::SigningKey) -> Result<Vec<u8>, String> {
+    let client = user_program("superior-testclient", arch)?;
+    let image = std::fs::read(&client).map_err(|e| format!("reading {}: {e}", client.display()))?;
+    let files = vec![("manifest".to_string(), manifest.as_bytes().to_vec()), ("app".to_string(), image)];
+    Ok(sign(pack(&files), 1, key))
+}
+
+/// Writes a fresh package test disk: an empty store, and after it the
+/// packages the installer downloads (see the test client's
+/// `PACKAGE_DOWNLOADS`): the app signed by another key, the app changed
+/// after signing, apps asking for the disk, a device and the right to
+/// install, and the app.
+fn write_packages_disk(arch: Arch) -> Result<(), String> {
+    use superior_objects::ab::SECTOR;
+    use superior_objects::package::{COUNT, FIRST, SECTORS, header};
+    let key = publisher_key()?;
+    let mut changed = app_package(arch, APP_MANIFEST, &key)?;
+    let n = changed.len();
+    changed[n / 2] ^= 0x04;
+    let downloads = [
+        app_package(arch, APP_MANIFEST, &ed25519_dalek::SigningKey::from_bytes(&[0x5a; 32]))?,
+        changed,
+        app_package(arch, &format!("{APP_MANIFEST}  uses block 1\n"), &key)?,
+        app_package(arch, &format!("{APP_MANIFEST}  device pci-config 1\n"), &key)?,
+        app_package(arch, &format!("{APP_MANIFEST}  install-control\n"), &key)?,
+        app_package(arch, APP_MANIFEST, &key)?,
+    ];
+    let first = FIRST + COUNT as u64 * SECTORS;
+    let mut disk = vec![0u8; ((first + downloads.len() as u64 * SECTORS) as usize) * SECTOR];
+    for (k, p) in downloads.iter().enumerate() {
+        let at = (first + k as u64 * SECTORS) as usize * SECTOR;
+        disk[at..at + SECTOR].copy_from_slice(&header(p.len()));
+        disk[at + SECTOR..at + SECTOR + p.len()].copy_from_slice(p);
+    }
+    let path = packages_disk(arch);
+    std::fs::write(&path, disk).map_err(|e| format!("writing {}: {e}", path.display()))
+}
+
+/// Signed app packages, in three boots of one disk
+/// (`boot/packages.manifest`):
+/// 1. the installer has five bad packages refused (another key, changed
+///    after signing, asking for the disk, a device, the right to
+///    install) and cleared from the store, then installs the app, which
+///    runs and calls it; a second copy is refused;
+/// 2. the app is installed at boot from the store, calls in, and is
+///    uninstalled;
+/// 3. nothing is installed.
+fn packages_test(arch: Arch) -> Result<(), String> {
+    let img = image_with(false, arch, "packages")?;
+    write_packages_disk(arch)?;
+    let boots: [(&str, &[&str]); 3] = [
+        (
+            "installing",
+            &[
+                "[cm] package store: 0 installed",
+                "[pass] packages: a fresh store holds no packages",
+                "[cm] package in store slot 0 refused: its signature does not verify",
+                "[pass] packages: the app signed by another key is refused",
+                "[cm] package in store slot 0 refused: its signature does not verify",
+                "[pass] packages: the app changed after signing is refused",
+                "[cm] package in store slot 0 refused: uses a service not offered to apps (block)",
+                "[pass] packages: an app that uses the disk is refused",
+                "[cm] package in store slot 0 refused: asks for a device (pci-config)",
+                "[pass] packages: an app that asks for a device is refused",
+                "[cm] package in store slot 0 refused: asks for a manager privilege (app)",
+                "[pass] packages: an app that asks to install packages is refused",
+                "[pass] packages: refused packages are cleared from the store",
+                "[cm] installed package in store slot 0 (version 1): app",
+                "[cm] started app (boot)",
+                "[pass] packages: the app is installed",
+                "[pass] packages: the installed app runs, and calls the installer",
+                "[cm] package in store slot 1 refused: a component of that name is installed (app)",
+                "[pass] packages: installing it twice is refused",
+                "[pass] packages: the store holds the app alone",
+                "[cm] installer asked to shut down (pass)",
+            ],
+        ),
+        (
+            "installed from the store",
+            &[
+                "[cm] installed package in store slot 0 (version 1): app",
+                "[cm] package store: 1 installed",
+                "[pass] packages: the app was installed at boot from the store",
+                "[pass] packages: it runs, and calls the installer",
+                "[cm] uninstalled package in store slot 0: app",
+                "[pass] packages: the app is uninstalled",
+                "[cm] installer asked to shut down (pass)",
+            ],
+        ),
+        (
+            "uninstalled",
+            &[
+                "[cm] package store: 0 installed",
+                "[pass] packages: once uninstalled, nothing is installed at boot",
+                "[cm] installer asked to shut down (pass)",
+            ],
+        ),
+    ];
+    for (k, (what, steps)) in boots.iter().enumerate() {
+        println!("== package test, boot {} ({what}) on {}", k + 1, img.path.display());
+        let out = run_to_exit(&img, Duration::from_secs(90))?;
+        check_log(&format!("package boot {} ({what})", k + 1), &out, steps)?;
+        if k == 2 && out.contains("[cm] started app (boot)") {
+            return Err("package boot 3: the uninstalled app started".into());
+        }
+    }
+    println!("package test passed");
     Ok(())
 }
 

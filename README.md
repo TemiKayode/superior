@@ -921,6 +921,23 @@ holds the rest):
   4; version 4 boots and confirms, raising the floor, and version 2 may not be
   staged again; with slot B damaged nothing boots, as slot A is now older than the
   floor.
+- Signed app packages (`superior_objects::package`). A package is a bundle
+  signed like the system, but with the publisher key (`packages.key` in the
+  system or boot bundle), holding its components' manifest and images. With
+  `packages <service>` the Component Manager keeps a store of four packages on
+  that disk and installs them all at boot; an `install-control` component writes
+  one into a free store slot and asks the manager to install it, or to uninstall
+  one. A package is admitted only if it verifies and asks for nothing an app may
+  not have: no devices, no services of its own, no manager privileges (a control
+  capability, state, `install-control` and the like), no heap, no more than 1 MiB
+  of memory, 64 KiB untyped blocks or priority 10, and only the services the
+  system names with `app-service`. A refused package is cleared from the store.
+  `cargo xtask packages-test` boots one disk three times on both ISAs: five bad
+  packages refused (another key, changed after signing, asking for the disk, a
+  device, the right to install), the app installed, running and calling the
+  installer, and a second copy refused; the app installed again at boot from the
+  store, then uninstalled; and nothing installed after that. The root task's
+  stack is 128 KiB, as the manager's state and manifests outgrew 64 KiB.
 - Interrupt and exception entries clear the direction flag. User code may be
   interrupted mid-way through a backward copy, with the flag set; the kernel's own
   copies need it clear, and without the `cld` they ran backwards, wrecking saved
@@ -988,7 +1005,10 @@ AArch64 by the firmware), measurements extended into a TPM and attestation,
 the boot bundle itself in A/B slots (it is built into the kernel image), a
 rollback counter kept in tamper-resistant storage (the floor is on the system
 disk, and the kernel's oldest version built into it), a boot record written
-atomically (two copies), an updater that downloads, signed app packages and release keys kept off the build machine; the IDL describing interfaces other than the bus server's; escalating a component
+atomically (two copies), an updater that downloads, package versions and
+upgrades in place, apps that provide services, a package store on a
+filesystem rather than fixed disk slots, an app's right to the control
+capability (today any component holding one may shut the machine down), and release keys kept off the build machine; the IDL describing interfaces other than the bus server's; escalating a component
 given up on to a supervisor above it (today the
 manager is the only one), memory budgets from a policy service (Phase 3), sizing the Memory Server's CSpace
 from the RAM it gets (its manifest names the size, 2^17 slots on the test machines), page tables for boot processes paid for from user memory,
@@ -1066,6 +1086,7 @@ cargo xtask hotplug-test   # just the PCI hot-plug test (add aarch64 for that IS
 cargo xtask suspend-test   # suspend to idle twice around the virtio-blk driver, then read the disk (add aarch64 for that ISA)
 cargo xtask verified-boot-test  # a signed boot bundle verified and measured; changed, foreign-key, unsigned and old ones refused
 cargo xtask ab-test        # A/B system slots: an update staged, tried, fallen back from, confirmed; rollbacks refused
+cargo xtask packages-test  # signed app packages: bad ones refused, the app installed, kept across boots, uninstalled
 cargo xtask run            # boot the shell in QEMU (x86-64), its console on this terminal
 cargo xtask run aarch64    # the same on QEMU's AArch64 virt machine
 cargo xtask idl    # generate Rust from the interface descriptions in interfaces/

@@ -18,7 +18,9 @@ pub const USER_L0_INDEX: usize = 224;
 pub const USER_BASE: u64 = (USER_L0_INDEX as u64) << 39; // 0x7000_0000_0000
 pub const USER_END: u64 = USER_BASE + (1 << 39);
 pub const USER_STACK_TOP: u64 = USER_BASE + 0x8000_0000;
-const USER_STACK_PAGES: u64 = 16;
+/// The root task's stack: 128 KiB (the Component Manager keeps its state,
+/// manifests included, on it).
+const USER_STACK_PAGES: u64 = 32;
 const PAGE: u64 = 4096;
 /// The kernel maps RAM only in the second GiB.
 pub const KERNEL_RAM: core::ops::Range<u64> = 0x4000_0000..0x8000_0000;

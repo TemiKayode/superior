@@ -20,6 +20,7 @@ pub mod idl;
 pub mod interfaces;
 pub mod ipc;
 pub mod manifest;
+pub mod package;
 pub mod pages;
 #[cfg(test)]
 pub mod model;

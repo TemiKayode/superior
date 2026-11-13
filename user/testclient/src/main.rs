@@ -69,7 +69,7 @@ use core::sync::atomic::{AtomicU32, Ordering, fence};
 use superior_objects::abi::{CapTransfer, Error, ObjectType, Syscall, root};
 use superior_objects::idl::{display, window};
 use superior_objects::interfaces::fs::ring;
-use superior_objects::interfaces::{Status, block, dns, fs, input, mem, net, pci, power, update};
+use superior_objects::interfaces::{Status, block, dns, fs, input, install, mem, net, pci, power, update};
 use superior_sys::{Called, USER_BASE, call_retry, print_line, syscall, syscall_x};
 
 const ECHO: u64 = 0;
@@ -5265,6 +5265,125 @@ fn ab_client(role: u64) -> ! {
     superior_sys::park()
 }
 
+/// The package test's downloads (`boot/packages.manifest`), after the
+/// package store, each laid out as a store slot: 0 the app signed by
+/// another key, 1 the app changed after signing, 2 an app that uses the
+/// disk, 3 one that asks for a device, 4 one that asks to install
+/// packages itself, 5 the app.
+const PACKAGE_DOWNLOADS: u64 =
+    superior_objects::package::FIRST + superior_objects::package::COUNT as u64 * superior_objects::package::SECTORS;
+/// The installer's `report` service, which the app calls.
+const REPORT: u64 = 5;
+/// What the app says when it calls.
+const APP_HELLO: u64 = 0xa99;
+
+/// Copies download `k` into a free store slot, as an installer would once
+/// it had downloaded it, and asks the manager to install it: the
+/// manager's answer.
+fn install_download(k: u64) -> u64 {
+    use superior_objects::package;
+    let r = manager([install::OP_PACKAGE_SLOT, 0, 0, 0]);
+    if r[0] != Status::Ok as u64 {
+        return r[0];
+    }
+    let (from, to) = (PACKAGE_DOWNLOADS + k * package::SECTORS, r[2]);
+    if !disk(block::READ, from, 1) {
+        return Status::DeviceError as u64;
+    }
+    // SAFETY: the buffer is mapped; its first sector is the header.
+    let header: [u8; 512] = unsafe { *(BUFFER_VA as *const [u8; 512]) };
+    let Some(len) = package::length(&header) else {
+        return Status::NotFound as u64;
+    };
+    let sectors = 1 + len.div_ceil(512) as u64;
+    let mut done = 0;
+    while done < sectors {
+        let n = (sectors - done).min(8);
+        if !disk(block::READ, from + done, n) || !disk(block::WRITE, to + done, n) {
+            return Status::DeviceError as u64;
+        }
+        done += n;
+    }
+    if syscall(Syscall::Call, BLOCK, [block::FLUSH, 0, 0, 0]).msg[0] != Status::Ok as u64 {
+        return Status::DeviceError as u64;
+    }
+    manager([install::OP_INSTALL, r[1], 0, 0])[0]
+}
+
+/// Waits for the app to call `report`, and answers it: whether it said
+/// hello.
+fn app_calls() -> bool {
+    let call = syscall(Syscall::Recv, REPORT, [0; 4]);
+    syscall(Syscall::Reply, 0, [0; 4]);
+    call.status == 0 && call.msg[0] == APP_HELLO
+}
+
+/// The package test's installer (role 35): it counts its boots in sector
+/// 1 of the disk. Boot 1 has five bad packages refused and installs the
+/// app; boot 2 finds it installed from the store, and uninstalls it; boot
+/// 3 finds nothing installed.
+fn install_client() -> ! {
+    let mut t = Checks(0, "packages");
+    let ok = Status::Ok as u64;
+    let made = syscall(Syscall::Retype, BLOCK_MEMORY, [ObjectType::Frame as u64, 0, BUFFER, 0]);
+    let mapped = syscall(Syscall::FrameMap, BUFFER, [BUFFER_VA, 1, 0, 0]);
+    let read = disk(block::READ, 1, 1);
+    // SAFETY: the buffer is mapped; its first word is the boot count.
+    let boots = unsafe { core::ptr::read_volatile(BUFFER_VA as *const u64) };
+    unsafe { core::ptr::write_volatile(BUFFER_VA as *mut u64, boots + 1) };
+    let counted = disk(block::WRITE, 1, 1) && syscall(Syscall::Call, BLOCK, [block::FLUSH, 0, 0, 0]).msg[0] == ok;
+    let installed = manager([install::OP_PACKAGES, 0, 0, 0]);
+    t.check(
+        made.status == 0 && mapped.status == 0 && read && counted && installed[0] == ok,
+        format_args!("boot {}: store slots in use {:#x}", boots + 1, installed[1]),
+    );
+    match boots {
+        0 => {
+            t.check(installed[1] == 0, format_args!("a fresh store holds no packages"));
+            let bad: [(u64, &str, Status); 5] = [
+                (0, "the app signed by another key", Status::Denied),
+                (1, "the app changed after signing", Status::Denied),
+                (2, "an app that uses the disk", Status::Invalid),
+                (3, "an app that asks for a device", Status::Invalid),
+                (4, "an app that asks to install packages", Status::Invalid),
+            ];
+            for (k, what, want) in bad {
+                let r = install_download(k);
+                t.check(r == want as u64, format_args!("{what} is refused (status {r})"));
+            }
+            let empty = manager([install::OP_PACKAGES, 0, 0, 0])[1];
+            t.check(empty == 0, format_args!("refused packages are cleared from the store"));
+            let r = install_download(5);
+            t.check(r == ok, format_args!("the app is installed (status {r})"));
+            t.check(app_calls(), format_args!("the installed app runs, and calls the installer"));
+            let r = install_download(5);
+            t.check(r == Status::InUse as u64, format_args!("installing it twice is refused (status {r})"));
+            let now = manager([install::OP_PACKAGES, 0, 0, 0])[1];
+            t.check(now == 1, format_args!("the store holds the app alone"));
+        }
+        1 => {
+            t.check(installed[1] == 1, format_args!("the app was installed at boot from the store"));
+            t.check(app_calls(), format_args!("it runs, and calls the installer"));
+            let r = manager([install::OP_UNINSTALL, 0, 0, 0])[0];
+            let now = manager([install::OP_PACKAGES, 0, 0, 0])[1];
+            t.check(r == ok && now == 0, format_args!("the app is uninstalled (status {r})"));
+        }
+        _ => {
+            t.check(installed[1] == 0, format_args!("once uninstalled, nothing is installed at boot"));
+        }
+    }
+    syscall(Syscall::Call, BLOCK_CONTROL, [OP_SHUTDOWN, t.0, 0, 0]);
+    superior_sys::park()
+}
+
+/// The package test's app (role 36), installed from a package: it calls
+/// the installer's `report` service (slot 0), then waits to be
+/// uninstalled.
+fn app_client() -> ! {
+    syscall(Syscall::Call, 0, [APP_HELLO, 0, 0, 0]);
+    superior_sys::park()
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(role: u64) -> ! {
     match role {
@@ -5303,6 +5422,8 @@ pub extern "C" fn _start(role: u64) -> ! {
         30 => audio_second(),
         31 => suspend_client(),
         32..=34 => ab_client(role),
+        35 => install_client(),
+        36 => app_client(),
         _ => probe(),
     }
 }

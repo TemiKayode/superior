@@ -39,12 +39,17 @@
 //!   power-control           # may ask the manager to suspend the machine
 //!   update-control          # may confirm the system came up and stage
 //!                           # an update (`crate::ab`)
+//!   install-control         # may install and uninstall app packages
+//!                           # (`crate::package`)
 //! ```
 //!
 //! Before any component, `system block` says the rest of the system is in
 //! A/B slots on the disk behind service `block` (`crate::ab`): the manager
 //! starts the components here, then loads the system bundle from a slot
 //! and starts its components as if their manifest followed this one.
+//! `packages block` keeps a store of signed app packages on that disk
+//! (`crate::package`), installed at boot; each `app-service <name>` names
+//! a service apps may use (nothing else is offered to them).
 //!
 //! Slots are in the component's own CSpace, a CNode of [`CSPACE_SLOTS`]
 //! (more, up to 256 nameable here, after a `cspace` directive).
@@ -117,6 +122,9 @@ pub enum CapKind<'a> {
     Spare,
 }
 
+/// Most `app-service` lines.
+pub const MAX_APP_SERVICES: usize = 8;
+
 /// Most pages one `shared` directive may ask for.
 pub const MAX_SHARED_PAGES: u8 = 16;
 
@@ -153,6 +161,8 @@ pub struct Component<'a> {
     pub power_control: bool,
     /// May confirm the system came up, and stage an update.
     pub update_control: bool,
+    /// May install and uninstall app packages.
+    pub install_control: bool,
     pub caps: [Option<CapSpec<'a>>; MAX_CAPS],
 }
 
@@ -174,6 +184,7 @@ impl<'a> Component<'a> {
             power: false,
             power_control: false,
             update_control: false,
+            install_control: false,
             caps: [None; MAX_CAPS],
         }
     }
@@ -205,6 +216,10 @@ pub struct Manifest<'a> {
     pub components: [Option<Component<'a>>; MAX_COMPONENTS],
     /// The service whose disk holds the system slots (`system`), if any.
     pub system: Option<&'a str>,
+    /// The service whose disk holds the package store (`packages`).
+    pub packages: Option<&'a str>,
+    /// Services apps may use (`app-service`).
+    pub app_services: [Option<&'a str>; MAX_APP_SERVICES],
 }
 
 impl<'a> Manifest<'a> {
@@ -230,10 +245,32 @@ impl<'a> Manifest<'a> {
             .map(|(i, _)| i)
     }
 
+    /// Whether apps may use `service`.
+    pub fn offers(&self, service: &str) -> bool {
+        self.app_services.iter().flatten().any(|s| *s == service)
+    }
+
+    /// Whether any top-level directive (`system`, `packages`,
+    /// `app-service`) is set.
+    pub fn configures_system(&self) -> bool {
+        self.system.is_some() || self.packages.is_some() || self.app_services[0].is_some()
+    }
+
     pub fn parse(text: &'a str) -> Result<Manifest<'a>, ParseError<'a>> {
+        let m = Self::parse_unchecked(text)?;
+        m.check()?;
+        Ok(m)
+    }
+
+    /// Parses without the checks across components: a package's
+    /// manifest, whose `uses` name services of the system it joins
+    /// (`crate::package::admit` checks those).
+    pub fn parse_unchecked(text: &'a str) -> Result<Manifest<'a>, ParseError<'a>> {
         let mut m = Manifest {
             components: [None; MAX_COMPONENTS],
             system: None,
+            packages: None,
+            app_services: [None; MAX_APP_SERVICES],
         };
         let mut cur: Option<usize> = None;
         let mut count = 0;
@@ -264,6 +301,26 @@ impl<'a> Manifest<'a> {
                     return Err(err("system comes once, before any component", key));
                 }
                 m.system = Some(arg("system needs a service")?);
+                continue;
+            }
+            if key == "packages" {
+                if cur.is_some() || m.packages.is_some() {
+                    return Err(err("packages comes once, before any component", key));
+                }
+                m.packages = Some(arg("packages needs a service")?);
+                continue;
+            }
+            if key == "app-service" {
+                let s = arg("app-service needs a service")?;
+                if cur.is_some() {
+                    return Err(err("app-service comes before any component", key));
+                }
+                let free = m
+                    .app_services
+                    .iter_mut()
+                    .find(|x| x.is_none())
+                    .ok_or(err("too many app services", s))?;
+                *free = Some(s);
                 continue;
             }
             let c = match cur {
@@ -365,6 +422,10 @@ impl<'a> Manifest<'a> {
                     c.update_control = true;
                     None
                 }
+                "install-control" => {
+                    c.install_control = true;
+                    None
+                }
                 "quota" => {
                     c.quota_pages = number(arg("quota needs a page count")?)?;
                     None
@@ -441,7 +502,6 @@ impl<'a> Manifest<'a> {
                 return Err(err("unexpected word", extra));
             }
         }
-        m.check()?;
         Ok(m)
     }
 
@@ -485,6 +545,16 @@ impl<'a> Manifest<'a> {
         if let Some(s) = self.system {
             if self.provider(s).is_none() {
                 return Err(err("no component provides the system disk's service", s));
+            }
+        }
+        if let Some(s) = self.packages {
+            if self.provider(s).is_none() {
+                return Err(err("no component provides the package store's service", s));
+            }
+        }
+        for s in self.app_services.iter().flatten() {
+            if self.provider(s).is_none() {
+                return Err(err("no component provides this app service", s));
             }
         }
         Ok(())

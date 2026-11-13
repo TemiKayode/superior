@@ -70,7 +70,8 @@ use superior_objects::abi::{
 use superior_objects::bundle::{Bundle, BundleError, Signed};
 use superior_objects::elf::{Elf, Machine};
 use superior_objects::ab::{self, Record};
-use superior_objects::interfaces::{Status as Reply, block, mem, power, update};
+use superior_objects::interfaces::{Status as Reply, block, install, mem, power, update};
+use superior_objects::package;
 use superior_objects::manifest::{CapKind, Component, MAX_COMPONENTS, Manifest, Restart, Start};
 use superior_sys::{Ret, USER_BASE, syscall, syscall_x};
 
@@ -126,7 +127,11 @@ const SYSTEM_BLOCK: u64 = BLOCKS + BLOCK * MAX_COMPONENTS as u64;
 const IO_PAGE: u64 = SYSTEM_BLOCK + 1;
 const SYSTEM_PAGES: u64 = SYSTEM_BLOCK + 2;
 const SYSTEM_MAX_PAGES: u64 = ab::SLOT_BYTES.div_ceil(4096) as u64;
-const _: () = assert!(SYSTEM_PAGES + SYSTEM_MAX_PAGES <= 1 << root::CNODE_BITS);
+/// Pages holding each installed package, [`PACKAGE_MAX_PAGES`] slots for
+/// each store slot.
+const PACKAGE_PAGES: u64 = SYSTEM_PAGES + SYSTEM_MAX_PAGES;
+const PACKAGE_MAX_PAGES: u64 = package::BYTES.div_ceil(4096) as u64;
+const _: () = assert!(PACKAGE_PAGES + PACKAGE_MAX_PAGES * package::COUNT as u64 <= 1 << root::CNODE_BITS);
 /// The manager's badge on the system disk (clients' are their numbers).
 const BADGE_SYSTEM_DISK: u64 = 0x1000;
 
@@ -161,6 +166,10 @@ const TOMB_STACKS_VA: u64 = USER_BASE + 0x3_1000_0000;
 /// The page lent for system disk I/O, and the system bundle.
 const IO_VA: u64 = USER_BASE + 0x3_2000_0000;
 const SYSTEM_VA: u64 = USER_BASE + 0x3_4000_0000;
+/// Where store slot k's package is mapped: a MiB each.
+const PACKAGE_VA: u64 = USER_BASE + 0x3_6000_0000;
+const PACKAGE_SPAN: u64 = 0x10_0000;
+const _: () = assert!(PACKAGE_MAX_PAGES * PAGE <= PACKAGE_SPAN);
 
 // ---- in a component's address space ------------------------------------
 
@@ -233,6 +242,16 @@ struct Manager<'a> {
     booted: Option<(u8, u64, bool)>,
     /// System pages made so far.
     system_pages: u64,
+    /// Whether the manager's capability to the system disk is made.
+    disk: bool,
+    /// Each store slot's installed package (bundle and version), and the
+    /// pages made for it so far.
+    packages: [Option<(Bundle<'a>, u64)>; package::COUNT],
+    package_pages: [u64; package::COUNT],
+    /// The store slot each component was installed from, if any.
+    origin: [Option<usize>; MAX_COMPONENTS],
+    /// Where the next installed component goes (indices are not reused).
+    next_component: usize,
     status: [Status; MAX_COMPONENTS],
     /// Services in manifest order: (name, providing component).
     services: [Option<(&'a str, usize)>; MAX_SERVICES],
@@ -307,12 +326,13 @@ impl<'a> Manager<'a> {
         retype(ut, ObjectType::AddressSpace, c.vspace_bits as u64, vspace)
             .map_err(|e| ("address space", e))?;
         retype(ut, ObjectType::Thread, 0, tcb).map_err(|e| ("thread", e))?;
-        // The system bundle's images first, then the boot bundle's.
-        let image = self
-            .system
-            .and_then(|b| b.get(c.image))
-            .or_else(|| self.bundle.get(c.image))
-            .ok_or(("image not in the bundle", 0))?;
+        // A package's images are its own; otherwise the system bundle's
+        // first, then the boot bundle's.
+        let image = match self.origin[i] {
+            Some(k) => self.packages[k].and_then(|(b, _)| b.get(c.image)),
+            None => self.system.and_then(|b| b.get(c.image)).or_else(|| self.bundle.get(c.image)),
+        }
+        .ok_or(("image not in the bundle", 0))?;
         let entry = load(image, ut, block, vspace)?;
         for p in 0..STACK_PAGES {
             let f = block + B_STACK + p;
@@ -690,6 +710,23 @@ impl<'a> Manager<'a> {
         self.bundle.get("trust.key").and_then(|k| <[u8; 32]>::try_from(k).ok())
     }
 
+    /// Makes the manager's capability to the system disk, behind
+    /// `service`, and its I/O page, once.
+    fn open_disk(&mut self, service: &str) {
+        if self.disk {
+            return;
+        }
+        let s = SERVICES + self.service_index(service).unwrap() as u64;
+        let io = mint(s, SYSTEM_BLOCK, WRITE | GRANT | GRANT_REPLY, BADGE_SYSTEM_DISK)
+            .and_then(|_| retype(root::UNTYPED, ObjectType::Frame, 0, IO_PAGE))
+            .and_then(|_| sys(Syscall::FrameMap, IO_PAGE, [IO_VA, 1, 0, 0]).map(drop));
+        if let Err(e) = io {
+            say!("could not reach the system disk (error {e})");
+            shutdown(false);
+        }
+        self.disk = true;
+    }
+
     /// `system <service>`: reads the boot record from that service's
     /// disk, chooses a slot (`ab::plan`), loads and checks the system
     /// bundle in it (signed with the boot bundle's key, no older than the
@@ -701,14 +738,7 @@ impl<'a> Manager<'a> {
             say!("the boot bundle has no trust.key to check the system with");
             shutdown(false)
         };
-        let s = SERVICES + self.service_index(service).unwrap() as u64;
-        let io = mint(s, SYSTEM_BLOCK, WRITE | GRANT | GRANT_REPLY, BADGE_SYSTEM_DISK)
-            .and_then(|_| retype(root::UNTYPED, ObjectType::Frame, 0, IO_PAGE))
-            .and_then(|_| sys(Syscall::FrameMap, IO_PAGE, [IO_VA, 1, 0, 0]).map(drop));
-        if let Err(e) = io {
-            say!("could not reach the system disk (error {e})");
-            shutdown(false);
-        }
+        self.open_disk(service);
         let record = match disk_read(ab::RECORD_SECTOR, 1) {
             Ok(b) => Record::decode(b[..ab::SECTOR].try_into().unwrap()),
             Err(e) => {
@@ -779,28 +809,7 @@ impl<'a> Manager<'a> {
         let first = ab::SLOT_FIRST[slot as usize];
         let header = disk_read(first, 1).map_err(|_| "unreadable")?;
         let len = ab::slot_length(header[..ab::SECTOR].try_into().unwrap()).ok_or("empty")?;
-        let pages = len.div_ceil(4096) as u64;
-        while self.system_pages < pages {
-            let p = self.system_pages;
-            retype(root::UNTYPED, ObjectType::Frame, 0, SYSTEM_PAGES + p)
-                .and_then(|_| sys(Syscall::FrameMap, SYSTEM_PAGES + p, [SYSTEM_VA + p * 4096, 1, 0, 0]).map(drop))
-                .map_err(|_| "no memory for it")?;
-            self.system_pages += 1;
-        }
-        for p in 0..pages {
-            let sectors = (len - p as usize * 4096).div_ceil(ab::SECTOR).min(8) as u64;
-            let data = disk_read(first + 1 + p * 8, sectors).map_err(|_| "unreadable")?;
-            // SAFETY: page p of the system pages is mapped at this address.
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    data.as_ptr(),
-                    (SYSTEM_VA + p * 4096) as *mut u8,
-                    sectors as usize * ab::SECTOR,
-                );
-            }
-        }
-        // SAFETY: the pages just filled, mapped for as long as this runs.
-        let bytes: &'a [u8] = unsafe { core::slice::from_raw_parts(SYSTEM_VA as *const u8, len) };
+        let bytes = fill(&mut self.system_pages, SYSTEM_PAGES, SYSTEM_VA, first + 1, len)?;
         let signed = Signed::split(bytes).ok_or("not signed")?;
         if !signed.verify(key) {
             return Err("its signature does not verify");
@@ -878,6 +887,154 @@ impl<'a> Manager<'a> {
         }
     }
 
+    /// The key packages must be signed with: the system bundle's
+    /// `packages.key`, or else the boot bundle's.
+    fn publisher_key(&self) -> Option<[u8; 32]> {
+        self.system
+            .and_then(|b| b.get(package::KEY_FILE))
+            .or_else(|| self.bundle.get(package::KEY_FILE))
+            .and_then(|k| <[u8; 32]>::try_from(k).ok())
+    }
+
+    /// `packages <service>`: installs every package in the store, clearing
+    /// any it refuses.
+    fn load_packages(&mut self) {
+        self.next_component = self.manifest.iter().map(|(i, _)| i + 1).max().unwrap_or(0);
+        let Some(service) = self.manifest.packages else { return };
+        if self.manifest.system.is_some_and(|s| s != service) {
+            say!("the package store must be on the system disk");
+            shutdown(false);
+        }
+        self.open_disk(service);
+        let mut count = 0;
+        for k in 0..package::COUNT {
+            match disk_read(package::first(k), 1) {
+                Ok(h) if package::length(h[..ab::SECTOR].try_into().unwrap()).is_none() => continue,
+                Ok(_) => {}
+                Err(_) => {
+                    say!("package store slot {k} unreadable");
+                    continue;
+                }
+            }
+            if self.install(k).is_ok() {
+                count += 1;
+            }
+        }
+        say!("package store: {count} installed");
+    }
+
+    /// Checks the package in store slot `k` and starts its components;
+    /// clears the slot if it refuses it. The number of components.
+    fn install(&mut self, k: usize) -> Result<usize, Reply> {
+        if k >= package::COUNT {
+            return Err(Reply::Invalid);
+        }
+        if self.packages[k].is_some() {
+            return Err(Reply::InUse);
+        }
+        match self.admit(k) {
+            Ok((bundle, version, pkg)) => {
+                let from = self.next_component;
+                let mut names = [""; MAX_COMPONENTS];
+                let mut n = 0;
+                for (_, c) in pkg.iter() {
+                    self.manifest.components[from + n] = Some(*c);
+                    self.origin[from + n] = Some(k);
+                    names[n] = c.name;
+                    n += 1;
+                }
+                self.next_component += n;
+                self.packages[k] = Some((bundle, version));
+                say!("installed package in store slot {k} (version {version}): {}", Names(&names[..n]));
+                self.wire(from);
+                Ok(n)
+            }
+            Err((why, word, status)) => {
+                if word.is_empty() {
+                    say!("package in store slot {k} refused: {why}");
+                } else {
+                    say!("package in store slot {k} refused: {why} ({word})");
+                }
+                if write_sector(package::first(k), &[0; ab::SECTOR]).is_err() {
+                    say!("could not clear package store slot {k}");
+                }
+                Err(status)
+            }
+        }
+    }
+
+    /// Reads store slot `k`'s package into its pages and checks it: the
+    /// publisher's signature, then what it asks for.
+    #[allow(clippy::type_complexity)]
+    fn admit(&mut self, k: usize) -> Result<(Bundle<'a>, u64, Manifest<'a>), (&'static str, &'a str, Reply)> {
+        let denied = |why| (why, "", Reply::Denied);
+        let invalid = |why| (why, "", Reply::Invalid);
+        let key = self.publisher_key().ok_or(denied("no publisher key to check it with"))?;
+        let first = package::first(k);
+        let header = disk_read(first, 1).map_err(|_| (("unreadable"), "", Reply::DeviceError))?;
+        let len = package::length(header[..ab::SECTOR].try_into().unwrap()).ok_or(("empty", "", Reply::NotFound))?;
+        let va = PACKAGE_VA + k as u64 * PACKAGE_SPAN;
+        let base = PACKAGE_PAGES + k as u64 * PACKAGE_MAX_PAGES;
+        let bytes = fill(&mut self.package_pages[k], base, va, first + 1, len).map_err(invalid)?;
+        let signed = Signed::split(bytes).ok_or(denied("not signed"))?;
+        if !signed.verify(&key) {
+            return Err(denied("its signature does not verify"));
+        }
+        let bundle = Bundle::parse(signed.payload).map_err(|e| invalid(bundle_error(e)))?;
+        let text = bundle.get("manifest").and_then(|m| core::str::from_utf8(m).ok()).ok_or(invalid("no manifest"))?;
+        let pkg = Manifest::parse_unchecked(text).map_err(|e| (e.what, e.word, Reply::Invalid))?;
+        package::admit(&pkg, &self.manifest)
+            .map_err(|r| (r.why, r.word, if r.taken { Reply::InUse } else { Reply::Invalid }))?;
+        for (_, c) in pkg.iter() {
+            if bundle.get(c.image).is_none() {
+                return Err(("its image is not in it", c.image, Reply::Invalid));
+            }
+        }
+        if self.next_component + pkg.len() > MAX_COMPONENTS {
+            return Err(("no room for more components", "", Reply::InUse));
+        }
+        Ok((bundle, signed.version, pkg))
+    }
+
+    /// `[OP_UNINSTALL, k]`: stops store slot `k`'s components, forgets
+    /// them, and clears the slot.
+    fn uninstall(&mut self, k: usize) -> Reply {
+        if k >= package::COUNT || self.packages[k].is_none() {
+            return Reply::NotFound;
+        }
+        let mut names = [""; MAX_COMPONENTS];
+        let mut n = 0;
+        for i in 0..MAX_COMPONENTS {
+            if self.origin[i] == Some(k) {
+                self.stop(i);
+                names[n] = self.component(i).name;
+                n += 1;
+                self.manifest.components[i] = None;
+                self.origin[i] = None;
+            }
+        }
+        self.packages[k] = None;
+        if write_sector(package::first(k), &[0; ab::SECTOR]).is_err() {
+            return Reply::DeviceError;
+        }
+        say!("uninstalled package in store slot {k}: {}", Names(&names[..n]));
+        Reply::Ok
+    }
+
+    /// `[OP_PACKAGE_SLOT]`.
+    fn package_slot(&self) -> [u64; 4] {
+        match (0..package::COUNT).find(|&k| self.packages[k].is_none()) {
+            Some(k) if self.disk => [Reply::Ok as u64, k as u64, package::first(k), package::SECTORS],
+            Some(_) => [Reply::NotFound as u64, 0, 0, 0],
+            None => [Reply::InUse as u64, 0, 0, 0],
+        }
+    }
+
+    /// `[OP_PACKAGES]`.
+    fn installed(&self) -> u64 {
+        (0..package::COUNT).filter(|&k| self.packages[k].is_some()).map(|k| 1 << k).sum()
+    }
+
     /// Answers every service of component `i` with `SERVICE_UNAVAILABLE`
     /// from now on.
     fn tombstone(&mut self, i: usize) {
@@ -909,12 +1066,56 @@ fn disk_read(sector: u64, count: u64) -> Result<&'static [u8], Reply> {
     }
 }
 
+/// Component names, for the log.
+struct Names<'b, 'a>(&'b [&'a str]);
+
+impl core::fmt::Display for Names<'_, '_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        for (k, n) in self.0.iter().enumerate() {
+            if k > 0 {
+                f.write_str(", ")?;
+            }
+            f.write_str(n)?;
+        }
+        Ok(())
+    }
+}
+
+/// Reads `len` bytes from the system disk, from sector `first` on, into
+/// pages mapped at `va` (cap slots from `base`, `made` of them made so
+/// far; more are made as needed). Returns them.
+fn fill<'a>(made: &mut u64, base: u64, va: u64, first: u64, len: usize) -> Result<&'a [u8], &'static str> {
+    let pages = len.div_ceil(4096) as u64;
+    while *made < pages {
+        let p = *made;
+        retype(root::UNTYPED, ObjectType::Frame, 0, base + p)
+            .and_then(|_| sys(Syscall::FrameMap, base + p, [va + p * 4096, 1, 0, 0]).map(drop))
+            .map_err(|_| "no memory for it")?;
+        *made += 1;
+    }
+    for p in 0..pages {
+        let sectors = (len - p as usize * 4096).div_ceil(ab::SECTOR).min(8) as u64;
+        let data = disk_read(first + p * 8, sectors).map_err(|_| "unreadable")?;
+        // SAFETY: page p is mapped at this address.
+        unsafe {
+            core::ptr::copy_nonoverlapping(data.as_ptr(), (va + p * 4096) as *mut u8, sectors as usize * ab::SECTOR);
+        }
+    }
+    // SAFETY: the pages just filled, mapped for as long as this runs.
+    Ok(unsafe { core::slice::from_raw_parts(va as *const u8, len) })
+}
+
 /// Writes the boot record and flushes it to stable storage.
 fn write_record(r: &Record) -> Result<(), Reply> {
+    write_sector(ab::RECORD_SECTOR, &r.encode())
+}
+
+/// Writes one sector of the system disk and flushes it to stable storage.
+fn write_sector(sector: u64, data: &[u8; ab::SECTOR]) -> Result<(), Reply> {
     // SAFETY: the I/O page is mapped at IO_VA, a page long.
-    unsafe { core::ptr::copy_nonoverlapping(r.encode().as_ptr(), IO_VA as *mut u8, ab::SECTOR) };
+    unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), IO_VA as *mut u8, ab::SECTOR) };
     let lend = CapTransfer { grant: Some(IO_PAGE as u16), accept: None };
-    let w = syscall_x(Syscall::Call, SYSTEM_BLOCK, [block::WRITE, ab::RECORD_SECTOR, 1, 0], lend);
+    let w = syscall_x(Syscall::Call, SYSTEM_BLOCK, [block::WRITE, sector, 1, 0], lend);
     let f = syscall(Syscall::Call, SYSTEM_BLOCK, [block::FLUSH, 0, 0, 0]);
     let ok = |r: &Ret| r.status == 0 && r.msg[0] == Reply::Ok as u64;
     if ok(&w) && ok(&f) { Ok(()) } else { Err(Reply::DeviceError) }
@@ -1230,6 +1431,11 @@ pub extern "C" fn _start(arg: u64) -> ! {
         record: Record::default(),
         booted: None,
         system_pages: 0,
+        disk: false,
+        packages: [None; package::COUNT],
+        package_pages: [0; package::COUNT],
+        origin: [None; MAX_COMPONENTS],
+        next_component: 0,
         status: [Status::NotStarted; MAX_COMPONENTS],
         services: [None; MAX_SERVICES],
         made: [false; MAX_COMPONENTS],
@@ -1254,6 +1460,7 @@ pub extern "C" fn _start(arg: u64) -> ! {
     // boot components; then the system in the A/B slots, if any.
     m.wire(0);
     m.load_system(text);
+    m.load_packages();
 
     let mut msg = syscall(Syscall::Recv, CONTROL, [0; 4]);
     loop {
@@ -1374,6 +1581,21 @@ pub extern "C" fn _start(arg: u64) -> ! {
                     update::OP_BOOT_OK => [m.boot_ok() as u64, 0, 0, 0],
                     update::OP_UPDATE_SLOT => m.update_slot(),
                     _ => [m.update_ready() as u64, 0, 0, 0],
+                })
+            }
+            BADGE_REPORT
+                if i < MAX_COMPONENTS
+                    && m.component(i).install_control
+                    && (install::OP_PACKAGES..=install::OP_UNINSTALL).contains(&msg.msg[0]) =>
+            {
+                Some(match msg.msg[0] {
+                    install::OP_PACKAGES => [Reply::Ok as u64, m.installed(), 0, 0],
+                    install::OP_PACKAGE_SLOT => m.package_slot(),
+                    install::OP_INSTALL => match m.install(msg.msg[1] as usize) {
+                        Ok(n) => [Reply::Ok as u64, n as u64, 0, 0],
+                        Err(e) => [e as u64, 0, 0, 0],
+                    },
+                    _ => [m.uninstall(msg.msg[1] as usize) as u64, 0, 0, 0],
                 })
             }
             BADGE_REPORT if i < MAX_COMPONENTS && msg.msg[0] == OP_SHUTDOWN => {

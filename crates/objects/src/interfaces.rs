@@ -681,6 +681,29 @@ pub mod update {
     pub const OP_UPDATE_READY: u64 = 11;
 }
 
+/// App packages (`crate::package`): calls to the Component Manager from a
+/// component with `install-control`.
+pub mod install {
+    /// `[OP_PACKAGES]`: reply `[status, mask]`, a bit for each store slot
+    /// holding an installed package.
+    pub const OP_PACKAGES: u64 = 12;
+    /// `[OP_PACKAGE_SLOT]`: a free store slot to write a package into.
+    /// Reply `[status, slot, first sector, sectors]` (`InUse` if the store
+    /// is full); the package is a header sector (`crate::package::header`),
+    /// then the signed bundle.
+    pub const OP_PACKAGE_SLOT: u64 = 13;
+    /// `[OP_INSTALL, slot]`: the package is written. The manager checks it
+    /// and starts its components. Reply `[status, components]`: `Denied`
+    /// if it does not verify, `Invalid` if it asks for what an app may not
+    /// have, `InUse` if a component of its name is installed already,
+    /// `NotFound` if the slot is empty. A refused package is cleared from
+    /// the store.
+    pub const OP_INSTALL: u64 = 14;
+    /// `[OP_UNINSTALL, slot]`: stops the package's components and clears
+    /// its slot. Reply `[status]`.
+    pub const OP_UNINSTALL: u64 = 15;
+}
+
 /// Files: what the filesystem server serves.
 ///
 /// There is no global namespace: each component sees only its own
