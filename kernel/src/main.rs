@@ -151,6 +151,7 @@ fn kernel_start(untyped_caps: usize) -> ! {
     // is work for it.
     let cpus = arch::start_secondaries();
     kprintln!("[ok] {cpus} CPU{} online", if cpus == 1 { "" } else { "s" });
+    arch::console_hand_over();
     task::start()
 }
 

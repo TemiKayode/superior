@@ -1,5 +1,6 @@
-//! COM1 serial console: the kernel's only output device. Everything here is
-//! debug output; user-facing consoles are user-space services.
+//! COM1 serial console, and until user space starts the boot framebuffer
+//! too (`super::fbcon`). Everything here is debug output; user-facing
+//! consoles are user-space services.
 
 use core::fmt::{self, Write};
 use spin::{Lazy, Mutex};
@@ -23,6 +24,7 @@ pub fn _print(args: fmt::Arguments) {
     // deadlock against the code it interrupted.
     x86_64::instructions::interrupts::without_interrupts(|| {
         let _ = COM1.lock().write_fmt(args);
+        super::fbcon::print(args);
     });
 }
 

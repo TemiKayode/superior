@@ -23,5 +23,7 @@ spin = { version = "0.9", default-features = false, features = ["spin_mutex", "l
 
 [target.'cfg(target_arch = "x86_64")'.dependencies]
 bootloader_api = "0.11"
+# The 5x7 font, for the kernel's log on the boot framebuffer.
+superior-toolkit = { path = "../crates/toolkit" }
 x86_64 = "0.15"
 uart_16550 = "0.3"

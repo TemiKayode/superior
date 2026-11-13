@@ -698,6 +698,7 @@ dependencies = [
  "bootloader_api",
  "spin",
  "superior-objects",
+ "superior-toolkit",
  "uart_16550",
  "x86_64",
 ]

@@ -41,6 +41,14 @@ holds the rest):
   shell session on four CPUs with APIC IDs 0, 1, 2 and 4 (the firmware's boot
   manager, the bootloader's UEFI stage and all four CPUs must show), then the
   driver framework test on q35 with VT-d.
+- The kernel's log on the screen as well as COM1, for machines with no serial port:
+  drawn on the framebuffer the bootloader (a VESA mode) or UEFI firmware (its GOP)
+  set up, light grey on black in the toolkit's font, scrolling when full, until
+  user space starts (from then the PCI bus server and display driver own the display,
+  which may move), so a panic during boot shows too. `cargo xtask console-test`
+  takes a screenshot once the shell's prompt shows, from a BIOS (1280x720) and from
+  UEFI (1280x800), and the first log lines must have every pixel as the host draws
+  them.
 - Boot, serial console, GDT/TSS, exception handlers; the legacy PIC remapped to vector
   0x20 with every line masked until a driver claims one.
 - All usable physical memory handed to the root CNode as untyped capabilities; every
@@ -1176,6 +1184,7 @@ cargo xtask ab-test        # A/B system slots: an update staged, tried, fallen b
 cargo xtask packages-test  # signed app packages: bad ones refused, the app installed, kept across boots, uninstalled
 cargo xtask run            # boot the shell in QEMU (x86-64), its console on this terminal
 cargo xtask run aarch64    # the same on QEMU's AArch64 virt machine
+cargo xtask console-test   # the kernel's log on the boot framebuffer, from a BIOS and from UEFI, checked by screenshot
 cargo xtask uefi-test      # x86-64 booted by UEFI firmware (OVMF): the shell session and the driver test
 cargo xtask idl    # generate Rust from the interface descriptions in interfaces/
 cargo xtask image  # just build target/superior.img

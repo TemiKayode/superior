@@ -196,12 +196,14 @@ fn main() -> ExitCode {
                 })
             })
             .and_then(|_| uefi_test())
+            .and_then(|_| console_test())
             .and_then(|_| sel4_image())
             .and_then(|img| shell_session(&img)),
         Some("sel4-test") => sel4_image().and_then(|img| shell_session(&img)),
         Some("boot-test") => image(true, arch).and_then(|img| boot(&img, true)),
         Some("shell-test") => image(false, arch).and_then(|img| shell_session(&img)),
         Some("uefi-test") => uefi_test(),
+        Some("console-test") => console_test(),
         Some("cm-test") => image_with(false, arch, "test").and_then(|img| cm_test(&img)),
         Some("drivers-test") => {
             image_with(false, arch, "drivers").and_then(|img| drivers_test(&img))
@@ -238,7 +240,7 @@ fn main() -> ExitCode {
         }
         Some("bench") => image(false, Arch::X86_64).and_then(|img| bench(&img)),
         _ => Err(
-            "usage: cargo xtask <idl | image | run | test | boot-test | shell-test | cm-test | supervise-test | drivers-test | memory-test | reboot-test | fs-test | nvme-test | ahci-test | net-test | lde-test | lde-e100-test | display-test | desktop-test | windows-test | toolkit-test | panel-test | resize-test | uefi-test | input-test | audio-test | tcp-test | keyboard-test | hotplug-test | suspend-test | verified-boot-test | ab-test | packages-test | bench | sel4-test> [x86_64 | aarch64]"
+            "usage: cargo xtask <idl | image | run | test | boot-test | shell-test | cm-test | supervise-test | drivers-test | memory-test | reboot-test | fs-test | nvme-test | ahci-test | net-test | lde-test | lde-e100-test | display-test | desktop-test | windows-test | toolkit-test | panel-test | resize-test | uefi-test | console-test | input-test | audio-test | tcp-test | keyboard-test | hotplug-test | suspend-test | verified-boot-test | ab-test | packages-test | bench | sel4-test> [x86_64 | aarch64]"
                 .into(),
         ),
     });
@@ -4725,11 +4727,135 @@ fn uefi_test() -> Result<(), String> {
     Ok(())
 }
 
+/// The kernel's log on the boot framebuffer (kernel/src/arch/x86_64/
+/// fbcon.rs): its scale, margin, character cell and colour.
+const CON_SCALE: usize = 2;
+const CON_MARGIN: usize = 8;
+const CON_CELL: (usize, usize) = (6 * CON_SCALE, 9 * CON_SCALE);
+const CON_INK: [u8; 3] = [0xc8, 0xcc, 0xd0];
+
+/// Reads a binary PPM of any size: its width, height and RGB bytes.
+fn read_ppm(path: &Path) -> Result<(usize, usize, Vec<u8>), String> {
+    let data = std::fs::read(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
+    let (mut fields, mut at) = (Vec::new(), 0);
+    while fields.len() < 4 && at < data.len() {
+        while at < data.len() && data[at].is_ascii_whitespace() {
+            at += 1;
+        }
+        let start = at;
+        while at < data.len() && !data[at].is_ascii_whitespace() {
+            at += 1;
+        }
+        fields.push(String::from_utf8_lossy(&data[start..at]).into_owned());
+    }
+    let num = |i: usize| fields.get(i).and_then(|f| f.parse::<usize>().ok());
+    match (fields.first().map(String::as_str), num(1), num(2)) {
+        (Some("P6"), Some(w), Some(h)) if data.len() >= at + 1 + w * h * 3 => Ok((w, h, data[at + 1..].to_vec())),
+        _ => Err(format!("{}: not a binary PPM", path.display())),
+    }
+}
+
+/// Checks the screenshot at `path`: the top of the screen must be the
+/// kernel's first log lines (`lines`), laid out as the kernel does
+/// (wrapped at the screen's width), every pixel light grey or black.
+/// The screen's size, and how many pixels were checked.
+fn check_console(path: &Path, lines: &dyn Fn(usize, usize) -> Vec<String>) -> Result<String, String> {
+    use superior_toolkit::font;
+    let (w, h, px) = read_ppm(path)?;
+    let columns = (w - 2 * CON_MARGIN) / CON_CELL.0;
+    // Where each character lands: (column, row).
+    let mut cells = Vec::new();
+    let mut row = 0;
+    for line in lines(w, h) {
+        for (i, c) in line.bytes().enumerate() {
+            if i > 0 && i % columns == 0 {
+                row += 1;
+            }
+            cells.push((i % columns, row, c));
+        }
+        row += 1;
+    }
+    let mut want = vec![[0u8; 3]; w * (CON_MARGIN + row * CON_CELL.1)];
+    for &(col, row, c) in &cells {
+        let (x0, y0) = (CON_MARGIN + col * CON_CELL.0, CON_MARGIN + row * CON_CELL.1);
+        for dy in 0..7 * CON_SCALE {
+            for dx in 0..CON_CELL.0 {
+                if font::lit(c, (dx / CON_SCALE) as u32, (dy / CON_SCALE) as u32) {
+                    want[(y0 + dy) * w + x0 + dx] = CON_INK;
+                }
+            }
+        }
+    }
+    let mut wrong = 0;
+    let mut first = None;
+    for (i, want) in want.iter().enumerate() {
+        let have = [px[i * 3], px[i * 3 + 1], px[i * 3 + 2]];
+        if have != *want {
+            wrong += 1;
+            first.get_or_insert((i % w, i / w, have, *want));
+        }
+    }
+    match first {
+        None => Ok(format!("{w}x{h}, the first {row} lines' {} pixels right", want.len())),
+        Some((x, y, have, want)) => Err(format!(
+            "{}: {wrong} pixels wrong at the top, the first at ({x}, {y}): {have:?}, not {want:?}",
+            path.display()
+        )),
+    }
+}
+
+/// The kernel's log on the boot framebuffer, from a BIOS (the
+/// bootloader's VESA mode) and from UEFI firmware (its GOP): once the
+/// shell's prompt shows, QEMU's monitor takes a screenshot whose top must
+/// be the kernel's first lines, every pixel as the host draws them in the
+/// same font.
+fn console_test() -> Result<(), String> {
+    let lines = |w: usize, h: usize| {
+        vec![
+            String::new(),
+            format!("Superior microkernel {} (x86_64)", env!("CARGO_PKG_VERSION")),
+            format!("[ok] this log on the boot framebuffer too, {w}x{h}, until user space starts"),
+            "[ok] gdt + tss loaded".to_string(),
+            "[ok] idt loaded".to_string(),
+            "[ok] syscall/sysret enabled".to_string(),
+        ]
+    };
+    let qmp = format!("tcp:127.0.0.1:{QMP_PORT},server=on,wait=off");
+    for (img, firmware) in [(image(false, Arch::X86_64)?, "BIOS"), (uefi_image("shell")?, "UEFI")] {
+        println!("== console test ({firmware}) on {}", img.path.display());
+        let path = root().join("target").join(format!("console-{}.ppm", firmware.to_lowercase()));
+        let checked = std::cell::RefCell::new(String::new());
+        let out = drive_shell_at(&img, &["-qmp", &qmp], &SHELL_SCRIPT[..1], &|| {
+            let _ = std::fs::remove_file(&path);
+            screendump(&path)?;
+            *checked.borrow_mut() = check_console(&path, &lines)?;
+            Ok(())
+        })?;
+        check_log(
+            "console test",
+            &out,
+            &["[ok] this log on the boot framebuffer too", "[ok] the screen is user space's from here"],
+        )?;
+        println!("== console test passed ({firmware}): {}", checked.borrow());
+    }
+    Ok(())
+}
+
 /// Boots `img` with `extra` QEMU arguments and drives the shell over the
 /// serial port as a person would: wait for the prompt, type a command,
 /// check the answer, and finally `shutdown`, which must end QEMU with the
 /// pass code. Returns everything the shell printed.
 fn drive_shell(img: &Image, extra: &[&str], script: &[(&str, &str)]) -> Result<String, String> {
+    drive_shell_at(img, extra, script, &|| Ok(()))
+}
+
+/// As [`drive_shell`], calling `at_prompt` once the first prompt shows.
+fn drive_shell_at(
+    img: &Image,
+    extra: &[&str],
+    script: &[(&str, &str)],
+    at_prompt: &dyn Fn() -> Result<(), String>,
+) -> Result<String, String> {
     let mut child = qemu_command(img)
         .args(["-display", "none"])
         .args(extra)
@@ -4774,7 +4900,7 @@ fn drive_shell(img: &Image, extra: &[&str], script: &[(&str, &str)]) -> Result<S
     let prompt = "superior> ";
     let mut at = expect(prompt, 0)?;
     // Typing goes one byte at a time, as from a keyboard.
-    let mut result = Ok(());
+    let mut result = at_prompt();
     for (typed, want) in script {
         // Enter is sent as a line feed: QEMU on Windows drops a bare
         // carriage return read from a pipe. The shell accepts either.

@@ -43,6 +43,10 @@ const PSCI_CPU_ON: u64 = 0xc400_0003;
 /// The device tree in use, for drivers that look themselves up later.
 static DTB: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+/// User space is about to start. Nothing to hand over: QEMU's `virt`
+/// machine boots with no framebuffer, so the log is on the PL011 alone.
+pub fn console_hand_over() {}
+
 /// Finds and turns on the IOMMU, if the machine has one.
 pub fn iommu_init() -> Option<&'static str> {
     iommu::init(DTB.load(core::sync::atomic::Ordering::Relaxed))

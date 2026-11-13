@@ -25,6 +25,7 @@ use superior_objects::cap::{Capability, Object, Rights};
 pub const NAME: &str = "x86_64";
 
 mod acpi;
+mod fbcon;
 
 /// Finds and turns on the IOMMU, if the machine has one.
 pub fn iommu_init() -> Option<&'static str> {
@@ -42,7 +43,11 @@ entry_point!(kernel_main, config = &BOOTLOADER_CONFIG);
 
 fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     serial::init();
+    fbcon::init(boot_info.framebuffer.as_mut());
     crate::banner();
+    if let Some((w, h)) = fbcon::size() {
+        kprintln!("[ok] this log on the boot framebuffer too, {w}x{h}, until user space starts");
+    }
 
     gdt::init(0);
     kprintln!("[ok] gdt + tss loaded");
@@ -72,6 +77,15 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         apic::TICK_HZ
     );
     crate::kernel_start(mem.untyped_caps)
+}
+
+/// User space is about to start: the kernel stops drawing on the boot
+/// framebuffer, which the PCI bus server and a display driver may take.
+pub fn console_hand_over() {
+    if fbcon::size().is_some() {
+        kprintln!("[ok] the screen is user space's from here; the log goes on on COM1");
+        fbcon::hand_over();
+    }
 }
 
 /// This CPU's number (0 the boot CPU), from its local APIC ID.
