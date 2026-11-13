@@ -1,6 +1,6 @@
 //! Intel VT-d (DMA remapping), as QEMU's `intel-iommu` emulates it on the
-//! q35 machine: one remapping unit at 0xfed9_0000 covering every PCI
-//! function, register-based invalidation, legacy-mode root and context
+//! q35 machine: the one remapping unit ACPI's DMAR table says covers every
+//! PCI function (at 0xfed9_0000 on QEMU), register-based invalidation, legacy-mode root and context
 //! tables, and 3-level second-level page tables (39-bit I/O addresses).
 //!
 //! Once translation is on, a function with no context entry can reach no
@@ -29,7 +29,6 @@ use superior_objects::abi::PCI_BUSES;
 use core::sync::atomic::{AtomicU64, Ordering};
 use x86_64::PhysAddr;
 
-const BASE: u64 = 0xfed9_0000;
 const VER: u64 = 0x00;
 const CAP: u64 = 0x08;
 const ECAP: u64 = 0x10;
@@ -135,7 +134,8 @@ fn iotlb_reg() -> u64 {
 /// Finds and turns on the remapping unit, with nothing mapped for anyone.
 /// Returns its description, or `None` if the machine has none.
 pub fn init() -> Option<&'static str> {
-    let va = vm::map_mmio(PhysAddr::new(BASE)).ok()?.as_u64();
+    let base = super::acpi::vtd()?;
+    let va = vm::map_mmio(PhysAddr::new(base)).ok()?.as_u64();
     REGS.store(va, Ordering::Relaxed);
     let cap = r64(CAP);
     if r32(VER) != 0x10 || cap == u64::MAX || cap & SAGAW_39 == 0 {
@@ -243,7 +243,8 @@ fn irte(index: u16) -> *mut u64 {
 }
 
 /// Points interrupt remapping table entry `index` at `vector` on the boot
-/// CPU's local APIC (physical destination 0, fixed, edge), raisable only
+/// CPU's local APIC (physical destination its APIC ID, fixed, edge),
+/// raisable only
 /// by requester `source`; with no source, by nobody. Returns the
 /// remappable-format message (address, data) that raises it.
 pub fn route(index: u16, vector: u8, source: Option<u16>) -> (u64, u64) {
@@ -255,7 +256,7 @@ pub fn route(index: u16, vector: u8, source: Option<u16>) -> (u64, u64) {
         if let Some(sid) = source {
             // SVT = 01: the request's requester ID must equal SID.
             e.add(1).write_volatile(sid as u64 | 1 << 18);
-            e.write_volatile(1 | (vector as u64) << 16);
+            e.write_volatile(1 | (vector as u64) << 16 | (super::boot_apic() as u64 & 0xff) << 40);
         } else {
             e.add(1).write_volatile(0);
         }
@@ -335,9 +336,10 @@ fn context_entry(sid: u16) -> Option<*mut u64> {
     Some(vm::phys_ptr((entry & !0xfff) + 16 * (sid & 0xff) as u64) as *mut u64)
 }
 
-/// Whether requester ID `sid` can be bound.
+/// Whether requester ID `sid` can be bound: on a bus the tables reach,
+/// and covered by the unit in use (ACPI's DMAR).
 pub fn valid_sid(sid: u16) -> bool {
-    ((sid >> 8) as u64) < PCI_BUSES
+    ((sid >> 8) as u64) < PCI_BUSES && super::acpi::vtd_covers(sid)
 }
 
 /// Translates requester `sid`'s DMA through the tables under `root`.

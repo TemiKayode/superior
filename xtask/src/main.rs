@@ -129,6 +129,8 @@ struct Image {
     /// An x86-64 image booted by UEFI firmware (QEMU's OVMF) rather than
     /// a BIOS.
     uefi: bool,
+    /// QEMU's `-smp` in place of the usual CPU count (a CPU topology).
+    smp: Option<&'static str>,
 }
 
 /// The disk drivers, each with the PCI function its test disk appears as
@@ -838,6 +840,7 @@ fn image_sealed(
         display: matches!(manifest, "display" | "desktop" | "input" | "windows" | "toolkit" | "panel" | "resize"),
         audio: (manifest == "audio").then(|| audio_wav(arch)),
         uefi: false,
+        smp: None,
     })
 }
 
@@ -937,6 +940,7 @@ fn sel4_image() -> Result<Image, String> {
         display: false,
         audio: None,
         uefi: false,
+        smp: None,
     })
 }
 
@@ -1058,7 +1062,7 @@ fn qemu_command(img: &Image) -> Command {
     }
     // Several CPUs, except for seL4's images (built for one).
     if !img.sel4 {
-        q.args(["-smp", &cpus().to_string()]);
+        q.args(["-smp", &img.smp.map_or(cpus().to_string(), str::to_string)]);
     }
     // QEMU's IDE disks cannot be read-only; the drivers test's disk is
     // made afresh for every run anyway.
@@ -4690,17 +4694,30 @@ fn shell_session(img: &Image) -> Result<(), String> {
 
 /// x86-64 booted by UEFI firmware (QEMU's OVMF) from a GPT disk with no
 /// BIOS boot code: the shell session, which must show the firmware's boot
-/// manager starting the disk and the bootloader's UEFI stage, then the
-/// driver framework test on q35 (PCI Express, the VT-d IOMMU from ACPI's
-/// DMAR table, MSI).
+/// manager starting the disk and the bootloader's UEFI stage, on four CPUs
+/// whose APIC IDs have a gap (found from ACPI's MADT), then the driver
+/// framework test on q35 (PCI Express, the VT-d IOMMU from ACPI's DMAR
+/// table, MSI).
 fn uefi_test() -> Result<(), String> {
-    let img = uefi_image("shell")?;
+    let mut img = uefi_image("shell")?;
+    // Four CPUs of six possible, over two sockets of three cores: APIC IDs
+    // 0, 1, 2 and 4, with a gap at 3 as on real machines. The kernel must
+    // start the four ACPI's MADT lists enabled, not stop at the gap.
+    img.smp = Some("4,sockets=2,cores=3,threads=1,maxcpus=6");
     println!("== UEFI shell session on {}", img.path.display());
     let out = drive_shell(&img, &[], SHELL_SCRIPT)?;
     check_log(
         "UEFI test",
         &out,
-        &["BdsDxe: starting Boot0001 \"UEFI QEMU HARDDISK", "UEFI bootloader started", "Superior microkernel", "superior> "],
+        &[
+            "BdsDxe: starting Boot0001 \"UEFI QEMU HARDDISK",
+            "UEFI bootloader started",
+            "Superior microkernel",
+            "[ok] ACPI: 4 of 6 CPUs listed taken, APIC IDs [0, 1, 2, 4]",
+            "[ok] ACPI: no DMAR (no VT-d)",
+            "[ok] 4 CPUs online",
+            "superior> ",
+        ],
     )?;
     println!("== UEFI shell session passed");
     drivers_test(&uefi_image("drivers")?)?;

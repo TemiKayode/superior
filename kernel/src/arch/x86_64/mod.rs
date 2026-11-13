@@ -65,6 +65,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     kprintln!("[ok] physical memory mapped at {offset:#x}");
     acpi::init(boot_info.rsdp_addr.into_option());
     let timer_hz = apic::init();
+    smp::note_boot_apic();
     kprintln!(
         "[ok] local APIC timer: {} kHz input, {} Hz tick",
         timer_hz / 1000,
@@ -73,9 +74,14 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     crate::kernel_start(mem.untyped_caps)
 }
 
-/// This CPU's number: its APIC ID.
+/// This CPU's number (0 the boot CPU), from its local APIC ID.
 pub fn cpu_id() -> usize {
-    apic::id()
+    smp::cpu_of(apic::id() as u32)
+}
+
+/// The boot CPU's local APIC ID, where device interrupts are sent.
+pub fn boot_apic() -> u32 {
+    smp::apic_of(0)
 }
 
 /// Interrupts between CPUs.
@@ -89,7 +95,7 @@ pub enum Ipi {
 
 pub fn send_ipi(cpu: usize, ipi: Ipi) {
     apic::send_ipi(
-        cpu,
+        smp::apic_of(cpu) as usize,
         match ipi {
             Ipi::Kick => apic::KICK_VECTOR,
             Ipi::Shootdown => apic::SHOOTDOWN_VECTOR,

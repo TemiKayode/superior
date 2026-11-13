@@ -27,14 +27,20 @@ holds the rest):
   frame it maps, and `shutdown` uses the same exit-port capability, emulated.
 
 - x86-64 boots from a BIOS or, as on current laptops, from UEFI firmware: the same
-  kernel on a GPT disk with an EFI system partition and no BIOS boot code. It reads
-  ACPI's MCFG table (from the RSDP the bootloader passes) for PCI Express
-  configuration space, and keeps the window PCI BARs are assigned from clear of it
-  (OVMF puts it at 0xe0000000, SeaBIOS at 0xb0000000). The Component Manager's
-  8 MiB arena is carved before spare RAM is handed out, since UEFI leaves RAM in
-  many more pieces. `cargo xtask uefi-test` boots under QEMU's OVMF: the shell
-  session (the firmware's boot manager and the bootloader's UEFI stage must show),
-  then the driver framework test on q35 with VT-d.
+  kernel on a GPT disk with an EFI system partition and no BIOS boot code. The
+  Component Manager's 8 MiB arena is carved before spare RAM is handed out, since
+  UEFI leaves RAM in many more pieces. The machine is read from ACPI (from the RSDP
+  the bootloader passes), not assumed to be QEMU's: MCFG for PCI Express
+  configuration space, which the window PCI BARs are assigned from stays clear of
+  (OVMF puts it at 0xe0000000, SeaBIOS at 0xb0000000); MADT for the CPUs, started
+  by the APIC IDs it lists enabled (which can have gaps) with a table from CPU number
+  to APIC ID, and device interrupts sent to the boot CPU's own APIC ID; DMAR for the
+  VT-d unit, either the one covering every PCI function or the only one, covering
+  just the functions its device scopes name (QEMU's way), and a function it does
+  not cover cannot be bound. `cargo xtask uefi-test` boots under QEMU's OVMF: the
+  shell session on four CPUs with APIC IDs 0, 1, 2 and 4 (the firmware's boot
+  manager, the bootloader's UEFI stage and all four CPUs must show), then the
+  driver framework test on q35 with VT-d.
 - Boot, serial console, GDT/TSS, exception handlers; the legacy PIC remapped to vector
   0x20 with every line masked until a driver claims one.
 - All usable physical memory handed to the root CNode as untyped capabilities; every

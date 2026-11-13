@@ -142,8 +142,50 @@ pub fn note_boot_cpu() {
     }
 }
 
-/// Starts CPUs with APIC IDs 1, 2, ... until one does not come up (or
-/// [`MAX_CPUS`]). Returns how many CPUs are online.
+/// Each CPU's local APIC ID, by CPU number (`u32::MAX` for none yet):
+/// CPU 0 is the boot CPU, the rest in the order they were started.
+static APIC_OF: [core::sync::atomic::AtomicU32; MAX_CPUS] =
+    [const { core::sync::atomic::AtomicU32::new(u32::MAX) }; MAX_CPUS];
+
+/// CPU `cpu`'s local APIC ID.
+pub fn apic_of(cpu: usize) -> u32 {
+    APIC_OF[cpu].load(Ordering::Relaxed)
+}
+
+/// The number of the CPU with local APIC ID `apic` (0 if none has it).
+pub fn cpu_of(apic: u32) -> usize {
+    (0..MAX_CPUS).find(|&c| APIC_OF[c].load(Ordering::Relaxed) == apic).unwrap_or(0)
+}
+
+/// Records the boot CPU's APIC ID as CPU 0's, once its local APIC is on.
+pub fn note_boot_apic() {
+    APIC_OF[0].store(apic::id() as u32, Ordering::Relaxed);
+}
+
+/// The other CPUs to start, by APIC ID: those the ACPI MADT lists
+/// enabled, but the boot CPU; without a MADT, IDs 1, 2, ... (until one
+/// does not come up).
+fn others() -> [Option<u32>; MAX_CPUS] {
+    let mut out = [None; MAX_CPUS];
+    let boot = apic_of(0);
+    match super::acpi::cpus() {
+        Some(ids) => {
+            for (slot, id) in out.iter_mut().skip(1).zip(ids.filter(|&id| id != boot)) {
+                *slot = Some(id);
+            }
+        }
+        None => {
+            for (cpu, slot) in out.iter_mut().enumerate().skip(1) {
+                *slot = Some(cpu as u32);
+            }
+        }
+    }
+    out
+}
+
+/// Starts the other CPUs ([`others`]), up to [`MAX_CPUS`] in all, each
+/// numbered in turn; stops at one that does not come up. Returns how many
+/// CPUs are online.
 pub fn start_secondaries() -> usize {
     let page = STARTUP_PAGE.load(Ordering::Relaxed);
     let root = vm::kernel_root();
@@ -171,7 +213,9 @@ pub fn start_secondaries() -> usize {
         (at(page, &raw const sup_ap_entry) as *mut u64)
             .write_unaligned(ap_main as *const () as u64);
     }
-    for cpu in 1..MAX_CPUS {
+    for (cpu, apic) in others().into_iter().enumerate().skip(1) {
+        let Some(apic) = apic else { break };
+        APIC_OF[cpu].store(apic, Ordering::Relaxed);
         // SAFETY: as above; the previous CPU is past the trampoline (it
         // came up), so these fields are free to change.
         unsafe {
@@ -180,7 +224,7 @@ pub fn start_secondaries() -> usize {
             (at(page, &raw const sup_ap_stack) as *mut u64).write_unaligned(stack);
             (at(page, &raw const sup_ap_cpu) as *mut u64).write_unaligned(cpu as u64);
         }
-        apic::start_cpu(cpu, page);
+        apic::start_cpu(apic as usize, page);
         // Up to 200 ms to come up; QEMU starts nothing for an ID it does
         // not have.
         let mut waited = 0;
@@ -189,6 +233,7 @@ pub fn start_secondaries() -> usize {
             waited += 1;
         }
         if smp::online() <= cpu {
+            APIC_OF[cpu].store(u32::MAX, Ordering::Relaxed);
             break;
         }
     }
@@ -219,7 +264,7 @@ extern "C" fn ap_main(cpu: u64) -> ! {
     interrupts::load();
     syscall::init(cpu);
     apic::init_ap();
-    debug_assert_eq!(apic::id(), cpu);
+    debug_assert_eq!(apic::id() as u32, apic_of(cpu));
     smp::ONLINE.fetch_add(1, Ordering::AcqRel);
     crate::task::start()
 }
