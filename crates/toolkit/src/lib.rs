@@ -5,9 +5,10 @@
 //! takes the events the compositor gives the window ([`Event`]) and
 //! answers what they changed: the part of the window to show again, and
 //! the button clicked, if any. A button is clicked when pressed and let go
-//! over it; a field pressed takes the keyboard, and keys typed to it edit
-//! its text (letters, digits, space and some punctuation, Shift for
-//! capitals, Backspace). No heap: a `Ui` holds up to [`MAX_WIDGETS`],
+//! over it; a field pressed takes the keyboard, with its cursor where it
+//! was pressed, and keys typed to it edit its text at the cursor (letters,
+//! digits, space and some punctuation, Shift for capitals, Backspace and
+//! Delete; the arrows, Home and End move the cursor). No heap: a `Ui` holds up to [`MAX_WIDGETS`],
 //! each text up to [`MAX_TEXT`] bytes.
 //!
 //! The host draws the same to check the screenshots of the toolkit test,
@@ -163,6 +164,35 @@ impl Text {
         self.len -= 1;
         true
     }
+
+    /// Puts `b` before byte `at` (at most the length); false if full.
+    pub fn insert(&mut self, at: usize, b: u8) -> bool {
+        if self.len == MAX_TEXT || at > self.len {
+            return false;
+        }
+        self.bytes.copy_within(at..self.len, at + 1);
+        self.bytes[at] = b;
+        self.len += 1;
+        true
+    }
+
+    /// Takes out byte `at`; false if there is none.
+    pub fn remove(&mut self, at: usize) -> bool {
+        if at >= self.len {
+            return false;
+        }
+        self.bytes.copy_within(at + 1..self.len, at);
+        self.len -= 1;
+        true
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -179,6 +209,8 @@ pub struct Widget {
     pub text: Text,
     /// A button drawn as chosen.
     pub selected: bool,
+    /// A field's cursor: the byte of its text it is before.
+    pub cursor: usize,
 }
 
 /// A widget's number in its [`Ui`], in the order added.
@@ -232,6 +264,16 @@ pub fn character(usage: u64, modifiers: u8) -> Option<u8> {
 
 const BACKSPACE: u64 = 42;
 const ENTER: u64 = 40;
+const DELETE: u64 = 76;
+const HOME: u64 = 74;
+const END: u64 = 77;
+const RIGHT: u64 = 79;
+const LEFT: u64 = 80;
+
+/// How far apart characters are drawn in a field.
+const STEP: u32 = font::ADVANCE * SCALE;
+/// Where a field's text starts, from its left edge.
+const FIELD_INSET: u32 = 6;
 
 /// Widgets laid out in a column (or a row) on a window `w` by `h`, and
 /// their state.
@@ -258,7 +300,7 @@ pub struct Ui {
 impl Ui {
     /// A column, top to bottom.
     pub fn new(w: u32, h: u32) -> Ui {
-        let none = Widget { kind: Kind::Label, rect: Rect::NONE, text: Text::EMPTY, selected: false };
+        let none = Widget { kind: Kind::Label, rect: Rect::NONE, text: Text::EMPTY, selected: false, cursor: 0 };
         Ui {
             w,
             h,
@@ -300,7 +342,8 @@ impl Ui {
             self.next_y += h + PAD;
             r
         };
-        self.widgets[self.len] = Widget { kind, rect, text: Text::new(text), selected: false };
+        let text = Text::new(text);
+        self.widgets[self.len] = Widget { kind, rect, text, selected: false, cursor: text.len() };
         self.len += 1;
         self.len - 1
     }
@@ -363,12 +406,18 @@ impl Ui {
     }
 
     /// Sets widget `id`'s text: the part of the window to show again.
+    /// A field's cursor: the byte of its text it is before.
+    pub fn cursor(&self, id: Id) -> usize {
+        self.widgets[id].cursor
+    }
+
     pub fn set_text(&mut self, id: Id, text: &str) -> Rect {
         let t = Text::new(text.as_bytes());
         if self.widgets[id].text == t {
             return Rect::NONE;
         }
         self.widgets[id].text = t;
+        self.widgets[id].cursor = t.len();
         self.widgets[id].rect
     }
 
@@ -390,7 +439,7 @@ impl Ui {
     }
 
     fn draw_widget(&self, s: &mut Surface, id: Id) {
-        let Widget { kind, rect: r, text, selected } = self.widgets[id];
+        let Widget { kind, rect: r, text, selected, cursor } = self.widgets[id];
         let t = text.as_bytes();
         let th = font::HEIGHT * SCALE;
         match kind {
@@ -417,11 +466,12 @@ impl Ui {
                 let keyboard = self.keyboard() == Some(id);
                 s.fill(r, FIELD);
                 s.outline(r, if keyboard { FOCUS_EDGE } else { EDGE });
-                let (tx, ty) = (r.x + 6, r.y + (r.h - th) / 2);
+                let (tx, ty) = (r.x + FIELD_INSET, r.y + (r.h - th) / 2);
                 s.text(tx, ty, t, SCALE, INK);
                 if keyboard {
-                    // The cursor, after the text.
-                    let cx = tx + font::width(t, SCALE) + if t.is_empty() { 0 } else { SCALE };
+                    // The cursor, in the gap before the character it is
+                    // before (or after the last one).
+                    let cx = tx + cursor as u32 * STEP - SCALE;
                     s.fill(Rect { x: cx, y: ty - 1, w: SCALE, h: th + 2 }, INK);
                 }
             }
@@ -469,9 +519,16 @@ impl Ui {
                     self.pressed = button;
                     r.damage = r.damage.union(self.rect(button));
                     let field = under.filter(|&id| self.widgets[id].kind == Kind::Field);
-                    if field.is_some() && field != self.field {
-                        r.damage = r.damage.union(self.rect(self.field)).union(self.rect(field));
-                        self.field = field;
+                    if let Some(f) = field {
+                        // The cursor goes to the gap nearest the press.
+                        let w = &mut self.widgets[f];
+                        let from = x - (w.rect.x + FIELD_INSET) as i32 + STEP as i32 / 2;
+                        let cursor = (from.max(0) as u32 / STEP).min(w.text.len() as u32) as usize;
+                        if field != self.field || cursor != w.cursor {
+                            w.cursor = cursor;
+                            r.damage = r.damage.union(self.rect(self.field)).union(self.rect(field));
+                            self.field = field;
+                        }
                     }
                 }
                 if let_go {
@@ -495,16 +552,40 @@ impl Ui {
             }
             Event::Key { usage, down: true, modifiers } => {
                 if let Some(id) = self.keyboard() {
-                    let text = &mut self.widgets[id].text;
+                    let Widget { text, cursor, .. } = &mut self.widgets[id];
+                    let before = *cursor;
                     let changed = match usage {
-                        BACKSPACE => text.pop(),
+                        BACKSPACE => *cursor > 0 && text.remove(*cursor - 1) && {
+                            *cursor -= 1;
+                            true
+                        },
+                        DELETE => text.remove(*cursor),
+                        LEFT => {
+                            *cursor = cursor.saturating_sub(1);
+                            false
+                        }
+                        RIGHT => {
+                            *cursor = (*cursor + 1).min(text.len());
+                            false
+                        }
+                        HOME => {
+                            *cursor = 0;
+                            false
+                        }
+                        END => {
+                            *cursor = text.len();
+                            false
+                        }
                         ENTER => {
                             r.entered = Some(id);
                             false
                         }
-                        _ => character(usage, modifiers).is_some_and(|c| text.push(c)),
+                        _ => character(usage, modifiers).is_some_and(|c| text.insert(*cursor, c)) && {
+                            *cursor += 1;
+                            true
+                        },
                     };
-                    if changed {
+                    if changed || *cursor != before {
                         r.damage = self.widgets[id].rect;
                     }
                 }
@@ -523,7 +604,7 @@ fn overlaps(a: Rect, b: Rect) -> bool {
 mod tests {
     use super::*;
 
-    const LEFT: u64 = 1;
+    const LEFT_BUTTON: u64 = 1;
 
     fn greeter() -> (Ui, Id, Id, Id) {
         let mut ui = Ui::new(280, 124);
@@ -536,7 +617,7 @@ mod tests {
 
     fn press(ui: &mut Ui, x: i32, y: i32) -> Response {
         ui.event(Event::Pointer { x, y, buttons: 0 });
-        ui.event(Event::Pointer { x, y, buttons: LEFT });
+        ui.event(Event::Pointer { x, y, buttons: LEFT_BUTTON });
         ui.event(Event::Pointer { x, y, buttons: 0 })
     }
 
@@ -574,10 +655,10 @@ mod tests {
         let (mut ui, _, button, _) = greeter();
         assert_eq!(press(&mut ui, 40, 70).clicked, Some(button));
         // Pressed on it, let go off it: no click.
-        ui.event(Event::Pointer { x: 40, y: 70, buttons: LEFT });
+        ui.event(Event::Pointer { x: 40, y: 70, buttons: LEFT_BUTTON });
         assert_eq!(ui.event(Event::Pointer { x: 200, y: 70, buttons: 0 }).clicked, None);
         // Pressed off it, let go on it: no click.
-        ui.event(Event::Pointer { x: 200, y: 70, buttons: LEFT });
+        ui.event(Event::Pointer { x: 200, y: 70, buttons: LEFT_BUTTON });
         assert_eq!(ui.event(Event::Pointer { x: 40, y: 70, buttons: 0 }).clicked, None);
     }
 
@@ -634,15 +715,68 @@ mod tests {
         ui.event(Event::Focus(true));
         ui.draw(&mut s);
         assert_eq!(at(&s, 8, 32), FOCUS_EDGE, "the field with the keyboard");
-        // The cursor at the start of the empty field.
-        assert_eq!(at(&s, 14, 38), INK);
+        // The cursor at the start of the empty field, just before where
+        // text starts.
+        assert_eq!(at(&s, 12, 38), INK);
+        assert_eq!(at(&s, 14, 38), FIELD);
         key(&mut ui, 4, 0);
         assert_eq!(ui.text(field), "a");
         ui.draw(&mut s);
-        // The 'a' (its row 2 is 0x0e: columns 1 to 3), then the cursor.
+        // The 'a' (its row 2 is 0x0e: columns 1 to 3), then the cursor in
+        // the gap after it.
         assert_eq!(at(&s, 14 + 2, 39 + 4), INK);
         assert_eq!(at(&s, 14, 39 + 4), FIELD);
-        assert_eq!(at(&s, 14 + 10 + 2, 38), INK);
+        assert_eq!(at(&s, 14 + 10, 38), INK);
+        assert_eq!(at(&s, 12, 38), FIELD, "the cursor has moved on");
+    }
+
+    #[test]
+    fn the_cursor_moves_and_edits_happen_at_it() {
+        let (mut ui, field, ..) = greeter();
+        press(&mut ui, 100, 40);
+        ui.event(Event::Focus(true));
+        for u in [4, 7, 4] {
+            key(&mut ui, u, 0);
+        }
+        assert_eq!((ui.text(field), ui.cursor(field)), ("ada", 3));
+        // Moving the cursor shows the field again, though the text is the
+        // same; at either end it stays.
+        assert_eq!(key(&mut ui, LEFT, 0).damage, ui.widget(field).rect);
+        key(&mut ui, LEFT, 0);
+        assert_eq!(ui.cursor(field), 1);
+        key(&mut ui, DELETE, 0);
+        assert_eq!((ui.text(field), ui.cursor(field)), ("aa", 1));
+        key(&mut ui, 17, 0);
+        key(&mut ui, 17, 0);
+        assert_eq!((ui.text(field), ui.cursor(field)), ("anna", 3));
+        key(&mut ui, HOME, 0);
+        assert_eq!(key(&mut ui, LEFT, 0).damage, Rect::NONE, "already at the start");
+        assert_eq!(key(&mut ui, BACKSPACE, 0).damage, Rect::NONE, "nothing before it");
+        key(&mut ui, RIGHT, 0);
+        key(&mut ui, BACKSPACE, 0);
+        assert_eq!((ui.text(field), ui.cursor(field)), ("nna", 0));
+        key(&mut ui, END, 0);
+        key(&mut ui, RIGHT, 0);
+        assert_eq!(ui.cursor(field), 3);
+        // A press puts the cursor in the gap nearest it: text starts at 14,
+        // a character every 12 pixels.
+        let down = |ui: &mut Ui, x: i32| {
+            let r = ui.event(Event::Pointer { x, y: 40, buttons: LEFT_BUTTON });
+            ui.event(Event::Pointer { x, y: 40, buttons: 0 });
+            r.damage
+        };
+        assert_eq!(down(&mut ui, 14 + 12 + 5), ui.widget(field).rect);
+        assert_eq!(ui.cursor(field), 1);
+        press(&mut ui, 14 + 12 + 7, 40);
+        assert_eq!(ui.cursor(field), 2);
+        press(&mut ui, 9, 40);
+        assert_eq!(ui.cursor(field), 0);
+        press(&mut ui, 250, 40);
+        assert_eq!(ui.cursor(field), 3, "past the text, at its end");
+        assert_eq!(down(&mut ui, 250), Rect::NONE, "where it was already");
+        // Setting the text puts the cursor at its end.
+        ui.set_text(field, "ab");
+        assert_eq!(ui.cursor(field), 2);
     }
 
     #[test]

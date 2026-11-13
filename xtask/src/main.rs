@@ -2574,6 +2574,8 @@ enum Act {
     Button(bool),
     /// Types these letters on the keyboard.
     Type(&'static str),
+    /// Presses and lets go of the key with this QEMU name ("left", "end").
+    Key(&'static str),
     /// Puts the tablet where it puts the pointer at this pixel.
     Tablet(usize, usize),
     /// Turns the wheel one step up (1) or down (-1).
@@ -2671,6 +2673,14 @@ fn input_act(act: &Act, arch: Arch) -> Result<Option<String>, String> {
                 qmp(&[send(format!(
                     "{{\"type\":\"btn\",\"data\":{{\"down\":{down},\"button\":\"{button}\"}}}}"
                 ))])?;
+            }
+        }
+        Act::Key(k) => {
+            for down in [true, false] {
+                qmp(&[send(format!(
+                    "{{\"type\":\"key\",\"data\":{{\"down\":{down},\"key\":{{\"type\":\"qcode\",\"data\":\"{k}\"}}}}}}"
+                ))])?;
+                std::thread::sleep(Duration::from_millis(KEY_GAP_MS));
             }
         }
         Act::Type(keys) => {
@@ -3014,12 +3024,29 @@ fn toolkit_pictures() -> Vec<(Option<Vec<u32>>, Option<(usize, usize)>)> {
     }
     assert_eq!(ui.text(field), "ada");
     let typed = draw(&ui);
+    // Back two, the 'd' deleted, "nn" typed there.
+    let key = |ui: &mut superior_toolkit::Ui, usage: u64| {
+        ui.event(Event::Key { usage, down: true, modifiers: 0 });
+        ui.event(Event::Key { usage, down: false, modifiers: 0 });
+    };
+    for usage in [80, 80, 76, 17, 17] {
+        key(&mut ui, usage);
+    }
+    assert_eq!((ui.text(field), ui.cursor(field)), ("anna", 3));
+    let edited = draw(&ui);
+    // Pressed before the text, "jo" typed there, then End.
+    click(&mut ui, TOOLKIT_FIELD_START);
+    for usage in [13, 18, 77] {
+        key(&mut ui, usage);
+    }
+    assert_eq!((ui.text(field), ui.cursor(field)), ("joanna", 6));
     click(&mut ui, TOOLKIT_BUTTON);
-    ui.set_text(out, "Hello, ada!");
+    ui.set_text(out, "Hello, joanna!");
     let greeted = draw(&ui);
     vec![
         (Some(first), None),
         (Some(typed), Some(TOOLKIT_FIELD)),
+        (Some(edited), Some(TOOLKIT_FIELD)),
         (Some(greeted), Some(TOOLKIT_BUTTON)),
         (None, Some(TOOLKIT_CLOSE)),
     ]
@@ -3028,6 +3055,8 @@ fn toolkit_pictures() -> Vec<(Option<Vec<u32>>, Option<(usize, usize)>)> {
 /// Where the toolkit test's pointer goes on the screen: on the greeter's
 /// field, its button and its close box.
 const TOOLKIT_FIELD: (usize, usize) = (400, 225);
+/// Just inside the field's left edge, before its text.
+const TOOLKIT_FIELD_START: (usize, usize) = (275, 225);
 const TOOLKIT_BUTTON: (usize, usize) = (309, 259);
 const TOOLKIT_CLOSE: (usize, usize) = (530, 170);
 
@@ -3103,8 +3132,10 @@ fn toolkit_act(act: &Act, arch: Arch) -> Result<Option<String>, String> {
 
 /// Boots `boot/toolkit.manifest`: the greeter, the first toolkit app, in a
 /// decorated window the compositor titles. The host clicks its field,
-/// types "ada", clicks its button (it greets the name) and presses its
-/// close box (it closes). Four screenshots must have every pixel as the
+/// types "ada", edits it to "anna" with the arrows and Delete, clicks
+/// before the text and types "jo" there, presses End, clicks its button
+/// (it greets the name) and presses its close box (it closes). Five
+/// screenshots must have every pixel as the
 /// toolkit draws the window after the same events, in its frame with its
 /// title.
 fn toolkit_test(arch: Arch) -> Result<(), String> {
@@ -3126,24 +3157,41 @@ fn toolkit_test(arch: Arch) -> Result<(), String> {
             vec![Shot(1), rel((400, 300), TOOLKIT_FIELD), Button(true), Button(false), Type("ada")],
         ),
         (
-            vec!["greeter: the field holds \"ada\""],
-            vec![Shot(2), rel(TOOLKIT_FIELD, TOOLKIT_BUTTON), Button(true), Button(false)],
+            vec!["greeter: the field holds \"ada\", the cursor at 3"],
+            vec![Shot(2), Key("left"), Key("left"), Key("delete"), Type("nn")],
         ),
         (
-            vec!["greeter: said \"Hello, ada!\""],
-            vec![Shot(3), rel(TOOLKIT_BUTTON, TOOLKIT_CLOSE), Button(true), Button(false)],
+            vec!["greeter: the field holds \"anna\", the cursor at 3"],
+            vec![Shot(3), rel(TOOLKIT_FIELD, TOOLKIT_FIELD_START), Button(true), Button(false), Type("jo"), Key("end")],
         ),
-        (vec!["toolkit: the greeter's window is gone"], vec![Shot(4)]),
+        (
+            vec!["greeter: the field holds \"joanna\", the cursor at 6"],
+            vec![rel(TOOLKIT_FIELD_START, TOOLKIT_BUTTON), Button(true), Button(false)],
+        ),
+        (
+            vec!["greeter: said \"Hello, joanna!\""],
+            vec![Shot(4), rel(TOOLKIT_BUTTON, TOOLKIT_CLOSE), Button(true), Button(false)],
+        ),
+        (vec!["toolkit: the greeter's window is gone"], vec![Shot(5)]),
     ];
     let (out, shots) = run_script(&img, arch, "toolkit test", script, toolkit_act)?;
     let log = [
         "compositor: ready: the desktop on a 800x600 screen",
         "greeter: ready: window 0, decorated, titled \"Greeter\"",
         "toolkit: the greeter's window is on the screen",
-        "greeter: the field holds \"a\"",
-        "greeter: the field holds \"ad\"",
-        "greeter: the field holds \"ada\"",
-        "greeter: said \"Hello, ada!\"",
+        "greeter: the field holds \"a\", the cursor at 1",
+        "greeter: the field holds \"ad\", the cursor at 2",
+        "greeter: the field holds \"ada\", the cursor at 3",
+        "greeter: the field holds \"ada\", the cursor at 2",
+        "greeter: the field holds \"ada\", the cursor at 1",
+        "greeter: the field holds \"aa\", the cursor at 1",
+        "greeter: the field holds \"ana\", the cursor at 2",
+        "greeter: the field holds \"anna\", the cursor at 3",
+        "greeter: the field holds \"anna\", the cursor at 0",
+        "greeter: the field holds \"janna\", the cursor at 1",
+        "greeter: the field holds \"joanna\", the cursor at 2",
+        "greeter: the field holds \"joanna\", the cursor at 6",
+        "greeter: said \"Hello, joanna!\"",
         "compositor: window 0: its close box was pressed",
         "greeter: closed",
         "toolkit: the greeter's window is gone",

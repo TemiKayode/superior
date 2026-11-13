@@ -876,8 +876,10 @@ holds the rest):
   printable ASCII, drawing into a window's pixels, and widgets laid out in a
   column: labels, buttons (clicked when pressed and let go over them, the face
   showing the pointer over it and a press) and text fields (one pressed takes
-  the keyboard while the window has the focus; letters, digits, space, some
-  punctuation, Shift and Backspace edit it, Enter reports it). The app hands it
+  the keyboard while the window has the focus, its cursor in the gap nearest
+  the press; letters, digits, space, some punctuation and Shift type at the
+  cursor, Backspace and Delete take out the character before or after it, the
+  arrows, Home and End move it, Enter reports it). The app hands it
   the compositor's events and gets back the part of the window to show again
   and the button clicked; no heap. The compositor writes a decorated window's
   title (`SET_TITLE`, `window` version 5) in its title bar with the same font.
@@ -885,7 +887,9 @@ holds the rest):
   "Greeter", greets it when its button is clicked, closes from its close box, and
   makes its window again if the compositor restarts. `cargo xtask toolkit-test`
   boots `boot/toolkit.manifest` on both ISAs: the host clicks the field, types
-  "ada", clicks the button and presses the close box; four screenshots must have
+  "ada", edits it to "anna" with the arrows and Delete, clicks before the text
+  and types "jo", presses End, clicks the button and presses the close box;
+  five screenshots must have
   every pixel as the toolkit, run on the host after the same events, draws the
   window, in its frame with its title.
 - The desktop shell's panel (`user/panel/`), a strip along the bottom of the
@@ -1031,7 +1035,7 @@ holds the rest):
   notifications, a 256-slot CNode pool) so filling them stays quick; normal kernels have
   32 of each, 32 address spaces and a 4096-slot pool.
 
-Not yet: in the compositor resizing by the left and top borders and maximising; in the desktop shell a launcher menu, a clock, minimising, and app icons; in the toolkit layouts other than a column, scrolling, text selection and a cursor that moves within a field; a hardware cursor plane,
+Not yet: in the compositor resizing by the left and top borders and maximising; in the desktop shell a launcher menu, a clock, minimising, and app icons; in the toolkit layouts other than a column, scrolling (a field's text past its width), and text selection; a hardware cursor plane,
 pointer events when a window moves or appears under a still pointer, keyboard
 layouts and key repeat (keys are USB usages), and surviving a client
 that dies at the very moment its window is read (the compositor then faults and
@@ -1142,7 +1146,7 @@ cargo xtask display-test   # Linux's bochs display driver: two pictures, checked
 cargo xtask desktop-test   # the compositor: two clients' windows through restarts, five screenshots checked pixel by pixel
 cargo xtask panel-test     # the desktop shell's panel: two apps launched, one activated, closed and launched again, five screenshots checked
 cargo xtask resize-test    # a resizable window: its frame dragged out and in past its least size, three screenshots checked
-cargo xtask toolkit-test   # the greeter on the toolkit: a field typed in, a button clicked, closed, four screenshots checked against the toolkit drawn on the host
+cargo xtask toolkit-test   # the greeter on the toolkit: a field typed in and edited at its cursor, a button clicked, closed, five screenshots checked against the toolkit drawn on the host
 cargo xtask windows-test   # translucent and decorated windows: a blend, a drag by the title bar, a close box, three screenshots checked
 cargo xtask input-test     # the compositor's pointer, focus, keys and wheel from a USB mouse, tablet and keyboard, seven screenshots checked
 cargo xtask audio-test     # Linux's ES1370 driver and the mixer: two clients' sounds through restarts, every recorded sample checked

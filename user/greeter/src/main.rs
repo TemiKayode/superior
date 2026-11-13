@@ -211,11 +211,11 @@ impl App {
             }
             _ => return true,
         };
-        let before = self.ui.text(self.field).len();
+        let before = (self.ui.widget(self.field).text, self.ui.cursor(self.field));
         let r = self.ui.event(e);
         self.show(r.damage);
-        if self.ui.text(self.field).len() != before {
-            say!("the field holds \"{}\"", self.ui.text(self.field));
+        if (self.ui.widget(self.field).text, self.ui.cursor(self.field)) != before {
+            say!("the field holds \"{}\", the cursor at {}", self.ui.text(self.field), self.ui.cursor(self.field));
         }
         if r.clicked == Some(self.button) || r.entered == Some(self.field) {
             self.greet();
