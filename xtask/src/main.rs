@@ -173,6 +173,7 @@ fn main() -> ExitCode {
                         .and_then(|_| net_test(a, "lde-e100"))
                         .and_then(|_| display_test(a))
                         .and_then(|_| desktop_test(a))
+                        .and_then(|_| windows_test(a))
                         .and_then(|_| input_test(a))
                         .and_then(|_| audio_test(a))
                         .and_then(|_| tcp_test(a))
@@ -206,6 +207,7 @@ fn main() -> ExitCode {
         Some("lde-e100-test") => net_test(arch, "lde-e100"),
         Some("display-test") => display_test(arch),
         Some("desktop-test") => desktop_test(arch),
+        Some("windows-test") => windows_test(arch),
         Some("input-test") => input_test(arch),
         Some("audio-test") => audio_test(arch),
         Some("tcp-test") => tcp_test(arch),
@@ -223,7 +225,7 @@ fn main() -> ExitCode {
         }
         Some("bench") => image(false, Arch::X86_64).and_then(|img| bench(&img)),
         _ => Err(
-            "usage: cargo xtask <idl | image | run | test | boot-test | shell-test | cm-test | supervise-test | drivers-test | memory-test | reboot-test | fs-test | nvme-test | ahci-test | net-test | lde-test | lde-e100-test | display-test | desktop-test | input-test | audio-test | tcp-test | keyboard-test | hotplug-test | suspend-test | verified-boot-test | ab-test | packages-test | bench | sel4-test> [x86_64 | aarch64]"
+            "usage: cargo xtask <idl | image | run | test | boot-test | shell-test | cm-test | supervise-test | drivers-test | memory-test | reboot-test | fs-test | nvme-test | ahci-test | net-test | lde-test | lde-e100-test | display-test | desktop-test | windows-test | input-test | audio-test | tcp-test | keyboard-test | hotplug-test | suspend-test | verified-boot-test | ab-test | packages-test | bench | sel4-test> [x86_64 | aarch64]"
                 .into(),
         ),
     });
@@ -361,7 +363,7 @@ const LINUX_SOURCES: [(&str, &str, &str); 5] = [
 /// a network test's, the display tests', or the audio test's.
 fn linux_driver(manifest: &str) -> Option<&'static str> {
     match manifest {
-        "display" | "desktop" | "input" => Some("bochs"),
+        "display" | "desktop" | "input" | "windows" => Some("bochs"),
         "audio" => Some("es1370"),
         _ => linux_nic(manifest).map(|l| l.0),
     }
@@ -815,10 +817,10 @@ fn image_sealed(
         driver,
         net: matches!(manifest, "net" | "tcp") || linux_nic(manifest).is_some(),
         linux_nic: linux_nic(manifest).map(|l| l.1),
-        keyboard: matches!(manifest, "keyboard" | "input"),
-        mouse: manifest == "input",
+        keyboard: matches!(manifest, "keyboard" | "input" | "windows"),
+        mouse: matches!(manifest, "input" | "windows"),
         hotplug: manifest == "hotplug",
-        display: matches!(manifest, "display" | "desktop" | "input"),
+        display: matches!(manifest, "display" | "desktop" | "input" | "windows"),
         audio: (manifest == "audio").then(|| audio_wav(arch)),
     })
 }
@@ -2685,31 +2687,28 @@ fn input_act(act: &Act, arch: Arch) -> Result<Option<String>, String> {
     Ok(None)
 }
 
-/// Boots `boot/input.manifest`: the compositor with a USB keyboard and
-/// mouse. Through QEMU's monitor the host moves the pointer over window
-/// A, clicks it (it takes the focus and comes in front) and types to it
-/// (it is drawn anew at each key); presses on window B, holds the
-/// pointer off it and lets go, and types to B; then, after the second
-/// client kills the compositor and later the HID driver, types and points
-/// again; last, a USB tablet puts the pointer over window B and the wheel
-/// turns there. Seven screenshots must show every pixel right, the pointer
-/// included.
-fn input_test(arch: Arch) -> Result<(), String> {
-    let img = image_with(false, arch, "input")?;
-    println!("== input test on {}", img.path.display());
+/// Runs `img`, doing `script` through QEMU's monitor as its output comes
+/// (`act` does each act): the output, and how many screenshots were taken
+/// and checked.
+fn run_script(
+    img: &Image,
+    arch: Arch,
+    what: &'static str,
+    script: Vec<(Vec<&'static str>, Vec<Act>)>,
+    act: fn(&Act, Arch) -> Result<Option<String>, String>,
+) -> Result<(String, usize), String> {
     let results: Arc<Mutex<(usize, Vec<Result<String, String>>)>> = Arc::default();
     let done = results.clone();
-    let script = input_script();
     let steps = script.len();
-    let out = run_to_exit_watching(&img, Duration::from_secs(180), move |all| {
+    let out = run_to_exit_watching(img, Duration::from_secs(180), move |all| {
         let mut done = done.lock().unwrap();
         while done.0 < script.len() && done.1.iter().all(Result::is_ok) {
             let (wait, acts) = &script[done.0];
             if !wait.iter().all(|w| all.contains(w)) {
                 return;
             }
-            for act in acts {
-                match input_act(act, arch) {
+            for a in acts {
+                match act(a, arch) {
                     Ok(Some(shot)) => done.1.push(Ok(shot)),
                     Ok(None) => {}
                     Err(e) => {
@@ -2728,13 +2727,214 @@ fn input_test(arch: Arch) -> Result<(), String> {
     for s in &shots {
         match s {
             Ok(s) => println!("== {s}"),
-            Err(e) => return Err(format!("input test: {e}")),
+            Err(e) => return Err(format!("{what}: {e}")),
         }
     }
     let out = out?;
     if at != steps {
-        return Err(format!("input test: the script stopped at step {} of {steps}", at + 1));
+        return Err(format!("{what}: the script stopped at step {} of {steps}", at + 1));
     }
+    Ok((out, shots.len()))
+}
+
+/// A window of the window style test's screenshots: its number, where it
+/// is, its size, and its style. Listed back to front.
+#[derive(Clone, Copy)]
+struct StyledWindow {
+    id: usize,
+    at: (usize, usize),
+    size: (usize, usize),
+    /// Translucent: its pixel at (x, y) is as opaque as `translucence`.
+    alpha: bool,
+    decorated: bool,
+    focused: bool,
+}
+
+/// How opaque window B's pixel at (x, y) of it is (user/testclient:
+/// `translucence`).
+fn translucence(x: usize, y: usize) -> u32 {
+    ((x * 3 + y) & 0xff) as u32
+}
+
+/// Decorations' colours and sizes (user/compositor, and the `window`
+/// interface).
+const BORDER_COLOUR: [u8; 3] = [0x18, 0x1c, 0x22];
+const TITLE_FOCUSED: [u8; 3] = [0x35, 0x6a, 0x9e];
+const TITLE_UNFOCUSED: [u8; 3] = [0x50, 0x56, 0x5e];
+const CLOSE_COLOUR: [u8; 3] = [0xc0, 0x40, 0x38];
+const CLOSE_CROSS: [u8; 3] = [0xf0, 0xf0, 0xf0];
+
+impl StyledWindow {
+    /// Its pixel at (x, y) on the screen over `under`, if it covers it.
+    fn pixel(&self, x: usize, y: usize, under: [u8; 3]) -> Option<[u8; 3]> {
+        use superior_objects::idl::window::{BORDER, CLOSE_BOX, CLOSE_MARGIN, TITLE};
+        let (b, t, m, c) = (BORDER as usize, TITLE as usize, CLOSE_MARGIN as usize, CLOSE_BOX as usize);
+        let (ax, ay, w, h) = (self.at.0, self.at.1, self.size.0, self.size.1);
+        if (ax..ax + w).contains(&x) && (ay..ay + h).contains(&y) {
+            let p = window_pixel(x - ax, y - ay, self.id, 0);
+            if !self.alpha {
+                return Some(p);
+            }
+            let a = translucence(x - ax, y - ay);
+            let mix = |s: u8, d: u8| ((s as u32 * a + d as u32 * (255 - a) + 127) / 255) as u8;
+            return Some([mix(p[0], under[0]), mix(p[1], under[1]), mix(p[2], under[2])]);
+        }
+        if !self.decorated || !(ax - b..ax + w + b).contains(&x) || !(ay - t - b..ay + h + b).contains(&y) {
+            return None;
+        }
+        if !(ax..ax + w).contains(&x) || !(ay - t..ay).contains(&y) {
+            return Some(BORDER_COLOUR);
+        }
+        let (right, top) = (ax + w, ay - t);
+        if (right - m - c..right - m).contains(&x) && (top + m..top + m + c).contains(&y) {
+            let (cx, cy) = (x + m + c - right, y - top - m);
+            let cross = (3..c - 3).contains(&cx) && (cx == cy || cx + cy == c - 1);
+            return Some(if cross { CLOSE_CROSS } else { CLOSE_COLOUR });
+        }
+        Some(if self.focused { TITLE_FOCUSED } else { TITLE_UNFOCUSED })
+    }
+}
+
+/// What each of the window style test's screenshots must show: the
+/// windows, back to front, and where the pointer is (if it has moved).
+fn windows_pictures() -> Vec<(Vec<StyledWindow>, Option<(usize, usize)>)> {
+    let a = StyledWindow { id: 0, at: (100, 120), size: (300, 200), alpha: false, decorated: true, focused: false };
+    let b = StyledWindow { id: 1, at: (300, 220), size: (320, 240), alpha: true, decorated: true, focused: true };
+    let dragged = StyledWindow { at: (300, 270), focused: true, ..a };
+    vec![
+        (vec![a, b], None),
+        (vec![StyledWindow { focused: false, ..b }, dragged], Some((350, 260))),
+        (vec![dragged], Some((610, 210))),
+    ]
+}
+
+/// Checks the window style test's screenshot `k` (from 1) pixel by pixel.
+fn check_styled(path: &Path, k: usize) -> Result<String, String> {
+    let (windows, pointer) = &windows_pictures()[k - 1];
+    let pixels = read_screenshot(path)?;
+    let mut wrong = 0;
+    let mut first = None;
+    let (mut blended, mut framed) = (0, 0);
+    for y in 0..SCREEN.1 {
+        for x in 0..SCREEN.0 {
+            let mut want = desktop_pixel(x, y);
+            // Whether a translucent window's own pixel shows here.
+            let mut blend = false;
+            for w in windows {
+                if let Some(p) = w.pixel(x, y, want) {
+                    want = p;
+                    blend = w.alpha && (w.at.0..w.at.0 + w.size.0).contains(&x) && (w.at.1..w.at.1 + w.size.1).contains(&y);
+                }
+            }
+            blended += blend as usize;
+            if let Some((px, py)) = *pointer {
+                if x >= px && y >= py && y - py < CURSOR.len() && x - px < CURSOR[0].len() {
+                    match CURSOR[y - py].as_bytes()[x - px] {
+                        b'#' => want = [0, 0, 0],
+                        b'o' => want = [0xff, 0xff, 0xff],
+                        _ => {}
+                    }
+                }
+            }
+            if [BORDER_COLOUR, TITLE_FOCUSED, TITLE_UNFOCUSED].contains(&want) {
+                framed += 1;
+            }
+            let i = (y * SCREEN.0 + x) * 3;
+            let have = [pixels[i], pixels[i + 1], pixels[i + 2]];
+            if have != want {
+                wrong += 1;
+                first.get_or_insert((x, y, have, want));
+            }
+        }
+    }
+    match first {
+        None => Ok(format!(
+            "screenshot {k}: all {} pixels right: {} window{}, {framed} of frames, {blended} blended{}",
+            SCREEN.0 * SCREEN.1,
+            windows.len(),
+            if windows.len() == 1 { "" } else { "s" },
+            pointer.map_or(String::new(), |(x, y)| format!(", the pointer at ({x}, {y})"))
+        )),
+        Some((x, y, have, want)) => Err(format!(
+            "screenshot {k}: {wrong} pixels wrong, the first at ({x}, {y}): {have:?}, not {want:?}"
+        )),
+    }
+}
+
+/// Does one act of the window style test's script: screenshots are
+/// checked as its pictures, the rest as the input test's acts.
+fn windows_act(act: &Act, arch: Arch) -> Result<Option<String>, String> {
+    let Act::Shot(k) = act else { return input_act(act, arch) };
+    let path = root().join("target").join(format!("windows-{}-{k}.ppm", arch.name()));
+    let _ = std::fs::remove_file(&path);
+    screendump(&path)?;
+    check_styled(&path, *k).map(Some)
+}
+
+/// Boots `boot/windows.manifest`: the input test's desktop with styled
+/// windows. Window B, translucent and decorated, is shown over window A,
+/// decorated; the host drags A by its title bar (it comes in front with
+/// the focus) and presses B's close box (its client closes it). Three
+/// screenshots must show every pixel right: the blend, the frames, the
+/// focused title bar and the pointer.
+fn windows_test(arch: Arch) -> Result<(), String> {
+    use Act::*;
+    let img = image_with(false, arch, "windows")?;
+    println!("== window style test on {}", img.path.display());
+    let script = vec![
+        (
+            vec![
+                "relative X and Y",
+                "absolute X and Y",
+                "compositor: input subscribed",
+                "picture 1 on the screen",
+            ],
+            // From (400, 300) to (150, 110), on window A's title bar; held
+            // there and moved to (350, 260), dragging A from (100, 120) to
+            // (300, 270), in front of B.
+            vec![Shot(1), Move(-250, -190), Button(true), Move(200, 150), Button(false)],
+        ),
+        // To (610, 210), on window B's close box.
+        (vec!["picture 2 on the screen"], vec![Shot(2), Move(260, -50), Button(true), Button(false)]),
+        (vec!["picture 3 on the screen"], vec![Shot(3)]),
+    ];
+    let (out, shots) = run_script(&img, arch, "window style test", script, windows_act)?;
+    let log = [
+        "compositor: ready: the desktop on a 800x600 screen",
+        "compositor: input subscribed: keys and the pointer",
+        "[pass] windows: window A shown, decorated",
+        "[pass] windows: window A is on the screen",
+        "[pass] windows: decorations that would reach off the screen, and unknown styles, are refused",
+        "[pass] windows: picture 1 on the screen: window B shown over window A, translucent and decorated",
+        "compositor: window 0 has the focus",
+        "compositor: window 0 dragged to (300, 270)",
+        "[pass] windows: window A dragged by its title bar to (300, 270), in front, with the focus, and no pointer events of its own (0): picture 2 on the screen",
+        "compositor: window 1: its close box was pressed",
+        "[pass] windows: window B closed from its close box: picture 3 on the screen",
+        "windows: done (0 failed)",
+        "[cm] second asked to shut down (pass)",
+    ];
+    check_log("window style test", &out, &log)?;
+    if shots != windows_pictures().len() {
+        return Err(format!("window style test: {shots} screenshots taken, want {}", windows_pictures().len()));
+    }
+    println!("== window style test passed ({})", arch.name());
+    Ok(())
+}
+
+/// Boots `boot/input.manifest`: the compositor with a USB keyboard and
+/// mouse. Through QEMU's monitor the host moves the pointer over window
+/// A, clicks it (it takes the focus and comes in front) and types to it
+/// (it is drawn anew at each key); presses on window B, holds the
+/// pointer off it and lets go, and types to B; then, after the second
+/// client kills the compositor and later the HID driver, types and points
+/// again; last, a USB tablet puts the pointer over window B and the wheel
+/// turns there. Seven screenshots must show every pixel right, the pointer
+/// included.
+fn input_test(arch: Arch) -> Result<(), String> {
+    let img = image_with(false, arch, "input")?;
+    println!("== input test on {}", img.path.display());
+    let (out, shots) = run_script(&img, arch, "input test", input_script(), input_act)?;
     let log = [
         "hid: ready: a boot keyboard on device",
         "hid: ready: a pointer on device",
@@ -2774,8 +2974,8 @@ fn input_test(arch: Arch) -> Result<(), String> {
         "[cm] second asked to shut down (pass)",
     ];
     check_log("input test", &out, &log)?;
-    if shots.len() != input_pictures().len() {
-        return Err(format!("input test: {} screenshots taken, want {}", shots.len(), input_pictures().len()));
+    if shots != input_pictures().len() {
+        return Err(format!("input test: {shots} screenshots taken, want {}", input_pictures().len()));
     }
     println!("== input test passed ({})", arch.name());
     Ok(())

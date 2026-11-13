@@ -21,10 +21,20 @@
 /// the front window gets it. Each window keeps its events until its client
 /// reads them (`NEXT`), and signals the notification its client lent with
 /// `LISTEN` when one arrives.
+///
+/// Style (`STYLE`): a window may be translucent, its pixels' top byte
+/// then saying how opaque each is (0 not at all, 255 wholly), blended
+/// over what is behind it; and decorated, the compositor then drawing a
+/// border and a title bar with a close box around it, outside its
+/// pixels. A button pressed on the title bar gives the window the focus,
+/// puts it in front and drags it with the pointer until let go (it is
+/// told where it ended, `MOVED`); one pressed on the close box asks its
+/// client to close it (`CLOSE`). The window's position is still its own
+/// pixels' top left; its frame must lie wholly on the screen.
 pub mod window {
     use crate::interfaces::Status;
 
-    pub const VERSION: u64 = 3;
+    pub const VERSION: u64 = 4;
 
     /// The most windows on the screen, all clients together.
     pub const MAX_WINDOWS: u64 = 8;
@@ -57,8 +67,35 @@ pub mod window {
     /// number of steps.
     pub const WHEEL: u64 = 5;
 
+    /// A button was pressed on the window's close box: its client should
+    /// close it.
+    pub const CLOSE: u64 = 6;
+
+    /// The window was dragged by its title bar: `a` is where it is now (x |
+    /// y << 16 on the screen).
+    pub const MOVED: u64 = 7;
+
     /// Events a window keeps until they are read; past that the oldest go.
     pub const EVENTS: u64 = 32;
+
+    /// The flags `STYLE` takes.
+    /// The window's pixels' top byte is how opaque each is.
+    pub const ALPHA: u64 = 1;
+
+    /// The compositor draws a border and a title bar around the window.
+    pub const DECORATED: u64 = 2;
+
+    /// A decorated window's frame: the border's width all round, the title
+    /// bar's height between the top border and the window, and its close box,
+    /// a square at the title bar's right end that far from its top, bottom and
+    /// right.
+    pub const BORDER: u64 = 2;
+
+    pub const TITLE: u64 = 18;
+
+    pub const CLOSE_BOX: u64 = 12;
+
+    pub const CLOSE_MARGIN: u64 = 3;
 
     /// The screen's size, and how many windows are shown on it (every
     /// client's).
@@ -196,5 +233,14 @@ pub mod window {
             }),
             s => Err(s),
         }
+    }
+
+    /// Sets the window's style: `flags` of `ALPHA` and `DECORATED`. `Invalid`
+    /// for other flags, or if the frame it would have does not lie wholly on
+    /// the screen.
+    pub const STYLE: u64 = 10;
+    /// The message of a `STYLE` call.
+    pub const fn style(window: u64, flags: u64) -> [u64; 4] {
+        [STYLE, window, flags, 0]
     }
 }

@@ -4377,6 +4377,11 @@ fn wait_shown(shown: u64) -> bool {
 /// Makes the window, lends its pages and shows all of it; again from the
 /// start if the compositor restarts on the way. The reply to the commit.
 fn open_window(w: &mut TestWindow) -> [u64; 4] {
+    open_styled(w, 0)
+}
+
+/// As [`open_window`], the window given `style` before it is shown.
+fn open_styled(w: &mut TestWindow, style: u64) -> [u64; 4] {
     for _ in 0..50 {
         w.window = None;
         let size = w.size.0 | w.size.1 << 16;
@@ -4394,6 +4399,13 @@ fn open_window(w: &mut TestWindow) -> [u64; 4] {
         });
         if lent.is_err() {
             continue;
+        }
+        if style != 0 {
+            match window_call(window::style(n, style), None) {
+                Ok(m) if m[0] == 0 => {}
+                Ok(m) => return m,
+                Err(()) => continue,
+            }
         }
         let full = w.size.0 << 32 | w.size.1 << 48;
         if let Ok(m) = window_call(window::commit(n, full), None) {
@@ -4527,6 +4539,10 @@ enum WindowEvent {
     Leave,
     /// Where the pointer is in the window, and the steps up and right.
     Wheel(i64, i64, i64, i64),
+    /// Its close box was pressed.
+    Close,
+    /// It was dragged by its title bar to here.
+    Moved(u64, u64),
 }
 
 /// Makes the notification the compositor is to signal.
@@ -4554,6 +4570,8 @@ fn next_event(w: &TestWindow) -> Option<WindowEvent> {
         window::KEY => WindowEvent::Key(m[2], m[3] & 1 == 1),
         window::POINTER => WindowEvent::Pointer(m[2] as u16 as i16 as i64, (m[2] >> 16) as u16 as i16 as i64, m[3]),
         window::FOCUS => WindowEvent::Focus(m[2] == 1),
+        window::CLOSE => WindowEvent::Close,
+        window::MOVED => WindowEvent::Moved(m[2] & 0xffff, (m[2] >> 16) & 0xffff),
         window::WHEEL => WindowEvent::Wheel(
             m[2] as u16 as i16 as i64,
             (m[2] >> 16) as u16 as i16 as i64,
@@ -4803,6 +4821,102 @@ fn input_second() -> ! {
                     }
                 }
                 _ => {}
+            }
+        }
+    }
+}
+
+// ---- the window style clients (`arg 37` and `arg 38`, boot/windows.manifest) ----
+
+/// How opaque window B's pixel at (x, y) of it is. `cargo xtask
+/// windows-test` computes the same to check the screenshots.
+fn translucence(x: u64, y: u64) -> u64 {
+    (x * 3 + y) & 0xff
+}
+
+/// Window A of the window style test: decorated, opaque; the host drags
+/// it by its title bar.
+fn styled_first() -> ! {
+    let mut t = Checks(0, "windows");
+    let mut w = TestWindow { id: 0, size: (300, 200), at: (100, 120), phase: 0, window: None };
+    make_window_pages(&mut t, &w);
+    make_window_ntfn();
+    let r = open_styled(&mut w, window::DECORATED);
+    t.check(r[0] == 0 && listen(&w), format_args!("window A shown, decorated"));
+    let mut pointed = 0;
+    loop {
+        wait_events(5);
+        while let Some(e) = next_event(&w) {
+            match e {
+                // The pointer may cross it on its way to the title bar; from
+                // the press there (which gives it the focus) it gets none.
+                WindowEvent::Focus(true) => pointed = 0,
+                WindowEvent::Pointer(..) => pointed += 1,
+                WindowEvent::Moved(x, y) => {
+                    settled();
+                    t.check(
+                        (x, y) == (300, 270) && pointed == 0,
+                        format_args!(
+                            "window A dragged by its title bar to ({x}, {y}), in front, with the focus, \
+                             and no pointer events of its own ({pointed}): picture 2 on the screen"
+                        ),
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Window B of the window style test: translucent and decorated, over
+/// window A; the host presses its close box, and it closes.
+fn styled_second() -> ! {
+    let mut t = Checks(0, "windows");
+    let mut w = TestWindow { id: 1, size: (320, 240), at: (300, 220), phase: 0, window: None };
+    make_window_pages(&mut t, &w);
+    for y in 0..w.size.1 {
+        for x in 0..w.size.0 {
+            let p = window_pixel(x, y, w.id, w.phase) | (translucence(x, y) << 24) as u32;
+            // SAFETY: the window's pages are mapped, writable, and hold it.
+            unsafe { ((WINDOW_VA as *mut u32).add((y * w.size.0 + x) as usize)).write(p) };
+        }
+    }
+    make_window_ntfn();
+    t.check(wait_shown(1), format_args!("window A is on the screen"));
+    // A window whose frame would reach off the screen is refused its
+    // decorations, and a decorated one may not be moved there.
+    let corner = window_call(window::create(10 | 10 << 16, 0), None).map(|m| m[1]).unwrap_or(u64::MAX);
+    let off = window_call(window::style(corner, window::DECORATED), None).map(|m| m[0]);
+    let odd = window_call(window::style(corner, 4), None).map(|m| m[0]);
+    let placed = window_call(window::move_to(corner, 2 | 20 << 16), None).map(|m| m[0]);
+    let styled = window_call(window::style(corner, window::DECORATED), None).map(|m| m[0]);
+    let back = window_call(window::move_to(corner, 1 | 20 << 16), None).map(|m| m[0]);
+    let gone = window_call(window::destroy(corner), None).map(|m| m[0]);
+    let invalid = Ok(Status::Invalid as u64);
+    t.check(
+        off == invalid && odd == invalid && placed == Ok(OK) && styled == Ok(OK) && back == invalid && gone == Ok(OK),
+        format_args!("decorations that would reach off the screen, and unknown styles, are refused"),
+    );
+    let r = open_styled(&mut w, window::ALPHA | window::DECORATED);
+    t.check(
+        r[0] == 0 && listen(&w) && window_info()[3] == 2,
+        format_args!("picture 1 on the screen: window B shown over window A, translucent and decorated"),
+    );
+    loop {
+        wait_events(5);
+        while let Some(e) = next_event(&w) {
+            if let WindowEvent::Close = e {
+                let n = w.window.take().unwrap_or(u64::MAX);
+                let r = window_call(window::destroy(n), None);
+                settled();
+                t.check(
+                    r == Ok([0; 4]) && window_info()[3] == 1,
+                    format_args!("window B closed from its close box: picture 3 on the screen"),
+                );
+                superior_sys::sleep(SCREENSHOT_TICKS);
+                say!("windows: done ({} failed)", t.0);
+                syscall(Syscall::Call, DESKTOP_CONTROL, [OP_SHUTDOWN, t.0, 0, 0]);
+                superior_sys::park()
             }
         }
     }
@@ -5424,6 +5538,8 @@ pub extern "C" fn _start(role: u64) -> ! {
         32..=34 => ab_client(role),
         35 => install_client(),
         36 => app_client(),
+        37 => styled_first(),
+        38 => styled_second(),
         _ => probe(),
     }
 }

@@ -857,6 +857,21 @@ holds the rest):
   the wheel turns two steps up and one down there, which B must get as `WHEEL`
   events (`window` version 3) at that spot. Seven screenshots, the pointer drawn by
   xtask from the same shape, must have every pixel right.
+- Window styles in the compositor (`window` version 4, `STYLE`). A translucent
+  window's pixels carry how opaque each is in their top byte and are blended
+  over what is behind them; a decorated window gets a border and a title bar
+  with a close box, drawn by the compositor around its pixels, the focused
+  window's title bar in another colour. A button pressed on a title bar gives
+  the window the focus, puts it in front and drags it with the pointer, its frame
+  kept on the screen, until let go; its client is told where it ended (`MOVED`)
+  and gets no pointer events meanwhile. One pressed on the close box asks the
+  client to close it (`CLOSE`). Decorations that would reach off the screen, and
+  unknown styles, are refused. `cargo xtask windows-test` boots
+  `boot/windows.manifest` on both ISAs: window B, translucent and decorated, is
+  shown over window A, decorated; the host drags A by its title bar from (100,
+  120) to (300, 270), in front of B, and presses B's close box, and B's client
+  closes it. Three screenshots must have every pixel right, the blend computed
+  by xtask from the same formula.
 - The mixer (`user/mixer/`), the sound server. It is the sound driver's one
   client and serves the same `audio` interface to every component that plays
   sound: it adds their streams together, sample by sample and saturating, into a
@@ -971,8 +986,7 @@ holds the rest):
   notifications, a 256-slot CNode pool) so filling them stays quick; normal kernels have
   32 of each, 32 address spaces and a 4096-slot pool.
 
-Not yet: in the compositor transparency, window decorations (so moving windows
-with the pointer), the toolkit and the shell above it, a hardware cursor plane,
+Not yet: in the compositor title text, resizing windows by their frame, the toolkit and the shell above it, a hardware cursor plane,
 pointer events when a window moves or appears under a still pointer, keyboard
 layouts and key repeat (keys are USB usages), and surviving a client
 that dies at the very moment its window is read (the compositor then faults and
@@ -1055,7 +1069,7 @@ https://claude.ai/artifact/QKJS8qH5Dfbjzn58RStq1j
 | `user/xhci/` | The xHCI (USB) host controller driver |
 | `user/hid/` | The USB HID keyboard, mouse and tablet driver |
 | `user/echo/`, `user/counter/`, `user/testclient/` | Test components for the Component Manager, supervision and drivers |
-| `boot/` | Component manifests: `shell.manifest` (normal boot), `test.manifest` (`cm-test`), `supervise.manifest` (`supervise-test`) , `drivers.manifest` (`drivers-test`) , `memory.manifest` (`memory-test`), `reboot.manifest` (`reboot-test`), `fs.manifest` and `fs-verify.manifest` (`fs-test`), `net.manifest` (`net-test`), `tcp.manifest` (`tcp-test`), `keyboard.manifest` (`keyboard-test`), `display.manifest` (`display-test`), `desktop.manifest` (`desktop-test`), `input.manifest` (`input-test`), `audio.manifest` (`audio-test`), `suspend.manifest` (`suspend-test`) |
+| `boot/` | Component manifests: `shell.manifest` (normal boot), `test.manifest` (`cm-test`), `supervise.manifest` (`supervise-test`) , `drivers.manifest` (`drivers-test`) , `memory.manifest` (`memory-test`), `reboot.manifest` (`reboot-test`), `fs.manifest` and `fs-verify.manifest` (`fs-test`), `net.manifest` (`net-test`), `tcp.manifest` (`tcp-test`), `keyboard.manifest` (`keyboard-test`), `display.manifest` (`display-test`), `desktop.manifest` (`desktop-test`), `input.manifest` (`input-test`), `windows.manifest` (`windows-test`), `audio.manifest` (`audio-test`), `suspend.manifest` (`suspend-test`) |
 | `sel4/` | Docker build of seL4 and rust-sel4's kernel loader, for running the shell on seL4 |
 | `xtask/` | Build driver: user program, kernel, disk image, QEMU boot |
 
@@ -1078,6 +1092,7 @@ cargo xtask lde-test       # the network test over Linux's 8139cp driver (needs 
 cargo xtask lde-e100-test  # the same over Linux's e100 driver
 cargo xtask display-test   # Linux's bochs display driver: two pictures, checked pixel by pixel from QEMU screenshots
 cargo xtask desktop-test   # the compositor: two clients' windows through restarts, five screenshots checked pixel by pixel
+cargo xtask windows-test   # translucent and decorated windows: a blend, a drag by the title bar, a close box, three screenshots checked
 cargo xtask input-test     # the compositor's pointer, focus, keys and wheel from a USB mouse, tablet and keyboard, seven screenshots checked
 cargo xtask audio-test     # Linux's ES1370 driver and the mixer: two clients' sounds through restarts, every recorded sample checked
 cargo xtask tcp-test       # just the TCP test (add aarch64 for that ISA)

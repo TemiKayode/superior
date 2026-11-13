@@ -32,6 +32,12 @@
 //! a read it refuses has the compositor subscribe again (and it reads
 //! every fifth of a second as well as when signalled).
 //!
+//! Style: a translucent window's pixels are blended over what is behind
+//! them by their top byte; a decorated one gets a border and a title bar
+//! with a close box, drawn here around its pixels (focused windows' title
+//! bars in another colour). A button pressed on a title bar drags the
+//! window until let go; one pressed on a close box tells its client.
+//!
 //! Slots: 0 the display, 1 the receive side of `window`, 2 a notification
 //! (its timer and input), 3 memory for the screen, 6 the input driver (if
 //! any).
@@ -121,6 +127,34 @@ const CURSOR: [&[u8; 12]; 17] = [
 const CURSOR_W: u32 = 12;
 const CURSOR_H: u32 = 17;
 
+/// Decorations' colours. `cargo xtask windows-test` has the same to check
+/// screenshots.
+const BORDER_COLOUR: u32 = 0x0018_1c22;
+const TITLE_FOCUSED: u32 = 0x0035_6a9e;
+const TITLE_UNFOCUSED: u32 = 0x0050_565e;
+const CLOSE_COLOUR: u32 = 0x00c0_4038;
+const CLOSE_CROSS: u32 = 0x00f0_f0f0;
+
+/// `src` (its top byte how opaque it is) over `dst`.
+fn blend(src: u32, dst: u32) -> u32 {
+    let a = src >> 24;
+    let channel = |shift: u32| {
+        let (s, d) = ((src >> shift) & 0xff, (dst >> shift) & 0xff);
+        ((s * a + d * (255 - a) + 127) / 255) << shift
+    };
+    channel(16) | channel(8) | channel(0)
+}
+
+/// Where on a window (or its frame) a point is.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Part {
+    /// Its own pixels.
+    Inside,
+    Title,
+    Close,
+    Border,
+}
+
 /// A window's events not yet read.
 #[derive(Clone, Copy)]
 struct Queue {
@@ -199,11 +233,76 @@ struct Window {
     /// Pages attached so far.
     pages: u64,
     shown: bool,
+    /// `window::ALPHA` and `window::DECORATED`.
+    style: u64,
+}
+
+/// The frame of a window at `at` with `style`: itself, or with its
+/// decorations around it; `None` if they would reach past the screen's
+/// top or left.
+fn frame_of(at: Rect, style: u64) -> Option<Rect> {
+    if style & window::DECORATED == 0 {
+        return Some(at);
+    }
+    let (b, t) = (window::BORDER as u32, window::TITLE as u32);
+    Some(Rect { x: at.x.checked_sub(b)?, y: at.y.checked_sub(t + b)?, w: at.w + 2 * b, h: at.h + t + 2 * b })
 }
 
 impl Window {
     fn needed(&self) -> u64 {
         (self.at.w as u64 * self.at.h as u64 * 4).div_ceil(4096)
+    }
+
+    fn decorated(&self) -> bool {
+        self.style & window::DECORATED != 0
+    }
+
+    /// The part of the screen it covers, decorations and all.
+    fn frame(&self) -> Rect {
+        frame_of(self.at, self.style).unwrap_or(self.at)
+    }
+
+    /// Which part of it (x, y) on the screen is, if any.
+    fn part(&self, x: u32, y: u32) -> Option<Part> {
+        let f = self.frame();
+        let within = |r: Rect| x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h;
+        if !within(f) {
+            return None;
+        }
+        if within(self.at) {
+            return Some(Part::Inside);
+        }
+        let (t, m, c) = (window::TITLE as u32, window::CLOSE_MARGIN as u32, window::CLOSE_BOX as u32);
+        let top = self.at.y - t;
+        if !within(Rect { x: self.at.x, y: top, w: self.at.w, h: t }) {
+            return Some(Part::Border);
+        }
+        let right = self.at.x + self.at.w;
+        if x + m < right && x + m + c >= right && y >= top + m && y < top + m + c {
+            Some(Part::Close)
+        } else {
+            Some(Part::Title)
+        }
+    }
+
+    /// Its decoration's pixel at (x, y) on the screen, a part of its frame
+    /// outside it.
+    fn decoration(&self, x: u32, y: u32, focused: bool) -> u32 {
+        match self.part(x, y) {
+            Some(Part::Title) => {
+                if focused {
+                    TITLE_FOCUSED
+                } else {
+                    TITLE_UNFOCUSED
+                }
+            }
+            Some(Part::Close) => {
+                let (m, c) = (window::CLOSE_MARGIN as u32, window::CLOSE_BOX as u32);
+                let (cx, cy) = (x + m + c - (self.at.x + self.at.w), y - (self.at.y - window::TITLE as u32 + m));
+                if (3..c - 3).contains(&cx) && (cx == cy || cx + cy == c - 1) { CLOSE_CROSS } else { CLOSE_COLOUR }
+            }
+            _ => BORDER_COLOUR,
+        }
     }
 }
 
@@ -236,6 +335,10 @@ struct Compositor {
     hover: Option<usize>,
     grab: Option<usize>,
     focus: Option<usize>,
+    /// The window dragged by its title bar, and where the pointer is on it
+    /// (from its top left); whether it has moved.
+    drag: Option<(usize, (i32, i32))>,
+    dragged: bool,
     /// Whether the input driver has this compositor as a subscriber, and
     /// how many times it subscribed.
     subscribed: bool,
@@ -328,7 +431,7 @@ impl Compositor {
         say!("window {i} is gone with its client; taken off the screen");
         self.reaped += 1;
         if w.shown {
-            self.pending = self.pending.union(w.at);
+            self.pending = self.pending.union(w.frame());
         }
         self.remove(i);
         false
@@ -357,19 +460,30 @@ impl Compositor {
         for k in 0..self.shown {
             let i = self.order[k];
             let Some(w) = self.windows[i] else { continue };
-            let part = w.at.intersect(r);
+            let part = w.frame().intersect(r);
             if part.empty() {
                 continue;
             }
+            let (alpha, focused) = (w.style & window::ALPHA != 0, self.focus == Some(i));
             let from = window_ptr(i);
             for y in part.y..part.y + part.h {
-                let row = (y - w.at.y) as usize * w.at.w as usize;
                 for x in part.x..part.x + part.w {
-                    // SAFETY: all the window's pages are mapped (it is shown
-                    // only once they are), in a row from its address.
-                    let p = unsafe { from.add(row + (x - w.at.x) as usize).read() };
                     // SAFETY: as above, for the screen.
-                    unsafe { screen.add(y as usize * pitch + x as usize).write(p) };
+                    let to = unsafe { screen.add(y as usize * pitch + x as usize) };
+                    let inside = x >= w.at.x && x < w.at.x + w.at.w && y >= w.at.y && y < w.at.y + w.at.h;
+                    let p = if inside {
+                        let at = (y - w.at.y) as usize * w.at.w as usize + (x - w.at.x) as usize;
+                        // SAFETY: all the window's pages are mapped (it is
+                        // shown only once they are), in a row from its
+                        // address.
+                        let p = unsafe { from.add(at).read() };
+                        // SAFETY: as above, for the screen.
+                        if alpha { blend(p, unsafe { to.read() }) } else { p }
+                    } else {
+                        w.decoration(x, y, focused)
+                    };
+                    // SAFETY: as above.
+                    unsafe { to.write(p) };
                 }
             }
         }
@@ -447,6 +561,9 @@ impl Compositor {
         if self.hover == Some(i) {
             self.hover = None;
         }
+        if self.drag.is_some_and(|(d, _)| d == i) {
+            (self.drag, self.dragged) = (None, false);
+        }
         if self.focus == Some(i) {
             // The front window takes the focus.
             self.focus = None;
@@ -480,20 +597,37 @@ impl Compositor {
         }
         if let Some(o) = self.focus {
             self.post(o, window::FOCUS, 0, 0);
+            self.repaint_title(o);
         }
         self.focus = to;
         if let Some(n) = to {
             say!("window {n} has the focus");
             self.post(n, window::FOCUS, 1, 0);
+            self.repaint_title(n);
         }
     }
 
-    /// The front window under the pointer.
-    fn window_at(&self) -> Option<usize> {
+    /// Window `i`'s title bar shows whether it has the focus: if it is a
+    /// shown decorated window, its frame is to be repainted.
+    fn repaint_title(&mut self, i: usize) {
+        if let Some(w) = self.windows[i].filter(|w| w.shown && w.decorated()) {
+            self.pending = self.pending.union(w.frame());
+        }
+    }
+
+    /// The front window whose frame the pointer is on, and where on it.
+    fn hit(&self) -> Option<(usize, Part)> {
         let (x, y) = self.pointer;
-        self.order[..self.shown].iter().rev().copied().find(|&i| {
-            self.windows[i].is_some_and(|w| x >= w.at.x && x < w.at.x + w.at.w && y >= w.at.y && y < w.at.y + w.at.h)
-        })
+        self.order[..self.shown]
+            .iter()
+            .rev()
+            .find_map(|&i| self.windows[i].and_then(|w| w.part(x, y)).map(|p| (i, p)))
+    }
+
+    /// The front window under the pointer, if the pointer is on its own
+    /// pixels (not its decorations).
+    fn window_at(&self) -> Option<usize> {
+        self.hit().filter(|&(_, p)| p == Part::Inside).map(|(i, _)| i)
     }
 
     /// The pointer in window `i`'s pixels (x | y << 16, each a signed
@@ -557,19 +691,33 @@ impl Compositor {
                 }
                 let mut damage = NONE;
                 if held == 0 && self.buttons != 0 {
-                    let under = self.window_at();
+                    let hit = self.hit();
+                    let under = hit.filter(|&(_, p)| p == Part::Inside).map(|(i, _)| i);
                     self.grab = under;
                     self.hover_to(under);
-                    if let Some(i) = under {
+                    if let Some((i, part)) = hit {
                         self.set_focus(Some(i));
                         if self.front() != Some(i) {
                             self.to_front(i);
-                            damage = self.windows[i].map_or(NONE, |w| w.at);
+                            damage = self.windows[i].map_or(NONE, |w| w.frame());
+                        }
+                        match (part, self.windows[i]) {
+                            (Part::Title, Some(w)) => {
+                                let (x, y) = self.pointer;
+                                self.drag = Some((i, (x as i32 - w.at.x as i32, y as i32 - w.at.y as i32)));
+                                self.dragged = false;
+                            }
+                            (Part::Close, _) => {
+                                say!("window {i}: its close box was pressed");
+                                self.post(i, window::CLOSE, 0, 0);
+                            }
+                            _ => {}
                         }
                     }
                 }
                 self.post_pointer(self.grab.or(self.hover));
                 if self.buttons == 0 && held != 0 {
+                    self.end_drag();
                     self.let_go();
                 }
                 damage
@@ -584,10 +732,47 @@ impl Compositor {
         let before = self.cursor_rect();
         self.pointer = to;
         self.cursor = true;
+        if let Some((i, (ox, oy))) = self.drag {
+            return before.union(self.cursor_rect()).union(self.drag_to(i, ox, oy));
+        }
         let target = self.grab.or_else(|| self.window_at());
         self.hover_to(target);
         self.post_pointer(target);
         before.union(self.cursor_rect())
+    }
+
+    /// Moves window `i`, dragged by its title bar, to keep the pointer
+    /// where it was on it (`ox`, `oy` from its top left), its frame on the
+    /// screen. The part of the screen it changes.
+    fn drag_to(&mut self, i: usize, ox: i32, oy: i32) -> Rect {
+        let Some(mut w) = self.windows[i] else { return NONE };
+        let (b, t) = (window::BORDER as u32, window::TITLE as u32);
+        let (min_x, min_y) = (b, t + b);
+        let max_x = self.width.saturating_sub(w.at.w + b).max(min_x);
+        let max_y = self.height.saturating_sub(w.at.h + b).max(min_y);
+        let x = (self.pointer.0 as i32 - ox).clamp(min_x as i32, max_x as i32) as u32;
+        let y = (self.pointer.1 as i32 - oy).clamp(min_y as i32, max_y as i32) as u32;
+        if (x, y) == (w.at.x, w.at.y) {
+            return NONE;
+        }
+        let from = w.frame();
+        (w.at.x, w.at.y) = (x, y);
+        self.windows[i] = Some(w);
+        self.dragged = true;
+        from.union(w.frame())
+    }
+
+    /// The buttons are up: a window dragged by its title bar is told where
+    /// it ended.
+    fn end_drag(&mut self) {
+        if let Some((i, _)) = self.drag.take() {
+            if core::mem::replace(&mut self.dragged, false) {
+                if let Some(w) = self.windows[i] {
+                    say!("window {i} dragged to ({}, {})", w.at.x, w.at.y);
+                    self.post(i, window::MOVED, w.at.x as u64 | (w.at.y as u64) << 16, 0);
+                }
+            }
+        }
     }
 
     /// Every button is up: the window that held the pointer lets it go,
@@ -619,6 +804,7 @@ impl Compositor {
         if self.buttons != 0 {
             self.buttons = 0;
             self.post_pointer(self.grab.or(self.hover));
+            self.end_drag();
             self.let_go();
         }
     }
@@ -644,7 +830,8 @@ impl Compositor {
             }
             damage = damage.union(self.input_event(r.msg[1], r.msg[2], r.msg[3]));
         }
-        if !damage.empty() {
+        // A title bar repainted for the focus is pending.
+        if !damage.empty() || !self.pending.empty() {
             self.show(damage);
         }
     }
@@ -704,12 +891,18 @@ impl Compositor {
         !at.empty() && at.x + at.w <= self.width && at.y + at.h <= self.height
     }
 
+    /// Whether a window at `at` with `style` would lie wholly on the
+    /// screen, decorations and all.
+    fn fits_styled(&self, at: Rect, style: u64) -> bool {
+        frame_of(at, style).is_some_and(|f| self.fits(f))
+    }
+
     fn create(&mut self, size: u64, position: u64, badge: u64) -> [u64; 4] {
         let at = Rect::from_word(position & 0xffff_ffff | size << 32);
         if size >> 32 != 0 || position >> 32 != 0 || !self.fits(at) {
             return [Status::Invalid as u64, 0, 0, 0];
         }
-        let w = Window { owner: badge, at, pages: 0, shown: false };
+        let w = Window { owner: badge, at, pages: 0, shown: false, style: 0 };
         if w.needed() > window::WINDOW_PAGES {
             return [Status::Invalid as u64, 0, 0, 0];
         }
@@ -760,7 +953,7 @@ impl Compositor {
             self.windows[i] = Some(w);
             self.to_front(i);
             self.set_focus(Some(i));
-            w.at
+            w.frame()
         };
         self.show(damage);
         [Status::Ok as u64, self.frames, 0, 0]
@@ -769,17 +962,31 @@ impl Compositor {
     fn move_to(&mut self, i: usize, position: u64) -> Status {
         let Some(mut w) = self.windows[i] else { return Status::NotFound };
         let to = Rect { x: position as u32 & 0xffff, y: (position >> 16) as u32 & 0xffff, w: w.at.w, h: w.at.h };
-        if position >> 32 != 0 || !self.fits(to) {
+        if position >> 32 != 0 || !self.fits_styled(to, w.style) {
             return Status::Invalid;
         }
-        let from = w.at;
-        if from == to {
+        if w.at == to {
             return Status::Ok;
         }
+        let from = w.frame();
         w.at = to;
         self.windows[i] = Some(w);
         if w.shown {
-            self.show(from.union(to));
+            self.show(from.union(w.frame()));
+        }
+        Status::Ok
+    }
+
+    fn set_style(&mut self, i: usize, style: u64) -> Status {
+        let Some(mut w) = self.windows[i] else { return Status::NotFound };
+        if style & !(window::ALPHA | window::DECORATED) != 0 || !self.fits_styled(w.at, style) {
+            return Status::Invalid;
+        }
+        let from = w.frame();
+        w.style = style;
+        self.windows[i] = Some(w);
+        if w.shown {
+            self.show(from.union(w.frame()));
         }
         Status::Ok
     }
@@ -800,7 +1007,8 @@ impl Compositor {
             | window::RAISE
             | window::DESTROY
             | window::LISTEN
-            | window::NEXT) => {
+            | window::NEXT
+            | window::STYLE) => {
                 let Some(i) = self.own(m[1], badge) else {
                     return status(Status::NotFound);
                 };
@@ -810,10 +1018,11 @@ impl Compositor {
                     window::MOVE_TO => status(self.move_to(i, m[2])),
                     window::LISTEN => status(self.listen(i, lent)),
                     window::NEXT => self.next(i),
+                    window::STYLE => status(self.set_style(i, m[2])),
                     window::RAISE => {
                         if let Some(w) = self.windows[i].filter(|w| w.shown) {
                             self.to_front(i);
-                            self.show(w.at);
+                            self.show(w.frame());
                         }
                         status(Status::Ok)
                     }
@@ -821,7 +1030,7 @@ impl Compositor {
                         let w = self.windows[i];
                         self.remove(i);
                         if let Some(w) = w.filter(|w| w.shown) {
-                            self.show(w.at);
+                            self.show(w.frame());
                         }
                         status(Status::Ok)
                     }
@@ -871,6 +1080,8 @@ pub extern "C" fn _start(_: u64) -> ! {
         hover: None,
         grab: None,
         focus: None,
+        drag: None,
+        dragged: false,
         subscribed: false,
         subscriptions: 0,
     };

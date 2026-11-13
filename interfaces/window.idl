@@ -18,7 +18,17 @@
 # the front window gets it. Each window keeps its events until its client
 # reads them (`NEXT`), and signals the notification its client lent with
 # `LISTEN` when one arrives.
-interface window version 3
+#
+# Style (`STYLE`): a window may be translucent, its pixels' top byte
+# then saying how opaque each is (0 not at all, 255 wholly), blended
+# over what is behind it; and decorated, the compositor then drawing a
+# border and a title bar with a close box around it, outside its
+# pixels. A button pressed on the title bar gives the window the focus,
+# puts it in front and drags it with the pointer until let go (it is
+# told where it ended, `MOVED`); one pressed on the close box asks its
+# client to close it (`CLOSE`). The window's position is still its own
+# pixels' top left; its frame must lie wholly on the screen.
+interface window version 4
 
 # The most windows on the screen, all clients together.
 const MAX_WINDOWS = 8
@@ -76,6 +86,12 @@ const LEAVE = 4
 # user) in bits 0 to 31 and right in bits 32 to 63, each a signed 32-bit
 # number of steps.
 const WHEEL = 5
+# A button was pressed on the window's close box: its client should
+# close it.
+const CLOSE = 6
+# The window was dragged by its title bar: `a` is where it is now (x |
+# y << 16 on the screen).
+const MOVED = 7
 
 # Events a window keeps until they are read; past that the oldest go.
 const EVENTS = 32
@@ -87,3 +103,23 @@ op LISTEN = 8 (window)
 # The window's oldest event not yet read: its kind and what it says.
 # `Empty` if there is none.
 op NEXT = 9 (window) -> (kind, a, b)
+
+# The flags `STYLE` takes.
+# The window's pixels' top byte is how opaque each is.
+const ALPHA = 1
+# The compositor draws a border and a title bar around the window.
+const DECORATED = 2
+
+# A decorated window's frame: the border's width all round, the title
+# bar's height between the top border and the window, and its close box,
+# a square at the title bar's right end that far from its top, bottom and
+# right.
+const BORDER = 2
+const TITLE = 18
+const CLOSE_BOX = 12
+const CLOSE_MARGIN = 3
+
+# Sets the window's style: `flags` of `ALPHA` and `DECORATED`. `Invalid`
+# for other flags, or if the frame it would have does not lie wholly on
+# the screen.
+op STYLE = 10 (window, flags)
