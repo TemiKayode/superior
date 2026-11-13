@@ -174,6 +174,7 @@ fn main() -> ExitCode {
                         .and_then(|_| display_test(a))
                         .and_then(|_| desktop_test(a))
                         .and_then(|_| windows_test(a))
+                        .and_then(|_| toolkit_test(a))
                         .and_then(|_| input_test(a))
                         .and_then(|_| audio_test(a))
                         .and_then(|_| tcp_test(a))
@@ -208,6 +209,7 @@ fn main() -> ExitCode {
         Some("display-test") => display_test(arch),
         Some("desktop-test") => desktop_test(arch),
         Some("windows-test") => windows_test(arch),
+        Some("toolkit-test") => toolkit_test(arch),
         Some("input-test") => input_test(arch),
         Some("audio-test") => audio_test(arch),
         Some("tcp-test") => tcp_test(arch),
@@ -225,7 +227,7 @@ fn main() -> ExitCode {
         }
         Some("bench") => image(false, Arch::X86_64).and_then(|img| bench(&img)),
         _ => Err(
-            "usage: cargo xtask <idl | image | run | test | boot-test | shell-test | cm-test | supervise-test | drivers-test | memory-test | reboot-test | fs-test | nvme-test | ahci-test | net-test | lde-test | lde-e100-test | display-test | desktop-test | windows-test | input-test | audio-test | tcp-test | keyboard-test | hotplug-test | suspend-test | verified-boot-test | ab-test | packages-test | bench | sel4-test> [x86_64 | aarch64]"
+            "usage: cargo xtask <idl | image | run | test | boot-test | shell-test | cm-test | supervise-test | drivers-test | memory-test | reboot-test | fs-test | nvme-test | ahci-test | net-test | lde-test | lde-e100-test | display-test | desktop-test | windows-test | toolkit-test | input-test | audio-test | tcp-test | keyboard-test | hotplug-test | suspend-test | verified-boot-test | ab-test | packages-test | bench | sel4-test> [x86_64 | aarch64]"
                 .into(),
         ),
     });
@@ -312,6 +314,8 @@ fn host_tests() -> Result<(), String> {
         "superior-driver",
         "-p",
         "superior-idl",
+        "-p",
+        "superior-toolkit",
     ]))?;
     println!("== model check and long simulation (release)");
     run(cargo().args([
@@ -363,7 +367,7 @@ const LINUX_SOURCES: [(&str, &str, &str); 5] = [
 /// a network test's, the display tests', or the audio test's.
 fn linux_driver(manifest: &str) -> Option<&'static str> {
     match manifest {
-        "display" | "desktop" | "input" | "windows" => Some("bochs"),
+        "display" | "desktop" | "input" | "windows" | "toolkit" => Some("bochs"),
         "audio" => Some("es1370"),
         _ => linux_nic(manifest).map(|l| l.0),
     }
@@ -566,6 +570,7 @@ fn bundle(arch: Arch, manifest: &str, driver: &str) -> Result<PathBuf, String> {
         ("fs", "superior-fs"),
         ("testclient", "superior-testclient"),
         ("compositor", "superior-compositor"),
+        ("greeter", "superior-greeter"),
         ("mixer", "superior-mixer"),
         // Need Linux's source and the build container: only where used.
         ("lde-8139cp", "superior-lde-8139cp"),
@@ -817,10 +822,10 @@ fn image_sealed(
         driver,
         net: matches!(manifest, "net" | "tcp") || linux_nic(manifest).is_some(),
         linux_nic: linux_nic(manifest).map(|l| l.1),
-        keyboard: matches!(manifest, "keyboard" | "input" | "windows"),
-        mouse: matches!(manifest, "input" | "windows"),
+        keyboard: matches!(manifest, "keyboard" | "input" | "windows" | "toolkit"),
+        mouse: matches!(manifest, "input" | "windows" | "toolkit"),
         hotplug: manifest == "hotplug",
-        display: matches!(manifest, "display" | "desktop" | "input" | "windows"),
+        display: matches!(manifest, "display" | "desktop" | "input" | "windows" | "toolkit"),
         audio: (manifest == "audio").then(|| audio_wav(arch)),
     })
 }
@@ -2748,6 +2753,8 @@ struct StyledWindow {
     alpha: bool,
     decorated: bool,
     focused: bool,
+    /// Its title, written in its title bar.
+    title: &'static [u8],
 }
 
 /// How opaque window B's pixel at (x, y) of it is (user/testclient:
@@ -2763,6 +2770,13 @@ const TITLE_FOCUSED: [u8; 3] = [0x35, 0x6a, 0x9e];
 const TITLE_UNFOCUSED: [u8; 3] = [0x50, 0x56, 0x5e];
 const CLOSE_COLOUR: [u8; 3] = [0xc0, 0x40, 0x38];
 const CLOSE_CROSS: [u8; 3] = [0xf0, 0xf0, 0xf0];
+const TITLE_TEXT: [u8; 3] = [0xf0, 0xf0, 0xf0];
+/// Where a title starts in its title bar (from its left and top), its
+/// scale, and the space it leaves before the close box.
+const TITLE_LEFT: usize = 4;
+const TITLE_TOP: usize = 2;
+const TITLE_SCALE: usize = 2;
+const TITLE_GAP: usize = 4;
 
 impl StyledWindow {
     /// Its pixel at (x, y) on the screen over `under`, if it covers it.
@@ -2791,6 +2805,18 @@ impl StyledWindow {
             let cross = (3..c - 3).contains(&cx) && (cx == cy || cx + cy == c - 1);
             return Some(if cross { CLOSE_CROSS } else { CLOSE_COLOUR });
         }
+        let (tx, ty) = (ax + TITLE_LEFT, top + TITLE_TOP);
+        // The characters wholly before the close box, less the gap.
+        let room = w.saturating_sub(TITLE_LEFT + TITLE_GAP + m + c);
+        let fits = (room / TITLE_SCALE + 1) / superior_toolkit::font::ADVANCE as usize;
+        let title = &self.title[..self.title.len().min(fits)];
+        if x >= tx && y >= ty {
+            let (cx, cy) = ((x - tx) / TITLE_SCALE, (y - ty) / TITLE_SCALE);
+            let adv = superior_toolkit::font::ADVANCE as usize;
+            if cx / adv < title.len() && superior_toolkit::font::lit(title[cx / adv], (cx % adv) as u32, cy as u32) {
+                return Some(TITLE_TEXT);
+            }
+        }
         Some(if self.focused { TITLE_FOCUSED } else { TITLE_UNFOCUSED })
     }
 }
@@ -2798,8 +2824,16 @@ impl StyledWindow {
 /// What each of the window style test's screenshots must show: the
 /// windows, back to front, and where the pointer is (if it has moved).
 fn windows_pictures() -> Vec<(Vec<StyledWindow>, Option<(usize, usize)>)> {
-    let a = StyledWindow { id: 0, at: (100, 120), size: (300, 200), alpha: false, decorated: true, focused: false };
-    let b = StyledWindow { id: 1, at: (300, 220), size: (320, 240), alpha: true, decorated: true, focused: true };
+    let a = StyledWindow {
+        id: 0,
+        at: (100, 120),
+        size: (300, 200),
+        alpha: false,
+        decorated: true,
+        focused: false,
+        title: b"",
+    };
+    let b = StyledWindow { id: 1, at: (300, 220), size: (320, 240), alpha: true, decorated: true, focused: true, title: b"" };
     let dragged = StyledWindow { at: (300, 270), focused: true, ..a };
     vec![
         (vec![a, b], None),
@@ -2919,6 +2953,193 @@ fn windows_test(arch: Arch) -> Result<(), String> {
         return Err(format!("window style test: {shots} screenshots taken, want {}", windows_pictures().len()));
     }
     println!("== window style test passed ({})", arch.name());
+    Ok(())
+}
+
+/// The greeter's window (user/greeter): its size, where it is, and its
+/// widgets as it lays them out: the field, the button and the line it
+/// greets on.
+const GREETER_SIZE: (usize, usize) = (280, 124);
+const GREETER_AT: (usize, usize) = (260, 180);
+
+fn greeter_ui() -> (superior_toolkit::Ui, usize, usize, usize) {
+    let mut ui = superior_toolkit::Ui::new(GREETER_SIZE.0 as u32, GREETER_SIZE.1 as u32);
+    ui.label("Your name:");
+    let field = ui.field();
+    let button = ui.button("Greet");
+    let out = ui.label("");
+    (ui, field, button, out)
+}
+
+/// What the greeter's window holds at each of the toolkit test's
+/// screenshots, as the toolkit draws it after the same events (the
+/// pointer in the window's pixels): `None` once it is closed. And where the
+/// pointer is.
+fn toolkit_pictures() -> Vec<(Option<Vec<u32>>, Option<(usize, usize)>)> {
+    use superior_toolkit::{Event, Surface};
+    let (mut ui, field, _, out) = greeter_ui();
+    let draw = |ui: &superior_toolkit::Ui| {
+        let mut px = vec![0u32; GREETER_SIZE.0 * GREETER_SIZE.1];
+        ui.draw(&mut Surface { px: &mut px, w: GREETER_SIZE.0 as u32, h: GREETER_SIZE.1 as u32 });
+        px
+    };
+    let local = |at: (usize, usize)| ((at.0 - GREETER_AT.0) as i32, (at.1 - GREETER_AT.1) as i32);
+    let click = |ui: &mut superior_toolkit::Ui, at: (usize, usize)| {
+        let (x, y) = local(at);
+        for buttons in [0, 1, 0] {
+            ui.event(Event::Pointer { x, y, buttons });
+        }
+    };
+    // A newly shown window has the focus.
+    ui.event(Event::Focus(true));
+    let first = draw(&ui);
+    click(&mut ui, TOOLKIT_FIELD);
+    for usage in [4, 7, 4] {
+        ui.event(Event::Key { usage, down: true, modifiers: 0 });
+        ui.event(Event::Key { usage, down: false, modifiers: 0 });
+    }
+    assert_eq!(ui.text(field), "ada");
+    let typed = draw(&ui);
+    click(&mut ui, TOOLKIT_BUTTON);
+    ui.set_text(out, "Hello, ada!");
+    let greeted = draw(&ui);
+    vec![
+        (Some(first), None),
+        (Some(typed), Some(TOOLKIT_FIELD)),
+        (Some(greeted), Some(TOOLKIT_BUTTON)),
+        (None, Some(TOOLKIT_CLOSE)),
+    ]
+}
+
+/// Where the toolkit test's pointer goes on the screen: on the greeter's
+/// field, its button and its close box.
+const TOOLKIT_FIELD: (usize, usize) = (400, 225);
+const TOOLKIT_BUTTON: (usize, usize) = (309, 259);
+const TOOLKIT_CLOSE: (usize, usize) = (530, 170);
+
+/// Checks the toolkit test's screenshot `k` (from 1) pixel by pixel: the
+/// desktop, the greeter's window as the toolkit draws it in its frame,
+/// and the pointer.
+fn check_toolkit(path: &Path, k: usize) -> Result<String, String> {
+    let (content, pointer) = &toolkit_pictures()[k - 1];
+    let frame = StyledWindow {
+        id: 0,
+        at: GREETER_AT,
+        size: GREETER_SIZE,
+        alpha: false,
+        decorated: true,
+        focused: true,
+        title: b"Greeter",
+    };
+    let pixels = read_screenshot(path)?;
+    let (mut wrong, mut first, mut inked) = (0, None, 0);
+    for y in 0..SCREEN.1 {
+        for x in 0..SCREEN.0 {
+            let mut want = desktop_pixel(x, y);
+            if let Some(content) = content {
+                let (ax, ay) = GREETER_AT;
+                if (ax..ax + GREETER_SIZE.0).contains(&x) && (ay..ay + GREETER_SIZE.1).contains(&y) {
+                    let p = content[(y - ay) * GREETER_SIZE.0 + x - ax];
+                    want = [(p >> 16) as u8, (p >> 8) as u8, p as u8];
+                    inked += (p == superior_toolkit::INK) as usize;
+                } else if let Some(p) = frame.pixel(x, y, want) {
+                    want = p;
+                    inked += (p == TITLE_TEXT) as usize;
+                }
+            }
+            if let Some((px, py)) = *pointer {
+                if x >= px && y >= py && y - py < CURSOR.len() && x - px < CURSOR[0].len() {
+                    match CURSOR[y - py].as_bytes()[x - px] {
+                        b'#' => want = [0, 0, 0],
+                        b'o' => want = [0xff, 0xff, 0xff],
+                        _ => {}
+                    }
+                }
+            }
+            let i = (y * SCREEN.0 + x) * 3;
+            let have = [pixels[i], pixels[i + 1], pixels[i + 2]];
+            if have != want {
+                wrong += 1;
+                first.get_or_insert((x, y, have, want));
+            }
+        }
+    }
+    match first {
+        None => Ok(format!(
+            "screenshot {k}: all {} pixels right: {}{}",
+            SCREEN.0 * SCREEN.1,
+            if content.is_some() { format!("the greeter's window, {inked} pixels of text") } else { "the desktop alone".into() },
+            pointer.map_or(String::new(), |(x, y)| format!(", the pointer at ({x}, {y})"))
+        )),
+        Some((x, y, have, want)) => Err(format!(
+            "screenshot {k}: {wrong} pixels wrong, the first at ({x}, {y}): {have:?}, not {want:?}"
+        )),
+    }
+}
+
+/// Does one act of the toolkit test's script: screenshots are checked as
+/// its pictures, the rest as the input test's acts.
+fn toolkit_act(act: &Act, arch: Arch) -> Result<Option<String>, String> {
+    let Act::Shot(k) = act else { return input_act(act, arch) };
+    let path = root().join("target").join(format!("toolkit-{}-{k}.ppm", arch.name()));
+    let _ = std::fs::remove_file(&path);
+    screendump(&path)?;
+    check_toolkit(&path, *k).map(Some)
+}
+
+/// Boots `boot/toolkit.manifest`: the greeter, the first toolkit app, in a
+/// decorated window the compositor titles. The host clicks its field,
+/// types "ada", clicks its button (it greets the name) and presses its
+/// close box (it closes). Four screenshots must have every pixel as the
+/// toolkit draws the window after the same events, in its frame with its
+/// title.
+fn toolkit_test(arch: Arch) -> Result<(), String> {
+    use Act::*;
+    let img = image_with(false, arch, "toolkit")?;
+    println!("== toolkit test on {}", img.path.display());
+    let rel = |from: (usize, usize), to: (usize, usize)| Move(to.0 as i64 - from.0 as i64, to.1 as i64 - from.1 as i64);
+    let script = vec![
+        (
+            vec![
+                "relative X and Y",
+                "absolute X and Y",
+                "compositor: input subscribed",
+                "greeter: ready",
+                "toolkit: the greeter's window is on the screen",
+            ],
+            // From the middle of the screen to the field: pressed there, it
+            // takes the keyboard.
+            vec![Shot(1), rel((400, 300), TOOLKIT_FIELD), Button(true), Button(false), Type("ada")],
+        ),
+        (
+            vec!["greeter: the field holds \"ada\""],
+            vec![Shot(2), rel(TOOLKIT_FIELD, TOOLKIT_BUTTON), Button(true), Button(false)],
+        ),
+        (
+            vec!["greeter: said \"Hello, ada!\""],
+            vec![Shot(3), rel(TOOLKIT_BUTTON, TOOLKIT_CLOSE), Button(true), Button(false)],
+        ),
+        (vec!["toolkit: the greeter's window is gone"], vec![Shot(4)]),
+    ];
+    let (out, shots) = run_script(&img, arch, "toolkit test", script, toolkit_act)?;
+    let log = [
+        "compositor: ready: the desktop on a 800x600 screen",
+        "greeter: ready: window 0, decorated, titled \"Greeter\"",
+        "toolkit: the greeter's window is on the screen",
+        "greeter: the field holds \"a\"",
+        "greeter: the field holds \"ad\"",
+        "greeter: the field holds \"ada\"",
+        "greeter: said \"Hello, ada!\"",
+        "compositor: window 0: its close box was pressed",
+        "greeter: closed",
+        "toolkit: the greeter's window is gone",
+        "[cm] watcher asked to shut down (pass)",
+    ];
+    check_log("toolkit test", &out, &log)?;
+    if shots != toolkit_pictures().len() {
+        return Err(format!("toolkit test: {shots} screenshots taken, want {}", toolkit_pictures().len()));
+    }
+    println!("== toolkit test passed ({})", arch.name());
     Ok(())
 }
 

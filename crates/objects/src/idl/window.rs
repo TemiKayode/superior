@@ -30,11 +30,12 @@
 /// puts it in front and drags it with the pointer until let go (it is
 /// told where it ended, `MOVED`); one pressed on the close box asks its
 /// client to close it (`CLOSE`). The window's position is still its own
-/// pixels' top left; its frame must lie wholly on the screen.
+/// pixels' top left; its frame must lie wholly on the screen. A decorated
+/// window's title (`SET_TITLE`) is drawn in its title bar.
 pub mod window {
     use crate::interfaces::Status;
 
-    pub const VERSION: u64 = 4;
+    pub const VERSION: u64 = 5;
 
     /// The most windows on the screen, all clients together.
     pub const MAX_WINDOWS: u64 = 8;
@@ -96,6 +97,9 @@ pub mod window {
     pub const CLOSE_BOX: u64 = 12;
 
     pub const CLOSE_MARGIN: u64 = 3;
+
+    /// The most bytes of a window's title.
+    pub const TITLE_BYTES: u64 = 16;
 
     /// The screen's size, and how many windows are shown on it (every
     /// client's).
@@ -242,5 +246,15 @@ pub mod window {
     /// The message of a `STYLE` call.
     pub const fn style(window: u64, flags: u64) -> [u64; 4] {
         [STYLE, window, flags, 0]
+    }
+
+    /// Sets the window's title: up to `TITLE_BYTES` of ASCII, `a` the first 8
+    /// (the first in its low byte) and `b` the next, a zero byte ending it
+    /// early. A decorated window shows as much of it as fits before its close
+    /// box.
+    pub const SET_TITLE: u64 = 11;
+    /// The message of a `SET_TITLE` call.
+    pub const fn set_title(window: u64, a: u64, b: u64) -> [u64; 4] {
+        [SET_TITLE, window, a, b]
     }
 }

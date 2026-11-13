@@ -4922,6 +4922,28 @@ fn styled_second() -> ! {
     }
 }
 
+/// The toolkit test's watcher (`arg 39`, boot/toolkit.manifest): once the
+/// greeter's window has been shown and is gone again, shuts the system
+/// down (after the host's last screenshot).
+fn toolkit_watcher() -> ! {
+    let mut seen = false;
+    loop {
+        let shown = window_info()[3];
+        if shown == 1 && !seen {
+            seen = true;
+            say!("toolkit: the greeter's window is on the screen");
+        }
+        if shown == 0 && seen {
+            break;
+        }
+        superior_sys::sleep(5);
+    }
+    say!("toolkit: the greeter's window is gone");
+    superior_sys::sleep(SCREENSHOT_TICKS);
+    syscall(Syscall::Call, DESKTOP_CONTROL, [OP_SHUTDOWN, 0, 0, 0]);
+    superior_sys::park()
+}
+
 fn display_client() -> ! {
     let mut t = Checks(0, "display");
     let pages = (SCREEN.0 * SCREEN.1 * 4).div_ceil(4096);
@@ -5540,6 +5562,7 @@ pub extern "C" fn _start(role: u64) -> ! {
         36 => app_client(),
         37 => styled_first(),
         38 => styled_second(),
+        39 => toolkit_watcher(),
         _ => probe(),
     }
 }

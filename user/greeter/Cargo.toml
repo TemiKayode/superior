@@ -1,0 +1,18 @@
+[package]
+name = "superior-greeter"
+description = "The first toolkit app: asks for a name and greets it, in a decorated window."
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "superior-greeter"
+test = false
+bench = false
+
+[dependencies]
+superior-objects = { path = "../../crates/objects" }
+superior-sys = { path = "../../crates/sys" }
+superior-toolkit = { path = "../../crates/toolkit" }

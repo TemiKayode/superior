@@ -872,6 +872,22 @@ holds the rest):
   120) to (300, 270), in front of B, and presses B's close box, and B's client
   closes it. Three screenshots must have every pixel right, the blend computed
   by xtask from the same formula.
+- The toolkit (`crates/toolkit/`) and the first app on it. A 5x7 bitmap font for
+  printable ASCII, drawing into a window's pixels, and widgets laid out in a
+  column: labels, buttons (clicked when pressed and let go over them, the face
+  showing the pointer over it and a press) and text fields (one pressed takes
+  the keyboard while the window has the focus; letters, digits, space, some
+  punctuation, Shift and Backspace edit it, Enter reports it). The app hands it
+  the compositor's events and gets back the part of the window to show again
+  and the button clicked; no heap. The compositor writes a decorated window's
+  title (`SET_TITLE`, `window` version 5) in its title bar with the same font.
+  The greeter (`user/greeter/`) asks for a name in a decorated window titled
+  "Greeter", greets it when its button is clicked, closes from its close box, and
+  makes its window again if the compositor restarts. `cargo xtask toolkit-test`
+  boots `boot/toolkit.manifest` on both ISAs: the host clicks the field, types
+  "ada", clicks the button and presses the close box; four screenshots must have
+  every pixel as the toolkit, run on the host after the same events, draws the
+  window, in its frame with its title.
 - The mixer (`user/mixer/`), the sound server. It is the sound driver's one
   client and serves the same `audio` interface to every component that plays
   sound: it adds their streams together, sample by sample and saturating, into a
@@ -986,7 +1002,7 @@ holds the rest):
   notifications, a 256-slot CNode pool) so filling them stays quick; normal kernels have
   32 of each, 32 address spaces and a 4096-slot pool.
 
-Not yet: in the compositor title text, resizing windows by their frame, the toolkit and the shell above it, a hardware cursor plane,
+Not yet: in the compositor resizing windows by their frame and the shell above the toolkit; in the toolkit layouts other than a column, scrolling, text selection and a cursor that moves within a field; a hardware cursor plane,
 pointer events when a window moves or appears under a still pointer, keyboard
 layouts and key repeat (keys are USB usages), and surviving a client
 that dies at the very moment its window is read (the compositor then faults and
@@ -1056,6 +1072,8 @@ https://claude.ai/artifact/QKJS8qH5Dfbjzn58RStq1j
 | `user/lde-bochs/` | Linux's bochs DRM display driver, likewise |
 | `user/lde-es1370/` | Linux's ES1370 sound driver, likewise |
 | `user/compositor/` | The display server: windows from every client over the desktop |
+| `crates/toolkit/` | The UI toolkit: a bitmap font, drawing, labels, buttons and text fields in a column |
+| `user/greeter/` | The first toolkit app: asks for a name and greets it |
 | `user/mixer/` | The sound server: every client's stream mixed through the sound driver |
 | `user/pcibus/` | The PCI bus server |
 | `user/memserver/` | The Memory Server |
@@ -1069,7 +1087,7 @@ https://claude.ai/artifact/QKJS8qH5Dfbjzn58RStq1j
 | `user/xhci/` | The xHCI (USB) host controller driver |
 | `user/hid/` | The USB HID keyboard, mouse and tablet driver |
 | `user/echo/`, `user/counter/`, `user/testclient/` | Test components for the Component Manager, supervision and drivers |
-| `boot/` | Component manifests: `shell.manifest` (normal boot), `test.manifest` (`cm-test`), `supervise.manifest` (`supervise-test`) , `drivers.manifest` (`drivers-test`) , `memory.manifest` (`memory-test`), `reboot.manifest` (`reboot-test`), `fs.manifest` and `fs-verify.manifest` (`fs-test`), `net.manifest` (`net-test`), `tcp.manifest` (`tcp-test`), `keyboard.manifest` (`keyboard-test`), `display.manifest` (`display-test`), `desktop.manifest` (`desktop-test`), `input.manifest` (`input-test`), `windows.manifest` (`windows-test`), `audio.manifest` (`audio-test`), `suspend.manifest` (`suspend-test`) |
+| `boot/` | Component manifests: `shell.manifest` (normal boot), `test.manifest` (`cm-test`), `supervise.manifest` (`supervise-test`) , `drivers.manifest` (`drivers-test`) , `memory.manifest` (`memory-test`), `reboot.manifest` (`reboot-test`), `fs.manifest` and `fs-verify.manifest` (`fs-test`), `net.manifest` (`net-test`), `tcp.manifest` (`tcp-test`), `keyboard.manifest` (`keyboard-test`), `display.manifest` (`display-test`), `desktop.manifest` (`desktop-test`), `input.manifest` (`input-test`), `windows.manifest` (`windows-test`), `toolkit.manifest` (`toolkit-test`), `audio.manifest` (`audio-test`), `suspend.manifest` (`suspend-test`) |
 | `sel4/` | Docker build of seL4 and rust-sel4's kernel loader, for running the shell on seL4 |
 | `xtask/` | Build driver: user program, kernel, disk image, QEMU boot |
 
@@ -1092,6 +1110,7 @@ cargo xtask lde-test       # the network test over Linux's 8139cp driver (needs 
 cargo xtask lde-e100-test  # the same over Linux's e100 driver
 cargo xtask display-test   # Linux's bochs display driver: two pictures, checked pixel by pixel from QEMU screenshots
 cargo xtask desktop-test   # the compositor: two clients' windows through restarts, five screenshots checked pixel by pixel
+cargo xtask toolkit-test   # the greeter on the toolkit: a field typed in, a button clicked, closed, four screenshots checked against the toolkit drawn on the host
 cargo xtask windows-test   # translucent and decorated windows: a blend, a drag by the title bar, a close box, three screenshots checked
 cargo xtask input-test     # the compositor's pointer, focus, keys and wheel from a USB mouse, tablet and keyboard, seven screenshots checked
 cargo xtask audio-test     # Linux's ES1370 driver and the mixer: two clients' sounds through restarts, every recorded sample checked

@@ -1,0 +1,79 @@
+# The toolkit test (cargo xtask toolkit-test).
+#
+# The greeter, the first app on the toolkit, in a decorated window
+# titled by the compositor, over the input test's desktop. The host
+# clicks its text field, types a name, clicks its button and presses
+# its close box through QEMU's monitor, and checks every pixel of four
+# screenshots against the toolkit drawing the same on the host. The
+# watcher shuts the system down once the window is gone.
+
+component pcibus
+  image pcibus
+  priority 12
+  cspace 7
+  provides pci 0
+  device pci-config 1
+  device pci-mmio 2
+  device pci-io 84
+  device msi 3
+  device iommu 11
+  untyped 18 12
+  device intx 80
+
+component xhci
+  image xhci
+  priority 11
+  uses pci 0
+  provides usb 1
+  notification 2
+  untyped 17 3
+
+component hid
+  image hid
+  priority 11
+  uses usb 0
+  provides input 1
+  untyped 14 2
+
+component lde-bochs
+  image lde-bochs
+  priority 11
+  cspace 11
+  vspace 18
+  uses pci 0
+  provides display 1
+  notification 2
+  memory 22
+  untyped 20 3
+
+component compositor
+  image compositor
+  priority 10
+  # Its slots: the screen (up to 1024 pages) and 8 windows of up to 384
+  # pages each.
+  cspace 13
+  # Page tables for the screen and the windows.
+  vspace 17
+  uses display 0
+  provides window 1
+  notification 2
+  # 2 MiB for the screen (800x600 at 32 bits is 469 pages).
+  memory 22
+  untyped 21 3
+  uses input 6
+
+component greeter
+  image greeter
+  priority 8
+  uses window 0
+  cspace 8
+  # Its window: 280x124 at 32 bits is 34 pages, and a notification.
+  memory 21
+  untyped 18 1
+
+component watcher
+  image testclient
+  arg 39
+  priority 8
+  uses window 0
+  control 1

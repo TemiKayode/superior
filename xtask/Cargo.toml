@@ -14,3 +14,5 @@ superior-idl = { path = "../crates/idl" }
 ed25519-dalek = "2"
 getrandom = "0.2"
 superior-objects = { path = "../crates/objects" }
+# Draws the toolkit test's app as it must look, to check screenshots.
+superior-toolkit = { path = "../crates/toolkit" }

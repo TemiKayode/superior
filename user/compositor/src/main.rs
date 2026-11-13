@@ -35,7 +35,8 @@
 //! Style: a translucent window's pixels are blended over what is behind
 //! them by their top byte; a decorated one gets a border and a title bar
 //! with a close box, drawn here around its pixels (focused windows' title
-//! bars in another colour). A button pressed on a title bar drags the
+//! bars in another colour), its title written in its title bar in the
+//! toolkit's font. A button pressed on a title bar drags the
 //! window until let go; one pressed on a close box tells its client.
 //!
 //! Slots: 0 the display, 1 the receive side of `window`, 2 a notification
@@ -134,6 +135,13 @@ const TITLE_FOCUSED: u32 = 0x0035_6a9e;
 const TITLE_UNFOCUSED: u32 = 0x0050_565e;
 const CLOSE_COLOUR: u32 = 0x00c0_4038;
 const CLOSE_CROSS: u32 = 0x00f0_f0f0;
+const TITLE_TEXT: u32 = 0x00f0_f0f0;
+/// Where a title starts in its title bar, from its left and top, at what
+/// scale of the font, and the space it leaves before the close box.
+const TITLE_LEFT: u32 = 4;
+const TITLE_TOP: u32 = 2;
+const TITLE_SCALE: u32 = 2;
+const TITLE_GAP: u32 = 4;
 
 /// `src` (its top byte how opaque it is) over `dst`.
 fn blend(src: u32, dst: u32) -> u32 {
@@ -235,6 +243,9 @@ struct Window {
     shown: bool,
     /// `window::ALPHA` and `window::DECORATED`.
     style: u64,
+    /// Its title, and how long it is.
+    title: [u8; window::TITLE_BYTES as usize],
+    title_len: usize,
 }
 
 /// The frame of a window at `at` with `style`: itself, or with its
@@ -285,12 +296,26 @@ impl Window {
         }
     }
 
+    /// As much of its title as fits before the close box.
+    fn shown_title(&self) -> &[u8] {
+        let (m, c) = (window::CLOSE_MARGIN as u32, window::CLOSE_BOX as u32);
+        let room = self.at.w.saturating_sub(TITLE_LEFT + TITLE_GAP + m + c);
+        let fits = (room / TITLE_SCALE + 1) / superior_toolkit::font::ADVANCE;
+        &self.title[..self.title_len.min(fits as usize)]
+    }
+
     /// Its decoration's pixel at (x, y) on the screen, a part of its frame
     /// outside it.
     fn decoration(&self, x: u32, y: u32, focused: bool) -> u32 {
         match self.part(x, y) {
             Some(Part::Title) => {
-                if focused {
+                let (tx, ty) = (self.at.x + TITLE_LEFT, self.at.y - window::TITLE as u32 + TITLE_TOP);
+                if x >= tx
+                    && y >= ty
+                    && superior_toolkit::font::text_lit(self.shown_title(), TITLE_SCALE, x - tx, y - ty)
+                {
+                    TITLE_TEXT
+                } else if focused {
                     TITLE_FOCUSED
                 } else {
                     TITLE_UNFOCUSED
@@ -902,7 +927,15 @@ impl Compositor {
         if size >> 32 != 0 || position >> 32 != 0 || !self.fits(at) {
             return [Status::Invalid as u64, 0, 0, 0];
         }
-        let w = Window { owner: badge, at, pages: 0, shown: false, style: 0 };
+        let w = Window {
+            owner: badge,
+            at,
+            pages: 0,
+            shown: false,
+            style: 0,
+            title: [0; window::TITLE_BYTES as usize],
+            title_len: 0,
+        };
         if w.needed() > window::WINDOW_PAGES {
             return [Status::Invalid as u64, 0, 0, 0];
         }
@@ -977,6 +1010,23 @@ impl Compositor {
         Status::Ok
     }
 
+    fn set_title(&mut self, i: usize, a: u64, b: u64) -> Status {
+        let Some(mut w) = self.windows[i] else { return Status::NotFound };
+        let mut bytes = [0u8; window::TITLE_BYTES as usize];
+        bytes[..8].copy_from_slice(&a.to_le_bytes());
+        bytes[8..].copy_from_slice(&b.to_le_bytes());
+        let len = bytes.iter().position(|&c| c == 0).unwrap_or(bytes.len());
+        if !bytes[..len].iter().all(|c| (32..=126).contains(c)) {
+            return Status::Invalid;
+        }
+        (w.title, w.title_len) = (bytes, len);
+        self.windows[i] = Some(w);
+        if w.shown && w.decorated() {
+            self.show(w.frame());
+        }
+        Status::Ok
+    }
+
     fn set_style(&mut self, i: usize, style: u64) -> Status {
         let Some(mut w) = self.windows[i] else { return Status::NotFound };
         if style & !(window::ALPHA | window::DECORATED) != 0 || !self.fits_styled(w.at, style) {
@@ -1008,7 +1058,8 @@ impl Compositor {
             | window::DESTROY
             | window::LISTEN
             | window::NEXT
-            | window::STYLE) => {
+            | window::STYLE
+            | window::SET_TITLE) => {
                 let Some(i) = self.own(m[1], badge) else {
                     return status(Status::NotFound);
                 };
@@ -1019,6 +1070,7 @@ impl Compositor {
                     window::LISTEN => status(self.listen(i, lent)),
                     window::NEXT => self.next(i),
                     window::STYLE => status(self.set_style(i, m[2])),
+                    window::SET_TITLE => status(self.set_title(i, m[2], m[3])),
                     window::RAISE => {
                         if let Some(w) = self.windows[i].filter(|w| w.shown) {
                             self.to_front(i);

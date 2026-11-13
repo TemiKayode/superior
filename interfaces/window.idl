@@ -27,8 +27,9 @@
 # puts it in front and drags it with the pointer until let go (it is
 # told where it ended, `MOVED`); one pressed on the close box asks its
 # client to close it (`CLOSE`). The window's position is still its own
-# pixels' top left; its frame must lie wholly on the screen.
-interface window version 4
+# pixels' top left; its frame must lie wholly on the screen. A decorated
+# window's title (`SET_TITLE`) is drawn in its title bar.
+interface window version 5
 
 # The most windows on the screen, all clients together.
 const MAX_WINDOWS = 8
@@ -123,3 +124,12 @@ const CLOSE_MARGIN = 3
 # for other flags, or if the frame it would have does not lie wholly on
 # the screen.
 op STYLE = 10 (window, flags)
+
+# The most bytes of a window's title.
+const TITLE_BYTES = 16
+
+# Sets the window's title: up to `TITLE_BYTES` of ASCII, `a` the first 8
+# (the first in its low byte) and `b` the next, a zero byte ending it
+# early. A decorated window shows as much of it as fits before its close
+# box.
+op SET_TITLE = 11 (window, a, b)

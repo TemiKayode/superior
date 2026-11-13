@@ -622,6 +622,7 @@ version = "0.1.0"
 dependencies = [
  "superior-objects",
  "superior-sys",
+ "superior-toolkit",
 ]
 
 [[package]]
@@ -662,6 +663,15 @@ version = "0.1.0"
 dependencies = [
  "superior-objects",
  "superior-sys",
+]
+
+[[package]]
+name = "superior-greeter"
+version = "0.1.0"
+dependencies = [
+ "superior-objects",
+ "superior-sys",
+ "superior-toolkit",
 ]
 
 [[package]]
@@ -813,6 +823,10 @@ dependencies = [
  "superior-objects",
  "superior-sys",
 ]
+
+[[package]]
+name = "superior-toolkit"
+version = "0.1.0"
 
 [[package]]
 name = "superior-virtio-blk"
@@ -1055,6 +1069,7 @@ dependencies = [
  "getrandom 0.2.17",
  "superior-idl",
  "superior-objects",
+ "superior-toolkit",
 ]
 
 [[package]]
