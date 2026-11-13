@@ -1,0 +1,10 @@
+[package]
+name = "superior-wifi"
+description = "Wi-Fi security for Superior's station that host tests can check: WPA2-Personal's key derivation, 4-way handshake and CCMP."
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+edition = "2024"
+publish = false
+
+[dependencies]

@@ -857,6 +857,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "superior-wifi"
+version = "0.1.0"
+
+[[package]]
 name = "superior-xhci"
 version = "0.1.0"
 dependencies = [

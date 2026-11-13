@@ -810,6 +810,21 @@ holds the rest):
   20,000 bytes each way, the accepted end giving its peer's IPv6 address. (QEMU
   forwards only IPv4 connections in from the host.) Segments must have been sent
   again, dropped and kept out of order.
+- Wi-Fi security, the first piece of Wi-Fi (`crates/wifi`, `no_std` and
+  allocation-free, host-tested): WPA2-Personal. SHA-1, HMAC-SHA1 and PBKDF2 turn
+  the passphrase and SSID into the pairwise master key; 802.11's PRF derives the
+  session keys; AES-128, CCM and AES key wrap. The 4-way handshake both ways, the
+  station's side and the access point's: nonces exchanged, every frame after the
+  first signed and checked, replay counters only rising, the group key delivered
+  wrapped in message 3 with the access point's RSN element, which must match the
+  one it advertised. CCMP seals and opens data frames under the temporal key,
+  the header authenticated with the bits that change in flight masked, and a
+  frame taken only if its packet number is above the last. The host tests check
+  each primitive against its published vectors (FIPS 180 and 197, RFC 2202, 3394,
+  3610 and 6070, IEEE 802.11 Annex J), then a whole handshake, a wrong
+  passphrase, forged, replayed and downgraded frames, and CCMP's refusals. QEMU
+  emulates no Wi-Fi card: a simulated radio and access point come next, so a
+  station can join and carry traffic in a test, ahead of a laptop's real card.
 - USB: an xHCI host controller driver (`user/xhci/`) and a HID driver for
   keyboards, mice and tablets (`user/hid/`).
   - The xHCI driver opens the first function of class 0c:03:30, resets the controller,

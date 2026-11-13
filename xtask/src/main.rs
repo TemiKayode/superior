@@ -329,6 +329,8 @@ fn host_tests() -> Result<(), String> {
         "superior-idl",
         "-p",
         "superior-toolkit",
+        "-p",
+        "superior-wifi",
     ]))?;
     println!("== model check and long simulation (release)");
     run(cargo().args([
