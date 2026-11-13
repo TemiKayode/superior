@@ -1,0 +1,18 @@
+[package]
+name = "superior-panel"
+description = "The desktop shell's panel: a launcher for each launchable app and a button for each window, along the bottom of the screen."
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "superior-panel"
+test = false
+bench = false
+
+[dependencies]
+superior-objects = { path = "../../crates/objects" }
+superior-sys = { path = "../../crates/sys" }
+superior-toolkit = { path = "../../crates/toolkit" }

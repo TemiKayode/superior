@@ -704,6 +704,40 @@ pub mod install {
     pub const OP_UNINSTALL: u64 = 15;
 }
 
+/// Launching apps: calls to the Component Manager from a component with
+/// `launch-control` (the desktop shell). A component is named by up to
+/// [`NAME_BYTES`] bytes in three words, the first byte in the low byte of
+/// the first, a zero byte ending it early.
+pub mod launch {
+    pub const NAME_BYTES: usize = 24;
+    /// `[OP_LAUNCHERS, k]`: the `k`th component with `start launch`, in
+    /// manifest order. Reply `[status, name words...]`, `NotFound` past the
+    /// last.
+    pub const OP_LAUNCHERS: u64 = 16;
+    /// `[OP_LAUNCH, name words...]`: starts that component. Reply
+    /// `[status]`: `InUse` if it is running, `NotFound` if there is no
+    /// such component, `Denied` if it is not `start launch`.
+    pub const OP_LAUNCH: u64 = 17;
+
+    /// A name as three words.
+    pub fn words(name: &[u8]) -> [u64; 3] {
+        let mut b = [0u8; NAME_BYTES];
+        let n = name.len().min(NAME_BYTES);
+        b[..n].copy_from_slice(&name[..n]);
+        core::array::from_fn(|k| u64::from_le_bytes(b[k * 8..k * 8 + 8].try_into().unwrap()))
+    }
+
+    /// The name three words hold, and its length.
+    pub fn name(w: [u64; 3]) -> ([u8; NAME_BYTES], usize) {
+        let mut b = [0u8; NAME_BYTES];
+        for (k, x) in w.iter().enumerate() {
+            b[k * 8..k * 8 + 8].copy_from_slice(&x.to_le_bytes());
+        }
+        let n = b.iter().position(|&c| c == 0).unwrap_or(NAME_BYTES);
+        (b, n)
+    }
+}
+
 /// Files: what the filesystem server serves.
 ///
 /// There is no global namespace: each component sees only its own

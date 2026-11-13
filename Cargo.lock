@@ -785,6 +785,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "superior-panel"
+version = "0.1.0"
+dependencies = [
+ "superior-objects",
+ "superior-sys",
+ "superior-toolkit",
+]
+
+[[package]]
 name = "superior-pcibus"
 version = "0.1.0"
 dependencies = [

@@ -39,6 +39,12 @@
 //! toolkit's font. A button pressed on a title bar drags the
 //! window until let go; one pressed on a close box tells its client.
 //!
+//! The desktop shell: a client whose badge is a manager's
+//! (`MANAGER_BADGE`, from `manages window` in its manifest) may list,
+//! describe and activate every window; its own windows are told when the
+//! windows change, stay in front of every other client's and never take
+//! the keyboard focus.
+//!
 //! Slots: 0 the display, 1 the receive side of `window`, 2 a notification
 //! (its timer and input), 3 memory for the screen, 6 the input driver (if
 //! any).
@@ -49,6 +55,7 @@
 use superior_objects::abi::{CapTransfer, Error, ObjectType, Syscall};
 use superior_objects::idl::{display, window};
 use superior_objects::interfaces::{Status, input};
+use superior_objects::manifest::MANAGER_BADGE;
 use superior_sys::{USER_BASE, print_line, syscall, syscall_x};
 
 const DISPLAY: u64 = 0;
@@ -594,10 +601,33 @@ impl Compositor {
             self.focus = None;
             self.set_focus(self.front());
         }
+        self.changed();
     }
 
+    /// The front window that may have the focus: not a manager's.
     fn front(&self) -> Option<usize> {
-        self.shown.checked_sub(1).map(|k| self.order[k])
+        self.order[..self.shown].iter().rev().copied().find(|&i| !self.manager(i))
+    }
+
+    /// Whether window `i` is a manager's (the desktop shell's).
+    fn manager(&self, i: usize) -> bool {
+        self.windows[i].is_some_and(|w| w.owner & MANAGER_BADGE != 0)
+    }
+
+    /// The windows, their titles or the focus changed: every manager's
+    /// window is told (once, until it reads it).
+    fn changed(&mut self) {
+        for i in 0..self.windows.len() {
+            if !self.manager(i) {
+                continue;
+            }
+            let q = &self.queues[i];
+            let n = q.events.len();
+            if q.len > 0 && q.events[(q.head + q.len - 1) % n].0 == window::WINDOWS {
+                continue;
+            }
+            self.post(i, window::WINDOWS, 0, 0);
+        }
     }
 
     /// Gives window `i` an event, and signals its client.
@@ -617,6 +647,7 @@ impl Compositor {
     }
 
     fn set_focus(&mut self, to: Option<usize>) {
+        let to = to.filter(|&i| !self.manager(i));
         if to == self.focus {
             return;
         }
@@ -630,6 +661,7 @@ impl Compositor {
             self.post(n, window::FOCUS, 1, 0);
             self.repaint_title(n);
         }
+        self.changed();
     }
 
     /// Window `i`'s title bar shows whether it has the focus: if it is a
@@ -720,7 +752,7 @@ impl Compositor {
                     let under = hit.filter(|&(_, p)| p == Part::Inside).map(|(i, _)| i);
                     self.grab = under;
                     self.hover_to(under);
-                    if let Some((i, part)) = hit {
+                    if let Some((i, part)) = hit.filter(|&(i, _)| !self.manager(i)) {
                         self.set_focus(Some(i));
                         if self.front() != Some(i) {
                             self.to_front(i);
@@ -896,10 +928,24 @@ impl Compositor {
         }
     }
 
+    /// Puts window `i` in front; managers' windows stay in front of every
+    /// other.
     fn to_front(&mut self, i: usize) {
         self.unstack(i);
         self.order[self.shown] = i;
         self.shown += 1;
+        let mut stack = [0; window::MAX_WINDOWS as usize];
+        let mut n = 0;
+        for managers in [false, true] {
+            for k in 0..self.shown {
+                let j = self.order[k];
+                if self.manager(j) == managers {
+                    stack[n] = j;
+                    n += 1;
+                }
+            }
+        }
+        self.order[..n].copy_from_slice(&stack[..n]);
     }
 
     /// The caller's window `n`, if it has one by that number.
@@ -986,6 +1032,7 @@ impl Compositor {
             self.windows[i] = Some(w);
             self.to_front(i);
             self.set_focus(Some(i));
+            self.changed();
             w.frame()
         };
         self.show(damage);
@@ -1021,6 +1068,7 @@ impl Compositor {
         }
         (w.title, w.title_len) = (bytes, len);
         self.windows[i] = Some(w);
+        self.changed();
         if w.shown && w.decorated() {
             self.show(w.frame());
         }
@@ -1051,6 +1099,35 @@ impl Compositor {
                 [Status::Ok as u64, self.width as u64, self.height as u64, self.shown as u64]
             }
             window::CREATE => self.create(m[1], m[2], badge),
+            window::LIST | window::DESCRIBE | window::ACTIVATE if badge & MANAGER_BADGE == 0 => status(Status::Denied),
+            window::LIST => {
+                if self.reap() {
+                    self.show(NONE);
+                }
+                let shown = (0..self.windows.len())
+                    .filter(|&i| self.windows[i].is_some_and(|w| w.shown))
+                    .fold(0, |m, i| m | 1 << i);
+                [Status::Ok as u64, shown, self.focus.map_or(window::MAX_WINDOWS, |f| f as u64), 0]
+            }
+            window::DESCRIBE | window::ACTIVATE => {
+                let i = usize::try_from(m[1]).ok().filter(|&i| i < self.windows.len());
+                let Some(i) = i.filter(|&i| self.windows[i].is_some_and(|w| w.shown) && self.alive(i)) else {
+                    return status(Status::NotFound);
+                };
+                let Some(w) = self.windows[i] else { return status(Status::NotFound) };
+                if m[0] == window::DESCRIBE {
+                    let word = |k: usize| u64::from_le_bytes(w.title[k * 8..k * 8 + 8].try_into().unwrap());
+                    return [Status::Ok as u64, word(0), word(1), self.manager(i) as u64];
+                }
+                if self.manager(i) {
+                    return status(Status::Invalid);
+                }
+                say!("window {i} activated by the desktop shell");
+                self.to_front(i);
+                self.set_focus(Some(i));
+                self.show(w.frame());
+                status(Status::Ok)
+            }
             op @ (window::ATTACH
             | window::COMMIT
             | window::MOVE_TO

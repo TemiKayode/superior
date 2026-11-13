@@ -888,6 +888,23 @@ holds the rest):
   "ada", clicks the button and presses the close box; four screenshots must have
   every pixel as the toolkit, run on the host after the same events, draws the
   window, in its frame with its title.
+- The desktop shell's panel (`user/panel/`), a strip along the bottom of the
+  screen drawn with the toolkit (now with row layouts and selected buttons). It
+  has a launcher button for each `start launch` component in the manifest, which
+  asks the Component Manager to start it (`launch-control`: `LAUNCHERS` lists
+  them, `LAUNCH` starts one that is not running, again after it exits), and a
+  button for each other client's window, the focused one selected; pressing one
+  puts that window in front with the focus. It manages the compositor: its
+  capability is `manages window`, a client capability whose badge the manager
+  marks (`MANAGER_BADGE`), so the compositor lets it list, describe and activate
+  every window (`window` version 6) and tells its window when they change
+  (`WINDOWS`); its window stays in front of every app's and never takes the
+  keyboard focus. App packages may not have `manages`, `launch-control` or
+  `start launch`. The greeter exits when closed, and with `arg 1` is a second app,
+  "Hello". `cargo xtask panel-test` boots `boot/panel.manifest` on both ISAs:
+  the host launches both apps from the panel, brings the greeter back in front
+  from its task button, closes it and launches it again; five screenshots must
+  have every pixel right, the panel laid out by the toolkit on the host.
 - The mixer (`user/mixer/`), the sound server. It is the sound driver's one
   client and serves the same `audio` interface to every component that plays
   sound: it adds their streams together, sample by sample and saturating, into a
@@ -1002,7 +1019,7 @@ holds the rest):
   notifications, a 256-slot CNode pool) so filling them stays quick; normal kernels have
   32 of each, 32 address spaces and a 4096-slot pool.
 
-Not yet: in the compositor resizing windows by their frame and the shell above the toolkit; in the toolkit layouts other than a column, scrolling, text selection and a cursor that moves within a field; a hardware cursor plane,
+Not yet: in the compositor resizing windows by their frame; in the desktop shell a launcher menu, a clock, minimising, and app icons; in the toolkit layouts other than a column, scrolling, text selection and a cursor that moves within a field; a hardware cursor plane,
 pointer events when a window moves or appears under a still pointer, keyboard
 layouts and key repeat (keys are USB usages), and surviving a client
 that dies at the very moment its window is read (the compositor then faults and
@@ -1074,6 +1091,7 @@ https://claude.ai/artifact/QKJS8qH5Dfbjzn58RStq1j
 | `user/compositor/` | The display server: windows from every client over the desktop |
 | `crates/toolkit/` | The UI toolkit: a bitmap font, drawing, labels, buttons and text fields in a column |
 | `user/greeter/` | The first toolkit app: asks for a name and greets it |
+| `user/panel/` | The desktop shell's panel: launchers and a button for each window |
 | `user/mixer/` | The sound server: every client's stream mixed through the sound driver |
 | `user/pcibus/` | The PCI bus server |
 | `user/memserver/` | The Memory Server |
@@ -1087,7 +1105,7 @@ https://claude.ai/artifact/QKJS8qH5Dfbjzn58RStq1j
 | `user/xhci/` | The xHCI (USB) host controller driver |
 | `user/hid/` | The USB HID keyboard, mouse and tablet driver |
 | `user/echo/`, `user/counter/`, `user/testclient/` | Test components for the Component Manager, supervision and drivers |
-| `boot/` | Component manifests: `shell.manifest` (normal boot), `test.manifest` (`cm-test`), `supervise.manifest` (`supervise-test`) , `drivers.manifest` (`drivers-test`) , `memory.manifest` (`memory-test`), `reboot.manifest` (`reboot-test`), `fs.manifest` and `fs-verify.manifest` (`fs-test`), `net.manifest` (`net-test`), `tcp.manifest` (`tcp-test`), `keyboard.manifest` (`keyboard-test`), `display.manifest` (`display-test`), `desktop.manifest` (`desktop-test`), `input.manifest` (`input-test`), `windows.manifest` (`windows-test`), `toolkit.manifest` (`toolkit-test`), `audio.manifest` (`audio-test`), `suspend.manifest` (`suspend-test`) |
+| `boot/` | Component manifests: `shell.manifest` (normal boot), `test.manifest` (`cm-test`), `supervise.manifest` (`supervise-test`) , `drivers.manifest` (`drivers-test`) , `memory.manifest` (`memory-test`), `reboot.manifest` (`reboot-test`), `fs.manifest` and `fs-verify.manifest` (`fs-test`), `net.manifest` (`net-test`), `tcp.manifest` (`tcp-test`), `keyboard.manifest` (`keyboard-test`), `display.manifest` (`display-test`), `desktop.manifest` (`desktop-test`), `input.manifest` (`input-test`), `windows.manifest` (`windows-test`), `toolkit.manifest` (`toolkit-test`), `panel.manifest` (`panel-test`), `audio.manifest` (`audio-test`), `suspend.manifest` (`suspend-test`) |
 | `sel4/` | Docker build of seL4 and rust-sel4's kernel loader, for running the shell on seL4 |
 | `xtask/` | Build driver: user program, kernel, disk image, QEMU boot |
 
@@ -1110,6 +1128,7 @@ cargo xtask lde-test       # the network test over Linux's 8139cp driver (needs 
 cargo xtask lde-e100-test  # the same over Linux's e100 driver
 cargo xtask display-test   # Linux's bochs display driver: two pictures, checked pixel by pixel from QEMU screenshots
 cargo xtask desktop-test   # the compositor: two clients' windows through restarts, five screenshots checked pixel by pixel
+cargo xtask panel-test     # the desktop shell's panel: two apps launched, one activated, closed and launched again, five screenshots checked
 cargo xtask toolkit-test   # the greeter on the toolkit: a field typed in, a button clicked, closed, four screenshots checked against the toolkit drawn on the host
 cargo xtask windows-test   # translucent and decorated windows: a blend, a drag by the title bar, a close box, three screenshots checked
 cargo xtask input-test     # the compositor's pointer, focus, keys and wheel from a USB mouse, tablet and keyboard, seven screenshots checked

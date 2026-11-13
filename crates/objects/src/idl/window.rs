@@ -32,10 +32,17 @@
 /// client to close it (`CLOSE`). The window's position is still its own
 /// pixels' top left; its frame must lie wholly on the screen. A decorated
 /// window's title (`SET_TITLE`) is drawn in its title bar.
+///
+/// The desktop shell: a client whose capability is a manager's (`manages
+/// window` in its manifest, its badge marked `MANAGER_BADGE`) may list,
+/// describe and activate every client's windows, and its own windows are
+/// told when they change (`WINDOWS`). Its windows stay in front of every
+/// other client's and never take the keyboard focus. Anyone else asking
+/// is `Denied`.
 pub mod window {
     use crate::interfaces::Status;
 
-    pub const VERSION: u64 = 5;
+    pub const VERSION: u64 = 6;
 
     /// The most windows on the screen, all clients together.
     pub const MAX_WINDOWS: u64 = 8;
@@ -75,6 +82,10 @@ pub mod window {
     /// The window was dragged by its title bar: `a` is where it is now (x |
     /// y << 16 on the screen).
     pub const MOVED: u64 = 7;
+
+    /// To a manager's windows: the windows shown, their titles or the focus
+    /// changed.
+    pub const WINDOWS: u64 = 8;
 
     /// Events a window keeps until they are read; past that the oldest go.
     pub const EVENTS: u64 = 32;
@@ -256,5 +267,63 @@ pub mod window {
     /// The message of a `SET_TITLE` call.
     pub const fn set_title(window: u64, a: u64, b: u64) -> [u64; 4] {
         [SET_TITLE, window, a, b]
+    }
+
+    /// A manager's: the windows shown (bit n for window n) and the one with
+    /// the keyboard focus (`MAX_WINDOWS` if none).
+    pub const LIST: u64 = 12;
+    /// The message of a `LIST` call.
+    pub const fn list() -> [u64; 4] {
+        [LIST, 0, 0, 0]
+    }
+    /// What a `LIST` call answers.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct ListReply {
+        pub shown: u64,
+        pub focus: u64,
+    }
+    /// Reads a `LIST` reply: its results, or the status it failed with.
+    pub fn list_reply(m: [u64; 4]) -> Result<ListReply, Status> {
+        match Status::from_u64(m[0]) {
+            Status::Ok => Ok(ListReply {
+                shown: m[1],
+                focus: m[2],
+            }),
+            s => Err(s),
+        }
+    }
+
+    /// A manager's: window `window`'s title (as `SET_TITLE` takes it) and
+    /// whether it is a manager's own (bit 0 of `flags`).
+    pub const DESCRIBE: u64 = 13;
+    /// The message of a `DESCRIBE` call.
+    pub const fn describe(window: u64) -> [u64; 4] {
+        [DESCRIBE, window, 0, 0]
+    }
+    /// What a `DESCRIBE` call answers.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct DescribeReply {
+        pub a: u64,
+        pub b: u64,
+        pub flags: u64,
+    }
+    /// Reads a `DESCRIBE` reply: its results, or the status it failed with.
+    pub fn describe_reply(m: [u64; 4]) -> Result<DescribeReply, Status> {
+        match Status::from_u64(m[0]) {
+            Status::Ok => Ok(DescribeReply {
+                a: m[1],
+                b: m[2],
+                flags: m[3],
+            }),
+            s => Err(s),
+        }
+    }
+
+    /// A manager's: puts window `window` in front of every other client's and
+    /// gives it the keyboard focus.
+    pub const ACTIVATE: u64 = 14;
+    /// The message of a `ACTIVATE` call.
+    pub const fn activate(window: u64) -> [u64; 4] {
+        [ACTIVATE, window, 0, 0]
     }
 }

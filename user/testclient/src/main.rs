@@ -4944,6 +4944,26 @@ fn toolkit_watcher() -> ! {
     superior_sys::park()
 }
 
+/// The desktop shell test's watcher (`arg 40`, boot/panel.manifest): the
+/// windows shown go from the panel alone to it and both apps, down to two
+/// as the greeter closes, and up to three as it is launched again; then it
+/// shuts the system down (after the host's last screenshot).
+fn panel_watcher() -> ! {
+    let steps = [1, 2, 3, 2, 3];
+    let mut at = 0;
+    while at + 1 < steps.len() {
+        let shown = window_info()[3];
+        if shown == steps[at + 1] {
+            at += 1;
+            say!("panel test: {shown} windows on the screen (step {at})");
+        }
+        superior_sys::sleep(5);
+    }
+    superior_sys::sleep(SCREENSHOT_TICKS);
+    syscall(Syscall::Call, DESKTOP_CONTROL, [OP_SHUTDOWN, 0, 0, 0]);
+    superior_sys::park()
+}
+
 fn display_client() -> ! {
     let mut t = Checks(0, "display");
     let pages = (SCREEN.0 * SCREEN.1 * 4).div_ceil(4096);
@@ -5563,6 +5583,7 @@ pub extern "C" fn _start(role: u64) -> ! {
         37 => styled_first(),
         38 => styled_second(),
         39 => toolkit_watcher(),
+        40 => panel_watcher(),
         _ => probe(),
     }
 }

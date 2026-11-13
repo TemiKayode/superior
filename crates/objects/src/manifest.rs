@@ -10,7 +10,8 @@
 //!   image echo              # bundle entry holding its executable
 //!   start lazy              # boot (default): at boot; lazy: on first call;
 //!                           # clone: only as a copy-on-write clone of a
-//!                           # running component with the same image
+//!                           # running component with the same image;
+//!                           # launch: when a launcher asks
 //!   priority 10             # default 10
 //!   arg 0                   # passed in its first argument register
 //!   memory 20               # bits of untyped memory for this instance
@@ -19,6 +20,9 @@
 //! component client
 //!   image client
 //!   uses echo 0             # a badged client capability to "echo"
+//!   manages window 4        # the same, its badge marked a manager's
+//!                           # (`MANAGER_BADGE`): the server lets it do
+//!                           # more (the desktop shell, say)
 //!   control 1               # an endpoint to the Component Manager
 //!   device uart 2           # a device capability the CM was given
 //!   notification 3          # a fresh notification
@@ -41,6 +45,8 @@
 //!                           # an update (`crate::ab`)
 //!   install-control         # may install and uninstall app packages
 //!                           # (`crate::package`)
+//!   launch-control          # may start `start launch` components
+//!                           # (`crate::interfaces::launch`)
 //! ```
 //!
 //! Before any component, `system block` says the rest of the system is in
@@ -84,7 +90,16 @@ pub enum Start {
     /// Started only when a running component with the same image asks the
     /// manager to clone itself into it (copy-on-write heap).
     Clone,
+    /// Started only when a component with `launch-control` asks, and again
+    /// after it has exited.
+    Launch,
 }
+
+/// The bit a `manages` capability's badge has, beside the client's
+/// number: a server gives such a client more (the compositor lets the
+/// desktop shell see and raise every client's windows). No client can set
+/// it on a badge of its own.
+pub const MANAGER_BADGE: u64 = 1 << 32;
 
 /// What happens when the component dies (spec section 4).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -101,6 +116,8 @@ pub enum Restart {
 pub enum CapKind<'a> {
     Provides(&'a str),
     Uses(&'a str),
+    /// As `Uses`, its badge marked with [`MANAGER_BADGE`].
+    Manages(&'a str),
     Device(&'a str),
     Notification,
     Untyped(u8),
@@ -163,6 +180,8 @@ pub struct Component<'a> {
     pub update_control: bool,
     /// May install and uninstall app packages.
     pub install_control: bool,
+    /// May start `start launch` components.
+    pub launch_control: bool,
     pub caps: [Option<CapSpec<'a>>; MAX_CAPS],
 }
 
@@ -185,6 +204,7 @@ impl<'a> Component<'a> {
             power_control: false,
             update_control: false,
             install_control: false,
+            launch_control: false,
             caps: [None; MAX_CAPS],
         }
     }
@@ -345,12 +365,13 @@ impl<'a> Manifest<'a> {
                     None
                 }
                 "start" => {
-                    let w = arg("start needs boot, lazy or clone")?;
+                    let w = arg("start needs boot, lazy, clone or launch")?;
                     c.start = match w {
                         "boot" => Start::Boot,
                         "lazy" => Start::Lazy,
                         "clone" => Start::Clone,
-                        _ => return Err(err("start must be boot, lazy or clone", w)),
+                        "launch" => Start::Launch,
+                        _ => return Err(err("start must be boot, lazy, clone or launch", w)),
                     };
                     None
                 }
@@ -426,6 +447,10 @@ impl<'a> Manifest<'a> {
                     c.install_control = true;
                     None
                 }
+                "launch-control" => {
+                    c.launch_control = true;
+                    None
+                }
                 "quota" => {
                     c.quota_pages = number(arg("quota needs a page count")?)?;
                     None
@@ -445,6 +470,10 @@ impl<'a> Manifest<'a> {
                 "uses" => {
                     let s = arg("uses needs a service name")?;
                     Some((CapKind::Uses(s), arg("uses needs a slot")?))
+                }
+                "manages" => {
+                    let s = arg("manages needs a service name")?;
+                    Some((CapKind::Manages(s), arg("manages needs a slot")?))
                 }
                 "device" => {
                     let d = arg("device needs a name")?;
@@ -532,7 +561,7 @@ impl<'a> Manifest<'a> {
             }
             for cap in c.caps() {
                 match cap.kind {
-                    CapKind::Uses(s) if self.provider(s).is_none() => {
+                    CapKind::Uses(s) | CapKind::Manages(s) if self.provider(s).is_none() => {
                         return Err(err("no component provides this service", s));
                     }
                     CapKind::Provides(s) if self.provider(s) != Some(i) => {
@@ -689,6 +718,24 @@ component memserver
     }
 
     #[test]
+    fn the_desktop_shell_launches_and_manages() {
+        let m = Manifest::parse(
+            "component compositor\n image compositor\n provides window 1\n\
+             component panel\n image panel\n manages window 0\n control 1\n launch-control\n\
+             component app\n image app\n start launch\n uses window 0\n",
+        )
+        .unwrap();
+        let (_, panel) = m.iter().nth(1).unwrap();
+        assert!(panel.launch_control);
+        assert_eq!(panel.caps().next().unwrap().kind, CapKind::Manages("window"));
+        assert_eq!(m.iter().nth(2).unwrap().1.start, Start::Launch);
+        assert_eq!(
+            Manifest::parse("component a\n image a\n manages nothing 0\n").unwrap_err().what,
+            "no component provides this service"
+        );
+    }
+
+    #[test]
     fn rejects_bad_manifests() {
         assert_eq!(error("image x"), (1, "directive before any component"));
         assert_eq!(
@@ -709,7 +756,7 @@ component memserver
         );
         assert_eq!(
             error("component a\n image a\n start soon"),
-            (3, "start must be boot, lazy or clone")
+            (3, "start must be boot, lazy, clone or launch")
         );
         assert_eq!(
             error("component a

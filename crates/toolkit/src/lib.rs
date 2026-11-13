@@ -1,7 +1,7 @@
 //! The Superior UI toolkit: what an app draws its window with.
 //!
-//! An app lays out widgets in a column ([`Ui`]): labels, buttons and text
-//! fields. The toolkit draws them into the window's pixels ([`Surface`]),
+//! An app lays out widgets in a column or a row ([`Ui`]): labels, buttons
+//! and text fields. The toolkit draws them into the window's pixels ([`Surface`]),
 //! takes the events the compositor gives the window ([`Event`]) and
 //! answers what they changed: the part of the window to show again, and
 //! the button clicked, if any. A button is clicked when pressed and let go
@@ -38,6 +38,9 @@ pub const FOCUS_EDGE: u32 = 0x0035_6a9e;
 pub const FACE: u32 = 0x00d0_d4da;
 pub const FACE_HOVER: u32 = 0x00c0_c6ce;
 pub const FACE_PRESSED: u32 = 0x0090_a0b0;
+/// A selected button's face (the focused window's, on the desktop shell's
+/// panel).
+pub const FACE_SELECTED: u32 = 0x00a8_bcd4;
 pub const FIELD: u32 = 0x00ff_ffff;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -174,6 +177,8 @@ pub struct Widget {
     pub kind: Kind,
     pub rect: Rect,
     pub text: Text,
+    /// A button drawn as chosen.
+    pub selected: bool,
 }
 
 /// A widget's number in its [`Ui`], in the order added.
@@ -228,14 +233,18 @@ pub fn character(usage: u64, modifiers: u8) -> Option<u8> {
 const BACKSPACE: u64 = 42;
 const ENTER: u64 = 40;
 
-/// Widgets laid out in a column on a window `w` by `h`, and their state.
+/// Widgets laid out in a column (or a row) on a window `w` by `h`, and
+/// their state.
 pub struct Ui {
     pub w: u32,
     pub h: u32,
     widgets: [Widget; MAX_WIDGETS],
     len: usize,
+    /// Laid out left to right, each centred on the window's height.
+    row: bool,
     /// Where the next widget goes.
     next_y: u32,
+    next_x: u32,
     /// The field with the keyboard, the button under the pointer, the one
     /// pressed (held until the buttons are let go), and whether the window
     /// has the focus.
@@ -247,14 +256,17 @@ pub struct Ui {
 }
 
 impl Ui {
+    /// A column, top to bottom.
     pub fn new(w: u32, h: u32) -> Ui {
-        let none = Widget { kind: Kind::Label, rect: Rect::NONE, text: Text::EMPTY };
+        let none = Widget { kind: Kind::Label, rect: Rect::NONE, text: Text::EMPTY, selected: false };
         Ui {
             w,
             h,
             widgets: [none; MAX_WIDGETS],
             len: 0,
+            row: false,
             next_y: PAD,
+            next_x: PAD,
             field: None,
             hover: None,
             pressed: None,
@@ -263,18 +275,58 @@ impl Ui {
         }
     }
 
+    /// A row, left to right.
+    pub fn row(w: u32, h: u32) -> Ui {
+        Ui { row: true, ..Ui::new(w, h) }
+    }
+
+    /// Takes every widget away, to lay out anew (state tied to them goes:
+    /// the field with the keyboard, the button under the pointer or
+    /// pressed).
+    pub fn clear(&mut self) {
+        self.len = 0;
+        (self.next_x, self.next_y) = (PAD, PAD);
+        (self.field, self.hover, self.pressed) = (None, None, None);
+    }
+
     fn add(&mut self, kind: Kind, w: u32, h: u32, text: &[u8]) -> Id {
         assert!(self.len < MAX_WIDGETS, "too many widgets");
-        let rect = Rect { x: PAD, y: self.next_y, w, h };
-        self.widgets[self.len] = Widget { kind, rect, text: Text::new(text) };
-        self.next_y += h + PAD;
+        let rect = if self.row {
+            let r = Rect { x: self.next_x, y: self.h.saturating_sub(h) / 2, w, h };
+            self.next_x += w + PAD;
+            r
+        } else {
+            let r = Rect { x: PAD, y: self.next_y, w, h };
+            self.next_y += h + PAD;
+            r
+        };
+        self.widgets[self.len] = Widget { kind, rect, text: Text::new(text), selected: false };
         self.len += 1;
         self.len - 1
     }
 
-    /// A line of text, the window's width.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// A line of text: the window's width in a column, its own in a row.
     pub fn label(&mut self, text: &str) -> Id {
-        self.add(Kind::Label, self.w - 2 * PAD, LABEL_H, text.as_bytes())
+        let w = if self.row { font::width(text.as_bytes(), SCALE) } else { self.w - 2 * PAD };
+        self.add(Kind::Label, w, LABEL_H, text.as_bytes())
+    }
+
+    /// Draws button `id` as chosen, or not: the part of the window to show
+    /// again.
+    pub fn select(&mut self, id: Id, selected: bool) -> Rect {
+        if self.widgets[id].selected == selected {
+            return Rect::NONE;
+        }
+        self.widgets[id].selected = selected;
+        self.widgets[id].rect
     }
 
     /// A button as wide as its text.
@@ -324,7 +376,7 @@ impl Ui {
     }
 
     fn draw_widget(&self, s: &mut Surface, id: Id) {
-        let Widget { kind, rect: r, text } = self.widgets[id];
+        let Widget { kind, rect: r, text, selected } = self.widgets[id];
         let t = text.as_bytes();
         let th = font::HEIGHT * SCALE;
         match kind {
@@ -335,6 +387,8 @@ impl Ui {
             Kind::Button => {
                 let face = if self.pressed == Some(id) && self.hover == Some(id) {
                     FACE_PRESSED
+                } else if selected {
+                    FACE_SELECTED
                 } else if self.hover == Some(id) {
                     FACE_HOVER
                 } else {
@@ -575,6 +629,30 @@ mod tests {
         assert_eq!(at(&s, 14 + 2, 39 + 4), INK);
         assert_eq!(at(&s, 14, 39 + 4), FIELD);
         assert_eq!(at(&s, 14 + 10 + 2, 38), INK);
+    }
+
+    #[test]
+    fn a_row_goes_left_to_right_and_lays_out_anew() {
+        let mut ui = Ui::row(800, 32);
+        let a = ui.button("+ greeter");
+        let b = ui.button("Hello");
+        let l = ui.label("ab");
+        assert_eq!(ui.widget(a).rect, Rect { x: 8, y: 3, w: 130, h: 26 });
+        assert_eq!(ui.widget(b).rect, Rect { x: 146, y: 3, w: 82, h: 26 });
+        assert_eq!(ui.widget(l).rect, Rect { x: 236, y: 8, w: 22, h: 16 });
+        assert_eq!(press(&mut ui, 150, 10).clicked, Some(b));
+        ui.event(Event::Pointer { x: 150, y: 10, buttons: 0 });
+        assert_eq!(ui.select(b, true), ui.widget(b).rect);
+        assert_eq!(ui.select(b, true), Rect::NONE);
+        let mut px = [0u32; 800 * 32];
+        let mut s = Surface { px: &mut px, w: 800, h: 32 };
+        ui.draw(&mut s);
+        assert_eq!(s.px[(4 * 800 + 147) as usize], FACE_SELECTED, "selected over the pointer's hover");
+        ui.clear();
+        assert!(ui.is_empty());
+        let c = ui.button("Greeter");
+        assert_eq!(ui.widget(c).rect.x, 8);
+        assert!(!ui.widget(c).selected);
     }
 
     #[test]

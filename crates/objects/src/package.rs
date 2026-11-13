@@ -89,7 +89,7 @@ pub fn admit<'a>(pkg: &Manifest<'a>, host: &Manifest<'_>) -> Result<(), Refusal<
         if c.start != Start::Boot {
             return no("an app starts when it is installed", name);
         }
-        if c.injector || c.power || c.power_control || c.update_control || c.install_control {
+        if c.injector || c.power || c.power_control || c.update_control || c.install_control || c.launch_control {
             return no("asks for a manager privilege", name);
         }
         if c.heap_pages > 0 || c.quota_pages > 0 {
@@ -108,6 +108,7 @@ pub fn admit<'a>(pkg: &Manifest<'a>, host: &Manifest<'_>) -> Result<(), Refusal<
                 CapKind::Untyped(bits) if bits <= MAX_UNTYPED_BITS => {}
                 CapKind::Untyped(_) => return no("more memory than an app may have", name),
                 CapKind::Provides(s) => return no("provides a service", s),
+                CapKind::Manages(s) => return no("asks to manage a service", s),
                 CapKind::Device(d) => return no("asks for a device", d),
                 CapKind::Control | CapKind::State | CapKind::Shared(_) | CapKind::Spare => {
                     return no("asks for a manager privilege", name);
@@ -151,6 +152,9 @@ component installer
         assert_eq!(why("component app\n image app\n provides x 0\n"), "provides a service");
         assert_eq!(why("component app\n image app\n control 1\n"), "asks for a manager privilege");
         assert_eq!(why("component app\n image app\n install-control\n"), "asks for a manager privilege");
+        assert_eq!(why("component app\n image app\n launch-control\n"), "asks for a manager privilege");
+        assert_eq!(why("component app\n image app\n manages report 0\n"), "asks to manage a service");
+        assert_eq!(why("component app\n image app\n start launch\n"), "an app starts when it is installed");
         assert_eq!(why("component app\n image app\n priority 11\n"), "priority above an app's");
         assert_eq!(why("component app\n image app\n untyped 17 1\n"), "more memory than an app may have");
         assert_eq!(why("component app\n image app\n memory 21\n"), "more memory than an app may have");

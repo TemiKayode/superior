@@ -29,7 +29,14 @@
 # client to close it (`CLOSE`). The window's position is still its own
 # pixels' top left; its frame must lie wholly on the screen. A decorated
 # window's title (`SET_TITLE`) is drawn in its title bar.
-interface window version 5
+#
+# The desktop shell: a client whose capability is a manager's (`manages
+# window` in its manifest, its badge marked `MANAGER_BADGE`) may list,
+# describe and activate every client's windows, and its own windows are
+# told when they change (`WINDOWS`). Its windows stay in front of every
+# other client's and never take the keyboard focus. Anyone else asking
+# is `Denied`.
+interface window version 6
 
 # The most windows on the screen, all clients together.
 const MAX_WINDOWS = 8
@@ -93,6 +100,9 @@ const CLOSE = 6
 # The window was dragged by its title bar: `a` is where it is now (x |
 # y << 16 on the screen).
 const MOVED = 7
+# To a manager's windows: the windows shown, their titles or the focus
+# changed.
+const WINDOWS = 8
 
 # Events a window keeps until they are read; past that the oldest go.
 const EVENTS = 32
@@ -133,3 +143,15 @@ const TITLE_BYTES = 16
 # early. A decorated window shows as much of it as fits before its close
 # box.
 op SET_TITLE = 11 (window, a, b)
+
+# A manager's: the windows shown (bit n for window n) and the one with
+# the keyboard focus (`MAX_WINDOWS` if none).
+op LIST = 12 () -> (shown, focus)
+
+# A manager's: window `window`'s title (as `SET_TITLE` takes it) and
+# whether it is a manager's own (bit 0 of `flags`).
+op DESCRIBE = 13 (window) -> (a, b, flags)
+
+# A manager's: puts window `window` in front of every other client's and
+# gives it the keyboard focus.
+op ACTIVATE = 14 (window)

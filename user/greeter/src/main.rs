@@ -1,12 +1,16 @@
 //! The greeter: the first app on the toolkit. A decorated window titled
 //! "Greeter" asks for a name in a text field; its button (or Enter in the
-//! field) greets it below. The close box closes it.
+//! field) greets it below. The close box closes it, and the greeter
+//! exits (so a launcher may start it again). Started with `arg 1` it is
+//! "Hello" instead, elsewhere on the screen: a second app for the desktop
+//! shell's test.
 //!
 //! Crash-only like every window client: when the compositor restarts, the
 //! next call fails and the greeter makes its window again, its state kept.
 //!
 //! Slots: 0 the compositor's `window`, 1 memory, 2 the notification the
-//! compositor signals (made here), 8 on the window's pages.
+//! compositor signals (made here), 3 the Component Manager (if given, to
+//! exit), 8 on the window's pages.
 
 #![no_std]
 #![no_main]
@@ -19,15 +23,35 @@ use superior_toolkit::{Event, Id, Rect, Surface, Ui};
 const WINDOWS: u64 = 0;
 const MEMORY: u64 = 1;
 const NTFN: u64 = 2;
+const MANAGER: u64 = 3;
+/// `[OP_EXIT, failures]` to the Component Manager: stop for good.
+const OP_EXIT: u64 = 5;
 const PAGE_SLOTS: u64 = 8;
 const VA: u64 = USER_BASE + 0x4000_0000;
-/// The window's size, and where it first goes.
+/// The window's size.
 pub const SIZE: (u32, u32) = (280, 124);
-const AT: (u64, u64) = (260, 180);
-const TITLE: &[u8] = b"Greeter";
+
+/// What it is called (in its log and its title) and where its window
+/// first goes, by its `arg`.
+struct Variant {
+    name: &'static str,
+    title: &'static [u8],
+    at: (u64, u64),
+}
+
+const VARIANTS: [Variant; 2] = [
+    Variant { name: "greeter", title: b"Greeter", at: (260, 180) },
+    Variant { name: "hello", title: b"Hello", at: (330, 250) },
+];
+
+static VARIANT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+fn variant() -> &'static Variant {
+    &VARIANTS[VARIANT.load(core::sync::atomic::Ordering::Relaxed)]
+}
 
 macro_rules! say {
-    ($($t:tt)*) => { print_line(format_args!("greeter: {}", format_args!($($t)*))) };
+    ($($t:tt)*) => { print_line(format_args!("{}: {}", variant().name, format_args!($($t)*))) };
 }
 
 fn pages() -> u64 {
@@ -53,7 +77,8 @@ fn rect_word(r: Rect) -> u64 {
 /// The title as `SET_TITLE` takes it.
 fn title_words() -> (u64, u64) {
     let mut b = [0u8; 16];
-    b[..TITLE.len()].copy_from_slice(TITLE);
+    let title = variant().title;
+    b[..title.len()].copy_from_slice(title);
     (u64::from_le_bytes(b[..8].try_into().unwrap()), u64::from_le_bytes(b[8..].try_into().unwrap()))
 }
 
@@ -149,6 +174,7 @@ impl App {
                     let _ = call(window::destroy(n), None);
                 }
                 say!("closed");
+                syscall(Syscall::Call, MANAGER, [OP_EXIT, 0, 0, 0]);
                 return false;
             }
             _ => return true,
@@ -167,7 +193,8 @@ impl App {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn _start(_: u64) -> ! {
+pub extern "C" fn _start(arg: u64) -> ! {
+    VARIANT.store((arg as usize).min(VARIANTS.len() - 1), core::sync::atomic::Ordering::Relaxed);
     let mut made = syscall(Syscall::Retype, MEMORY, [ObjectType::Notification as u64, 0, NTFN, 0]).status == 0;
     for p in 0..pages() {
         made &= syscall(Syscall::Retype, MEMORY, [ObjectType::Frame as u64, 0, PAGE_SLOTS + p, 0]).status == 0
@@ -182,12 +209,13 @@ pub extern "C" fn _start(_: u64) -> ! {
     let field = ui.field();
     let button = ui.button("Greet");
     let out = ui.label("");
-    let mut app = App { ui, field, button, out, window: None, at: AT };
+    let mut app = App { ui, field, button, out, window: None, at: variant().at };
     if !app.open() {
         say!("[fail] the compositor would not show the window");
         superior_sys::park()
     }
-    say!("ready: window {}, decorated, titled \"Greeter\"", app.window.unwrap_or(u64::MAX));
+    let title = core::str::from_utf8(variant().title).unwrap_or("?");
+    say!("ready: window {}, decorated, titled \"{title}\"", app.window.unwrap_or(u64::MAX));
     loop {
         syscall(Syscall::TimerSignal, NTFN, [5, 0, 0, 0]);
         syscall(Syscall::Wait, NTFN, [0; 4]);

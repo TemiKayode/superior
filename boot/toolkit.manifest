@@ -70,6 +70,8 @@ component greeter
   # Its window: 280x124 at 32 bits is 34 pages, and a notification.
   memory 21
   untyped 18 1
+  # To exit once closed.
+  control 3
 
 component watcher
   image testclient

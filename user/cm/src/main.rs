@@ -70,9 +70,9 @@ use superior_objects::abi::{
 use superior_objects::bundle::{Bundle, BundleError, Signed};
 use superior_objects::elf::{Elf, Machine};
 use superior_objects::ab::{self, Record};
-use superior_objects::interfaces::{Status as Reply, block, install, mem, power, update};
+use superior_objects::interfaces::{Status as Reply, block, install, launch, mem, power, update};
 use superior_objects::package;
-use superior_objects::manifest::{CapKind, Component, MAX_COMPONENTS, Manifest, Restart, Start};
+use superior_objects::manifest::{CapKind, Component, MANAGER_BADGE, MAX_COMPONENTS, Manifest, Restart, Start};
 use superior_sys::{Ret, USER_BASE, syscall, syscall_x};
 
 // Rights masks.
@@ -346,12 +346,15 @@ impl<'a> Manager<'a> {
                     let ep = SERVICES + self.service_index(s).unwrap() as u64;
                     cnode_copy(cnode, slot, ep, READ | WRITE | GRANT_REPLY, 0)
                 }
-                CapKind::Uses(s) => {
+                CapKind::Uses(s) | CapKind::Manages(s) => {
                     let ep = SERVICES + self.service_index(s).unwrap() as u64;
                     // The Memory Server learns the client's quota from
-                    // the badge, which the client cannot change.
+                    // the badge, which the client cannot change; a manager
+                    // is known by its badge's mark.
                     let badge = if s == "mem" {
                         mem::badge(i, c.quota_pages)
+                    } else if matches!(cap.kind, CapKind::Manages(_)) {
+                        (i as u64 + 1) | MANAGER_BADGE
                     } else {
                         i as u64 + 1
                     };
@@ -474,6 +477,30 @@ impl<'a> Manager<'a> {
                 say!("could not start {name}: {what} (error {code})");
             }
         }
+    }
+
+    /// The `k`th component with `start launch`.
+    fn launcher(&self, k: usize) -> Option<usize> {
+        self.manifest.iter().filter(|(_, c)| c.start == Start::Launch).nth(k).map(|(i, _)| i)
+    }
+
+    /// `[OP_LAUNCH, name]` from a launcher: starts the component of that
+    /// name if it is `start launch` and not running.
+    fn launch(&mut self, w: [u64; 3]) -> Reply {
+        let (name, n) = launch::name(w);
+        let Some((i, c)) = self.manifest.iter().find(|(_, c)| c.name.as_bytes() == &name[..n]) else {
+            return Reply::NotFound;
+        };
+        if c.start != Start::Launch {
+            return Reply::Denied;
+        }
+        if self.status[i] == Status::Running {
+            return Reply::InUse;
+        }
+        // What an instance that exited or failed left is taken back first.
+        self.stop(i);
+        self.start_logged(i, "launched");
+        if self.status[i] == Status::Running { Reply::Ok } else { Reply::DeviceError }
     }
 
     /// Destroys component `i`'s current instance by revoking everything
@@ -1596,6 +1623,23 @@ pub extern "C" fn _start(arg: u64) -> ! {
                         Err(e) => [e as u64, 0, 0, 0],
                     },
                     _ => [m.uninstall(msg.msg[1] as usize) as u64, 0, 0, 0],
+                })
+            }
+            BADGE_REPORT
+                if i < MAX_COMPONENTS
+                    && m.component(i).launch_control
+                    && (launch::OP_LAUNCHERS..=launch::OP_LAUNCH).contains(&msg.msg[0]) =>
+            {
+                Some(if msg.msg[0] == launch::OP_LAUNCHERS {
+                    match m.launcher(msg.msg[1] as usize) {
+                        Some(t) => {
+                            let w = launch::words(m.component(t).name.as_bytes());
+                            [Reply::Ok as u64, w[0], w[1], w[2]]
+                        }
+                        None => [Reply::NotFound as u64, 0, 0, 0],
+                    }
+                } else {
+                    [m.launch([msg.msg[1], msg.msg[2], msg.msg[3]]) as u64, 0, 0, 0]
                 })
             }
             BADGE_REPORT if i < MAX_COMPONENTS && msg.msg[0] == OP_SHUTDOWN => {

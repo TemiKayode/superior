@@ -175,6 +175,7 @@ fn main() -> ExitCode {
                         .and_then(|_| desktop_test(a))
                         .and_then(|_| windows_test(a))
                         .and_then(|_| toolkit_test(a))
+                        .and_then(|_| panel_test(a))
                         .and_then(|_| input_test(a))
                         .and_then(|_| audio_test(a))
                         .and_then(|_| tcp_test(a))
@@ -210,6 +211,7 @@ fn main() -> ExitCode {
         Some("desktop-test") => desktop_test(arch),
         Some("windows-test") => windows_test(arch),
         Some("toolkit-test") => toolkit_test(arch),
+        Some("panel-test") => panel_test(arch),
         Some("input-test") => input_test(arch),
         Some("audio-test") => audio_test(arch),
         Some("tcp-test") => tcp_test(arch),
@@ -227,7 +229,7 @@ fn main() -> ExitCode {
         }
         Some("bench") => image(false, Arch::X86_64).and_then(|img| bench(&img)),
         _ => Err(
-            "usage: cargo xtask <idl | image | run | test | boot-test | shell-test | cm-test | supervise-test | drivers-test | memory-test | reboot-test | fs-test | nvme-test | ahci-test | net-test | lde-test | lde-e100-test | display-test | desktop-test | windows-test | toolkit-test | input-test | audio-test | tcp-test | keyboard-test | hotplug-test | suspend-test | verified-boot-test | ab-test | packages-test | bench | sel4-test> [x86_64 | aarch64]"
+            "usage: cargo xtask <idl | image | run | test | boot-test | shell-test | cm-test | supervise-test | drivers-test | memory-test | reboot-test | fs-test | nvme-test | ahci-test | net-test | lde-test | lde-e100-test | display-test | desktop-test | windows-test | toolkit-test | panel-test | input-test | audio-test | tcp-test | keyboard-test | hotplug-test | suspend-test | verified-boot-test | ab-test | packages-test | bench | sel4-test> [x86_64 | aarch64]"
                 .into(),
         ),
     });
@@ -367,7 +369,7 @@ const LINUX_SOURCES: [(&str, &str, &str); 5] = [
 /// a network test's, the display tests', or the audio test's.
 fn linux_driver(manifest: &str) -> Option<&'static str> {
     match manifest {
-        "display" | "desktop" | "input" | "windows" | "toolkit" => Some("bochs"),
+        "display" | "desktop" | "input" | "windows" | "toolkit" | "panel" => Some("bochs"),
         "audio" => Some("es1370"),
         _ => linux_nic(manifest).map(|l| l.0),
     }
@@ -571,6 +573,7 @@ fn bundle(arch: Arch, manifest: &str, driver: &str) -> Result<PathBuf, String> {
         ("testclient", "superior-testclient"),
         ("compositor", "superior-compositor"),
         ("greeter", "superior-greeter"),
+        ("panel", "superior-panel"),
         ("mixer", "superior-mixer"),
         // Need Linux's source and the build container: only where used.
         ("lde-8139cp", "superior-lde-8139cp"),
@@ -822,10 +825,10 @@ fn image_sealed(
         driver,
         net: matches!(manifest, "net" | "tcp") || linux_nic(manifest).is_some(),
         linux_nic: linux_nic(manifest).map(|l| l.1),
-        keyboard: matches!(manifest, "keyboard" | "input" | "windows" | "toolkit"),
-        mouse: matches!(manifest, "input" | "windows" | "toolkit"),
+        keyboard: matches!(manifest, "keyboard" | "input" | "windows" | "toolkit" | "panel"),
+        mouse: matches!(manifest, "input" | "windows" | "toolkit" | "panel"),
         hotplug: manifest == "hotplug",
-        display: matches!(manifest, "display" | "desktop" | "input" | "windows" | "toolkit"),
+        display: matches!(manifest, "display" | "desktop" | "input" | "windows" | "toolkit" | "panel"),
         audio: (manifest == "audio").then(|| audio_wav(arch)),
     })
 }
@@ -2692,6 +2695,15 @@ fn input_act(act: &Act, arch: Arch) -> Result<Option<String>, String> {
     Ok(None)
 }
 
+/// Whether `all` holds what a script waits for: `what`, or with a prefix
+/// `<n>x ` that many times.
+fn script_ready(all: &str, what: &str) -> bool {
+    match what.split_once("x ").and_then(|(n, rest)| Some((n.parse::<usize>().ok()?, rest))) {
+        Some((n, rest)) => all.matches(rest).count() >= n,
+        None => all.contains(what),
+    }
+}
+
 /// Runs `img`, doing `script` through QEMU's monitor as its output comes
 /// (`act` does each act): the output, and how many screenshots were taken
 /// and checked.
@@ -2709,7 +2721,7 @@ fn run_script(
         let mut done = done.lock().unwrap();
         while done.0 < script.len() && done.1.iter().all(Result::is_ok) {
             let (wait, acts) = &script[done.0];
-            if !wait.iter().all(|w| all.contains(w)) {
+            if !wait.iter().all(|w| script_ready(all, w)) {
                 return;
             }
             for a in acts {
@@ -3140,6 +3152,236 @@ fn toolkit_test(arch: Arch) -> Result<(), String> {
         return Err(format!("toolkit test: {shots} screenshots taken, want {}", toolkit_pictures().len()));
     }
     println!("== toolkit test passed ({})", arch.name());
+    Ok(())
+}
+
+/// The panel (user/panel): its height, and its layout for these launchers
+/// and windows (title, focused), the same as the panel's `layout`.
+const PANEL_H: usize = 32;
+
+fn panel_ui(launchers: &[&str], tasks: &[(&str, bool)]) -> superior_toolkit::Ui {
+    let mut ui = superior_toolkit::Ui::row(SCREEN.0 as u32, PANEL_H as u32);
+    for l in launchers {
+        ui.button(&format!("+ {l}"));
+    }
+    for (title, focused) in tasks {
+        let id = ui.button(title);
+        ui.select(id, *focused);
+    }
+    ui
+}
+
+/// The middle of widget `id` of the panel, on the screen.
+fn panel_spot(ui: &superior_toolkit::Ui, id: usize) -> (usize, usize) {
+    let r = ui.widget(id).rect;
+    ((r.x + r.w / 2) as usize, SCREEN.1 - PANEL_H + (r.y + r.h / 2) as usize)
+}
+
+/// A window on a desktop shell test screenshot: where it is, its size,
+/// its frame (if decorated) and its pixels.
+struct Layer {
+    at: (usize, usize),
+    size: (usize, usize),
+    frame: Option<StyledWindow>,
+    pixels: Vec<u32>,
+}
+
+/// The greeter's window (its `arg`'s variant: the greeter or "Hello"),
+/// freshly drawn, with the focus or not.
+fn greeter_layer(hello: bool, focused: bool) -> Layer {
+    let (ui, ..) = greeter_ui();
+    let mut pixels = vec![0u32; GREETER_SIZE.0 * GREETER_SIZE.1];
+    ui.draw(&mut superior_toolkit::Surface { px: &mut pixels, w: GREETER_SIZE.0 as u32, h: GREETER_SIZE.1 as u32 });
+    let (at, title): (_, &'static [u8]) = if hello { ((330, 250), b"Hello") } else { (GREETER_AT, b"Greeter") };
+    Layer {
+        at,
+        size: GREETER_SIZE,
+        frame: Some(StyledWindow { id: 0, at, size: GREETER_SIZE, alpha: false, decorated: true, focused, title }),
+        pixels,
+    }
+}
+
+/// The panel, laid out for `tasks` with the pointer at `pointer` (on the
+/// screen) if it is on the panel.
+fn panel_layer(tasks: &[(&str, bool)], pointer: Option<(usize, usize)>) -> Layer {
+    use superior_toolkit::Event;
+    let mut ui = panel_ui(PANEL_LAUNCHERS, tasks);
+    if let Some((x, y)) = pointer.filter(|&(_, y)| y >= SCREEN.1 - PANEL_H) {
+        ui.event(Event::Pointer { x: x as i32, y: (y - (SCREEN.1 - PANEL_H)) as i32, buttons: 0 });
+    }
+    let mut pixels = vec![0u32; SCREEN.0 * PANEL_H];
+    ui.draw(&mut superior_toolkit::Surface { px: &mut pixels, w: SCREEN.0 as u32, h: PANEL_H as u32 });
+    Layer { at: (0, SCREEN.1 - PANEL_H), size: (SCREEN.0, PANEL_H), frame: None, pixels }
+}
+
+/// The apps boot/panel.manifest may launch, in manifest order.
+const PANEL_LAUNCHERS: &[&str] = &["greeter", "hello"];
+
+/// Where the desktop shell test's pointer goes: the two launchers, the
+/// greeter's task button (with both apps' windows on the panel) and the
+/// greeter's close box.
+fn panel_spots() -> [(usize, usize); 4] {
+    let ui = panel_ui(PANEL_LAUNCHERS, &[("Greeter", false), ("Hello", true)]);
+    [panel_spot(&ui, 0), panel_spot(&ui, 1), panel_spot(&ui, 2), TOOLKIT_CLOSE]
+}
+
+/// What each of the desktop shell test's screenshots must show: the
+/// windows back to front, and where the pointer is.
+fn panel_pictures() -> Vec<(Vec<Layer>, Option<(usize, usize)>)> {
+    let [run_greeter, run_hello, greeter_task, close] = panel_spots();
+    let both = |front_greeter: bool| {
+        if front_greeter {
+            [("Greeter", true), ("Hello", false)]
+        } else {
+            [("Greeter", false), ("Hello", true)]
+        }
+    };
+    vec![
+        (vec![panel_layer(&[], None)], None),
+        (
+            vec![greeter_layer(false, false), greeter_layer(true, true), panel_layer(&both(false), Some(run_hello))],
+            Some(run_hello),
+        ),
+        (
+            vec![greeter_layer(true, false), greeter_layer(false, true), panel_layer(&both(true), Some(greeter_task))],
+            Some(greeter_task),
+        ),
+        (vec![greeter_layer(true, true), panel_layer(&[("Hello", true)], Some(close))], Some(close)),
+        (
+            vec![greeter_layer(true, false), greeter_layer(false, true), panel_layer(&both(true), Some(run_greeter))],
+            Some(run_greeter),
+        ),
+    ]
+}
+
+/// Checks the desktop shell test's screenshot `k` (from 1) pixel by pixel.
+fn check_panel(path: &Path, k: usize) -> Result<String, String> {
+    let (layers, pointer) = &panel_pictures()[k - 1];
+    let pixels = read_screenshot(path)?;
+    let (mut wrong, mut first) = (0, None);
+    for y in 0..SCREEN.1 {
+        for x in 0..SCREEN.0 {
+            let mut want = desktop_pixel(x, y);
+            for l in layers {
+                let (ax, ay) = l.at;
+                if (ax..ax + l.size.0).contains(&x) && (ay..ay + l.size.1).contains(&y) {
+                    let p = l.pixels[(y - ay) * l.size.0 + x - ax];
+                    want = [(p >> 16) as u8, (p >> 8) as u8, p as u8];
+                } else if let Some(p) = l.frame.and_then(|f| f.pixel(x, y, want)) {
+                    want = p;
+                }
+            }
+            if let Some((px, py)) = *pointer {
+                if x >= px && y >= py && y - py < CURSOR.len() && x - px < CURSOR[0].len() {
+                    match CURSOR[y - py].as_bytes()[x - px] {
+                        b'#' => want = [0, 0, 0],
+                        b'o' => want = [0xff, 0xff, 0xff],
+                        _ => {}
+                    }
+                }
+            }
+            let i = (y * SCREEN.0 + x) * 3;
+            let have = [pixels[i], pixels[i + 1], pixels[i + 2]];
+            if have != want {
+                wrong += 1;
+                first.get_or_insert((x, y, have, want));
+            }
+        }
+    }
+    match first {
+        None => Ok(format!(
+            "screenshot {k}: all {} pixels right: the panel and {} app window{}{}",
+            SCREEN.0 * SCREEN.1,
+            layers.len() - 1,
+            if layers.len() == 2 { "" } else { "s" },
+            pointer.map_or(String::new(), |(x, y)| format!(", the pointer at ({x}, {y})"))
+        )),
+        Some((x, y, have, want)) => Err(format!(
+            "screenshot {k}: {wrong} pixels wrong, the first at ({x}, {y}): {have:?}, not {want:?}"
+        )),
+    }
+}
+
+fn panel_act(act: &Act, arch: Arch) -> Result<Option<String>, String> {
+    let Act::Shot(k) = act else { return input_act(act, arch) };
+    let path = root().join("target").join(format!("panel-{}-{k}.ppm", arch.name()));
+    let _ = std::fs::remove_file(&path);
+    screendump(&path)?;
+    check_panel(&path, *k).map(Some)
+}
+
+/// Boots `boot/panel.manifest`: the desktop shell's panel, which manages
+/// the compositor and may launch the greeter and "Hello". Through QEMU's
+/// monitor the host launches both from the panel, puts the greeter back
+/// in front from its task button, closes it from its close box (it exits)
+/// and launches it again. Five screenshots must have every pixel right:
+/// the panel as the toolkit lays it out on the host, the apps' windows in
+/// their titled frames, the focus and the stacking.
+fn panel_test(arch: Arch) -> Result<(), String> {
+    use Act::*;
+    let img = image_with(false, arch, "panel")?;
+    println!("== desktop shell test on {}", img.path.display());
+    let [run_greeter, run_hello, greeter_task, close] = panel_spots();
+    let to = |from: (usize, usize), to: (usize, usize)| Move(to.0 as i64 - from.0 as i64, to.1 as i64 - from.1 as i64);
+    let click = |v: &mut Vec<Act>| {
+        v.push(Button(true));
+        v.push(Button(false));
+    };
+    let mut s1 = vec![Shot(1), to((400, 300), run_greeter)];
+    click(&mut s1);
+    let mut s2 = vec![to(run_greeter, run_hello)];
+    click(&mut s2);
+    let mut s3 = vec![Shot(2), to(run_hello, greeter_task)];
+    click(&mut s3);
+    let mut s4 = vec![Shot(3), to(greeter_task, close)];
+    click(&mut s4);
+    let mut s5 = vec![Shot(4), to(close, run_greeter)];
+    click(&mut s5);
+    let script = vec![
+        (
+            vec![
+                "relative X and Y",
+                "absolute X and Y",
+                "compositor: input subscribed",
+                "panel: ready",
+                "panel: windows: none",
+            ],
+            s1,
+        ),
+        (vec!["greeter: ready", "panel: windows: \"Greeter\" (focused)"], s2),
+        (vec!["hello: ready", "panel: windows: \"Greeter\", \"Hello\" (focused)"], s3),
+        (vec!["panel: windows: \"Greeter\" (focused), \"Hello\""], s4),
+        (vec!["greeter: closed", "panel: windows: \"Hello\" (focused)"], s5),
+        (vec!["2x greeter: ready", "2x panel: windows: \"Greeter\" (focused), \"Hello\""], vec![Shot(5)]),
+    ];
+    let (out, shots) = run_script(&img, arch, "desktop shell test", script, panel_act)?;
+    let log = [
+        "compositor: ready: the desktop on a 800x600 screen",
+        "panel: windows: none",
+        "panel: ready: 800x32 at the bottom, 2 launchers (greeter, hello)",
+        "[cm] started greeter (launched)",
+        "panel: launched greeter (status 0)",
+        // The panel's own lists race the apps' lines (it runs before
+        // them): the script waits for each.
+        "greeter: ready: window 1, decorated, titled \"Greeter\"",
+        "[cm] started hello (launched)",
+        "hello: ready: window 2, decorated, titled \"Hello\"",
+        "compositor: window 1 activated by the desktop shell",
+        "panel: activated \"Greeter\" (status 0)",
+        "panel: windows: \"Greeter\" (focused), \"Hello\"",
+        "compositor: window 1: its close box was pressed",
+        "greeter: closed",
+        "[cm] greeter exited",
+        "[cm] started greeter (launched)",
+        "greeter: ready: window 1, decorated, titled \"Greeter\"",
+        "panel test: 3 windows on the screen (step 4)",
+        "[cm] watcher asked to shut down (pass)",
+    ];
+    check_log("desktop shell test", &out, &log)?;
+    if shots != panel_pictures().len() {
+        return Err(format!("desktop shell test: {shots} screenshots taken, want {}", panel_pictures().len()));
+    }
+    println!("== desktop shell test passed ({})", arch.name());
     Ok(())
 }
 

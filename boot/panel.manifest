@@ -1,0 +1,105 @@
+# The desktop shell test (cargo xtask panel-test).
+#
+# The panel, the desktop shell's strip along the bottom of the screen,
+# manages the compositor and may launch the two `start launch` apps: the
+# greeter and its "Hello" variant. The host launches both from the panel,
+# brings the greeter back in front from its task button, closes it and
+# launches it again, through QEMU's monitor, and checks every pixel of
+# five screenshots. The watcher shuts the system down at the end.
+
+component pcibus
+  image pcibus
+  priority 12
+  cspace 7
+  provides pci 0
+  device pci-config 1
+  device pci-mmio 2
+  device pci-io 84
+  device msi 3
+  device iommu 11
+  untyped 18 12
+  device intx 80
+
+component xhci
+  image xhci
+  priority 11
+  uses pci 0
+  provides usb 1
+  notification 2
+  untyped 17 3
+
+component hid
+  image hid
+  priority 11
+  uses usb 0
+  provides input 1
+  untyped 14 2
+
+component lde-bochs
+  image lde-bochs
+  priority 11
+  cspace 11
+  vspace 18
+  uses pci 0
+  provides display 1
+  notification 2
+  memory 22
+  untyped 20 3
+
+component compositor
+  image compositor
+  priority 10
+  # Its slots: the screen (up to 1024 pages) and 8 windows of up to 384
+  # pages each.
+  cspace 13
+  # Page tables for the screen and the windows.
+  vspace 17
+  uses display 0
+  provides window 1
+  notification 2
+  # 2 MiB for the screen (800x600 at 32 bits is 469 pages).
+  memory 22
+  untyped 21 3
+  uses input 6
+
+component panel
+  image panel
+  priority 9
+  # Manages the compositor: sees and activates every window.
+  manages window 0
+  control 1
+  launch-control
+  cspace 8
+  # Its window: up to 1024x32 at 32 bits is 32 pages, and a notification.
+  memory 21
+  untyped 18 2
+
+component greeter
+  image greeter
+  start launch
+  restart never
+  priority 8
+  uses window 0
+  cspace 8
+  memory 21
+  untyped 18 1
+  control 3
+
+component hello
+  image greeter
+  arg 1
+  start launch
+  restart never
+  priority 8
+  uses window 0
+  cspace 8
+  memory 21
+  untyped 18 1
+  control 3
+
+component watcher
+  image testclient
+  arg 40
+  priority 8
+  uses window 0
+  control 1
