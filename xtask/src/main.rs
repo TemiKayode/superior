@@ -126,6 +126,9 @@ struct Image {
     /// QEMU's ENSONIQ AudioPCI, recording what it plays to this WAV file
     /// (the audio test).
     audio: Option<PathBuf>,
+    /// An x86-64 image booted by UEFI firmware (QEMU's OVMF) rather than
+    /// a BIOS.
+    uefi: bool,
 }
 
 /// The disk drivers, each with the PCI function its test disk appears as
@@ -190,11 +193,13 @@ fn main() -> ExitCode {
                         .and_then(|img| shell_session(&img))
                 })
             })
+            .and_then(|_| uefi_test())
             .and_then(|_| sel4_image())
             .and_then(|img| shell_session(&img)),
         Some("sel4-test") => sel4_image().and_then(|img| shell_session(&img)),
         Some("boot-test") => image(true, arch).and_then(|img| boot(&img, true)),
         Some("shell-test") => image(false, arch).and_then(|img| shell_session(&img)),
+        Some("uefi-test") => uefi_test(),
         Some("cm-test") => image_with(false, arch, "test").and_then(|img| cm_test(&img)),
         Some("drivers-test") => {
             image_with(false, arch, "drivers").and_then(|img| drivers_test(&img))
@@ -231,7 +236,7 @@ fn main() -> ExitCode {
         }
         Some("bench") => image(false, Arch::X86_64).and_then(|img| bench(&img)),
         _ => Err(
-            "usage: cargo xtask <idl | image | run | test | boot-test | shell-test | cm-test | supervise-test | drivers-test | memory-test | reboot-test | fs-test | nvme-test | ahci-test | net-test | lde-test | lde-e100-test | display-test | desktop-test | windows-test | toolkit-test | panel-test | resize-test | input-test | audio-test | tcp-test | keyboard-test | hotplug-test | suspend-test | verified-boot-test | ab-test | packages-test | bench | sel4-test> [x86_64 | aarch64]"
+            "usage: cargo xtask <idl | image | run | test | boot-test | shell-test | cm-test | supervise-test | drivers-test | memory-test | reboot-test | fs-test | nvme-test | ahci-test | net-test | lde-test | lde-e100-test | display-test | desktop-test | windows-test | toolkit-test | panel-test | resize-test | uefi-test | input-test | audio-test | tcp-test | keyboard-test | hotplug-test | suspend-test | verified-boot-test | ab-test | packages-test | bench | sel4-test> [x86_64 | aarch64]"
                 .into(),
         ),
     });
@@ -832,6 +837,7 @@ fn image_sealed(
         hotplug: manifest == "hotplug",
         display: matches!(manifest, "display" | "desktop" | "input" | "windows" | "toolkit" | "panel" | "resize"),
         audio: (manifest == "audio").then(|| audio_wav(arch)),
+        uefi: false,
     })
 }
 
@@ -930,6 +936,7 @@ fn sel4_image() -> Result<Image, String> {
         hotplug: false,
         display: false,
         audio: None,
+        uefi: false,
     })
 }
 
@@ -957,6 +964,37 @@ fn qemu(arch: Arch) -> PathBuf {
     exe.into()
 }
 
+/// QEMU's x86-64 UEFI firmware (OVMF, from EDK II): beside QEMU's
+/// executable in `share`, or $OVMF.
+fn ovmf() -> PathBuf {
+    if let Ok(p) = env::var("OVMF") {
+        return p.into();
+    }
+    let exe = qemu(Arch::X86_64);
+    let dirs = [exe.parent().map(|d| d.join("share")), Some(PathBuf::from("/usr/share/qemu"))];
+    dirs.into_iter()
+        .flatten()
+        .map(|d| d.join("edk2-x86_64-code.fd"))
+        .find(|p| p.exists())
+        .unwrap_or_else(|| "edk2-x86_64-code.fd".into())
+}
+
+/// The x86-64 image for `boot/<manifest>.manifest` as a UEFI disk: a GPT
+/// disk with an EFI system partition holding the bootloader's UEFI
+/// application and the kernel, and no BIOS boot code.
+fn uefi_image(manifest: &str) -> Result<Image, String> {
+    let mut img = image_with(false, Arch::X86_64, manifest)?;
+    let kernel = root().join("target").join(Arch::X86_64.target()).join("release").join("superior-kernel");
+    let name = if manifest == "shell" { "superior-uefi.img".to_string() } else { format!("superior-uefi-{manifest}.img") };
+    let path = root().join("target").join(name);
+    bootloader::UefiBoot::new(&kernel)
+        .create_disk_image(&path)
+        .map_err(|e| format!("creating UEFI disk image: {e}"))?;
+    img.path = path;
+    img.uefi = true;
+    Ok(img)
+}
+
 fn qemu_command(img: &Image) -> Command {
     let mut q = Command::new(qemu(img.arch));
     match img.arch {
@@ -980,6 +1018,12 @@ fn qemu_command(img: &Image) -> Command {
             } else {
                 q.arg("-drive")
                     .arg(format!("format=raw,file={}", img.path.display()));
+            }
+            if img.uefi {
+                // OVMF, the UEFI firmware QEMU ships, in place of SeaBIOS.
+                q.arg("-drive")
+                    .arg(format!("if=pflash,format=raw,readonly=on,file={}", ovmf().display()))
+                    .args(["-m", "512M"]);
             }
             q.args(["-device", "isa-debug-exit,iobase=0xf4,iosize=0x04"]);
         }
@@ -4621,25 +4665,46 @@ fn run_capture(
 /// person would: wait for the prompt, type a command, check the answer.
 /// The shell's own `shutdown` command must then end QEMU with the pass
 /// code.
+/// The shell session's script: (typed text, text the answer must contain).
+const SHELL_SCRIPT: &[(&str, &str)] = &[
+    ("help", "shutdown        power off"),
+    ("echo hello from user space", "\nhello from user space"),
+    ("about", "its own serial driver"),
+    ("sleep 20", "slept 20 ticks"),
+    ("ipc 20000", "20000 round trips to another thread"),
+    ("frobnicate", "unknown command: frobnicate"),
+    // A typo fixed with backspace: the shell runs "echo fixed".
+    ("echp\x7fo fixed", "\nfixed"),
+];
+
 fn shell_session(img: &Image) -> Result<(), String> {
     println!("== shell session on {}", img.path.display());
-    // (typed text, text the answer must contain).
-    let script: &[(&str, &str)] = &[
-        ("help", "shutdown        power off"),
-        ("echo hello from user space", "\nhello from user space"),
-        ("about", "its own serial driver"),
-        ("sleep 20", "slept 20 ticks"),
-        ("ipc 20000", "20000 round trips to another thread"),
-        ("frobnicate", "unknown command: frobnicate"),
-        // A typo fixed with backspace: the shell runs "echo fixed".
-        ("echp\x7fo fixed", "\nfixed"),
-    ];
-    drive_shell(img, &[], script)?;
+    drive_shell(img, &[], SHELL_SCRIPT)?;
     println!(
         "== shell session passed ({}{})",
         img.arch.name(),
         if img.sel4 { ", on seL4" } else { "" }
     );
+    Ok(())
+}
+
+/// x86-64 booted by UEFI firmware (QEMU's OVMF) from a GPT disk with no
+/// BIOS boot code: the shell session, which must show the firmware's boot
+/// manager starting the disk and the bootloader's UEFI stage, then the
+/// driver framework test on q35 (PCI Express, the VT-d IOMMU from ACPI's
+/// DMAR table, MSI).
+fn uefi_test() -> Result<(), String> {
+    let img = uefi_image("shell")?;
+    println!("== UEFI shell session on {}", img.path.display());
+    let out = drive_shell(&img, &[], SHELL_SCRIPT)?;
+    check_log(
+        "UEFI test",
+        &out,
+        &["BdsDxe: starting Boot0001 \"UEFI QEMU HARDDISK", "UEFI bootloader started", "Superior microkernel", "superior> "],
+    )?;
+    println!("== UEFI shell session passed");
+    drivers_test(&uefi_image("drivers")?)?;
+    println!("== UEFI test passed (x86_64)");
     Ok(())
 }
 

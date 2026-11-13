@@ -1,5 +1,5 @@
-//! x86-64: boots through the `bootloader` crate (BIOS), with the serial
-//! console on COM1, the GDT/TSS, an IDT, `syscall`/`sysret`, the local APIC
+//! x86-64: boots through the `bootloader` crate (from a BIOS or UEFI), with
+//! the serial console on COM1, the GDT/TSS, an IDT, `syscall`/`sysret`, the local APIC
 //! timer, and the legacy PIC for COM1's interrupt.
 
 pub mod apic;
@@ -23,6 +23,8 @@ use bootloader_api::{entry_point, BootInfo};
 use superior_objects::cap::{Capability, Object, Rights};
 
 pub const NAME: &str = "x86_64";
+
+mod acpi;
 
 /// Finds and turns on the IOMMU, if the machine has one.
 pub fn iommu_init() -> Option<&'static str> {
@@ -61,6 +63,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         .expect("bootloader did not map physical memory");
     vm::init(offset);
     kprintln!("[ok] physical memory mapped at {offset:#x}");
+    acpi::init(boot_info.rsdp_addr.into_option());
     let timer_hz = apic::init();
     kprintln!(
         "[ok] local APIC timer: {} kHz input, {} Hz tick",
@@ -143,11 +146,21 @@ pub fn msi_message(line: u8, source: Option<u16>) -> Option<(u64, u64)> {
     interrupts::msi_message(line, source)
 }
 
+/// The device-memory window the PCI bus server assigns BARs from: 128 MiB
+/// in QEMU's PCI hole, clear of RAM (below 0xe000_0000 with up to 3.5 GiB)
+/// and of the firmware's own BARs (SeaBIOS assigns from the top of the
+/// hole down, OVMF from 0x8000_0000 up), and of PCI Express configuration
+/// space where ACPI's MCFG puts it (OVMF: at 0xe000_0000, so the window
+/// moves to 0xf000_0000).
+fn bar_window() -> u64 {
+    const SIZE: u64 = 1 << 27;
+    let clear = |base: u64| acpi::ecam().is_none_or(|e| base + SIZE <= e.start || base >= e.end);
+    [0xe000_0000, 0xf000_0000].into_iter().find(|&b| clear(b)).unwrap_or(0xe000_0000)
+}
+
 /// For the root task's PCI bus server: configuration space (the legacy
 /// 0xcf8/0xcfc address and data ports), a device-memory window to assign
-/// BARs from, and the MSI lines. QEMU's `pc` machine puts RAM below
-/// 0xe000_0000 (with up to 3.5 GiB) and firmware assigns BARs from the
-/// top of the hole down towards it, so its first 128 MiB are free.
+/// BARs from ([`bar_window`]), and the MSI lines.
 pub fn pci_caps() -> (Capability, Capability, core::ops::Range<u8>) {
     let rw = Rights::READ | Rights::WRITE;
     (
@@ -160,7 +173,7 @@ pub fn pci_caps() -> (Capability, Capability, core::ops::Range<u8>) {
         ),
         Capability::new(
             Object::DeviceUntyped {
-                base: 0xe000_0000,
+                base: bar_window(),
                 size_bits: 27,
             },
             Rights::ALL,

@@ -26,6 +26,15 @@ holds the rest):
   on both, so fault handlers are portable. The shell drives the PL011 through a device
   frame it maps, and `shutdown` uses the same exit-port capability, emulated.
 
+- x86-64 boots from a BIOS or, as on current laptops, from UEFI firmware: the same
+  kernel on a GPT disk with an EFI system partition and no BIOS boot code. It reads
+  ACPI's MCFG table (from the RSDP the bootloader passes) for PCI Express
+  configuration space, and keeps the window PCI BARs are assigned from clear of it
+  (OVMF puts it at 0xe0000000, SeaBIOS at 0xb0000000). The Component Manager's
+  8 MiB arena is carved before spare RAM is handed out, since UEFI leaves RAM in
+  many more pieces. `cargo xtask uefi-test` boots under QEMU's OVMF: the shell
+  session (the firmware's boot manager and the bootloader's UEFI stage must show),
+  then the driver framework test on q35 with VT-d.
 - Boot, serial console, GDT/TSS, exception handlers; the legacy PIC remapped to vector
   0x20 with every line masked until a driver claims one.
 - All usable physical memory handed to the root CNode as untyped capabilities; every
@@ -1161,6 +1170,7 @@ cargo xtask ab-test        # A/B system slots: an update staged, tried, fallen b
 cargo xtask packages-test  # signed app packages: bad ones refused, the app installed, kept across boots, uninstalled
 cargo xtask run            # boot the shell in QEMU (x86-64), its console on this terminal
 cargo xtask run aarch64    # the same on QEMU's AArch64 virt machine
+cargo xtask uefi-test      # x86-64 booted by UEFI firmware (OVMF): the shell session and the driver test
 cargo xtask idl    # generate Rust from the interface descriptions in interfaces/
 cargo xtask image  # just build target/superior.img
 cargo xtask bench  # IPC timing under WHPX or KVM, checked against seL4's figures

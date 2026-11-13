@@ -45,10 +45,11 @@ static ARENA: Mutex<Arena> = Mutex::new(Arena {
 /// Size of the root task's arena, in bits.
 pub const ARENA_BITS: u8 = 23;
 
-/// Starts (or, after a fast reboot, starts again) handing out the root
-/// task's arena: from now until [`arena_off`], [`user_page`] takes pages
-/// from it. False if there is no memory for it.
-pub fn arena_on() -> bool {
+/// Carves the root task's arena, once: before spare RAM is given away
+/// (see [`take_spare`]), so that a block of its size, aligned, is still
+/// whole. UEFI firmware leaves RAM in many more pieces than a BIOS does.
+/// False if there is no memory for it.
+pub fn reserve_arena() -> bool {
     let mut a = ARENA.lock();
     if a.end == 0 {
         let Some(base) = carve(ARENA_BITS) else {
@@ -57,6 +58,17 @@ pub fn arena_on() -> bool {
         a.start = base;
         a.end = base + (1 << ARENA_BITS);
     }
+    true
+}
+
+/// Starts (or, after a fast reboot, starts again) handing out the root
+/// task's arena: from now until [`arena_off`], [`user_page`] takes pages
+/// from it. False if there is no memory for it.
+pub fn arena_on() -> bool {
+    if !reserve_arena() {
+        return false;
+    }
+    let mut a = ARENA.lock();
     a.next = a.start;
     a.on = true;
     true
