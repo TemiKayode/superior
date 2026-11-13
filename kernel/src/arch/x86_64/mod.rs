@@ -25,6 +25,8 @@ use superior_objects::cap::{Capability, Object, Rights};
 pub const NAME: &str = "x86_64";
 
 mod acpi;
+mod aml;
+mod ioapic;
 mod fbcon;
 
 /// Finds and turns on the IOMMU, if the machine has one.
@@ -69,6 +71,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     vm::init(offset);
     kprintln!("[ok] physical memory mapped at {offset:#x}");
     acpi::init(boot_info.rsdp_addr.into_option());
+    interrupts::init_routing();
     let timer_hz = apic::init();
     smp::note_boot_apic();
     kprintln!(
@@ -203,7 +206,7 @@ pub fn pci_caps() -> (Capability, Capability, core::ops::Range<u8>) {
 }
 
 pub fn irq_unmask(line: u8) {
-    interrupts::pic_unmask(line)
+    interrupts::unmask(line)
 }
 
 /// I/O ports for PCI BARs: on QEMU's q35 nothing else is at 0xd000 and

@@ -267,6 +267,26 @@ pub fn route(index: u16, vector: u8, source: Option<u16>) -> (u64, u64) {
     (address, 0)
 }
 
+/// Points remapping table entry `index` at `vector` on the boot CPU for an
+/// I/O APIC's input, level-triggered or edge, raisable only by requester
+/// `sid` (the I/O APIC's, from the DMAR), or by any requester if the DMAR
+/// does not say. An entry already so leaves the cache alone.
+pub fn route_line(index: u16, vector: u8, level: bool, sid: Option<u16>) {
+    let e = irte(index);
+    let lo = 1 | (level as u64) << 4 | (vector as u64) << 16 | (super::boot_apic() as u64 & 0xff) << 40;
+    let hi = sid.map_or(0, |s| s as u64 | 1 << 18);
+    // SAFETY: as in `route`.
+    unsafe {
+        if e.read_volatile() == lo && e.add(1).read_volatile() == hi {
+            return;
+        }
+        e.write_volatile(0);
+        e.add(1).write_volatile(hi);
+        e.write_volatile(lo);
+    }
+    invalidate(&[INV_IEC_GLOBAL]);
+}
+
 /// Takes every vector routed to requester `sid` away from it.
 fn unroute(sid: u16) {
     if !remapping() {

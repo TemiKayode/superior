@@ -37,7 +37,16 @@ holds the rest):
   to APIC ID, and device interrupts sent to the boot CPU's own APIC ID; DMAR for the
   VT-d unit, either the one covering every PCI function or the only one, covering
   just the functions its device scopes name (QEMU's way), and a function it does
-  not cover cannot be bound. `cargo xtask uefi-test` boots under QEMU's OVMF: the
+  not cover cannot be bound. Legacy interrupts go through the I/O APIC (from the
+  MADT, every entry masked until its line is claimed), not the 8259 PIC: COM1 on
+  the GSI the MADT's interrupt source overrides give ISA IRQ 4, and PCI's
+  interrupt pins as the root bridge's `_PRT` says. A small AML reader walks the
+  DSDT's definitions without running any of them, finds the device named PNP0A08
+  or PNP0A03, and reads its `_PRT`: a package, or the packages its method returns,
+  keeping the one whose entries all reach the I/O APIC (a GSI written out, or a
+  link device whose `_CRS` is a fixed interrupt, as QEMU's are). Where VT-d remaps
+  interrupts, each I/O APIC entry is in the remappable format, raisable only by
+  the I/O APIC's requester ID from the DMAR. `cargo xtask uefi-test` boots under QEMU's OVMF: the
   shell session on four CPUs with APIC IDs 0, 1, 2 and 4 (the firmware's boot
   manager, the bootloader's UEFI stage and all four CPUs must show), then the
   driver framework test on q35 with VT-d.
@@ -50,7 +59,7 @@ holds the rest):
   UEFI (1280x800), and the first log lines must have every pixel as the host draws
   them.
 - Boot, serial console, GDT/TSS, exception handlers; the legacy PIC remapped to vector
-  0x20 with every line masked until a driver claims one.
+  0x20 with every line masked, carrying COM1 only on a machine with no I/O APIC.
 - All usable physical memory handed to the root CNode as untyped capabilities; every
   page table and user page is retyped from them. There is no kernel heap.
 - Several CPUs (SMP; QEMU runs every test with 2, `SUPERIOR_CPUS` sets up to 4): the
@@ -338,13 +347,14 @@ holds the rest):
     compiler (malformed descriptions are refused with their line) and checks the
     generated numbers against the hand-written interface the bus server answers.
   - Legacy PCI interrupts, for devices with no MSI: the kernel hands the root task
-    an IRQ capability for each of the bus's four interrupt wires (on QEMU's q35 it
-    steers the ICH9's PIRQ[E-H] to PIC lines 10, 11, 5 and 9 and marks them
-    level-triggered; on `virt` they are shared interrupts 35 to 38), the bus server
+    an IRQ capability for each of the bus's four interrupt wires (on x86-64 the
+    I/O APIC GSIs `_PRT` gives slot 0's pins, 20 to 23 on QEMU's q35, offered only
+    if `_PRT` routes every slot as those four wires rotated; on `virt` they are
+    shared interrupts 35 to 38), the bus server
     works out which wire a function's pin drives (rotating through bridges) and
     gives that line to its driver (`pci::INTX`), one function a line. The kernel
-    masks the line as it signals; the driver unmasks it (`IrqAck`) once its device
-    has let go.
+    masks a level-triggered line as it signals; the driver unmasks it (`IrqAck`)
+    once its device has let go.
   - The Linux Driver Environment (`crates/lde/`) hosts an unmodified Linux driver
     in a component. Linux's source file is compiled as it is (clang, in the build
     container) against the environment's own headers, which give it Linux's kernel

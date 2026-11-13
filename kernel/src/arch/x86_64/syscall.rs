@@ -592,10 +592,9 @@ extern "C" fn fault_handler(frame: &mut UserFrame, kind: u64, code: u64) -> Exit
 }
 
 extern "C" fn com1_handler(frame: &mut UserFrame) -> Exit {
-    // Masked until the driver acknowledges, so a level that stays raised
-    // cannot storm the kernel.
-    super::interrupts::pic_mask(super::interrupts::COM1_IRQ);
-    super::interrupts::pic_eoi(super::interrupts::COM1_IRQ);
+    // Masked until the driver acknowledges where it is level-triggered (or
+    // on the PIC), so a level that stays raised cannot storm the kernel.
+    super::interrupts::taken(super::interrupts::COM1_IRQ);
     crate::task::handle_irq(frame, super::interrupts::COM1_IRQ)
 }
 
@@ -634,8 +633,7 @@ macro_rules! intx_entries {
 
             extern "C" fn $handler(frame: &mut UserFrame) -> Exit {
                 let line = super::interrupts::INTX_LINES[$n];
-                super::interrupts::pic_mask(line);
-                super::interrupts::pic_eoi(line);
+                super::interrupts::taken(line);
                 crate::task::handle_irq(frame, line)
             }
         )*
