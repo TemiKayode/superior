@@ -8,6 +8,11 @@
 //! turn, every `REKEY_EVERY` frames; after a new group key it asks for the
 //! station's address by a broadcast ARP request, so a frame under the new
 //! group key needs an answer.
+//!
+//! Two more networks are in range, beaconing only: an open one and a
+//! WPA3-only one, on other channels and fainter, for the station's
+//! survey. Every datagram to the radio starts with the signal strength it
+//! is "heard" at (dBm, one signed byte), as a real radio reports it.
 
 use std::net::UdpSocket;
 use std::sync::Arc;
@@ -31,6 +36,49 @@ const LEASED: [u8; 4] = [10, 0, 5, 30];
 const ECHO_PORT: u16 = 47001;
 /// Frames from the station between rekeyings.
 const REKEY_EVERY: u64 = 20;
+/// The access point's signal at the radio, in dBm.
+const SIGNAL: i8 = -45;
+
+/// A network in range that only beacons: BSSID, SSID, capability, RSN
+/// element (if any), channel, signal.
+struct Neighbour {
+    bssid: [u8; 6],
+    ssid: &'static [u8],
+    capability: u16,
+    rsne: Option<&'static [u8]>,
+    channel: u8,
+    signal: i8,
+}
+
+/// WPA3-Personal only: SAE, management frame protection required.
+const RSNE_SAE: [u8; 22] = [0x30, 20, 1, 0, 0x00, 0x0f, 0xac, 4, 1, 0, 0x00, 0x0f, 0xac, 4, 1, 0, 0x00, 0x0f, 0xac, 8, 0xc0, 0];
+
+const NEIGHBOURS: [Neighbour; 2] = [
+    Neighbour { bssid: [0x02, 0x57, 0x49, 0x46, 0x49, 0x02], ssid: b"superior-guest", capability: 0x0001, rsne: None, channel: 11, signal: -71 },
+    Neighbour { bssid: [0x02, 0x4e, 0x45, 0x49, 0x47, 0x03], ssid: b"neighbour-wpa3", capability: 0x0011, rsne: Some(&RSNE_SAE), channel: 1, signal: -80 },
+];
+
+impl Neighbour {
+    /// Its beacon, with the signal byte before it.
+    fn beacon(&self, seq: u16) -> Vec<u8> {
+        use superior_wifi::frame::{BEACON, BROADCAST, DS_PARAMS, RATES, RATE_SET, SSID, element, header};
+        let mut f = [0u8; 256];
+        let mut n = header(&mut f, BEACON, 0, &BROADCAST, &self.bssid, &self.bssid, seq);
+        f[n + 8..n + 10].copy_from_slice(&100u16.to_le_bytes());
+        f[n + 10..n + 12].copy_from_slice(&self.capability.to_le_bytes());
+        n += 12;
+        n = element(&mut f, n, SSID, self.ssid);
+        n = element(&mut f, n, RATES, &RATE_SET);
+        n = element(&mut f, n, DS_PARAMS, &[self.channel]);
+        if let Some(e) = self.rsne {
+            f[n..n + e.len()].copy_from_slice(e);
+            n += e.len();
+        }
+        let mut d = vec![self.signal as u8];
+        d.extend_from_slice(&f[..n]);
+        d
+    }
+}
 
 /// What the access point saw, for the test to check.
 #[derive(Default)]
@@ -68,15 +116,19 @@ pub fn start(stop: Arc<AtomicBool>, seen: Arc<Seen>) -> Result<JoinHandle<()>, S
         let started = Instant::now();
         let radio = ("127.0.0.1", RADIO_PORT);
         let mut next_beacon = 0;
+        let mut beacons = 0u16;
         let mut buf = [0u8; 4096];
         while !stop.load(Ordering::Relaxed) {
             let now = started.elapsed().as_millis() as u64;
             let mut out: Vec<Vec<u8>> = Vec::new();
+            let mut neighbours = Vec::new();
             if now >= next_beacon {
                 let mut b = [0u8; 200];
                 let n = ap.beacon(&mut b);
                 out.push(b[..n].to_vec());
                 next_beacon = now + 100;
+                beacons = beacons.wrapping_add(1);
+                neighbours.extend(NEIGHBOURS.iter().map(|nb| nb.beacon(beacons)));
             }
             ap.poll(now, &mut |f| out.push(f.to_vec()));
             if let Ok(n) = sock.recv(&mut buf) {
@@ -123,7 +175,12 @@ pub fn start(stop: Arc<AtomicBool>, seen: Arc<Seen>) -> Result<JoinHandle<()>, S
             seen.group_rekeys.store(ap.group_rekeys as u64, Ordering::Relaxed);
             seen.refused.store(ap.refused, Ordering::Relaxed);
             for f in out {
-                let _ = sock.send_to(&f, radio);
+                let mut d = vec![SIGNAL as u8];
+                d.extend_from_slice(&f);
+                let _ = sock.send_to(&d, radio);
+            }
+            for d in neighbours {
+                let _ = sock.send_to(&d, radio);
             }
         }
     }))

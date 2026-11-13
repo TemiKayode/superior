@@ -23,7 +23,14 @@
 //! before it switched (until one comes under the new key); group keys are
 //! held by key ID, so frames under the outgoing one still open.
 //!
-//! Times are in milliseconds, of any clock that only goes forward.
+//! Apart from joining, the station can survey the networks in range
+//! ([`Station::survey`]), linked or not: probe requests for any SSID, and
+//! every beacon and probe response heard for a while recorded with its
+//! signal strength, channel and security ([`Network`]), strongest first.
+//!
+//! Times are in milliseconds, of any clock that only goes forward. Each
+//! frame received comes with its signal strength (dBm), as the radio
+//! measured it.
 
 use crate::ccmp;
 use crate::frame::{self, *};
@@ -50,6 +57,79 @@ impl Link {
         self as u64
     }
 }
+
+/// How a network is secured, from its RSN element (or its absence).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Security {
+    /// No RSN element and no privacy bit: open.
+    Open,
+    /// WPA2-Personal with CCMP: what the station can join.
+    Wpa2Psk,
+    /// WPA3-Personal (SAE) only.
+    Wpa3Sae,
+    /// WPA2- and WPA3-Personal both offered (transition mode).
+    Wpa2Wpa3,
+    /// 802.1X (Enterprise).
+    Enterprise,
+    /// Anything else (WEP, TKIP only, unknown suites).
+    Other,
+}
+
+impl Security {
+    pub fn code(self) -> u8 {
+        self as u8
+    }
+
+    /// From a beacon's capability field and RSN element (the whole
+    /// element, if any).
+    pub fn of(capability: u16, rsne: Option<&[u8]>) -> Security {
+        let Some(e) = rsne else {
+            return if capability & 0x10 != 0 { Security::Other } else { Security::Open };
+        };
+        // ID, length, version (2), group cipher (4), pairwise count and
+        // suites, AKM count and suites.
+        let suites = |at: usize| -> Option<(usize, &[u8])> {
+            let n = u16::from_le_bytes([*e.get(at)?, *e.get(at + 1)?]) as usize;
+            Some((at + 2 + 4 * n, e.get(at + 2..at + 2 + 4 * n)?))
+        };
+        let Some((akm_at, pairwise)) = suites(8) else { return Security::Other };
+        let Some((_, akms)) = suites(akm_at) else { return Security::Other };
+        let ccmp = pairwise.chunks(4).any(|c| c == [0x00, 0x0f, 0xac, 4]);
+        let has = |t: u8| akms.chunks(4).any(|c| c == [0x00, 0x0f, 0xac, t]);
+        match (has(2), has(8), has(1)) {
+            _ if !ccmp => Security::Other,
+            (true, true, _) => Security::Wpa2Wpa3,
+            (true, false, _) => Security::Wpa2Psk,
+            (false, true, _) => Security::Wpa3Sae,
+            (false, false, true) => Security::Enterprise,
+            _ => Security::Other,
+        }
+    }
+}
+
+/// A network heard while surveying.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Network {
+    pub bssid: [u8; 6],
+    pub ssid: [u8; 32],
+    pub ssid_len: u8,
+    /// The strongest signal heard from it, in dBm.
+    pub signal: i8,
+    /// Its channel (from its DS parameter set; 0 if it gave none).
+    pub channel: u8,
+    pub security: Security,
+}
+
+impl Network {
+    pub fn ssid(&self) -> &[u8] {
+        &self.ssid[..self.ssid_len as usize]
+    }
+}
+
+/// The networks a survey keeps, and how long it listens (a second wildcard
+/// probe halfway).
+pub const NETWORKS: usize = 32;
+const SURVEY_MS: u64 = 400;
 
 /// How long each step waits for an answer, and how many times a step is
 /// tried before the station scans again.
@@ -87,6 +167,11 @@ pub struct Station {
     /// Rekeyings since the link came up: pairwise, and group.
     pub rekeys: u32,
     pub group_rekeys: u32,
+    /// A survey: when its next step is due (the second probe, then the
+    /// end), and whether the second probe has gone.
+    survey: Option<(u64, bool)>,
+    networks: [Option<Network>; NETWORKS],
+    found: usize,
 }
 
 impl Station {
@@ -115,6 +200,92 @@ impl Station {
             refused: 0,
             rekeys: 0,
             group_rekeys: 0,
+            survey: None,
+            networks: [None; NETWORKS],
+            found: 0,
+        }
+    }
+
+    /// Starts surveying the networks in range (whatever the link is
+    /// doing), forgetting the last survey's: false if one is under way.
+    pub fn survey(&mut self, now: u64, radio: &mut dyn FnMut(&[u8])) -> bool {
+        if self.survey.is_some() {
+            return false;
+        }
+        (self.networks, self.found) = ([None; NETWORKS], 0);
+        self.survey = Some((now + SURVEY_MS / 2, false));
+        self.probe_any(radio);
+        true
+    }
+
+    /// Whether a survey is under way.
+    pub fn surveying(&self) -> bool {
+        self.survey.is_some()
+    }
+
+    /// The last survey's networks, strongest first (once it has ended).
+    pub fn networks(&self) -> impl Iterator<Item = &Network> {
+        self.networks[..self.found].iter().flatten()
+    }
+
+    fn probe_any(&mut self, radio: &mut dyn FnMut(&[u8])) {
+        let mut f = [0u8; 64];
+        let seq = self.next_seq();
+        let n = header(&mut f, PROBE_REQ, 0, &BROADCAST, &self.mac, &BROADCAST, seq);
+        let n = element(&mut f, n, SSID, &[]);
+        let n = element(&mut f, n, RATES, &RATE_SET);
+        radio(&f[..n]);
+    }
+
+    /// Records a beacon or probe response heard while surveying.
+    fn heard(&mut self, bssid: [u8; 6], body: &[u8], signal: i8) {
+        let Some(elems) = body.get(12..) else { return };
+        let capability = u16::from_le_bytes([body[10], body[11]]);
+        let ssid = frame::elements(elems).find(|e| e.0 == SSID).map_or(&[][..], |e| e.1);
+        let channel = frame::elements(elems).find(|e| e.0 == DS_PARAMS).and_then(|e| e.1.first().copied()).unwrap_or(0);
+        let mut n = Network {
+            bssid,
+            ssid: [0; 32],
+            ssid_len: ssid.len().min(32) as u8,
+            signal,
+            channel,
+            security: Security::of(capability, find_element(elems, RSN)),
+        };
+        n.ssid[..n.ssid_len as usize].copy_from_slice(&ssid[..n.ssid_len as usize]);
+        match self.networks[..self.found].iter_mut().flatten().find(|k| k.bssid == bssid) {
+            Some(k) => {
+                // Heard again: the strongest signal is kept.
+                let strongest = k.signal.max(signal);
+                *k = n;
+                k.signal = strongest;
+            }
+            None if self.found < NETWORKS => {
+                self.networks[self.found] = Some(n);
+                self.found += 1;
+            }
+            None => {}
+        }
+    }
+
+    /// The survey's step when due: the second probe, then the end (the
+    /// networks sorted, strongest first).
+    fn survey_step(&mut self, now: u64, radio: &mut dyn FnMut(&[u8])) {
+        let Some((due, probed)) = self.survey.filter(|s| now >= s.0) else { return };
+        if !probed {
+            self.survey = Some((due + SURVEY_MS / 2, true));
+            self.probe_any(radio);
+            return;
+        }
+        self.survey = None;
+        // Strongest first: an insertion sort (32 at most; core's sorts
+        // bring in code that does not link position-independent).
+        let signal = |n: &Option<Network>| n.map_or(i8::MIN, |n| n.signal);
+        for i in 1..self.found {
+            let mut j = i;
+            while j > 0 && signal(&self.networks[j - 1]) < signal(&self.networks[j]) {
+                self.networks.swap(j - 1, j);
+                j -= 1;
+            }
         }
     }
 
@@ -157,7 +328,12 @@ impl Station {
 
     /// When [`poll`](Self::poll) next has something to do.
     pub fn deadline(&self) -> Option<u64> {
-        (!matches!(self.link, Link::Idle | Link::Up)).then_some(self.deadline)
+        let join = (!matches!(self.link, Link::Idle | Link::Up)).then_some(self.deadline);
+        let survey = self.survey.map(|s| s.0);
+        match (join, survey) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
     }
 
     fn next_seq(&mut self) -> u16 {
@@ -168,7 +344,8 @@ impl Station {
     /// Sends what is due: probes while scanning, a step again when its
     /// answer is late, or a fresh scan when a step has failed too often.
     pub fn poll(&mut self, now: u64, radio: &mut dyn FnMut(&[u8])) {
-        if self.deadline().is_none_or(|d| now < d) {
+        self.survey_step(now, radio);
+        if matches!(self.link, Link::Idle | Link::Up) || now < self.deadline {
             return;
         }
         match self.link {
@@ -229,15 +406,22 @@ impl Station {
         n
     }
 
-    /// Takes a frame from the radio.
-    pub fn receive(&mut self, f: &[u8], now: u64, radio: &mut dyn FnMut(&[u8]), up: &mut dyn FnMut(&[u8])) {
-        if f.len() < HEADER || self.link == Link::Idle {
+    /// Takes a frame from the radio, heard at `signal` dBm.
+    #[allow(clippy::too_many_arguments)]
+    pub fn receive(&mut self, f: &[u8], signal: i8, now: u64, radio: &mut dyn FnMut(&[u8]), up: &mut dyn FnMut(&[u8])) {
+        if f.len() < HEADER {
             return;
         }
         let (fc0, fc1) = (f[0], f[1]);
         let (a1, a2, a3) = (addr(f, 1), addr(f, 2), addr(f, 3));
         let to_us = a1 == self.mac;
         let body = &f[HEADER..];
+        if self.survey.is_some() && (fc0 == BEACON || fc0 == PROBE_RESP && to_us) && body.len() >= 12 {
+            self.heard(a3, body, signal);
+        }
+        if self.link == Link::Idle {
+            return;
+        }
         match fc0 {
             PROBE_RESP | BEACON if self.link == Link::Scanning => {
                 // Timestamp, interval, capability, then elements.

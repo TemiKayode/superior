@@ -230,6 +230,40 @@ pub mod nic {
     /// high 32 bits, group in the low. A wired card is always
     /// [`link::UP`], with 0.
     pub const LINK: u64 = 8;
+    /// `[SCAN]`: a radio starts surveying the networks in range (about
+    /// 400 ms; the link, if up, stays up). Reply `[status]`: `InUse` if a
+    /// survey is under way, `NotFound` from a wired card.
+    pub const SCAN: u64 = 9;
+    /// `[NETWORKS]` with a page lent (writable): the last survey's
+    /// networks written into it, [`network::SIZE`] bytes each, strongest
+    /// signal first. Reply `[status, count]`: `Empty` while a survey is
+    /// under way, `NotFound` from a wired card.
+    pub const NETWORKS: u64 = 10;
+    /// A network in `NETWORKS`' page: BSSID (6 bytes), signal (dBm, as an
+    /// `i8`), channel, [`security`] code, SSID length, then the SSID
+    /// (up to 32 bytes, the rest zero).
+    pub mod network {
+        pub const SIZE: usize = 48;
+        pub const BSSID: usize = 0;
+        pub const SIGNAL: usize = 6;
+        pub const CHANNEL: usize = 7;
+        pub const SECURITY: usize = 8;
+        pub const SSID_LEN: usize = 9;
+        pub const SSID: usize = 10;
+        /// The most a page holds (and a survey keeps).
+        pub const MAX: usize = 32;
+    }
+    /// How a surveyed network is secured.
+    pub mod security {
+        pub const OPEN: u8 = 0;
+        /// WPA2-Personal with CCMP: what a radio can join.
+        pub const WPA2_PSK: u8 = 1;
+        pub const WPA3_SAE: u8 = 2;
+        /// WPA2- and WPA3-Personal both offered.
+        pub const WPA2_WPA3: u8 = 3;
+        pub const ENTERPRISE: u8 = 4;
+        pub const OTHER: u8 = 5;
+    }
     /// Where a radio's joining has got to.
     pub mod link {
         pub const IDLE: u64 = 0;

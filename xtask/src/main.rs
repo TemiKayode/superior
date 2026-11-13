@@ -2067,6 +2067,11 @@ fn wifi_test(arch: Arch) -> Result<(), String> {
             "[pass] wifi: a page of its own",
             "[pass] wifi: the kernel gives random bytes, a fresh 32 at every draw",
             "[pass] wifi: the radio starts with no network (link 0)",
+            "virtio-net: wifi: surveying the networks in range",
+            "virtio-net: wifi: survey done: 3 networks in range",
+            "[pass] wifi: a survey finds the 3 networks in range, strongest first",
+            "[pass] wifi: a second scan during a survey is refused (in use)",
+            "[pass] wifi: surveying joined nothing",
             "[pass] wifi: a passphrase under 8 characters is refused",
             "[pass] wifi: the radio is told to join \"superior-test\"",
             "virtio-net: wifi: scanning for \"superior-test\"",
@@ -2083,6 +2088,7 @@ fn wifi_test(arch: Arch) -> Result<(), String> {
             "virtio-net: wifi: pairwise keys renewed (1 so far)",
             "virtio-net: wifi: group key renewed (1 so far)",
             "[pass] wifi: the keys were renewed under way,",
+            "[pass] wifi: a survey while linked finds the same networks, and the link stays up",
         ],
     )?;
     if out.contains("[fail]") {

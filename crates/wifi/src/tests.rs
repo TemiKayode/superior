@@ -294,7 +294,7 @@ mod air {
                 }
                 for f in core::mem::take(&mut self.to_sta) {
                     let (mut back, mut up) = (Vec::new(), Vec::new());
-                    self.sta.receive(&f, self.now, &mut |r| back.push(r.to_vec()), &mut |e| up.push(e.to_vec()));
+                    self.sta.receive(&f, -40, self.now, &mut |r| back.push(r.to_vec()), &mut |e| up.push(e.to_vec()));
                     self.to_ap.extend(back);
                     self.sta_up.extend(up);
                 }
@@ -534,4 +534,87 @@ fn rekeying_survives_losing_every_other_frame() {
     let sent = (0..4).map(|k| exchange(&mut air, k)).sum::<usize>();
     assert_eq!(air.sta_up.len() + air.ap_up.len() - before, sent);
     assert_eq!(sent, 8);
+}
+
+/// A beacon from `bssid` for `ssid` on `channel`, with `capability` and
+/// RSN element `rsne` (if any).
+fn beacon(bssid: [u8; 6], ssid: &[u8], capability: u16, rsne: Option<&[u8]>, channel: u8) -> std::vec::Vec<u8> {
+    use crate::frame::*;
+    let mut f = [0u8; 256];
+    let mut n = header(&mut f, BEACON, 0, &BROADCAST, &bssid, &bssid, 1);
+    f[n + 10..n + 12].copy_from_slice(&capability.to_le_bytes());
+    n += 12;
+    n = element(&mut f, n, SSID, ssid);
+    n = element(&mut f, n, DS_PARAMS, &[channel]);
+    if let Some(e) = rsne {
+        f[n..n + e.len()].copy_from_slice(e);
+        n += e.len();
+    }
+    f[..n].to_vec()
+}
+
+extern crate std;
+
+/// RSN elements: SAE only (with management frame protection required),
+/// PSK and SAE, 802.1X, and PSK with TKIP alone.
+const RSNE_SAE: [u8; 22] = [0x30, 20, 1, 0, 0x00, 0x0f, 0xac, 4, 1, 0, 0x00, 0x0f, 0xac, 4, 1, 0, 0x00, 0x0f, 0xac, 8, 0xc0, 0];
+const RSNE_MIXED: [u8; 26] =
+    [0x30, 24, 1, 0, 0x00, 0x0f, 0xac, 4, 1, 0, 0x00, 0x0f, 0xac, 4, 2, 0, 0x00, 0x0f, 0xac, 2, 0x00, 0x0f, 0xac, 8, 0x80, 0];
+const RSNE_8021X: [u8; 22] = [0x30, 20, 1, 0, 0x00, 0x0f, 0xac, 4, 1, 0, 0x00, 0x0f, 0xac, 4, 1, 0, 0x00, 0x0f, 0xac, 1, 0, 0];
+const RSNE_TKIP: [u8; 22] = [0x30, 20, 1, 0, 0x00, 0x0f, 0xac, 2, 1, 0, 0x00, 0x0f, 0xac, 2, 1, 0, 0x00, 0x0f, 0xac, 2, 0, 0];
+
+#[test]
+fn security_is_read_from_the_rsn_element() {
+    use crate::station::Security;
+    assert_eq!(Security::of(0x0001, None), Security::Open);
+    assert_eq!(Security::of(0x0011, None), Security::Other, "privacy without RSN: WEP");
+    assert_eq!(Security::of(0x0011, Some(&RSNE_PSK_CCMP)), Security::Wpa2Psk);
+    assert_eq!(Security::of(0x0011, Some(&RSNE_SAE)), Security::Wpa3Sae);
+    assert_eq!(Security::of(0x0011, Some(&RSNE_MIXED)), Security::Wpa2Wpa3);
+    assert_eq!(Security::of(0x0011, Some(&RSNE_8021X)), Security::Enterprise);
+    assert_eq!(Security::of(0x0011, Some(&RSNE_TKIP)), Security::Other);
+    assert_eq!(Security::of(0x0011, Some(&RSNE_SAE[..9])), Security::Other, "cut short");
+}
+
+#[test]
+fn a_survey_lists_every_network_heard_strongest_first() {
+    use crate::station::{Link, Security};
+    let mut air = air::Air::new(b"correct horse");
+    let mut out = std::vec::Vec::new();
+    assert!(air.sta.survey(0, &mut |f| out.push(f.to_vec())));
+    assert!(!air.sta.survey(0, &mut |_| {}), "one at a time");
+    air.to_ap.extend(out); // a wildcard probe: the access point answers
+    let guest = [0x02, 0, 0, 0, 0, 0x02];
+    let sae = [0x02, 0, 0, 0, 0, 0x03];
+    let mut ignore = |_: &[u8]| {};
+    let mut nothing = |_: &[u8]| {};
+    air.sta.receive(&beacon(guest, b"guest", 0x0001, None, 11), -71, 0, &mut ignore, &mut nothing);
+    air.sta.receive(&beacon(sae, b"neighbour", 0x0011, Some(&RSNE_SAE), 1), -85, 0, &mut ignore, &mut nothing);
+    air.sta.receive(&beacon(sae, b"neighbour", 0x0011, Some(&RSNE_SAE), 1), -78, 0, &mut ignore, &mut nothing);
+    air.run(200);
+    assert!(air.sta.surveying());
+    air.run(300);
+    assert!(!air.sta.surveying());
+    let found: std::vec::Vec<_> = air.sta.networks().map(|n| (n.bssid, n.ssid().to_vec(), n.signal, n.channel, n.security)).collect();
+    assert_eq!(
+        found,
+        [
+            (air::BSSID, b"superior".to_vec(), -40, 6, Security::Wpa2Psk),
+            (guest, b"guest".to_vec(), -71, 11, Security::Open),
+            (sae, b"neighbour".to_vec(), -78, 1, Security::Wpa3Sae),
+        ]
+    );
+    assert_eq!(air.sta.link(), Link::Idle, "surveying joins nothing");
+    // Surveying while linked leaves the link up and frames flowing.
+    air.sta.join(b"superior", b"correct horse", [7; 32], air.now);
+    air.run(200);
+    assert!(air.joined());
+    let now = air.now;
+    let mut out = std::vec::Vec::new();
+    assert!(air.sta.survey(now, &mut |f| out.push(f.to_vec())));
+    air.to_ap.extend(out);
+    let sent = (0..50).map(|k| exchange(&mut air, k)).sum::<usize>();
+    assert!(air.joined() && !air.sta.surveying());
+    assert_eq!(air.sta.networks().count(), 1);
+    assert_eq!(air.sta_up.len() + air.ap_up.len(), sent);
 }

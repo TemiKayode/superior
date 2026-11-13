@@ -43,6 +43,10 @@
 //! are dropped while the link is down. To the network server it is a
 //! network card like any other. A timer (a badged copy of the driver's
 //! notification) wakes it when the station has a step to try again.
+//! `SCAN` has the station survey the networks in range and `NETWORKS`
+//! lists them. Each frame the radio receives starts with a byte the
+//! harness adds: the signal it was heard at, in dBm (as a real radio
+//! reports beside the frame).
 //!
 //! Slots: 0 the bus server, 1 the `nic` endpoint (receive), 2 a
 //! notification, 3 untyped memory (64 KiB).
@@ -173,6 +177,8 @@ struct Nic {
     shown: Link,
     /// The rekeyings (pairwise, group) last reported.
     shown_rekeys: (u32, u32),
+    /// A survey was under way when last looked at.
+    surveying: bool,
 }
 
 /// Ethernet frames the station has delivered, waiting for the caller
@@ -414,6 +420,7 @@ fn start(radio: bool) -> Result<Nic, Failure> {
         radio,
         shown: Link::Idle,
         shown_rekeys: (0, 0),
+        surveying: false,
     };
     if radio {
         let mac = nic.mac.to_be_bytes();
@@ -578,8 +585,10 @@ impl Nic {
             if let Some(va) = self.rx_buf.buffer(i as usize).map(|b| b.va) {
                 // SAFETY: the buffer is mapped and holds `len` bytes after
                 // virtio's header; it goes back to the device only after.
-                let f = unsafe { core::slice::from_raw_parts((va + HEADER) as *const u8, len) };
-                st.receive(f, now, &mut |r| out.push(r), &mut |e| up().push(e));
+                let d = unsafe { core::slice::from_raw_parts((va + HEADER) as *const u8, len) };
+                if let Some((&signal, f)) = d.split_first() {
+                    st.receive(f, signal as i8, now, &mut |r| out.push(r), &mut |e| up().push(e));
+                }
                 self.received += 1;
             }
             self.offer(i);
@@ -605,6 +614,7 @@ impl Nic {
         let deadline = st.deadline();
         let (link, bssid) = (st.link(), st.bssid());
         let rekeys = (st.rekeys, st.group_rekeys);
+        let surveyed = (self.surveying && !st.surveying()).then(|| st.networks().count());
         let mut ssid = [0u8; 32];
         let n = st.ssid().len();
         ssid[..n].copy_from_slice(st.ssid());
@@ -641,6 +651,10 @@ impl Nic {
             }
         }
         self.shown = link;
+        if let Some(n) = surveyed {
+            self.surveying = false;
+            say!("wifi: survey done: {n} networks in range");
+        }
         if rekeys != self.shown_rekeys {
             if rekeys.0 > self.shown_rekeys.0 {
                 say!("wifi: pairwise keys renewed ({} so far)", rekeys.0);
@@ -650,6 +664,51 @@ impl Nic {
             }
             self.shown_rekeys = rekeys;
         }
+    }
+
+    /// Radio mode `SCAN`: the station starts a survey.
+    fn scan(&mut self) -> Status {
+        let Some(mut st) = self.station.take() else { return Status::NotFound };
+        let mut out = Outbox::new();
+        let started = st.survey(now_ms(), &mut |r| out.push(r));
+        self.station = Some(st);
+        for k in 0..out.n {
+            self.radio_send(&out.frames[k][..out.len[k]]);
+        }
+        if !started {
+            return Status::InUse;
+        }
+        say!("wifi: surveying the networks in range");
+        self.surveying = true;
+        Status::Ok
+    }
+
+    /// Radio mode `NETWORKS`: the last survey's networks, into the lent
+    /// page.
+    fn networks(&mut self) -> [u64; 4] {
+        use superior_objects::interfaces::nic::network as at;
+        let Some(st) = self.station.as_ref() else { return [Status::NotFound as u64, 0, 0, 0] };
+        if st.surveying() {
+            return [Status::Empty as u64, 0, 0, 0];
+        }
+        if !self.map_lent(true) {
+            return [Status::Invalid as u64, 0, 0, 0];
+        }
+        let mut count = 0;
+        for (i, n) in st.networks().take(at::MAX).enumerate() {
+            let mut e = [0u8; at::SIZE];
+            e[at::BSSID..at::BSSID + 6].copy_from_slice(&n.bssid);
+            e[at::SIGNAL] = n.signal as u8;
+            e[at::CHANNEL] = n.channel;
+            e[at::SECURITY] = n.security.code();
+            e[at::SSID_LEN] = n.ssid_len;
+            e[at::SSID..at::SSID + 32].copy_from_slice(&n.ssid);
+            // SAFETY: the lent page is mapped writable; 32 entries of 48
+            // bytes fit in it.
+            unsafe { core::ptr::copy_nonoverlapping(e.as_ptr(), (LENT_VA as usize + i * at::SIZE) as *mut u8, at::SIZE) };
+            count += 1;
+        }
+        [Status::Ok as u64, count, 0, 0]
     }
 
     /// Radio mode `JOIN`: the SSID and passphrase from the lent page.
@@ -922,6 +981,8 @@ impl Nic {
             nic::RING_ATTACH => status(self.ring_attach(m[1], lent)),
             nic::RING_START => status(self.ring_start()),
             nic::JOIN if lent => status(self.join(m[1], m[2])),
+            nic::SCAN => status(self.scan()),
+            nic::NETWORKS if lent => self.networks(),
             nic::LINK => match &self.station {
                 Some(st) => {
                     let b = st.bssid();

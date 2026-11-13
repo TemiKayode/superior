@@ -4134,6 +4134,59 @@ fn wifi_join(ssid: &[u8], pass: &[u8]) -> u64 {
     if r.status == 0 { r.msg[0] } else { u64::MAX }
 }
 
+/// The networks a survey found: each one's entry as `NETWORKS` wrote it.
+type Networks = ([[u8; nic::network::SIZE]; nic::network::MAX], usize);
+
+/// Has the radio survey the networks in range (`SCAN`), then asks for them
+/// (`NETWORKS`) until the survey is done. Also returns whether a second
+/// `SCAN` during the survey was refused with `InUse`.
+fn wifi_survey() -> Option<(Networks, bool)> {
+    let r = syscall(Syscall::Call, RADIO, [nic::SCAN, 0, 0, 0]);
+    if r.status != 0 || r.msg[0] != OK {
+        return None;
+    }
+    let again = syscall(Syscall::Call, RADIO, [nic::SCAN, 0, 0, 0]).msg[0] == Status::InUse as u64;
+    let start = ticks();
+    while ticks() < start + LINK_TICKS {
+        superior_sys::sleep(5);
+        let x = CapTransfer {
+            grant: Some(NET_PAGE as u16),
+            accept: None,
+        };
+        let r = syscall_x(Syscall::Call, RADIO, [nic::NETWORKS, 0, 0, 0], x);
+        if r.status == 0 && r.msg[0] == OK {
+            let page = net_page();
+            let n = (r.msg[1] as usize).min(nic::network::MAX);
+            let mut out = [[0u8; nic::network::SIZE]; nic::network::MAX];
+            for (i, e) in out.iter_mut().enumerate().take(n) {
+                e.copy_from_slice(&page[i * nic::network::SIZE..(i + 1) * nic::network::SIZE]);
+            }
+            return Some(((out, n), again));
+        }
+    }
+    None
+}
+
+/// The networks the Wi-Fi test's harness puts in range, strongest first:
+/// SSID, security, channel, signal (dBm).
+const WIFI_IN_RANGE: [(&[u8], u8, u8, i8); 3] = [
+    (b"superior-test", nic::security::WPA2_PSK, 6, -45),
+    (b"superior-guest", nic::security::OPEN, 11, -71),
+    (b"neighbour-wpa3", nic::security::WPA3_SAE, 1, -80),
+];
+
+/// Whether a survey found just the networks the harness puts in range, in
+/// order of signal.
+fn wifi_found_all(found: &Networks) -> bool {
+    use nic::network as at;
+    let (list, n) = found;
+    *n == WIFI_IN_RANGE.len()
+        && list.iter().zip(WIFI_IN_RANGE).all(|(e, (ssid, security, channel, signal))| {
+            let len = e[at::SSID_LEN] as usize;
+            &e[at::SSID..at::SSID + len] == ssid && e[at::SECURITY] == security && e[at::CHANNEL] == channel && e[at::SIGNAL] as i8 == signal
+        })
+}
+
 fn wifi_client() -> ! {
     let mut t = Checks(0, "wifi");
     let made = syscall(Syscall::Retype, NET_MEMORY, [ObjectType::Frame as u64, 0, NET_PAGE, 0]);
@@ -4150,6 +4203,20 @@ fn wifi_client() -> ! {
     t.check(
         before[0] == OK && before[1] == nic::link::IDLE,
         format_args!("the radio starts with no network (link {})", before[1]),
+    );
+    let survey = wifi_survey();
+    let (found, refused_again) = survey.unwrap_or((([[0; nic::network::SIZE]; nic::network::MAX], 0), false));
+    t.check(
+        survey.is_some() && wifi_found_all(&found),
+        format_args!(
+            "a survey finds the {} networks in range, strongest first: superior-test (WPA2-PSK, ch 6, -45 dBm), superior-guest (open, ch 11, -71), neighbour-wpa3 (WPA3-SAE, ch 1, -80)",
+            found.1
+        ),
+    );
+    t.check(refused_again, format_args!("a second scan during a survey is refused (in use)"));
+    t.check(
+        link()[1] == nic::link::IDLE,
+        format_args!("surveying joined nothing"),
     );
     t.check(
         wifi_join(WIFI_SSID, b"short") == Status::Invalid as u64,
@@ -4250,6 +4317,12 @@ fn wifi_client() -> ! {
     t.check(
         l[1] == nic::link::UP && pairwise >= 1 && group >= 1,
         format_args!("the keys were renewed under way, {pairwise} times pairwise and {group} the group key, the link still up"),
+    );
+    // A survey while linked: the link stays up.
+    let again = wifi_survey();
+    t.check(
+        again.is_some_and(|(f, _)| wifi_found_all(&f)) && link()[1] == nic::link::UP,
+        format_args!("a survey while linked finds the same networks, and the link stays up"),
     );
     syscall(Syscall::Call, NET_CONTROL, [OP_SHUTDOWN, t.0, 0, 0]);
     superior_sys::park()

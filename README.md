@@ -847,8 +847,21 @@ holds the rest):
   server lease an address by DHCP (answers broadcast, so under the group key),
   ping the gateway and have it echo 40 UDP datagrams (some in fragments), and
   the access point must have refused nothing. A laptop's real card, through
-  its driver and firmware, comes later; so do WPA3 (SAE) and scanning for every
-  network in range.
+  its driver and firmware, comes later; so does WPA3 (SAE).
+- Surveying the networks in range: the station's `survey` sends probe
+  requests for any SSID (two, 200 ms apart) and for 400 ms records every
+  beacon and probe response it hears, linked or not: BSSID, SSID, channel, the
+  strongest signal heard, and the security its RSN element offers (open,
+  WPA2-PSK, WPA3-SAE, both, Enterprise, or something else such as WEP or TKIP),
+  then sorts them strongest first. `nic`'s `SCAN` starts one (`InUse` while
+  one runs) and `NETWORKS` writes the list into a lent page, 48 bytes a
+  network. The radio reports each frame's signal strength (the test harness
+  prefixes it to every datagram). Host tests classify RSN elements and survey
+  an access point and two neighbours, idle and while linked with frames
+  flowing. In `wifi-test` the harness also beacons an open network and a
+  WPA3-only one, fainter and on other channels; the client surveys before
+  joining (all three, in order of signal, joining nothing) and again while
+  linked (the link stays up).
 - Rekeying: once keyed, the access point can renew the pairwise keys (the 4-way
   handshake again, under the keys in use, the station answering with a nonce
   of its own given in advance) and the group key (the group key handshake: one
