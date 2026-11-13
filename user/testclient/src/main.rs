@@ -4887,7 +4887,7 @@ fn styled_second() -> ! {
     // decorations, and a decorated one may not be moved there.
     let corner = window_call(window::create(10 | 10 << 16, 0), None).map(|m| m[1]).unwrap_or(u64::MAX);
     let off = window_call(window::style(corner, window::DECORATED), None).map(|m| m[0]);
-    let odd = window_call(window::style(corner, 4), None).map(|m| m[0]);
+    let odd = window_call(window::style(corner, 8), None).map(|m| m[0]);
     let placed = window_call(window::move_to(corner, 2 | 20 << 16), None).map(|m| m[0]);
     let styled = window_call(window::style(corner, window::DECORATED), None).map(|m| m[0]);
     let back = window_call(window::move_to(corner, 1 | 20 << 16), None).map(|m| m[0]);

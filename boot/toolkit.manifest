@@ -67,9 +67,9 @@ component greeter
   priority 8
   uses window 0
   cspace 8
-  # Its window: 280x124 at 32 bits is 34 pages, and a notification.
+  # Its window, up to 600x400 at 32 bits (235 pages), and a notification.
   memory 21
-  untyped 18 1
+  untyped 20 1
   # To exit once closed.
   control 3
 

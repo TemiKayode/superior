@@ -305,6 +305,20 @@ impl Ui {
         self.len - 1
     }
 
+    /// The window is now `w` by `h`: in a column, labels and fields take
+    /// its new width (a row stays as it is laid out). Draw it all again.
+    pub fn resize(&mut self, w: u32, h: u32) {
+        (self.w, self.h) = (w, h);
+        if self.row {
+            return;
+        }
+        for widget in &mut self.widgets[..self.len] {
+            if widget.kind != Kind::Button {
+                widget.rect.w = w.saturating_sub(2 * PAD);
+            }
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.len
     }
@@ -653,6 +667,16 @@ mod tests {
         let c = ui.button("Greeter");
         assert_eq!(ui.widget(c).rect.x, 8);
         assert!(!ui.widget(c).selected);
+    }
+
+    #[test]
+    fn a_column_follows_the_window_width() {
+        let (mut ui, field, button, out) = greeter();
+        ui.resize(380, 184);
+        assert_eq!((ui.w, ui.h), (380, 184));
+        assert_eq!(ui.widget(field).rect, Rect { x: 8, y: 32, w: 364, h: 26 });
+        assert_eq!(ui.widget(button).rect, Rect { x: 8, y: 66, w: 82, h: 26 }, "a button keeps its own width");
+        assert_eq!(ui.widget(out).rect.w, 364);
     }
 
     #[test]

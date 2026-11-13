@@ -176,6 +176,7 @@ fn main() -> ExitCode {
                         .and_then(|_| windows_test(a))
                         .and_then(|_| toolkit_test(a))
                         .and_then(|_| panel_test(a))
+                        .and_then(|_| resize_test(a))
                         .and_then(|_| input_test(a))
                         .and_then(|_| audio_test(a))
                         .and_then(|_| tcp_test(a))
@@ -212,6 +213,7 @@ fn main() -> ExitCode {
         Some("windows-test") => windows_test(arch),
         Some("toolkit-test") => toolkit_test(arch),
         Some("panel-test") => panel_test(arch),
+        Some("resize-test") => resize_test(arch),
         Some("input-test") => input_test(arch),
         Some("audio-test") => audio_test(arch),
         Some("tcp-test") => tcp_test(arch),
@@ -229,7 +231,7 @@ fn main() -> ExitCode {
         }
         Some("bench") => image(false, Arch::X86_64).and_then(|img| bench(&img)),
         _ => Err(
-            "usage: cargo xtask <idl | image | run | test | boot-test | shell-test | cm-test | supervise-test | drivers-test | memory-test | reboot-test | fs-test | nvme-test | ahci-test | net-test | lde-test | lde-e100-test | display-test | desktop-test | windows-test | toolkit-test | panel-test | input-test | audio-test | tcp-test | keyboard-test | hotplug-test | suspend-test | verified-boot-test | ab-test | packages-test | bench | sel4-test> [x86_64 | aarch64]"
+            "usage: cargo xtask <idl | image | run | test | boot-test | shell-test | cm-test | supervise-test | drivers-test | memory-test | reboot-test | fs-test | nvme-test | ahci-test | net-test | lde-test | lde-e100-test | display-test | desktop-test | windows-test | toolkit-test | panel-test | resize-test | input-test | audio-test | tcp-test | keyboard-test | hotplug-test | suspend-test | verified-boot-test | ab-test | packages-test | bench | sel4-test> [x86_64 | aarch64]"
                 .into(),
         ),
     });
@@ -369,7 +371,7 @@ const LINUX_SOURCES: [(&str, &str, &str); 5] = [
 /// a network test's, the display tests', or the audio test's.
 fn linux_driver(manifest: &str) -> Option<&'static str> {
     match manifest {
-        "display" | "desktop" | "input" | "windows" | "toolkit" | "panel" => Some("bochs"),
+        "display" | "desktop" | "input" | "windows" | "toolkit" | "panel" | "resize" => Some("bochs"),
         "audio" => Some("es1370"),
         _ => linux_nic(manifest).map(|l| l.0),
     }
@@ -825,10 +827,10 @@ fn image_sealed(
         driver,
         net: matches!(manifest, "net" | "tcp") || linux_nic(manifest).is_some(),
         linux_nic: linux_nic(manifest).map(|l| l.1),
-        keyboard: matches!(manifest, "keyboard" | "input" | "windows" | "toolkit" | "panel"),
-        mouse: matches!(manifest, "input" | "windows" | "toolkit" | "panel"),
+        keyboard: matches!(manifest, "keyboard" | "input" | "windows" | "toolkit" | "panel" | "resize"),
+        mouse: matches!(manifest, "input" | "windows" | "toolkit" | "panel" | "resize"),
         hotplug: manifest == "hotplug",
-        display: matches!(manifest, "display" | "desktop" | "input" | "windows" | "toolkit" | "panel"),
+        display: matches!(manifest, "display" | "desktop" | "input" | "windows" | "toolkit" | "panel" | "resize"),
         audio: (manifest == "audio").then(|| audio_wav(arch)),
     })
 }
@@ -3257,6 +3259,32 @@ fn panel_pictures() -> Vec<(Vec<Layer>, Option<(usize, usize)>)> {
 /// Checks the desktop shell test's screenshot `k` (from 1) pixel by pixel.
 fn check_panel(path: &Path, k: usize) -> Result<String, String> {
     let (layers, pointer) = &panel_pictures()[k - 1];
+    check_layers(path, k, layers, None, *pointer).map(|()| {
+        format!(
+            "screenshot {k}: all {} pixels right: the panel and {} app window{}{}",
+            SCREEN.0 * SCREEN.1,
+            layers.len() - 1,
+            if layers.len() == 2 { "" } else { "s" },
+            pointer.map_or(String::new(), |(x, y)| format!(", the pointer at ({x}, {y})"))
+        )
+    })
+}
+
+/// The outline a resize drags (user/compositor): its colour and
+/// thickness.
+const OUTLINE_COLOUR: [u8; 3] = [0xf0, 0xc0, 0x40];
+const OUTLINE: usize = 2;
+
+/// Checks screenshot `k` pixel by pixel: the desktop, `layers` back to
+/// front, a resize's `outline` (a rectangle on the screen) over them, and
+/// the pointer over everything.
+fn check_layers(
+    path: &Path,
+    k: usize,
+    layers: &[Layer],
+    outline: Option<(usize, usize, usize, usize)>,
+    pointer: Option<(usize, usize)>,
+) -> Result<(), String> {
     let pixels = read_screenshot(path)?;
     let (mut wrong, mut first) = (0, None);
     for y in 0..SCREEN.1 {
@@ -3271,7 +3299,14 @@ fn check_panel(path: &Path, k: usize) -> Result<String, String> {
                     want = p;
                 }
             }
-            if let Some((px, py)) = *pointer {
+            if let Some((ox, oy, ow, oh)) = outline {
+                let on = (ox..ox + ow).contains(&x) && (oy..oy + oh).contains(&y);
+                let inner = (ox + OUTLINE..ox + ow - OUTLINE).contains(&x) && (oy + OUTLINE..oy + oh - OUTLINE).contains(&y);
+                if on && !inner {
+                    want = OUTLINE_COLOUR;
+                }
+            }
+            if let Some((px, py)) = pointer {
                 if x >= px && y >= py && y - py < CURSOR.len() && x - px < CURSOR[0].len() {
                     match CURSOR[y - py].as_bytes()[x - px] {
                         b'#' => want = [0, 0, 0],
@@ -3289,17 +3324,129 @@ fn check_panel(path: &Path, k: usize) -> Result<String, String> {
         }
     }
     match first {
-        None => Ok(format!(
-            "screenshot {k}: all {} pixels right: the panel and {} app window{}{}",
-            SCREEN.0 * SCREEN.1,
-            layers.len() - 1,
-            if layers.len() == 2 { "" } else { "s" },
-            pointer.map_or(String::new(), |(x, y)| format!(", the pointer at ({x}, {y})"))
-        )),
+        None => Ok(()),
         Some((x, y, have, want)) => Err(format!(
             "screenshot {k}: {wrong} pixels wrong, the first at ({x}, {y}): {have:?}, not {want:?}"
         )),
     }
+}
+
+/// The greeter's window at `size`, drawn fresh at that size, focused.
+fn greeter_sized(size: (usize, usize)) -> Layer {
+    let (mut ui, ..) = greeter_ui();
+    ui.resize(size.0 as u32, size.1 as u32);
+    let mut pixels = vec![0u32; size.0 * size.1];
+    ui.draw(&mut superior_toolkit::Surface { px: &mut pixels, w: size.0 as u32, h: size.1 as u32 });
+    Layer {
+        at: GREETER_AT,
+        size,
+        frame: Some(StyledWindow {
+            id: 0,
+            at: GREETER_AT,
+            size,
+            alpha: false,
+            decorated: true,
+            focused: true,
+            title: b"Greeter",
+        }),
+        pixels,
+    }
+}
+
+/// Where the resize test's pointer goes: the greeter's frame's
+/// bottom-right corner, dragged out, then in, then its close box once it
+/// is the least it takes.
+const RESIZE_CORNER: (usize, usize) = (541, 305);
+const RESIZE_OUT: (usize, usize) = (641, 365);
+const RESIZE_IN: (usize, usize) = (391, 245);
+const RESIZE_CLOSE: (usize, usize) = (450, 170);
+
+/// A rectangle on the screen: x, y, width, height.
+type Area = (usize, usize, usize, usize);
+
+/// What each of the resize test's screenshots must show: the greeter's
+/// window, the outline being dragged (if any), and the pointer.
+fn resize_pictures() -> Vec<(Layer, Option<Area>, (usize, usize))> {
+    // The frame of a 380x184 window at the greeter's place.
+    let (b, t) = (2, 18);
+    let out = (GREETER_AT.0 - b, GREETER_AT.1 - t - b, 380 + 2 * b, 184 + t + 2 * b);
+    vec![
+        (greeter_sized(GREETER_SIZE), Some(out), RESIZE_OUT),
+        (greeter_sized((380, 184)), None, RESIZE_OUT),
+        // Asked for 130x64, it takes the least it can: 200x124.
+        (greeter_sized((200, 124)), None, RESIZE_IN),
+    ]
+}
+
+fn resize_act(act: &Act, arch: Arch) -> Result<Option<String>, String> {
+    let Act::Shot(k) = act else { return input_act(act, arch) };
+    let path = root().join("target").join(format!("resize-{}-{k}.ppm", arch.name()));
+    let _ = std::fs::remove_file(&path);
+    screendump(&path)?;
+    let (layer, outline, pointer) = &resize_pictures()[*k - 1];
+    check_layers(&path, *k, std::slice::from_ref(layer), *outline, Some(*pointer)).map(|()| {
+        Some(format!(
+            "screenshot {k}: all {} pixels right: the greeter at {}x{}{}, the pointer at {pointer:?}",
+            SCREEN.0 * SCREEN.1,
+            layer.size.0,
+            layer.size.1,
+            outline.map_or(String::new(), |o| format!(", an outline of {}x{} dragged", o.2, o.3))
+        ))
+    })
+}
+
+/// Boots `boot/resize.manifest`: the greeter in a resizable window.
+/// Through QEMU's monitor the host drags its frame's bottom-right corner
+/// out (an outline shows the size asked for; let go, the greeter draws
+/// itself at that size and sets it), then in past the least it takes (it
+/// takes that), then closes it. Three screenshots must have every pixel
+/// right.
+fn resize_test(arch: Arch) -> Result<(), String> {
+    use Act::*;
+    let img = image_with(false, arch, "resize")?;
+    println!("== resize test on {}", img.path.display());
+    let to = |from: (usize, usize), to: (usize, usize)| Move(to.0 as i64 - from.0 as i64, to.1 as i64 - from.1 as i64);
+    let script = vec![
+        (
+            vec![
+                "relative X and Y",
+                "absolute X and Y",
+                "compositor: input subscribed",
+                "greeter: ready",
+                "toolkit: the greeter's window is on the screen",
+            ],
+            vec![to((400, 300), RESIZE_CORNER), Button(true), to(RESIZE_CORNER, RESIZE_OUT)],
+        ),
+        (vec!["compositor: window 0: asking for 380x184"], vec![Shot(1), Button(false)]),
+        (
+            vec!["greeter: resized to 380x184 (status 0)"],
+            vec![Shot(2), Button(true), to(RESIZE_OUT, RESIZE_IN), Button(false)],
+        ),
+        (
+            vec!["greeter: resized to 200x124 (status 0)"],
+            vec![Shot(3), to(RESIZE_IN, RESIZE_CLOSE), Button(true), Button(false)],
+        ),
+        (vec!["toolkit: the greeter's window is gone"], vec![]),
+    ];
+    let (out, shots) = run_script(&img, arch, "resize test", script, resize_act)?;
+    let log = [
+        "greeter: ready: window 0, decorated, titled \"Greeter\"",
+        "compositor: window 0: asking for 380x184",
+        "compositor: window 0 resized to 380x184",
+        "greeter: resized to 380x184 (status 0)",
+        "compositor: window 0: asking for 130x64",
+        "compositor: window 0 resized to 200x124",
+        "greeter: resized to 200x124 (status 0)",
+        "compositor: window 0: its close box was pressed",
+        "greeter: closed",
+        "[cm] watcher asked to shut down (pass)",
+    ];
+    check_log("resize test", &out, &log)?;
+    if shots != resize_pictures().len() {
+        return Err(format!("resize test: {shots} screenshots taken, want {}", resize_pictures().len()));
+    }
+    println!("== resize test passed ({})", arch.name());
+    Ok(())
 }
 
 fn panel_act(act: &Act, arch: Arch) -> Result<Option<String>, String> {

@@ -1,7 +1,8 @@
 //! The greeter: the first app on the toolkit. A decorated window titled
 //! "Greeter" asks for a name in a text field; its button (or Enter in the
 //! field) greets it below. The close box closes it, and the greeter
-//! exits (so a launcher may start it again). Started with `arg 1` it is
+//! exits (so a launcher may start it again). Its frame resizes it, from
+//! `MIN` to `MAX`: its widgets follow the width. Started with `arg 1` it is
 //! "Hello" instead, elsewhere on the screen: a second app for the desktop
 //! shell's test.
 //!
@@ -28,8 +29,11 @@ const MANAGER: u64 = 3;
 const OP_EXIT: u64 = 5;
 const PAGE_SLOTS: u64 = 8;
 const VA: u64 = USER_BASE + 0x4000_0000;
-/// The window's size.
+/// The window's size at first, the least it takes and the most (its pages
+/// hold that much).
 pub const SIZE: (u32, u32) = (280, 124);
+const MIN: (u32, u32) = (200, 124);
+const MAX: (u32, u32) = (600, 400);
 
 /// What it is called (in its log and its title) and where its window
 /// first goes, by its `arg`.
@@ -54,8 +58,9 @@ macro_rules! say {
     ($($t:tt)*) => { print_line(format_args!("{}: {}", variant().name, format_args!($($t)*))) };
 }
 
+/// Pages for the largest window.
 fn pages() -> u64 {
-    (SIZE.0 as u64 * SIZE.1 as u64 * 4).div_ceil(4096)
+    (MAX.0 as u64 * MAX.1 as u64 * 4).div_ceil(4096)
 }
 
 /// A call to the compositor, lending window page `page` or the
@@ -93,10 +98,33 @@ struct App {
 
 impl App {
     fn surface(&self) -> Surface<'static> {
+        let (w, h) = (self.ui.w, self.ui.h);
         // SAFETY: the window's pages are mapped, writable, in a row from
-        // `VA`, and hold `SIZE` pixels; only one surface is used at a time.
-        let px = unsafe { core::slice::from_raw_parts_mut(VA as *mut u32, (SIZE.0 * SIZE.1) as usize) };
-        Surface { px, w: SIZE.0, h: SIZE.1 }
+        // `VA`, and hold `MAX` pixels, more than `w` by `h`; only one
+        // surface is used at a time.
+        let px = unsafe { core::slice::from_raw_parts_mut(VA as *mut u32, (w * h) as usize) };
+        Surface { px, w, h }
+    }
+
+    fn size_word(&self) -> u64 {
+        self.ui.w as u64 | (self.ui.h as u64) << 16
+    }
+
+    /// The user asked for `w` by `h`: it takes the nearest it can, draws
+    /// itself at that size and sets it.
+    fn resize(&mut self, w: u32, h: u32) {
+        let (w, h) = (w.clamp(MIN.0, MAX.0), h.clamp(MIN.1, MAX.1));
+        let Some(n) = self.window else { return };
+        let was = (self.ui.w, self.ui.h);
+        self.ui.resize(w, h);
+        self.ui.draw(&mut self.surface());
+        let r = call(window::set_size(n, self.size_word()), None).map_or(u64::MAX, |m| m[0]);
+        if r != 0 {
+            // Refused (it would not fit where it is): as it was.
+            self.ui.resize(was.0, was.1);
+            self.show(Rect { x: 0, y: 0, w: was.0, h: was.1 });
+        }
+        say!("resized to {w}x{h} (status {r})");
     }
 
     /// Makes the window, decorated and titled, lends its pages and the
@@ -105,7 +133,7 @@ impl App {
         self.ui.draw(&mut self.surface());
         for _ in 0..50 {
             self.window = None;
-            let size = SIZE.0 as u64 | (SIZE.1 as u64) << 16;
+            let size = self.size_word();
             let Some(r) = call(window::create(size, self.at.0 | self.at.1 << 16), None) else {
                 superior_sys::sleep(5);
                 continue;
@@ -116,10 +144,10 @@ impl App {
             let n = r[1];
             let (a, b) = title_words();
             let made = (0..pages()).all(|p| ok(call(window::attach(n, p), Some(PAGE_SLOTS + p))))
-                && ok(call(window::style(n, window::DECORATED), None))
+                && ok(call(window::style(n, window::DECORATED | window::RESIZABLE), None))
                 && ok(call(window::set_title(n, a, b), None))
                 && ok(call(window::listen(n), Some(NTFN)));
-            let all = Rect { x: 0, y: 0, w: SIZE.0, h: SIZE.1 };
+            let all = Rect { x: 0, y: 0, w: self.ui.w, h: self.ui.h };
             if made && ok(call(window::commit(n, rect_word(all)), None)) {
                 self.window = Some(n);
                 return true;
@@ -167,6 +195,10 @@ impl App {
             window::LEAVE => Event::Leave,
             window::MOVED => {
                 self.at = (a & 0xffff, (a >> 16) & 0xffff);
+                return true;
+            }
+            window::RESIZE => {
+                self.resize(a as u32 & 0xffff, (a >> 16) as u32 & 0xffff);
                 return true;
             }
             window::CLOSE => {

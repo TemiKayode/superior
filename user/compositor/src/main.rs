@@ -37,7 +37,10 @@
 //! with a close box, drawn here around its pixels (focused windows' title
 //! bars in another colour), its title written in its title bar in the
 //! toolkit's font. A button pressed on a title bar drags the
-//! window until let go; one pressed on a close box tells its client.
+//! window until let go; one pressed on a close box tells its client. A
+//! resizable window's right and bottom borders drag an outline of the
+//! size asked for, drawn over every window; let go, its client is told
+//! and sets the size it accepts.
 //!
 //! The desktop shell: a client whose badge is a manager's
 //! (`MANAGER_BADGE`, from `manages window` in its manifest) may list,
@@ -149,6 +152,9 @@ const TITLE_LEFT: u32 = 4;
 const TITLE_TOP: u32 = 2;
 const TITLE_SCALE: u32 = 2;
 const TITLE_GAP: u32 = 4;
+/// The outline a resize drags: its colour and thickness.
+const OUTLINE_COLOUR: u32 = 0x00f0_c040;
+const OUTLINE: u32 = 2;
 
 /// `src` (its top byte how opaque it is) over `dst`.
 fn blend(src: u32, dst: u32) -> u32 {
@@ -168,6 +174,10 @@ enum Part {
     Title,
     Close,
     Border,
+    /// The right border (or the bottom one, or the corner between them),
+    /// which resizes a resizable window: whether it moves the right edge
+    /// and the bottom one.
+    Edge(bool, bool),
 }
 
 /// A window's events not yet read.
@@ -240,6 +250,15 @@ impl Rect {
 const NONE: Rect = Rect { x: 0, y: 0, w: 0, h: 0 };
 
 #[derive(Clone, Copy)]
+struct Resize {
+    window: usize,
+    right: bool,
+    bottom: bool,
+    from: (u32, u32),
+    size: (u32, u32),
+}
+
+#[derive(Clone, Copy)]
 struct Window {
     /// The badge of the client that made it.
     owner: u64,
@@ -293,6 +312,10 @@ impl Window {
         let (t, m, c) = (window::TITLE as u32, window::CLOSE_MARGIN as u32, window::CLOSE_BOX as u32);
         let top = self.at.y - t;
         if !within(Rect { x: self.at.x, y: top, w: self.at.w, h: t }) {
+            let (right, bottom) = (x >= self.at.x + self.at.w, y >= self.at.y + self.at.h);
+            if (right || bottom) && self.style & window::RESIZABLE != 0 {
+                return Some(Part::Edge(right, bottom));
+            }
             return Some(Part::Border);
         }
         let right = self.at.x + self.at.w;
@@ -371,6 +394,9 @@ struct Compositor {
     /// (from its top left); whether it has moved.
     drag: Option<(usize, (i32, i32))>,
     dragged: bool,
+    /// The window being resized by its frame: which edges move, where the
+    /// pointer was pressed, and the size asked for so far.
+    resize: Option<Resize>,
     /// Whether the input driver has this compositor as a subscriber, and
     /// how many times it subscribed.
     subscribed: bool,
@@ -519,6 +545,18 @@ impl Compositor {
                 }
             }
         }
+        let o = self.outline();
+        if !o.empty() {
+            for y in r.y..r.y + r.h {
+                for x in r.x..r.x + r.w {
+                    let inside = x >= o.x + OUTLINE && x + OUTLINE < o.x + o.w && y >= o.y + OUTLINE && y + OUTLINE < o.y + o.h;
+                    if x >= o.x && x < o.x + o.w && y >= o.y && y < o.y + o.h && !inside {
+                        // SAFETY: as above.
+                        unsafe { screen.add(y as usize * pitch + x as usize).write(OUTLINE_COLOUR) };
+                    }
+                }
+            }
+        }
         let c = self.cursor_rect();
         let part = c.intersect(r);
         for y in part.y..part.y + part.h {
@@ -532,6 +570,14 @@ impl Compositor {
                 unsafe { screen.add(y as usize * pitch + x as usize).write(p) };
             }
         }
+    }
+
+    /// The outline of the frame a resize asks for, if one is dragged.
+    fn outline(&self) -> Rect {
+        let Some(z) = self.resize else { return NONE };
+        let Some(w) = self.windows[z.window] else { return NONE };
+        let at = Rect { w: z.size.0, h: z.size.1, ..w.at };
+        frame_of(at, w.style).unwrap_or(at).intersect(self.whole())
     }
 
     /// Where the pointer is drawn (nothing before it first moves).
@@ -595,6 +641,10 @@ impl Compositor {
         }
         if self.drag.is_some_and(|(d, _)| d == i) {
             (self.drag, self.dragged) = (None, false);
+        }
+        if self.resize.is_some_and(|z| z.window == i) {
+            self.pending = self.pending.union(self.outline());
+            self.resize = None;
         }
         if self.focus == Some(i) {
             // The front window takes the focus.
@@ -768,6 +818,15 @@ impl Compositor {
                                 say!("window {i}: its close box was pressed");
                                 self.post(i, window::CLOSE, 0, 0);
                             }
+                            (Part::Edge(right, bottom), Some(w)) => {
+                                self.resize = Some(Resize {
+                                    window: i,
+                                    right,
+                                    bottom,
+                                    from: self.pointer,
+                                    size: (w.at.w, w.at.h),
+                                });
+                            }
                             _ => {}
                         }
                     }
@@ -775,6 +834,7 @@ impl Compositor {
                 self.post_pointer(self.grab.or(self.hover));
                 if self.buttons == 0 && held != 0 {
                     self.end_drag();
+                    damage = damage.union(self.end_resize());
                     self.let_go();
                 }
                 damage
@@ -791,6 +851,9 @@ impl Compositor {
         self.cursor = true;
         if let Some((i, (ox, oy))) = self.drag {
             return before.union(self.cursor_rect()).union(self.drag_to(i, ox, oy));
+        }
+        if self.resize.is_some() {
+            return before.union(self.cursor_rect()).union(self.resize_to());
         }
         let target = self.grab.or_else(|| self.window_at());
         self.hover_to(target);
@@ -817,6 +880,46 @@ impl Compositor {
         self.windows[i] = Some(w);
         self.dragged = true;
         from.union(w.frame())
+    }
+
+    /// The pointer moved while a window's frame is dragged: the size it
+    /// asks for, at least `MIN_WIDTH` by `MIN_HEIGHT`, its frame on the
+    /// screen and its pixels within the pages attached. The part of the
+    /// screen it changes.
+    fn resize_to(&mut self) -> Rect {
+        let Some(mut z) = self.resize else { return NONE };
+        let Some(w) = self.windows[z.window] else { return NONE };
+        let grow = |from: u32, to: u32, size: u32| (size as i64 + to as i64 - from as i64).max(0) as u32;
+        let b = if w.decorated() { window::BORDER as u32 } else { 0 };
+        let mut size = (
+            if z.right { grow(z.from.0, self.pointer.0, w.at.w) } else { w.at.w },
+            if z.bottom { grow(z.from.1, self.pointer.1, w.at.h) } else { w.at.h },
+        );
+        size.0 = size.0.clamp(window::MIN_WIDTH as u32, self.width.saturating_sub(w.at.x + b).max(window::MIN_WIDTH as u32));
+        size.1 = size.1.clamp(window::MIN_HEIGHT as u32, self.height.saturating_sub(w.at.y + b).max(window::MIN_HEIGHT as u32));
+        // As many rows as the pages attached hold at that width.
+        let rows = (w.pages * 1024 / size.0 as u64) as u32;
+        size.1 = size.1.min(rows.max(1));
+        if size == z.size {
+            return NONE;
+        }
+        let before = self.outline();
+        z.size = size;
+        self.resize = Some(z);
+        say!("window {}: asking for {}x{}", z.window, size.0, size.1);
+        before.union(self.outline())
+    }
+
+    /// The buttons are up: a window whose frame was dragged is told the
+    /// size asked for (if not its own). The part of the screen to repaint.
+    fn end_resize(&mut self) -> Rect {
+        let Some(z) = self.resize else { return NONE };
+        let gone = self.outline();
+        self.resize = None;
+        if self.windows[z.window].is_some_and(|w| (w.at.w, w.at.h) != z.size) {
+            self.post(z.window, window::RESIZE, z.size.0 as u64 | (z.size.1 as u64) << 16, 0);
+        }
+        gone
     }
 
     /// The buttons are up: a window dragged by its title bar is told where
@@ -862,6 +965,8 @@ impl Compositor {
             self.buttons = 0;
             self.post_pointer(self.grab.or(self.hover));
             self.end_drag();
+            let gone = self.end_resize();
+            self.pending = self.pending.union(gone);
             self.let_go();
         }
     }
@@ -999,7 +1104,8 @@ impl Compositor {
 
     fn attach(&mut self, i: usize, page: u64, lent: bool) -> Status {
         let Some(w) = self.windows[i] else { return Status::NotFound };
-        if !lent || page != w.pages || page >= w.needed() {
+        // More pages than it needs now leave room to grow.
+        if !lent || page != w.pages || page >= window::WINDOW_PAGES {
             return Status::Invalid;
         }
         let slot = WINDOW_SLOTS + i as u64 * window::WINDOW_PAGES + page;
@@ -1075,9 +1181,29 @@ impl Compositor {
         Status::Ok
     }
 
+    fn set_size(&mut self, i: usize, size: u64) -> Status {
+        let Some(mut w) = self.windows[i] else { return Status::NotFound };
+        let to = Rect { w: size as u32 & 0xffff, h: (size >> 16) as u32 & 0xffff, ..w.at };
+        let needed = (to.w as u64 * to.h as u64 * 4).div_ceil(4096);
+        if size >> 32 != 0 || to.empty() || needed > w.pages || !self.fits_styled(to, w.style) {
+            return Status::Invalid;
+        }
+        if to == w.at {
+            return Status::Ok;
+        }
+        let from = w.frame();
+        w.at = to;
+        self.windows[i] = Some(w);
+        say!("window {i} resized to {}x{}", to.w, to.h);
+        if w.shown {
+            self.show(from.union(w.frame()));
+        }
+        Status::Ok
+    }
+
     fn set_style(&mut self, i: usize, style: u64) -> Status {
         let Some(mut w) = self.windows[i] else { return Status::NotFound };
-        if style & !(window::ALPHA | window::DECORATED) != 0 || !self.fits_styled(w.at, style) {
+        if style & !(window::ALPHA | window::DECORATED | window::RESIZABLE) != 0 || !self.fits_styled(w.at, style) {
             return Status::Invalid;
         }
         let from = w.frame();
@@ -1136,7 +1262,8 @@ impl Compositor {
             | window::LISTEN
             | window::NEXT
             | window::STYLE
-            | window::SET_TITLE) => {
+            | window::SET_TITLE
+            | window::SET_SIZE) => {
                 let Some(i) = self.own(m[1], badge) else {
                     return status(Status::NotFound);
                 };
@@ -1148,6 +1275,7 @@ impl Compositor {
                     window::NEXT => self.next(i),
                     window::STYLE => status(self.set_style(i, m[2])),
                     window::SET_TITLE => status(self.set_title(i, m[2], m[3])),
+                    window::SET_SIZE => status(self.set_size(i, m[2])),
                     window::RAISE => {
                         if let Some(w) = self.windows[i].filter(|w| w.shown) {
                             self.to_front(i);
@@ -1211,6 +1339,7 @@ pub extern "C" fn _start(_: u64) -> ! {
         focus: None,
         drag: None,
         dragged: false,
+        resize: None,
         subscribed: false,
         subscriptions: 0,
     };

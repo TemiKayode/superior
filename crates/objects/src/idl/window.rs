@@ -39,10 +39,17 @@
 /// told when they change (`WINDOWS`). Its windows stay in front of every
 /// other client's and never take the keyboard focus. Anyone else asking
 /// is `Denied`.
+///
+/// Resizing: a resizable window's client may lend more pages than its size
+/// needs (up to `WINDOW_PAGES`). A button pressed on its right or bottom
+/// border, or the corner between them, drags an outline of the size asked
+/// for; let go, the client is told (`RESIZE`), draws at the size it
+/// accepts and sets it (`SET_SIZE`), so it is never shown at a width its
+/// pixels were not drawn for.
 pub mod window {
     use crate::interfaces::Status;
 
-    pub const VERSION: u64 = 6;
+    pub const VERSION: u64 = 7;
 
     /// The most windows on the screen, all clients together.
     pub const MAX_WINDOWS: u64 = 8;
@@ -87,6 +94,10 @@ pub mod window {
     /// changed.
     pub const WINDOWS: u64 = 8;
 
+    /// The user dragged the window's frame to ask for a size: `a` is width |
+    /// height << 16. The client draws at the size it accepts and sets it.
+    pub const RESIZE: u64 = 9;
+
     /// Events a window keeps until they are read; past that the oldest go.
     pub const EVENTS: u64 = 32;
 
@@ -96,6 +107,14 @@ pub mod window {
 
     /// The compositor draws a border and a title bar around the window.
     pub const DECORATED: u64 = 2;
+
+    /// The window's right and bottom borders may be dragged to resize it.
+    pub const RESIZABLE: u64 = 4;
+
+    /// The smallest size a drag asks for.
+    pub const MIN_WIDTH: u64 = 64;
+
+    pub const MIN_HEIGHT: u64 = 32;
 
     /// A decorated window's frame: the border's width all round, the title
     /// bar's height between the top border and the window, and its close box,
@@ -162,7 +181,8 @@ pub mod window {
     }
 
     /// Keeps page `page` of window `window`, which the call lends. Pages come
-    /// in order from 0.
+    /// in order from 0, up to `WINDOW_PAGES`: more than its size needs leaves
+    /// room to grow.
     pub const ATTACH: u64 = 3;
     /// The message of a `ATTACH` call.
     pub const fn attach(window: u64, page: u64) -> [u64; 4] {
@@ -250,7 +270,7 @@ pub mod window {
         }
     }
 
-    /// Sets the window's style: `flags` of `ALPHA` and `DECORATED`. `Invalid`
+    /// Sets the window's style: `flags` of `ALPHA`, `DECORATED` and `RESIZABLE`. `Invalid`
     /// for other flags, or if the frame it would have does not lie wholly on
     /// the screen.
     pub const STYLE: u64 = 10;
@@ -325,5 +345,14 @@ pub mod window {
     /// The message of a `ACTIVATE` call.
     pub const fn activate(window: u64) -> [u64; 4] {
         [ACTIVATE, window, 0, 0]
+    }
+
+    /// Makes the window `size` (width | height << 16): its pixels' rows are
+    /// then the new width apart. `Invalid` if it would need more pages than
+    /// were attached, or would not lie wholly on the screen.
+    pub const SET_SIZE: u64 = 15;
+    /// The message of a `SET_SIZE` call.
+    pub const fn set_size(window: u64, size: u64) -> [u64; 4] {
+        [SET_SIZE, window, size, 0]
     }
 }

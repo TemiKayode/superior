@@ -905,6 +905,18 @@ holds the rest):
   the host launches both apps from the panel, brings the greeter back in front
   from its task button, closes it and launches it again; five screenshots must
   have every pixel right, the panel laid out by the toolkit on the host.
+- Resizing windows by their frame (`window` version 7). A window styled
+  `RESIZABLE` is resized by dragging its frame's right or bottom border (or the
+  corner between them): the compositor draws an outline of the size asked for
+  over every window, at least `MIN_WIDTH` by `MIN_HEIGHT`, on the screen and
+  within the pages attached (a client may attach up to `WINDOW_PAGES` to leave
+  room to grow). Let go, the client is told (`RESIZE`), draws itself at the size
+  it accepts and sets it (`SET_SIZE`). The toolkit's column follows the window's
+  width, and the greeter takes sizes from 200x124 to 600x400.
+  `cargo xtask resize-test` boots `boot/resize.manifest` on both ISAs: the host
+  drags the greeter's corner out and then in past its least size, and three
+  screenshots (the outline, and the greeter at each size it took) must have
+  every pixel right.
 - The mixer (`user/mixer/`), the sound server. It is the sound driver's one
   client and serves the same `audio` interface to every component that plays
   sound: it adds their streams together, sample by sample and saturating, into a
@@ -1019,7 +1031,7 @@ holds the rest):
   notifications, a 256-slot CNode pool) so filling them stays quick; normal kernels have
   32 of each, 32 address spaces and a 4096-slot pool.
 
-Not yet: in the compositor resizing windows by their frame; in the desktop shell a launcher menu, a clock, minimising, and app icons; in the toolkit layouts other than a column, scrolling, text selection and a cursor that moves within a field; a hardware cursor plane,
+Not yet: in the compositor resizing by the left and top borders and maximising; in the desktop shell a launcher menu, a clock, minimising, and app icons; in the toolkit layouts other than a column, scrolling, text selection and a cursor that moves within a field; a hardware cursor plane,
 pointer events when a window moves or appears under a still pointer, keyboard
 layouts and key repeat (keys are USB usages), and surviving a client
 that dies at the very moment its window is read (the compositor then faults and
@@ -1105,7 +1117,7 @@ https://claude.ai/artifact/QKJS8qH5Dfbjzn58RStq1j
 | `user/xhci/` | The xHCI (USB) host controller driver |
 | `user/hid/` | The USB HID keyboard, mouse and tablet driver |
 | `user/echo/`, `user/counter/`, `user/testclient/` | Test components for the Component Manager, supervision and drivers |
-| `boot/` | Component manifests: `shell.manifest` (normal boot), `test.manifest` (`cm-test`), `supervise.manifest` (`supervise-test`) , `drivers.manifest` (`drivers-test`) , `memory.manifest` (`memory-test`), `reboot.manifest` (`reboot-test`), `fs.manifest` and `fs-verify.manifest` (`fs-test`), `net.manifest` (`net-test`), `tcp.manifest` (`tcp-test`), `keyboard.manifest` (`keyboard-test`), `display.manifest` (`display-test`), `desktop.manifest` (`desktop-test`), `input.manifest` (`input-test`), `windows.manifest` (`windows-test`), `toolkit.manifest` (`toolkit-test`), `panel.manifest` (`panel-test`), `audio.manifest` (`audio-test`), `suspend.manifest` (`suspend-test`) |
+| `boot/` | Component manifests: `shell.manifest` (normal boot), `test.manifest` (`cm-test`), `supervise.manifest` (`supervise-test`) , `drivers.manifest` (`drivers-test`) , `memory.manifest` (`memory-test`), `reboot.manifest` (`reboot-test`), `fs.manifest` and `fs-verify.manifest` (`fs-test`), `net.manifest` (`net-test`), `tcp.manifest` (`tcp-test`), `keyboard.manifest` (`keyboard-test`), `display.manifest` (`display-test`), `desktop.manifest` (`desktop-test`), `input.manifest` (`input-test`), `windows.manifest` (`windows-test`), `toolkit.manifest` (`toolkit-test`), `panel.manifest` (`panel-test`), `resize.manifest` (`resize-test`), `audio.manifest` (`audio-test`), `suspend.manifest` (`suspend-test`) |
 | `sel4/` | Docker build of seL4 and rust-sel4's kernel loader, for running the shell on seL4 |
 | `xtask/` | Build driver: user program, kernel, disk image, QEMU boot |
 
@@ -1129,6 +1141,7 @@ cargo xtask lde-e100-test  # the same over Linux's e100 driver
 cargo xtask display-test   # Linux's bochs display driver: two pictures, checked pixel by pixel from QEMU screenshots
 cargo xtask desktop-test   # the compositor: two clients' windows through restarts, five screenshots checked pixel by pixel
 cargo xtask panel-test     # the desktop shell's panel: two apps launched, one activated, closed and launched again, five screenshots checked
+cargo xtask resize-test    # a resizable window: its frame dragged out and in past its least size, three screenshots checked
 cargo xtask toolkit-test   # the greeter on the toolkit: a field typed in, a button clicked, closed, four screenshots checked against the toolkit drawn on the host
 cargo xtask windows-test   # translucent and decorated windows: a blend, a drag by the title bar, a close box, three screenshots checked
 cargo xtask input-test     # the compositor's pointer, focus, keys and wheel from a USB mouse, tablet and keyboard, seven screenshots checked

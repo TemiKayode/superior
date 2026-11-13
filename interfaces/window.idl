@@ -36,7 +36,14 @@
 # told when they change (`WINDOWS`). Its windows stay in front of every
 # other client's and never take the keyboard focus. Anyone else asking
 # is `Denied`.
-interface window version 6
+#
+# Resizing: a resizable window's client may lend more pages than its size
+# needs (up to `WINDOW_PAGES`). A button pressed on its right or bottom
+# border, or the corner between them, drags an outline of the size asked
+# for; let go, the client is told (`RESIZE`), draws at the size it
+# accepts and sets it (`SET_SIZE`), so it is never shown at a width its
+# pixels were not drawn for.
+interface window version 7
 
 # The most windows on the screen, all clients together.
 const MAX_WINDOWS = 8
@@ -54,7 +61,8 @@ op INFO = 1 (version) -> (width, height, shown)
 op CREATE = 2 (size, position) -> (window)
 
 # Keeps page `page` of window `window`, which the call lends. Pages come
-# in order from 0.
+# in order from 0, up to `WINDOW_PAGES`: more than its size needs leaves
+# room to grow.
 op ATTACH = 3 (window, page)
 
 # Shows the window's rectangle `rect` (x | y << 16 | width << 32 | height
@@ -103,6 +111,9 @@ const MOVED = 7
 # To a manager's windows: the windows shown, their titles or the focus
 # changed.
 const WINDOWS = 8
+# The user dragged the window's frame to ask for a size: `a` is width |
+# height << 16. The client draws at the size it accepts and sets it.
+const RESIZE = 9
 
 # Events a window keeps until they are read; past that the oldest go.
 const EVENTS = 32
@@ -120,6 +131,12 @@ op NEXT = 9 (window) -> (kind, a, b)
 const ALPHA = 1
 # The compositor draws a border and a title bar around the window.
 const DECORATED = 2
+# The window's right and bottom borders may be dragged to resize it.
+const RESIZABLE = 4
+
+# The smallest size a drag asks for.
+const MIN_WIDTH = 64
+const MIN_HEIGHT = 32
 
 # A decorated window's frame: the border's width all round, the title
 # bar's height between the top border and the window, and its close box,
@@ -130,7 +147,7 @@ const TITLE = 18
 const CLOSE_BOX = 12
 const CLOSE_MARGIN = 3
 
-# Sets the window's style: `flags` of `ALPHA` and `DECORATED`. `Invalid`
+# Sets the window's style: `flags` of `ALPHA`, `DECORATED` and `RESIZABLE`. `Invalid`
 # for other flags, or if the frame it would have does not lie wholly on
 # the screen.
 op STYLE = 10 (window, flags)
@@ -155,3 +172,8 @@ op DESCRIBE = 13 (window) -> (a, b, flags)
 # A manager's: puts window `window` in front of every other client's and
 # gives it the keyboard focus.
 op ACTIVATE = 14 (window)
+
+# Makes the window `size` (width | height << 16): its pixels' rows are
+# then the new width apart. `Invalid` if it would need more pages than
+# were attached, or would not lie wholly on the screen.
+op SET_SIZE = 15 (window, size)

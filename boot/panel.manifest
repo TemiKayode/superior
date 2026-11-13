@@ -82,7 +82,7 @@ component greeter
   uses window 0
   cspace 8
   memory 21
-  untyped 18 1
+  untyped 20 1
   control 3
 
 component hello
@@ -94,7 +94,7 @@ component hello
   uses window 0
   cspace 8
   memory 21
-  untyped 18 1
+  untyped 20 1
   control 3
 
 component watcher
