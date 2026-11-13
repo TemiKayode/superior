@@ -10,6 +10,7 @@
 #[cfg(test)]
 extern crate std;
 
+pub mod ab;
 pub mod abi;
 pub mod bundle;
 pub mod cap;

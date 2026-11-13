@@ -322,29 +322,52 @@ fn reduce(h: &[u8; 64]) -> [u8; 32] {
 /// Whether `signature` is `public`'s Ed25519 signature of the message made
 /// of `message`'s pieces, one after another.
 pub fn verify(public: &[u8; 32], message: &[&[u8]], signature: &[u8; 64]) -> bool {
-    let r_bytes: &[u8; 32] = signature[..32].try_into().unwrap();
-    let s: &[u8; 32] = signature[32..].try_into().unwrap();
-    if !below_l(&limbs(s)) {
-        return false;
-    }
-    let c = Curve::new();
-    let (Some(a), Some(r)) = (Point::decode(&c, public), Point::decode(&c, r_bytes)) else {
-        return false;
-    };
-    let mut h = Sha512::new();
-    h.update(r_bytes);
-    h.update(public);
+    let mut v = Verifier::new(public, signature);
     for m in message {
-        h.update(m);
+        v.update(m);
     }
-    let k = reduce(&h.finish());
-    // The base point: y = 4/5, x even.
-    let mut b_enc = [0x66u8; 32];
-    b_enc[0] = 0x58;
-    let Some(b) = Point::decode(&c, &b_enc) else {
-        return false;
-    };
-    b.mul(&c, s).encode() == r.add(&c, a.mul(&c, &k)).encode()
+    v.finish()
+}
+
+/// A verification fed its message a piece at a time, so a message larger
+/// than memory at hand (a bundle on disk) can be checked as it is read.
+pub struct Verifier {
+    h: Sha512,
+    public: [u8; 32],
+    signature: [u8; 64],
+}
+
+impl Verifier {
+    pub fn new(public: &[u8; 32], signature: &[u8; 64]) -> Verifier {
+        let mut h = Sha512::new();
+        h.update(&signature[..32]);
+        h.update(public);
+        Verifier { h, public: *public, signature: *signature }
+    }
+
+    pub fn update(&mut self, piece: &[u8]) {
+        self.h.update(piece);
+    }
+
+    pub fn finish(self) -> bool {
+        let r_bytes: &[u8; 32] = self.signature[..32].try_into().unwrap();
+        let s: &[u8; 32] = self.signature[32..].try_into().unwrap();
+        if !below_l(&limbs(s)) {
+            return false;
+        }
+        let c = Curve::new();
+        let (Some(a), Some(r)) = (Point::decode(&c, &self.public), Point::decode(&c, r_bytes)) else {
+            return false;
+        };
+        let k = reduce(&self.h.finish());
+        // The base point: y = 4/5, x even.
+        let mut b_enc = [0x66u8; 32];
+        b_enc[0] = 0x58;
+        let Some(b) = Point::decode(&c, &b_enc) else {
+            return false;
+        };
+        b.mul(&c, s).encode() == r.add(&c, a.mul(&c, &k)).encode()
+    }
 }
 
 #[cfg(test)]

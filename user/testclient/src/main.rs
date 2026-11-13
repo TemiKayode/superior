@@ -69,7 +69,7 @@ use core::sync::atomic::{AtomicU32, Ordering, fence};
 use superior_objects::abi::{CapTransfer, Error, ObjectType, Syscall, root};
 use superior_objects::idl::{display, window};
 use superior_objects::interfaces::fs::ring;
-use superior_objects::interfaces::{Status, block, dns, fs, input, mem, net, pci, power};
+use superior_objects::interfaces::{Status, block, dns, fs, input, mem, net, pci, power, update};
 use superior_sys::{Called, USER_BASE, call_retry, print_line, syscall, syscall_x};
 
 const ECHO: u64 = 0;
@@ -5152,6 +5152,119 @@ fn suspend_client() -> ! {
     superior_sys::park()
 }
 
+/// The A/B test's downloads (`boot/ab-system.manifest`): updates the
+/// host left on the system disk after the slots, each laid out as a slot
+/// (a header sector, then the signed bundle): 0 a version 3 changed after
+/// signing, 1 version 3, 2 version 4.
+const DOWNLOAD_FIRST: u64 = superior_objects::ab::SLOT_FIRST[1] + superior_objects::ab::SLOT_SECTORS;
+
+/// A call to the manager through the control capability.
+fn manager(m: [u64; 4]) -> [u64; 4] {
+    let r = syscall(Syscall::Call, BLOCK_CONTROL, m);
+    if r.status != 0 { [u64::MAX, 0, 0, 0] } else { r.msg }
+}
+
+/// Moves `count` sectors (up to a page) between the disk and the buffer.
+fn disk(op: u64, sector: u64, count: u64) -> bool {
+    let lend = CapTransfer { grant: Some(BUFFER as u16), accept: None };
+    let r = syscall_x(Syscall::Call, BLOCK, [op, sector, count, 0], lend);
+    r.status == 0 && r.msg[0] == Status::Ok as u64
+}
+
+/// Copies download `k` into the slot the manager says is free, header and
+/// all, as an updater would once it had downloaded it; then tells the
+/// manager it is ready. The manager's answer.
+fn stage(k: u64) -> u64 {
+    let r = manager([update::OP_UPDATE_SLOT, 0, 0, 0]);
+    if r[0] != Status::Ok as u64 {
+        return r[0];
+    }
+    let (from, to) = (DOWNLOAD_FIRST + k * superior_objects::ab::SLOT_SECTORS, r[2]);
+    if !disk(block::READ, from, 1) {
+        return Status::DeviceError as u64;
+    }
+    // SAFETY: the buffer is mapped; its first sector is the header.
+    let header: [u8; 512] = unsafe { *(BUFFER_VA as *const [u8; 512]) };
+    let Some(len) = superior_objects::ab::slot_length(&header) else {
+        return Status::NotFound as u64;
+    };
+    let sectors = 1 + len.div_ceil(512) as u64;
+    let mut done = 0;
+    while done < sectors {
+        let n = (sectors - done).min(8);
+        if !disk(block::READ, from + done, n) || !disk(block::WRITE, to + done, n) {
+            return Status::DeviceError as u64;
+        }
+        done += n;
+    }
+    if syscall(Syscall::Call, BLOCK, [block::FLUSH, 0, 0, 0]).msg[0] != Status::Ok as u64 {
+        return Status::DeviceError as u64;
+    }
+    manager([update::OP_UPDATE_READY, 0, 0, 0])[0]
+}
+
+/// The A/B test's client, in each system the slots hold: role 32 in
+/// version 2, 33 in version 3 (which never confirms it came up, as a
+/// broken update would not), 34 in version 4.
+fn ab_client(role: u64) -> ! {
+    let mut t = Checks(0, "ab");
+    let made = syscall(Syscall::Retype, BLOCK_MEMORY, [ObjectType::Frame as u64, 0, BUFFER, 0]);
+    let mapped = syscall(Syscall::FrameMap, BUFFER, [BUFFER_VA, 1, 0, 0]);
+    let info = manager([update::OP_BOOT_INFO, 0, 0, 0]);
+    let (slot, fell_back, version, floor) = (info[1] & 0xff, info[1] & update::FELL_BACK != 0, info[2], info[3]);
+    let name = if slot == 0 { 'A' } else { 'B' };
+    t.check(
+        made.status == 0 && mapped.status == 0 && info[0] == Status::Ok as u64,
+        format_args!(
+            "running version {version} from slot {name}{}, rollback floor {floor}",
+            if fell_back { " (fell back)" } else { "" }
+        ),
+    );
+    let ok = Status::Ok as u64;
+    match role {
+        32 if !fell_back => {
+            t.check(slot == 0 && version == 2, format_args!("a fresh disk boots slot A"));
+            t.check(manager([update::OP_BOOT_OK, 0, 0, 0])[0] == ok, format_args!("confirmed it came up"));
+            let r = stage(0);
+            t.check(
+                r == Status::Denied as u64,
+                format_args!("an update changed after signing is refused (status {r})"),
+            );
+            let r = stage(1);
+            t.check(r == ok, format_args!("version 3 written to slot B and staged (status {r})"));
+        }
+        32 => {
+            t.check(
+                slot == 0 && version == 2 && floor == 2,
+                format_args!("version 3 never confirmed, so slot A again"),
+            );
+            t.check(manager([update::OP_BOOT_OK, 0, 0, 0])[0] == ok, format_args!("confirmed it came up"));
+            let r = stage(2);
+            t.check(r == ok, format_args!("version 4 written to slot B and staged (status {r})"));
+        }
+        33 => {
+            t.check(slot == 1 && version == 3, format_args!("the staged update boots, and does not confirm"));
+        }
+        _ => {
+            t.check(slot == 1 && version == 4, format_args!("the staged version 4 boots"));
+            let r = manager([update::OP_BOOT_OK, 0, 0, 0])[0];
+            let info = manager([update::OP_BOOT_INFO, 0, 0, 0]);
+            t.check(
+                r == ok && info[3] == 4,
+                format_args!("confirmed it came up: slot B active, rollback floor {}", info[3]),
+            );
+            // Slot A still holds version 2: below the floor now.
+            let r = manager([update::OP_UPDATE_READY, 0, 0, 0])[0];
+            t.check(
+                r == Status::Invalid as u64,
+                format_args!("version 2, still in slot A, may not be staged again: a rollback (status {r})"),
+            );
+        }
+    }
+    syscall(Syscall::Call, BLOCK_CONTROL, [OP_SHUTDOWN, t.0, 0, 0]);
+    superior_sys::park()
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(role: u64) -> ! {
     match role {
@@ -5189,6 +5302,7 @@ pub extern "C" fn _start(role: u64) -> ! {
         29 => audio_first(),
         30 => audio_second(),
         31 => suspend_client(),
+        32..=34 => ab_client(role),
         _ => probe(),
     }
 }

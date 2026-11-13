@@ -67,9 +67,10 @@ use superior_objects::abi::{
     CapTransfer, FaultKind, FaultReply, MAP_EXEC, MAP_WRITE, ObjectType, SERVICE_UNAVAILABLE,
     Syscall, TICK_HZ, root,
 };
-use superior_objects::bundle::{Bundle, BundleError};
+use superior_objects::bundle::{Bundle, BundleError, Signed};
 use superior_objects::elf::{Elf, Machine};
-use superior_objects::interfaces::{Status as Reply, mem, power};
+use superior_objects::ab::{self, Record};
+use superior_objects::interfaces::{Status as Reply, block, mem, power, update};
 use superior_objects::manifest::{CapKind, Component, MAX_COMPONENTS, Manifest, Restart, Start};
 use superior_sys::{Ret, USER_BASE, syscall, syscall_x};
 
@@ -117,7 +118,17 @@ const IMAGE_PAGES: u64 = 76;
 const B_STACK: u64 = B_IMAGE + IMAGE_PAGES;
 const STACK_PAGES: u64 = 16;
 const _: () = assert!(B_STACK + STACK_PAGES <= BLOCK);
-const _: () = assert!(BLOCKS + BLOCK * MAX_COMPONENTS as u64 <= 1 << root::CNODE_BITS);
+/// The system slots (`system` in the manifest, A/B updates): a badged
+/// capability to the system disk's block service for the manager's own
+/// reads and writes, a page it lends the driver for each, and the pages
+/// the system bundle is read into (kept: components are built from it).
+const SYSTEM_BLOCK: u64 = BLOCKS + BLOCK * MAX_COMPONENTS as u64;
+const IO_PAGE: u64 = SYSTEM_BLOCK + 1;
+const SYSTEM_PAGES: u64 = SYSTEM_BLOCK + 2;
+const SYSTEM_MAX_PAGES: u64 = ab::SLOT_BYTES.div_ceil(4096) as u64;
+const _: () = assert!(SYSTEM_PAGES + SYSTEM_MAX_PAGES <= 1 << root::CNODE_BITS);
+/// The manager's badge on the system disk (clients' are their numbers).
+const BADGE_SYSTEM_DISK: u64 = 0x1000;
 
 // ---- badges on the control endpoint ------------------------------------
 
@@ -147,6 +158,9 @@ const SCRATCH_VA: u64 = USER_BASE + 0x2_0000_0000;
 const WATCHER_STACKS_VA: u64 = USER_BASE + 0x3_0000_0000;
 /// Tombstone stacks, laid out the same way.
 const TOMB_STACKS_VA: u64 = USER_BASE + 0x3_1000_0000;
+/// The page lent for system disk I/O, and the system bundle.
+const IO_VA: u64 = USER_BASE + 0x3_2000_0000;
+const SYSTEM_VA: u64 = USER_BASE + 0x3_4000_0000;
 
 // ---- in a component's address space ------------------------------------
 
@@ -208,7 +222,17 @@ enum Status {
 
 struct Manager<'a> {
     bundle: Bundle<'a>,
+    /// The system bundle, once loaded from a slot (`system`).
+    system: Option<Bundle<'a>>,
     manifest: Manifest<'a>,
+    /// Service endpoints made so far.
+    service_count: usize,
+    /// The boot record as last written, and the slot booted, its version
+    /// and whether it was not the slot tried first.
+    record: Record,
+    booted: Option<(u8, u64, bool)>,
+    /// System pages made so far.
+    system_pages: u64,
     status: [Status; MAX_COMPONENTS],
     /// Services in manifest order: (name, providing component).
     services: [Option<(&'a str, usize)>; MAX_SERVICES],
@@ -283,9 +307,11 @@ impl<'a> Manager<'a> {
         retype(ut, ObjectType::AddressSpace, c.vspace_bits as u64, vspace)
             .map_err(|e| ("address space", e))?;
         retype(ut, ObjectType::Thread, 0, tcb).map_err(|e| ("thread", e))?;
+        // The system bundle's images first, then the boot bundle's.
         let image = self
-            .bundle
-            .get(c.image)
+            .system
+            .and_then(|b| b.get(c.image))
+            .or_else(|| self.bundle.get(c.image))
             .ok_or(("image not in the bundle", 0))?;
         let entry = load(image, ut, block, vspace)?;
         for p in 0..STACK_PAGES {
@@ -621,6 +647,237 @@ impl<'a> Manager<'a> {
         result
     }
 
+    /// Makes the endpoints for the services of components `from` on (the
+    /// manager keeps the originals) and their fault capabilities, starts
+    /// watchers for the lazy ones' services and starts the boot ones.
+    fn wire(&mut self, from: usize) {
+        let first_service = self.service_count;
+        for i in from..MAX_COMPONENTS {
+            let Some(c) = self.manifest.components[i] else { continue };
+            for s in c.provides() {
+                let n = self.service_count;
+                if n == MAX_SERVICES
+                    || retype(root::UNTYPED, ObjectType::Endpoint, 0, SERVICES + n as u64).is_err()
+                {
+                    say!("could not make the endpoint for service {s}");
+                    shutdown(false);
+                }
+                self.services[n] = Some((s, i));
+                self.service_count += 1;
+            }
+            if mint(CONTROL, FAULT_CAP + i as u64, WRITE, BADGE_FAULT + i as u64).is_err() {
+                say!("could not make a fault capability");
+                shutdown(false);
+            }
+        }
+        for s in first_service..self.service_count {
+            let (name, owner) = self.services[s].unwrap();
+            if self.component(owner).start == Start::Lazy && start_watcher(s as u64).is_err() {
+                say!("could not start the watcher for service {name}");
+                shutdown(false);
+            }
+        }
+        for i in from..MAX_COMPONENTS {
+            if matches!(self.manifest.components[i], Some(c) if c.start == Start::Boot) {
+                self.start_logged(i, "boot");
+            }
+        }
+    }
+
+    /// The key the system must be signed with: the boot bundle's
+    /// `trust.key` (the kernel verified the boot bundle).
+    fn trust_key(&self) -> Option<[u8; 32]> {
+        self.bundle.get("trust.key").and_then(|k| <[u8; 32]>::try_from(k).ok())
+    }
+
+    /// `system <service>`: reads the boot record from that service's
+    /// disk, chooses a slot (`ab::plan`), loads and checks the system
+    /// bundle in it (signed with the boot bundle's key, no older than the
+    /// record's floor), and starts its components as if their manifest
+    /// followed the boot manifest. With no slot to boot, stops the machine.
+    fn load_system(&mut self, boot_text: &'a str) {
+        let Some(service) = self.manifest.system else { return };
+        let Some(key) = self.trust_key() else {
+            say!("the boot bundle has no trust.key to check the system with");
+            shutdown(false)
+        };
+        let s = SERVICES + self.service_index(service).unwrap() as u64;
+        let io = mint(s, SYSTEM_BLOCK, WRITE | GRANT | GRANT_REPLY, BADGE_SYSTEM_DISK)
+            .and_then(|_| retype(root::UNTYPED, ObjectType::Frame, 0, IO_PAGE))
+            .and_then(|_| sys(Syscall::FrameMap, IO_PAGE, [IO_VA, 1, 0, 0]).map(drop));
+        if let Err(e) = io {
+            say!("could not reach the system disk (error {e})");
+            shutdown(false);
+        }
+        let record = match disk_read(ab::RECORD_SECTOR, 1) {
+            Ok(b) => Record::decode(b[..ab::SECTOR].try_into().unwrap()),
+            Err(e) => {
+                say!("could not read the boot record (status {})", e as u64);
+                shutdown(false)
+            }
+        };
+        let plan = ab::plan(record);
+        if let Some(p) = plan.dropped {
+            say!("the update in slot {} never confirmed it came up; dropped it", ab::slot_name(p));
+        }
+        self.record = plan.write.unwrap_or(record);
+        if plan.write.is_some() && write_record(&self.record).is_err() {
+            say!("could not write the boot record");
+            shutdown(false);
+        }
+        let mut chosen = None;
+        for (k, slot) in plan.order.iter().flatten().enumerate() {
+            match self.load_slot(*slot, &key) {
+                Ok((bundle, version)) => {
+                    chosen = Some((*slot, version, bundle, k > 0 || plan.dropped.is_some()));
+                    break;
+                }
+                Err(why) => say!("system slot {} refused: {why}", ab::slot_name(*slot)),
+            }
+        }
+        let Some((slot, version, bundle, fell_back)) = chosen else {
+            say!("no system slot to boot");
+            shutdown(false)
+        };
+        let text = bundle.get("manifest").and_then(|m| core::str::from_utf8(m).ok()).unwrap_or("");
+        // SAFETY: only this thread touches the buffer, filled once here; the
+        // manifest borrows from it for as long as the program runs.
+        let joined: &'a str = unsafe {
+            let buf = &mut *(&raw mut SYSTEM_MANIFEST);
+            let len = boot_text.len() + 1 + text.len();
+            if len > buf.len() {
+                say!("the boot and system manifests are too long together");
+                shutdown(false);
+            }
+            buf[..boot_text.len()].copy_from_slice(boot_text.as_bytes());
+            buf[boot_text.len()] = 10; // a newline
+            buf[boot_text.len() + 1..len].copy_from_slice(text.as_bytes());
+            core::str::from_utf8_unchecked(&buf[..len])
+        };
+        let manifest = match Manifest::parse(joined) {
+            Ok(m) => m,
+            Err(e) => {
+                say!("system manifest line {}: {} ({})", e.line, e.what, e.word);
+                shutdown(false)
+            }
+        };
+        let from = self.manifest.len();
+        say!(
+            "booting system slot {} (version {version}{}): {} more components",
+            ab::slot_name(slot),
+            if fell_back { ", fell back" } else { "" },
+            manifest.len() - from
+        );
+        self.manifest = manifest;
+        self.system = Some(bundle);
+        self.booted = Some((slot, version, fell_back));
+        self.wire(from);
+    }
+
+    /// Reads slot `slot`'s bundle into the system pages and checks it.
+    fn load_slot(&mut self, slot: u8, key: &[u8; 32]) -> Result<(Bundle<'a>, u64), &'static str> {
+        let first = ab::SLOT_FIRST[slot as usize];
+        let header = disk_read(first, 1).map_err(|_| "unreadable")?;
+        let len = ab::slot_length(header[..ab::SECTOR].try_into().unwrap()).ok_or("empty")?;
+        let pages = len.div_ceil(4096) as u64;
+        while self.system_pages < pages {
+            let p = self.system_pages;
+            retype(root::UNTYPED, ObjectType::Frame, 0, SYSTEM_PAGES + p)
+                .and_then(|_| sys(Syscall::FrameMap, SYSTEM_PAGES + p, [SYSTEM_VA + p * 4096, 1, 0, 0]).map(drop))
+                .map_err(|_| "no memory for it")?;
+            self.system_pages += 1;
+        }
+        for p in 0..pages {
+            let sectors = (len - p as usize * 4096).div_ceil(ab::SECTOR).min(8) as u64;
+            let data = disk_read(first + 1 + p * 8, sectors).map_err(|_| "unreadable")?;
+            // SAFETY: page p of the system pages is mapped at this address.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    data.as_ptr(),
+                    (SYSTEM_VA + p * 4096) as *mut u8,
+                    sectors as usize * ab::SECTOR,
+                );
+            }
+        }
+        // SAFETY: the pages just filled, mapped for as long as this runs.
+        let bytes: &'a [u8] = unsafe { core::slice::from_raw_parts(SYSTEM_VA as *const u8, len) };
+        let signed = Signed::split(bytes).ok_or("not signed")?;
+        if !signed.verify(key) {
+            return Err("its signature does not verify");
+        }
+        if signed.version < self.record.floor {
+            return Err("older than the rollback floor");
+        }
+        let bundle = Bundle::parse(signed.payload).map_err(bundle_error)?;
+        Ok((bundle, signed.version))
+    }
+
+    /// `[OP_BOOT_INFO]`.
+    fn boot_info(&self) -> [u64; 4] {
+        match self.booted {
+            Some((slot, version, fell_back)) => [
+                Reply::Ok as u64,
+                slot as u64 | if fell_back { update::FELL_BACK } else { 0 },
+                version,
+                self.record.floor,
+            ],
+            None => [Reply::NotFound as u64, 0, 0, 0],
+        }
+    }
+
+    /// `[OP_BOOT_OK]`: the booted slot becomes the active one.
+    fn boot_ok(&mut self) -> Reply {
+        let Some((slot, version, _)) = self.booted else { return Reply::NotFound };
+        let r = ab::confirmed(self.record, slot, version);
+        if r != self.record {
+            if write_record(&r).is_err() {
+                return Reply::DeviceError;
+            }
+            say!("system slot {} confirmed: active, rollback floor {}", ab::slot_name(slot), r.floor);
+        }
+        self.record = r;
+        Reply::Ok
+    }
+
+    /// `[OP_UPDATE_SLOT]`: the slot not booted.
+    fn update_slot(&self) -> [u64; 4] {
+        match self.booted {
+            Some((slot, ..)) => {
+                let other = 1 - slot;
+                [Reply::Ok as u64, other as u64, ab::SLOT_FIRST[other as usize], ab::SLOT_SECTORS]
+            }
+            None => [Reply::NotFound as u64, 0, 0, 0],
+        }
+    }
+
+    /// `[OP_UPDATE_READY]`: checks the update in the slot not booted,
+    /// reading it a page at a time (the system pages hold the running
+    /// system), and stages it.
+    fn update_ready(&mut self) -> Reply {
+        let (Some((slot, ..)), Some(key)) = (self.booted, self.trust_key()) else {
+            return Reply::NotFound;
+        };
+        let other = 1 - slot;
+        match check_slot(other, &key, self.record.floor) {
+            Ok(version) => {
+                let r = ab::staged(self.record, other);
+                if write_record(&r).is_err() {
+                    return Reply::DeviceError;
+                }
+                self.record = r;
+                say!(
+                    "update staged in slot {} (version {version}): the next boot tries it once",
+                    ab::slot_name(other)
+                );
+                Reply::Ok
+            }
+            Err((why, status)) => {
+                say!("update in slot {} refused: {why}", ab::slot_name(other));
+                status
+            }
+        }
+    }
+
     /// Answers every service of component `i` with `SERVICE_UNAVAILABLE`
     /// from now on.
     fn tombstone(&mut self, i: usize) {
@@ -632,6 +889,80 @@ impl<'a> Manager<'a> {
             }
         }
     }
+}
+
+/// The two manifests together, once the system's is loaded.
+static mut SYSTEM_MANIFEST: [u8; 16384] = [0; 16384];
+
+/// Reads `count` sectors (up to a page) from the system disk into the I/O
+/// page; returns them.
+fn disk_read(sector: u64, count: u64) -> Result<&'static [u8], Reply> {
+    let lend = CapTransfer { grant: Some(IO_PAGE as u16), accept: None };
+    let r = syscall_x(Syscall::Call, SYSTEM_BLOCK, [block::READ, sector, count, 0], lend);
+    match Reply::from_u64(r.msg[0]) {
+        // SAFETY: the I/O page is mapped at IO_VA.
+        Reply::Ok if r.status == 0 => Ok(unsafe {
+            core::slice::from_raw_parts(IO_VA as *const u8, count as usize * ab::SECTOR)
+        }),
+        _ if r.status != 0 => Err(Reply::DeviceError),
+        e => Err(e),
+    }
+}
+
+/// Writes the boot record and flushes it to stable storage.
+fn write_record(r: &Record) -> Result<(), Reply> {
+    // SAFETY: the I/O page is mapped at IO_VA, a page long.
+    unsafe { core::ptr::copy_nonoverlapping(r.encode().as_ptr(), IO_VA as *mut u8, ab::SECTOR) };
+    let lend = CapTransfer { grant: Some(IO_PAGE as u16), accept: None };
+    let w = syscall_x(Syscall::Call, SYSTEM_BLOCK, [block::WRITE, ab::RECORD_SECTOR, 1, 0], lend);
+    let f = syscall(Syscall::Call, SYSTEM_BLOCK, [block::FLUSH, 0, 0, 0]);
+    let ok = |r: &Ret| r.status == 0 && r.msg[0] == Reply::Ok as u64;
+    if ok(&w) && ok(&f) { Ok(()) } else { Err(Reply::DeviceError) }
+}
+
+/// Checks the signed bundle in slot `slot` without holding it all: the
+/// trailer first, then the signed part streamed through the verifier.
+/// Returns its version.
+fn check_slot(slot: u8, key: &[u8; 32], floor: u64) -> Result<u64, (&'static str, Reply)> {
+    use superior_objects::bundle::{SIG_MAGIC, TRAILER};
+    use superior_objects::crypto::ed25519::Verifier;
+    let unreadable = |_| ("unreadable", Reply::DeviceError);
+    let first = ab::SLOT_FIRST[slot as usize] + 1;
+    let header = disk_read(first - 1, 1).map_err(unreadable)?;
+    let len = ab::slot_length(header[..ab::SECTOR].try_into().unwrap()).ok_or(("empty", Reply::Invalid))?;
+    if len < TRAILER {
+        return Err(("not signed", Reply::Denied));
+    }
+    // The trailer, in the one or two sectors at the end.
+    let at = len - TRAILER;
+    let s0 = (at / ab::SECTOR) as u64;
+    let s1 = ((len - 1) / ab::SECTOR) as u64;
+    let data = disk_read(first + s0, s1 - s0 + 1).map_err(unreadable)?;
+    let off = at - s0 as usize * ab::SECTOR;
+    let mut trailer = [0u8; TRAILER];
+    trailer.copy_from_slice(&data[off..off + TRAILER]);
+    if &trailer[..8] != SIG_MAGIC {
+        return Err(("not signed", Reply::Denied));
+    }
+    let version = u64::from_le_bytes(trailer[8..16].try_into().unwrap());
+    let signature: [u8; 64] = trailer[16..].try_into().unwrap();
+    let mut v = Verifier::new(key, &signature);
+    let signed = len - 64;
+    let mut done = 0;
+    while done < signed {
+        let sectors = (signed - done).div_ceil(ab::SECTOR).min(8);
+        let data = disk_read(first + (done / ab::SECTOR) as u64, sectors as u64).map_err(unreadable)?;
+        let n = (signed - done).min(sectors * ab::SECTOR);
+        v.update(&data[..n]);
+        done += n;
+    }
+    if !v.finish() {
+        return Err(("its signature does not verify", Reply::Denied));
+    }
+    if version < floor {
+        return Err(("older than the rollback floor", Reply::Invalid));
+    }
+    Ok(version)
 }
 
 fn ticks() -> u64 {
@@ -893,7 +1224,12 @@ pub extern "C" fn _start(arg: u64) -> ! {
     };
     let mut m = Manager {
         bundle,
+        system: None,
         manifest,
+        service_count: 0,
+        record: Record::default(),
+        booted: None,
+        system_pages: 0,
         status: [Status::NotStarted; MAX_COMPONENTS],
         services: [None; MAX_SERVICES],
         made: [false; MAX_COMPONENTS],
@@ -914,37 +1250,10 @@ pub extern "C" fn _start(arg: u64) -> ! {
         say!("could not make the control endpoint");
         shutdown(false);
     }
-    // Every service endpoint, made and kept by the manager.
-    let mut n = 0;
-    for (i, c) in m.manifest.iter() {
-        for s in c.provides() {
-            if n == MAX_SERVICES
-                || retype(root::UNTYPED, ObjectType::Endpoint, 0, SERVICES + n as u64).is_err()
-            {
-                say!("could not make the endpoint for service {s}");
-                shutdown(false);
-            }
-            m.services[n] = Some((s, i));
-            n += 1;
-        }
-        if mint(CONTROL, FAULT_CAP + i as u64, WRITE, BADGE_FAULT + i as u64).is_err() {
-            say!("could not make a fault capability");
-            shutdown(false);
-        }
-    }
-    // Watchers for lazy components' services, then boot components.
-    for s in 0..n {
-        let (name, owner) = m.services[s].unwrap();
-        if m.component(owner).start == Start::Lazy && start_watcher(s as u64).is_err() {
-            say!("could not start the watcher for service {name}");
-            shutdown(false);
-        }
-    }
-    for i in 0..MAX_COMPONENTS {
-        if matches!(m.manifest.components[i], Some(c) if c.start == Start::Boot) {
-            m.start_logged(i, "boot");
-        }
-    }
+    // Every service endpoint, made and kept by the manager; then the
+    // boot components; then the system in the A/B slots, if any.
+    m.wire(0);
+    m.load_system(text);
 
     let mut msg = syscall(Syscall::Recv, CONTROL, [0; 4]);
     loop {
@@ -1054,6 +1363,18 @@ pub extern "C" fn _start(arg: u64) -> ! {
                     && m.component(i).power_control =>
             {
                 Some([m.suspend(msg.msg[1]) as u64, 0, 0, 0])
+            }
+            BADGE_REPORT
+                if i < MAX_COMPONENTS
+                    && m.component(i).update_control
+                    && (update::OP_BOOT_INFO..=update::OP_UPDATE_READY).contains(&msg.msg[0]) =>
+            {
+                Some(match msg.msg[0] {
+                    update::OP_BOOT_INFO => m.boot_info(),
+                    update::OP_BOOT_OK => [m.boot_ok() as u64, 0, 0, 0],
+                    update::OP_UPDATE_SLOT => m.update_slot(),
+                    _ => [m.update_ready() as u64, 0, 0, 0],
+                })
             }
             BADGE_REPORT if i < MAX_COMPONENTS && msg.msg[0] == OP_SHUTDOWN => {
                 let name = m.component(i).name;

@@ -563,7 +563,7 @@ mod tests {
 /// [`crate::bundle`]) is mapped read-only at [`BUNDLE_VA`](root::BUNDLE_VA)
 /// and its length is the root task's first argument.
 pub mod root {
-    pub const CNODE_BITS: u8 = 11;
+    pub const CNODE_BITS: u8 = 12;
     /// A capability to the root task's own CSpace CNode.
     pub const SELF_CNODE: u64 = 0;
     /// All the memory it hands out to components.

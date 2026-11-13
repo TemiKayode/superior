@@ -37,7 +37,14 @@
 //!   power                   # hears SUSPEND and RESUME (`power`) on its
 //!                           # first service when the machine suspends
 //!   power-control           # may ask the manager to suspend the machine
+//!   update-control          # may confirm the system came up and stage
+//!                           # an update (`crate::ab`)
 //! ```
+//!
+//! Before any component, `system block` says the rest of the system is in
+//! A/B slots on the disk behind service `block` (`crate::ab`): the manager
+//! starts the components here, then loads the system bundle from a slot
+//! and starts its components as if their manifest followed this one.
 //!
 //! Slots are in the component's own CSpace, a CNode of [`CSPACE_SLOTS`]
 //! (more, up to 256 nameable here, after a `cspace` directive).
@@ -144,6 +151,8 @@ pub struct Component<'a> {
     pub power: bool,
     /// May ask the manager to suspend the machine.
     pub power_control: bool,
+    /// May confirm the system came up, and stage an update.
+    pub update_control: bool,
     pub caps: [Option<CapSpec<'a>>; MAX_CAPS],
 }
 
@@ -164,6 +173,7 @@ impl<'a> Component<'a> {
             injector: false,
             power: false,
             power_control: false,
+            update_control: false,
             caps: [None; MAX_CAPS],
         }
     }
@@ -193,6 +203,8 @@ pub struct ParseError<'a> {
 #[derive(Clone, Copy, Debug)]
 pub struct Manifest<'a> {
     pub components: [Option<Component<'a>>; MAX_COMPONENTS],
+    /// The service whose disk holds the system slots (`system`), if any.
+    pub system: Option<&'a str>,
 }
 
 impl<'a> Manifest<'a> {
@@ -221,6 +233,7 @@ impl<'a> Manifest<'a> {
     pub fn parse(text: &'a str) -> Result<Manifest<'a>, ParseError<'a>> {
         let mut m = Manifest {
             components: [None; MAX_COMPONENTS],
+            system: None,
         };
         let mut cur: Option<usize> = None;
         let mut count = 0;
@@ -244,6 +257,13 @@ impl<'a> Manifest<'a> {
                 m.components[count] = Some(Component::new(name));
                 cur = Some(count);
                 count += 1;
+                continue;
+            }
+            if key == "system" {
+                if cur.is_some() || m.system.is_some() {
+                    return Err(err("system comes once, before any component", key));
+                }
+                m.system = Some(arg("system needs a service")?);
                 continue;
             }
             let c = match cur {
@@ -339,6 +359,10 @@ impl<'a> Manifest<'a> {
                 }
                 "power-control" => {
                     c.power_control = true;
+                    None
+                }
+                "update-control" => {
+                    c.update_control = true;
                     None
                 }
                 "quota" => {
@@ -456,6 +480,11 @@ impl<'a> Manifest<'a> {
                     }
                     _ => {}
                 }
+            }
+        }
+        if let Some(s) = self.system {
+            if self.provider(s).is_none() {
+                return Err(err("no component provides the system disk's service", s));
             }
         }
         Ok(())
@@ -694,6 +723,17 @@ component memserver
         assert_eq!(
             error("component a\n image a\n start lazy"),
             (0, "a lazy component must provide a service")
+        );
+        let m = Manifest::parse("system block\ncomponent d\n image d\n provides block 1").unwrap();
+        assert_eq!(m.system, Some("block"));
+        assert_eq!(Manifest::parse(EXAMPLE).unwrap().system, None);
+        assert_eq!(
+            error("component d\n image d\n provides block 1\nsystem block"),
+            (4, "system comes once, before any component")
+        );
+        assert_eq!(
+            error("system block\ncomponent d\n image d"),
+            (0, "no component provides the system disk's service")
         );
         assert_eq!(
             error("component a\n image a\n power"),

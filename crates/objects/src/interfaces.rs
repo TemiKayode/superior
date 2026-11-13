@@ -657,6 +657,30 @@ pub mod power {
     pub const OP_SUSPEND: u64 = 7;
 }
 
+/// A/B system updates (`crate::ab`): what an `update-control` component
+/// may ask the Component Manager through its `control` capability.
+pub mod update {
+    /// `[OP_BOOT_INFO]`: reply `[status, slot | FELL_BACK, version,
+    /// floor]`, the slot booted (0 A, 1 B), the version of the system in
+    /// it and the record's rollback floor.
+    pub const OP_BOOT_INFO: u64 = 8;
+    /// Set in `OP_BOOT_INFO`'s word 1 when the slot booted is not the one
+    /// tried first (an update that failed to verify or never confirmed).
+    pub const FELL_BACK: u64 = 1 << 8;
+    /// `[OP_BOOT_OK]`: the system came up. Its slot becomes the active
+    /// one and its version the rollback floor. Reply `[status]`.
+    pub const OP_BOOT_OK: u64 = 9;
+    /// `[OP_UPDATE_SLOT]`: where to write an update, the slot not booted.
+    /// Reply `[status, slot, first sector, sectors]`; the update is a slot
+    /// header sector (`crate::ab::slot_header`), then the signed bundle.
+    pub const OP_UPDATE_SLOT: u64 = 10;
+    /// `[OP_UPDATE_READY]`: the update is written. The manager checks its
+    /// signature and version and, if good, has the next boot try it once.
+    /// Reply `[status]`: `Denied` if it does not verify, `Invalid` if it is
+    /// older than the rollback floor or the slot is empty.
+    pub const OP_UPDATE_READY: u64 = 11;
+}
+
 /// Files: what the filesystem server serves.
 ///
 /// There is no global namespace: each component sees only its own

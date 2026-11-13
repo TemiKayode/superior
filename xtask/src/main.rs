@@ -180,6 +180,7 @@ fn main() -> ExitCode {
                         .and_then(|_| hotplug_test(a))
                         .and_then(|_| suspend_test(a))
                         .and_then(|_| verified_boot_test(a))
+                        .and_then(|_| ab_test(a))
                         .and_then(|_| image(false, a))
                         .and_then(|img| shell_session(&img))
                 })
@@ -211,6 +212,7 @@ fn main() -> ExitCode {
         Some("hotplug-test") => hotplug_test(arch),
         Some("suspend-test") => suspend_test(arch),
         Some("verified-boot-test") => verified_boot_test(arch),
+        Some("ab-test") => ab_test(arch),
         Some("memory-test") => {
             image_with(false, arch, "memory").and_then(|img| memory_test(&img))
         }
@@ -219,7 +221,7 @@ fn main() -> ExitCode {
         }
         Some("bench") => image(false, Arch::X86_64).and_then(|img| bench(&img)),
         _ => Err(
-            "usage: cargo xtask <idl | image | run | test | boot-test | shell-test | cm-test | supervise-test | drivers-test | memory-test | reboot-test | fs-test | nvme-test | ahci-test | net-test | lde-test | lde-e100-test | display-test | desktop-test | input-test | audio-test | tcp-test | keyboard-test | hotplug-test | suspend-test | verified-boot-test | bench | sel4-test> [x86_64 | aarch64]"
+            "usage: cargo xtask <idl | image | run | test | boot-test | shell-test | cm-test | supervise-test | drivers-test | memory-test | reboot-test | fs-test | nvme-test | ahci-test | net-test | lde-test | lde-e100-test | display-test | desktop-test | input-test | audio-test | tcp-test | keyboard-test | hotplug-test | suspend-test | verified-boot-test | ab-test | bench | sel4-test> [x86_64 | aarch64]"
                 .into(),
         ),
     });
@@ -577,12 +579,25 @@ fn bundle(arch: Arch, manifest: &str, driver: &str) -> Result<PathBuf, String> {
         let bytes = std::fs::read(&path).map_err(|e| format!("reading {}: {e}", path.display()))?;
         files.push((name.to_string(), bytes));
     }
+    // The key a system in the A/B slots must be signed with (the kernel
+    // verifies this bundle; the Component Manager trusts what it holds).
+    files.push(("trust.key".to_string(), signing_key()?.verifying_key().to_bytes().to_vec()));
+    let out = pack(&files);
+    let path = root()
+        .join("target")
+        .join(format!("bundle-{}-{manifest}.bin", arch.name()));
+    std::fs::write(&path, out).map_err(|e| format!("writing {}: {e}", path.display()))?;
+    Ok(path)
+}
+
+/// Packs named files into a bundle (`superior_objects::bundle`).
+fn pack(files: &[(String, Vec<u8>)]) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(b"SUPBNDL1");
     out.extend_from_slice(&(files.len() as u32).to_le_bytes());
     out.extend_from_slice(&[0; 4]);
     let mut offset = 16 + 40 * files.len();
-    for (name, data) in &files {
+    for (name, data) in files {
         let mut n = [0u8; 32];
         n[..name.len()].copy_from_slice(name.as_bytes());
         out.extend_from_slice(&n);
@@ -590,14 +605,21 @@ fn bundle(arch: Arch, manifest: &str, driver: &str) -> Result<PathBuf, String> {
         out.extend_from_slice(&(data.len() as u32).to_le_bytes());
         offset += data.len();
     }
-    for (_, data) in &files {
+    for (_, data) in files {
         out.extend_from_slice(data);
     }
-    let path = root()
-        .join("target")
-        .join(format!("bundle-{}-{manifest}.bin", arch.name()));
-    std::fs::write(&path, out).map_err(|e| format!("writing {}: {e}", path.display()))?;
-    Ok(path)
+    out
+}
+
+/// Appends the trailer (`superior_objects::bundle::Signed`): `version`
+/// and `key`'s signature.
+fn sign(mut bundle: Vec<u8>, version: u64, key: &ed25519_dalek::SigningKey) -> Vec<u8> {
+    use ed25519_dalek::Signer;
+    bundle.extend_from_slice(superior_objects::bundle::SIG_MAGIC);
+    bundle.extend_from_slice(&version.to_le_bytes());
+    let signature = key.sign(&bundle).to_bytes();
+    bundle.extend_from_slice(&signature);
+    bundle
 }
 
 fn image(selftest: bool, arch: Arch) -> Result<Image, String> {
@@ -664,8 +686,6 @@ fn signing_key() -> Result<ed25519_dalek::SigningKey, String> {
 /// says, writing the signed bundle beside it; returns its path and the
 /// trusted public key's path.
 fn seal_bundle(path: &Path, seal: Seal) -> Result<(PathBuf, PathBuf), String> {
-    use ed25519_dalek::Signer;
-    use superior_objects::bundle::SIG_MAGIC;
     let key = signing_key()?;
     let public = root().join("target").join("keys").join("dev-signing.pub");
     std::fs::write(&public, key.verifying_key().to_bytes()).map_err(|e| e.to_string())?;
@@ -677,11 +697,8 @@ fn seal_bundle(path: &Path, seal: Seal) -> Result<(PathBuf, PathBuf), String> {
         } else {
             key
         };
-        out.extend_from_slice(SIG_MAGIC);
         let version = if seal == Seal::Old { BUNDLE_VERSION - 1 } else { BUNDLE_VERSION };
-        out.extend_from_slice(&version.to_le_bytes());
-        let signature = signer.sign(&out).to_bytes();
-        out.extend_from_slice(&signature);
+        out = sign(out, version, &signer);
     }
     if seal == Seal::Tampered {
         // A byte in the middle of the last component's image.
@@ -763,6 +780,8 @@ fn image_sealed(
         Some(test_disk()?)
     } else if fs {
         Some(fs_disk())
+    } else if manifest == "ab" {
+        Some(ab_disk(arch))
     } else {
         None
     };
@@ -771,7 +790,7 @@ fn image_sealed(
         arch,
         sel4: false,
         disk,
-        writable: fs,
+        writable: fs || manifest == "ab",
         driver,
         net: matches!(manifest, "net" | "tcp") || linux_nic(manifest).is_some(),
         linux_nic: linux_nic(manifest).map(|l| l.1),
@@ -2857,6 +2876,141 @@ fn check_recording(bytes: &[u8]) -> Result<String, String> {
         ms(d),
         gaps
     ))
+}
+
+/// The A/B test's system disk.
+fn ab_disk(arch: Arch) -> PathBuf {
+    root().join("target").join(format!("ab-test-disk-{}.img", arch.name()))
+}
+
+/// A signed system bundle for the A/B slots: `boot/ab-system.manifest`
+/// with its client in `role`, and the test client's image.
+fn system_bundle(arch: Arch, role: u64, version: u64) -> Result<Vec<u8>, String> {
+    let text = std::fs::read_to_string(root().join("boot").join("ab-system.manifest"))
+        .map_err(|e| format!("reading boot/ab-system.manifest: {e}"))?
+        .replace("\r\n", "\n");
+    assert_eq!(text.matches("  arg 32\n").count(), 1, "the A/B client");
+    let text = text.replace("  arg 32\n", &format!("  arg {role}\n"));
+    let client = user_program("superior-testclient", arch)?;
+    let image = std::fs::read(&client).map_err(|e| format!("reading {}: {e}", client.display()))?;
+    let files = vec![("manifest".to_string(), text.into_bytes()), ("testclient".to_string(), image)];
+    Ok(sign(pack(&files), version, &signing_key()?))
+}
+
+/// Writes a fresh A/B disk (`superior_objects::ab`): no boot record, slot
+/// A holding system version 2 (client role 32), slot B empty, and after
+/// the slots three downloads for the client to stage: version 3 (role 33)
+/// changed after signing, version 3, and version 4 (role 34).
+fn write_ab_disk(arch: Arch) -> Result<(), String> {
+    use superior_objects::ab::{SECTOR, SLOT_FIRST, SLOT_SECTORS, slot_header};
+    let downloads = SLOT_FIRST[1] + SLOT_SECTORS;
+    let mut disk = vec![0u8; ((downloads + 3 * SLOT_SECTORS) as usize) * SECTOR];
+    let mut put = |first: u64, bundle: &[u8]| {
+        let at = first as usize * SECTOR;
+        disk[at..at + SECTOR].copy_from_slice(&slot_header(bundle.len()));
+        disk[at + SECTOR..at + SECTOR + bundle.len()].copy_from_slice(bundle);
+    };
+    put(SLOT_FIRST[0], &system_bundle(arch, 32, 2)?);
+    let mut changed = system_bundle(arch, 33, 3)?;
+    let n = changed.len();
+    changed[n / 2] ^= 0x10;
+    put(downloads, &changed);
+    put(downloads + SLOT_SECTORS, &system_bundle(arch, 33, 3)?);
+    put(downloads + 2 * SLOT_SECTORS, &system_bundle(arch, 34, 4)?);
+    let path = ab_disk(arch);
+    std::fs::write(&path, disk).map_err(|e| format!("writing {}: {e}", path.display()))
+}
+
+/// A/B updates, in five boots of one disk (`boot/ab.manifest`: the boot
+/// bundle holds the disk drivers; the system is in the slots):
+/// 1. a fresh disk boots version 2 from slot A, which confirms, has an
+///    update changed after signing refused, and stages version 3 in B;
+/// 2. version 3 boots from B (its one try) and never confirms;
+/// 3. so slot A again, the update dropped; it stages version 4;
+/// 4. version 4 boots from B and confirms: B active, rollback floor 4;
+///    version 2, still in A, may not be staged again;
+/// 5. with slot B damaged on the disk, nothing boots: B fails its
+///    signature, and A is older than the floor.
+fn ab_test(arch: Arch) -> Result<(), String> {
+    let img = image_with(false, arch, "ab")?;
+    write_ab_disk(arch)?;
+    let boots: [(&str, &[&str]); 4] = [
+        (
+            "fresh disk",
+            &[
+                "[cm] booting system slot A (version 2): 1 more components",
+                "[pass] ab: running version 2 from slot A, rollback floor 0",
+                "[pass] ab: a fresh disk boots slot A",
+                "[cm] system slot A confirmed: active, rollback floor 2",
+                "[pass] ab: confirmed it came up",
+                "[cm] update in slot B refused: its signature does not verify",
+                "[pass] ab: an update changed after signing is refused",
+                "[cm] update staged in slot B (version 3): the next boot tries it once",
+                "[pass] ab: version 3 written to slot B and staged",
+                "[cm] client asked to shut down (pass)",
+            ],
+        ),
+        (
+            "update to version 3",
+            &[
+                "[cm] booting system slot B (version 3): 1 more components",
+                "[pass] ab: running version 3 from slot B, rollback floor 2",
+                "[pass] ab: the staged update boots, and does not confirm",
+                "[cm] client asked to shut down (pass)",
+            ],
+        ),
+        (
+            "fall back",
+            &[
+                "[cm] the update in slot B never confirmed it came up; dropped it",
+                "[cm] booting system slot A (version 2, fell back): 1 more components",
+                "[pass] ab: running version 2 from slot A (fell back), rollback floor 2",
+                "[pass] ab: version 3 never confirmed, so slot A again",
+                "[cm] update staged in slot B (version 4): the next boot tries it once",
+                "[pass] ab: version 4 written to slot B and staged",
+                "[cm] client asked to shut down (pass)",
+            ],
+        ),
+        (
+            "update to version 4",
+            &[
+                "[cm] booting system slot B (version 4): 1 more components",
+                "[pass] ab: the staged version 4 boots",
+                "[cm] system slot B confirmed: active, rollback floor 4",
+                "[pass] ab: confirmed it came up: slot B active, rollback floor 4",
+                "[cm] update in slot A refused: older than the rollback floor",
+                "[pass] ab: version 2, still in slot A, may not be staged again: a rollback",
+                "[cm] client asked to shut down (pass)",
+            ],
+        ),
+    ];
+    for (k, (what, steps)) in boots.iter().enumerate() {
+        println!("== A/B test, boot {} ({what}) on {}", k + 1, img.path.display());
+        let out = run_to_exit(&img, Duration::from_secs(90))?;
+        check_log(&format!("A/B boot {} ({what})", k + 1), &out, steps)?;
+    }
+    // Damage slot B's bundle on the disk.
+    let path = ab_disk(arch);
+    let mut disk = std::fs::read(&path).map_err(|e| e.to_string())?;
+    let at = (superior_objects::ab::SLOT_FIRST[1] as usize + 1) * superior_objects::ab::SECTOR + 4096;
+    disk[at] ^= 0x01;
+    std::fs::write(&path, disk).map_err(|e| e.to_string())?;
+    println!("== A/B test, boot 5 (slot B damaged) on {}", img.path.display());
+    let (code, out) = run_capture(&img, Duration::from_secs(90), |_| {})?;
+    find_in_order(
+        &out,
+        &[
+            "[cm] system slot B refused: its signature does not verify",
+            "[cm] system slot A refused: older than the rollback floor",
+            "[cm] no system slot to boot",
+        ],
+    )
+    .map_err(|step| format!("A/B boot 5: missing (in order) {step:?}"))?;
+    if out.contains("[cm] booting system slot") || code.is_none() || code == Some(QEMU_PASS) {
+        return Err(format!("A/B boot 5: something booted, or QEMU exit {code:?}"));
+    }
+    println!("A/B test passed");
+    Ok(())
 }
 
 /// Verified boot: boots `boot/test.manifest` signed properly and checks

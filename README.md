@@ -903,6 +903,24 @@ holds the rest):
   verified-boot-test` boots a properly signed bundle on both ISAs, checking the
   kernel's measurement against one computed on the host, then the four bad ones,
   each of which must be refused.
+- A/B system updates (`superior_objects::ab`). With `system <service>` in its
+  manifest, the boot bundle (the one the kernel verifies) holds only the drivers
+  that reach the system disk, and its `trust.key`. The Component Manager then
+  reads the boot record from that disk, chooses slot A or B, checks the signed
+  system bundle in it against the key and the record's rollback floor, and starts
+  the components its manifest names, after the boot ones (they may use their
+  services). An `update-control` component asks the manager which slot is
+  running, confirms the system came up, and asks for the free slot to write an
+  update into and has it checked, streamed from the disk through the Ed25519
+  verifier a page at a time, then staged with one try. The next boot tries it; if
+  it confirms, its slot becomes the active one and its version the rollback
+  floor; if not, the boot after falls back to the other slot and drops it. `cargo
+  xtask ab-test` boots one disk five times on both ISAs: a fresh disk boots
+  version 2 from slot A, refuses an update changed after signing and stages
+  version 3; version 3 boots and never confirms; slot A again, staging version
+  4; version 4 boots and confirms, raising the floor, and version 2 may not be
+  staged again; with slot B damaged nothing boots, as slot A is now older than the
+  floor.
 - Interrupt and exception entries clear the direction flag. User code may be
   interrupted mid-way through a backward copy, with the flag set; the kernel's own
   copies need it clear, and without the `cld` they ran backwards, wrecking saved
@@ -967,9 +985,10 @@ handling in drivers other than virtio-blk and in the servers above them, and a
 timeout on a component that never answers `SUSPEND`; in verified boot the
 firmware's part (the bootloader and kernel checked by UEFI Secure Boot, or on
 AArch64 by the firmware), measurements extended into a TPM and attestation,
-the bundle in A/B slots on disk apart from the kernel, a rollback counter kept
-in tamper-resistant storage (today the oldest version is built into the
-kernel), signed app packages and release keys kept off the build machine; the IDL describing interfaces other than the bus server's; escalating a component
+the boot bundle itself in A/B slots (it is built into the kernel image), a
+rollback counter kept in tamper-resistant storage (the floor is on the system
+disk, and the kernel's oldest version built into it), a boot record written
+atomically (two copies), an updater that downloads, signed app packages and release keys kept off the build machine; the IDL describing interfaces other than the bus server's; escalating a component
 given up on to a supervisor above it (today the
 manager is the only one), memory budgets from a policy service (Phase 3), sizing the Memory Server's CSpace
 from the RAM it gets (its manifest names the size, 2^17 slots on the test machines), page tables for boot processes paid for from user memory,
@@ -1046,6 +1065,7 @@ cargo xtask keyboard-test  # just the USB keyboard test (add aarch64 for that IS
 cargo xtask hotplug-test   # just the PCI hot-plug test (add aarch64 for that ISA)
 cargo xtask suspend-test   # suspend to idle twice around the virtio-blk driver, then read the disk (add aarch64 for that ISA)
 cargo xtask verified-boot-test  # a signed boot bundle verified and measured; changed, foreign-key, unsigned and old ones refused
+cargo xtask ab-test        # A/B system slots: an update staged, tried, fallen back from, confirmed; rollbacks refused
 cargo xtask run            # boot the shell in QEMU (x86-64), its console on this terminal
 cargo xtask run aarch64    # the same on QEMU's AArch64 virt machine
 cargo xtask idl    # generate Rust from the interface descriptions in interfaces/

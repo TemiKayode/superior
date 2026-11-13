@@ -1,0 +1,12 @@
+# The A/B update test's system bundle (cargo xtask ab-test signs one per
+# version, with the client's role in place of 32: 32 in version 2, 33 in
+# version 3, 34 in version 4). It follows boot/ab.manifest, so it may use
+# the services the boot components provide.
+
+component client
+  image testclient
+  arg 32
+  uses block 0
+  untyped 15 2
+  control 3
+  update-control
