@@ -69,7 +69,7 @@ use core::sync::atomic::{AtomicU32, Ordering, fence};
 use superior_objects::abi::{CapTransfer, Error, ObjectType, Syscall, root};
 use superior_objects::idl::{display, window};
 use superior_objects::interfaces::fs::ring;
-use superior_objects::interfaces::{Status, block, dns, fs, input, install, mem, net, pci, power, update};
+use superior_objects::interfaces::{Status, block, dns, fs, input, install, mem, net, nic, pci, power, update};
 use superior_sys::{Called, USER_BASE, call_retry, print_line, syscall, syscall_x};
 
 const ECHO: u64 = 0;
@@ -4109,6 +4109,138 @@ const WORDS: u64 = 10;
 const TYPING_TICKS: u64 = 1500;
 const TYPING_LIMIT: u64 = 9000;
 
+// ---- the Wi-Fi client (`arg 41`, boot/wifi.manifest) ----
+
+/// The radio's `nic` endpoint, to tell it which network to join.
+const RADIO: u64 = 5;
+/// The network the test harness's access point runs.
+const WIFI_SSID: &[u8] = b"superior-test";
+const WIFI_PASSPHRASE: &[u8] = b"correct horse battery staple";
+/// Ticks to wait for the link to come up.
+const LINK_TICKS: u64 = 3000;
+const WIFI_PINGS: u64 = 10;
+const WIFI_ECHOES: u64 = 40;
+
+/// Asks the radio to join `ssid` with `pass`: the reply's status.
+fn wifi_join(ssid: &[u8], pass: &[u8]) -> u64 {
+    let page = net_page();
+    page[..ssid.len()].copy_from_slice(ssid);
+    page[ssid.len()..ssid.len() + pass.len()].copy_from_slice(pass);
+    let x = CapTransfer {
+        grant: Some(NET_PAGE as u16),
+        accept: None,
+    };
+    let r = syscall_x(Syscall::Call, RADIO, [nic::JOIN, ssid.len() as u64, pass.len() as u64, 0], x);
+    if r.status == 0 { r.msg[0] } else { u64::MAX }
+}
+
+fn wifi_client() -> ! {
+    let mut t = Checks(0, "wifi");
+    let made = syscall(Syscall::Retype, NET_MEMORY, [ObjectType::Frame as u64, 0, NET_PAGE, 0]);
+    let mapped = syscall(Syscall::FrameMap, NET_PAGE, [NET_PAGE_VA, 1, 0, 0]);
+    t.check(made.status == 0 && mapped.status == 0, format_args!("a page of its own"));
+    let link = || syscall(Syscall::Call, RADIO, [nic::LINK, 0, 0, 0]).msg;
+    let before = link();
+    t.check(
+        before[0] == OK && before[1] == nic::link::IDLE,
+        format_args!("the radio starts with no network (link {})", before[1]),
+    );
+    t.check(
+        wifi_join(WIFI_SSID, b"short") == Status::Invalid as u64,
+        format_args!("a passphrase under 8 characters is refused"),
+    );
+    t.check(
+        wifi_join(WIFI_SSID, WIFI_PASSPHRASE) == OK,
+        format_args!("the radio is told to join \"superior-test\""),
+    );
+    let start = ticks();
+    let mut l = link();
+    while l[1] != nic::link::UP && ticks() < start + LINK_TICKS {
+        superior_sys::sleep(5);
+        l = link();
+    }
+    let b = l[2].to_be_bytes();
+    t.check(
+        l[0] == OK && l[1] == nic::link::UP,
+        format_args!(
+            "joined and keyed in {} ms: BSSID {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+            (ticks() - start) * 10,
+            b[2], b[3], b[4], b[5], b[6], b[7]
+        ),
+    );
+    // The network server sees an ordinary card: DHCP over the link.
+    let ask = |op: u64| {
+        let start = ticks();
+        loop {
+            let r = syscall(Syscall::Call, NET, [op, net::VERSION, 0, 0]);
+            if r.status == 0 && r.msg[0] == OK {
+                return Some(r.msg);
+            }
+            if ticks() > start + LEASE_TICKS {
+                return None;
+            }
+            superior_sys::sleep(1);
+        }
+    };
+    let info = ask(net::INFO).unwrap_or([0; 4]);
+    let lease = ask(net::LEASE).unwrap_or([0; 4]);
+    t.check(
+        info[1] != 0 && info[3] != 0 && lease[1] != 0,
+        format_args!(
+            "leased {} (netmask /{}) over Wi-Fi, the gateway {}",
+            Dotted(info[1]),
+            (lease[1] as u32).count_ones(),
+            Dotted(info[3])
+        ),
+    );
+    let gw = info[3];
+    let mut answered = 0;
+    if let Some(mut s) = Sock::new(false) {
+        for seq in 0..WIFI_PINGS {
+            let to = gw | seq;
+            answered += s.exchange(
+                to,
+                56,
+                |b| {
+                    for (j, x) in b[..56].iter_mut().enumerate() {
+                        *x = echo_byte(seq, j as u64);
+                    }
+                },
+                |len, b, from| from == to && len == 56 && b.iter().enumerate().all(|(j, &x)| x == echo_byte(seq, j as u64)),
+            ) as u64;
+        }
+    }
+    t.check(
+        answered == WIFI_PINGS,
+        format_args!("{answered} of {WIFI_PINGS} pings to the gateway answered, every byte right"),
+    );
+    let (mut echoed, mut fragmented) = (0, 0);
+    if let Some(mut s) = Sock::new(true) {
+        let to = gw | ECHO_PORT as u64;
+        for k in 0..WIFI_ECHOES {
+            let len = echo_len(k);
+            let ok = s.exchange(
+                to,
+                len,
+                |b| {
+                    for j in 0..len {
+                        b[j as usize] = echo_at(k, j);
+                    }
+                },
+                |n, b, from| from == to && n == len && b.iter().enumerate().all(|(j, &x)| x == echo_at(k, j as u64)),
+            );
+            echoed += ok as u64;
+            fragmented += (ok && len > 1472) as u64;
+        }
+    }
+    t.check(
+        echoed == WIFI_ECHOES && fragmented > 0,
+        format_args!("{echoed} of {WIFI_ECHOES} UDP datagrams echoed by the gateway, every byte right ({fragmented} of them in fragments)"),
+    );
+    syscall(Syscall::Call, NET_CONTROL, [OP_SHUTDOWN, t.0, 0, 0]);
+    superior_sys::park()
+}
+
 fn subscribe() -> bool {
     for _ in 0..2000 {
         syscall(Syscall::CapDelete, INPUT_NTFN, [0; 4]);
@@ -5584,6 +5716,7 @@ pub extern "C" fn _start(role: u64) -> ! {
         38 => styled_second(),
         39 => toolkit_watcher(),
         40 => panel_watcher(),
+        41 => wifi_client(),
         _ => probe(),
     }
 }

@@ -230,3 +230,173 @@ fn ccmp_frames_round_trip_and_refuse_forgery_and_replay() {
     assert_eq!(ccmp::open(&[0x3d; 16], &mut other_key[..n], None).err(), Some(Refused::Forged));
     assert_eq!(ccmp::open(&tk, &mut replayed[..n], Some(7)).err(), Some(Refused::Replayed));
 }
+
+mod air {
+    //! A station and an access point on one simulated channel.
+
+    use crate::ap::{AccessPoint, Peer};
+    use crate::handshake::Gtk;
+    use crate::station::{Link, Station};
+    extern crate std;
+    use std::vec::Vec;
+
+    pub const STA: [u8; 6] = [0x52, 0x54, 0, 0x12, 0x34, 0x56];
+    pub const BSSID: [u8; 6] = [0x02, 0x57, 0x49, 0x46, 0x49, 0x01];
+
+    pub struct Air {
+        pub sta: Station,
+        pub ap: AccessPoint,
+        pub to_ap: Vec<Vec<u8>>,
+        pub to_sta: Vec<Vec<u8>>,
+        pub sta_up: Vec<Vec<u8>>,
+        pub ap_up: Vec<Vec<u8>>,
+        pub now: u64,
+        /// Whether to lose every other frame to the access point.
+        pub lossy: bool,
+        lost: bool,
+    }
+
+    impl Air {
+        pub fn new(ap_pass: &[u8]) -> Air {
+            let gtk = Gtk { index: 1, key: [0x47; 16] };
+            Air {
+                sta: Station::new(STA),
+                ap: AccessPoint::new(BSSID, b"superior", ap_pass, gtk, [9; 32]),
+                to_ap: Vec::new(),
+                to_sta: Vec::new(),
+                sta_up: Vec::new(),
+                ap_up: Vec::new(),
+                now: 0,
+                lossy: false,
+                lost: false,
+            }
+        }
+
+        /// Runs the channel for `ms` milliseconds, 10 at a time.
+        pub fn run(&mut self, ms: u64) {
+            for _ in 0..ms / 10 {
+                self.now += 10;
+                let mut out = Vec::new();
+                self.sta.poll(self.now, &mut |f| out.push(f.to_vec()));
+                self.ap.poll(self.now, &mut |f| self.to_sta.push(f.to_vec()));
+                self.to_ap.extend(out);
+                for f in core::mem::take(&mut self.to_ap) {
+                    if self.lossy {
+                        self.lost = !self.lost;
+                        if self.lost {
+                            continue;
+                        }
+                    }
+                    let (mut back, mut up) = (Vec::new(), Vec::new());
+                    self.ap.receive(&f, self.now, &mut |r| back.push(r.to_vec()), &mut |e| up.push(e.to_vec()));
+                    self.to_sta.extend(back);
+                    self.ap_up.extend(up);
+                }
+                for f in core::mem::take(&mut self.to_sta) {
+                    let (mut back, mut up) = (Vec::new(), Vec::new());
+                    self.sta.receive(&f, self.now, &mut |r| back.push(r.to_vec()), &mut |e| up.push(e.to_vec()));
+                    self.to_ap.extend(back);
+                    self.sta_up.extend(up);
+                }
+            }
+        }
+
+        pub fn joined(&self) -> bool {
+            self.sta.link() == Link::Up && self.ap.peer() == Peer::Up
+        }
+    }
+}
+
+fn ethernet_frame(da: [u8; 6], sa: [u8; 6], payload: &[u8]) -> ([u8; 1514], usize) {
+    let mut e = [0u8; 1514];
+    let n = crate::frame::to_ethernet(&mut e, &da, &sa, 0x0800, payload).unwrap();
+    (e, n)
+}
+
+#[test]
+fn a_station_finds_joins_and_carries_frames_both_ways() {
+    use crate::station::Link;
+    let mut air = air::Air::new(b"correct horse");
+    assert_eq!(air.sta.link(), Link::Idle);
+    assert!(air.sta.join(b"superior", b"correct horse", [7; 32], 0));
+    air.run(200);
+    assert!(air.joined(), "joined in 200 ms: {:?} / {:?}", air.sta.link(), air.ap.peer());
+    assert_eq!(air.sta.bssid(), air::BSSID);
+    // Up: the station's frame reaches the access point, sealed.
+    let (e, n) = ethernet_frame(air::BSSID, air::STA, b"to the gateway");
+    let mut f = [0u8; crate::frame::MAX];
+    let len = air.sta.send(&e[..n], &mut f).unwrap();
+    assert!(!f[..len].windows(14).any(|w| w == b"to the gateway"), "sealed");
+    air.to_ap.push(f[..len].to_vec());
+    // And the access point's, one to the station and one broadcast (the
+    // group key's).
+    for da in [air::STA, [0xff; 6]] {
+        let (e, n) = ethernet_frame(da, air::BSSID, b"from the gateway");
+        let len = air.ap.send(&e[..n], &mut f).unwrap();
+        air.to_sta.push(f[..len].to_vec());
+    }
+    air.run(10);
+    assert_eq!(air.ap_up.len(), 1);
+    assert_eq!(&air.ap_up[0][..], &e[..n]);
+    assert_eq!(air.sta_up.len(), 2);
+    assert_eq!(&air.sta_up[0][14..], b"from the gateway");
+    assert_eq!(&air.sta_up[1][..6], &[0xff; 6]);
+    // The same frame again is a replay.
+    let replay = air.to_sta.len();
+    let (e, n) = ethernet_frame(air::STA, air::BSSID, b"once");
+    let len = air.ap.send(&e[..n], &mut f).unwrap();
+    air.to_sta.push(f[..len].to_vec());
+    air.to_sta.push(f[..len].to_vec());
+    air.run(10);
+    assert_eq!(replay, 0);
+    assert_eq!(air.sta_up.len(), 3, "taken once");
+    assert_eq!(air.sta.refused, 1);
+}
+
+#[test]
+fn joining_survives_losing_every_other_frame() {
+    let mut air = air::Air::new(b"correct horse");
+    air.lossy = true;
+    air.sta.join(b"superior", b"correct horse", [7; 32], 0);
+    air.run(10_000);
+    assert!(air.joined(), "{:?} / {:?}", air.sta.link(), air.ap.peer());
+}
+
+#[test]
+fn a_wrong_passphrase_never_brings_the_link_up() {
+    use crate::station::Link;
+    let mut air = air::Air::new(b"another horse");
+    air.sta.join(b"superior", b"correct horse", [7; 32], 0);
+    air.run(10_000);
+    assert_ne!(air.sta.link(), Link::Up);
+    assert!(air.ap.refused > 0, "message 2's MIC refused");
+    let (e, n) = ethernet_frame(air::BSSID, air::STA, b"x");
+    assert_eq!(air.sta.send(&e[..n], &mut [0u8; 128]), None, "nothing goes out unkeyed");
+}
+
+#[test]
+fn another_ssid_is_not_joined() {
+    use crate::station::Link;
+    let mut air = air::Air::new(b"correct horse");
+    air.sta.join(b"elsewhere", b"correct horse", [7; 32], 0);
+    air.run(2000);
+    assert_eq!(air.sta.link(), Link::Scanning);
+    assert!(!air.sta.join(b"superior", b"short", [7; 32], 0), "a passphrase under 8 characters");
+}
+
+#[test]
+fn a_message_3_sent_again_is_answered_but_its_keys_not_reinstalled() {
+    let (mut ap, mut sta) = pair(b"correct horse");
+    let m2 = sta.receive(ap.start().bytes()).unwrap();
+    let m3 = ap.receive(m2.bytes()).unwrap().unwrap();
+    let _lost_m4 = sta.receive(m3.bytes()).unwrap();
+    let keys = sta.keys();
+    let again = ap.retry().expect("message 3 again");
+    let m4 = sta.receive(again.bytes()).unwrap();
+    assert_eq!(sta.keys(), keys);
+    assert!(matches!(ap.receive(m4.bytes()), Ok(None)));
+    assert!(ap.tk().is_some());
+    assert!(ap.retry().is_none(), "nothing to send once done");
+    // And no new handshake over keys in use.
+    assert_eq!(sta.receive(ap.start().bytes()).err(), Some(Error::State));
+}

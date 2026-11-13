@@ -217,6 +217,25 @@ pub mod nic {
     /// and sends what the caller puts there. The reply grants the
     /// doorbell (Write). It belongs to the driver: a restart destroys it.
     pub const RING_START: u64 = 6;
+    /// `[JOIN, ssid_len, passphrase_len]` with a page lent holding the
+    /// SSID (1 to 32 bytes) and then the passphrase (8 to 63 printable
+    /// characters): a radio joins that WPA2-Personal network, and goes on
+    /// joining it (scanning again whenever it loses it). Reply `[status]`:
+    /// `Invalid` if either is out of range, `NotFound` from a wired card.
+    /// A restarted radio has forgotten the network.
+    pub const JOIN: u64 = 7;
+    /// `[LINK]`: reply `[status, link, BSSID (as INFO gives a MAC), 0]`,
+    /// `link` one of [`link`]'s. A wired card is always [`link::UP`].
+    pub const LINK: u64 = 8;
+    /// Where a radio's joining has got to.
+    pub mod link {
+        pub const IDLE: u64 = 0;
+        pub const SCANNING: u64 = 1;
+        pub const AUTHENTICATING: u64 = 2;
+        pub const ASSOCIATING: u64 = 3;
+        pub const KEYING: u64 = 4;
+        pub const UP: u64 = 5;
+    }
 
     /// Frame rings (spec section 3, tier 2): received frames one way and
     /// frames to send the other, in pages shared by the driver and its

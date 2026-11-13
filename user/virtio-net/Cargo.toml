@@ -16,3 +16,4 @@ bench = false
 superior-objects = { path = "../../crates/objects" }
 superior-sys = { path = "../../crates/sys" }
 superior-driver = { path = "../../crates/driver" }
+superior-wifi = { path = "../../crates/wifi" }

@@ -1,0 +1,55 @@
+# The Wi-Fi test (cargo xtask wifi-test).
+#
+# QEMU has no Wi-Fi card: the virtio-net device stands in for a radio
+# (arg 1), its frames raw 802.11 frames that QEMU passes over UDP to the
+# test harness, which plays a WPA2-Personal access point with a small
+# network behind it (DHCP, a gateway that answers pings and echoes UDP).
+# The driver hosts the station and serves the nic interface to the network
+# server as any card would. The client tells the radio which network to
+# join, waits for the link, then pings the gateway and has it echo UDP
+# datagrams, some in fragments, all through CCMP.
+
+component pcibus
+  image pcibus
+  priority 12
+  # 2^7 slots: an ECAM page for each of 32 functions, BAR pages, domains.
+  cspace 7
+  provides pci 0
+  device pci-config 1
+  device pci-mmio 2
+  # Ports for I/O BARs.
+  device pci-io 84
+  device msi 3
+  device iommu 11
+  untyped 18 12
+
+component virtio-net
+  image virtio-net
+  # A radio: the frames are 802.11's, and a station runs in the driver.
+  arg 1
+  priority 11
+  uses pci 0
+  provides nic 1
+  notification 2
+  untyped 16 3
+
+component net
+  image net
+  priority 10
+  uses nic 0
+  provides net 1
+  memory 22
+  untyped 21 2
+  state 17
+  shared 13 18
+  cspace 9
+
+component client
+  image testclient
+  arg 41
+  priority 8
+  uses net 0
+  # The radio, to tell it which network to join.
+  uses nic 5
+  control 1
+  untyped 12 2

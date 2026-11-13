@@ -271,7 +271,11 @@ impl Supplicant {
             return Err(Error::State);
         }
         if k.info & MIC == 0 {
-            // Message 1: a nonce, unsigned. A new one starts over.
+            // Message 1: a nonce, unsigned. A new one starts over, until
+            // keys are installed (rekeying is not done).
+            if self.step == Step::Done {
+                return Err(Error::State);
+            }
             let ptk = ptk(&self.pmk, &self.aa, &self.spa, &k.nonce, &self.snonce);
             self.anonce = k.nonce;
             self.ptk = Some(ptk);
@@ -280,9 +284,12 @@ impl Supplicant {
             let info = VERSION_2 | PAIRWISE | MIC;
             return Ok(Frame::build(info, 0, k.replay, &self.snonce, self.own.get()).sign(&ptk.kck));
         }
-        // Message 3: signed, installing, with the group key encrypted.
+        // Message 3: signed, installing, with the group key encrypted. One
+        // sent again (message 4 was lost) is answered again, but its keys
+        // are not installed again: that would start the packet numbers
+        // over, letting frames already sent be replayed.
         let ptk = self.ptk.ok_or(Error::State)?;
-        if self.step != Step::Keyed || k.info & (INSTALL | SECURE | ENCRYPTED) != INSTALL | SECURE | ENCRYPTED {
+        if self.step == Step::Start || k.info & (INSTALL | SECURE | ENCRYPTED) != INSTALL | SECURE | ENCRYPTED {
             return Err(Error::State);
         }
         if !mic_ok(f, &ptk.kck) {
@@ -312,8 +319,10 @@ impl Supplicant {
         }
         let gtk = gtk.ok_or(Error::KeyData)?;
         self.replay = Some(k.replay);
-        self.keys = Some(Keys { tk: ptk.tk, gtk });
-        self.step = Step::Done;
+        if self.step != Step::Done {
+            self.keys = Some(Keys { tk: ptk.tk, gtk });
+            self.step = Step::Done;
+        }
         Ok(Frame::build(VERSION_2 | PAIRWISE | MIC | SECURE, 0, k.replay, &[0; 32], &[]).sign(&ptk.kck))
     }
 
@@ -351,6 +360,39 @@ impl Authenticator {
         Frame::build(VERSION_2 | PAIRWISE | ACK, 16, self.replay, &self.anonce, &[])
     }
 
+    /// What to send when the station has not answered: message 1 again
+    /// before message 2 came, message 3 again (with a higher replay
+    /// counter) before message 4 came; nothing once done.
+    pub fn retry(&mut self) -> Option<Frame> {
+        match (self.step, self.ptk) {
+            (Step::Start, _) => Some(self.start()),
+            (Step::Keyed, Some(ptk)) => Some(self.message3(&ptk)),
+            _ => None,
+        }
+    }
+
+    /// Message 3, with the next replay counter.
+    fn message3(&mut self, ptk: &Ptk) -> Frame {
+        self.replay += 1;
+        // Key data: our RSN element and the GTK KDE, padded (0xdd then
+        // zeros) to a multiple of 8, then wrapped.
+        let mut plain = [0u8; MAX_KEY_DATA - 8];
+        let mut n = self.rsne.n;
+        plain[..n].copy_from_slice(self.rsne.get());
+        let kde = [0xdd, 22, 0x00, 0x0f, 0xac, 1, self.gtk.index & 3, 0];
+        plain[n..n + 8].copy_from_slice(&kde);
+        plain[n + 8..n + 24].copy_from_slice(&self.gtk.key);
+        n += 24;
+        if n % 8 != 0 {
+            plain[n] = 0xdd;
+            n = n.next_multiple_of(8);
+        }
+        let mut wrapped = [0u8; MAX_KEY_DATA];
+        key_wrap(&ptk.kek, &plain[..n], &mut wrapped);
+        let info = VERSION_2 | PAIRWISE | INSTALL | ACK | MIC | SECURE | ENCRYPTED;
+        Frame::build(info, 16, self.replay, &self.anonce, &wrapped[..n + 8]).sign(&ptk.kck)
+    }
+
     /// Takes a frame from the station: message 2 is answered with message
     /// 3; message 4 finishes (no answer).
     pub fn receive(&mut self, f: &[u8]) -> Result<Option<Frame>, Error> {
@@ -372,24 +414,7 @@ impl Authenticator {
                 }
                 self.ptk = Some(ptk);
                 self.step = Step::Keyed;
-                self.replay += 1;
-                // Key data: our RSN element and the GTK KDE, padded (0xdd
-                // then zeros) to a multiple of 8, then wrapped.
-                let mut plain = [0u8; MAX_KEY_DATA - 8];
-                let mut n = self.rsne.n;
-                plain[..n].copy_from_slice(self.rsne.get());
-                let kde = [0xdd, 22, 0x00, 0x0f, 0xac, 1, self.gtk.index & 3, 0];
-                plain[n..n + 8].copy_from_slice(&kde);
-                plain[n + 8..n + 24].copy_from_slice(&self.gtk.key);
-                n += 24;
-                if n % 8 != 0 {
-                    plain[n] = 0xdd;
-                    n = n.next_multiple_of(8);
-                }
-                let mut wrapped = [0u8; MAX_KEY_DATA];
-                key_wrap(&ptk.kek, &plain[..n], &mut wrapped);
-                let info = VERSION_2 | PAIRWISE | INSTALL | ACK | MIC | SECURE | ENCRYPTED;
-                Ok(Some(Frame::build(info, 16, self.replay, &self.anonce, &wrapped[..n + 8]).sign(&ptk.kck)))
+                Ok(Some(self.message3(&ptk)))
             }
             Step::Keyed => {
                 let ptk = self.ptk.ok_or(Error::State)?;

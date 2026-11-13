@@ -854,6 +854,7 @@ dependencies = [
  "superior-driver",
  "superior-objects",
  "superior-sys",
+ "superior-wifi",
 ]
 
 [[package]]
@@ -1084,6 +1085,7 @@ dependencies = [
  "superior-idl",
  "superior-objects",
  "superior-toolkit",
+ "superior-wifi",
 ]
 
 [[package]]

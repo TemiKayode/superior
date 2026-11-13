@@ -33,6 +33,17 @@
 //! answering the interrupt and the doorbell, one serving calls, with the
 //! `Recv` that waits for both as the executor's idle step.
 //!
+//! Radio mode (the manifest's `arg 1`): the device is a simulated Wi-Fi
+//! radio, its frames raw 802.11 frames (QEMU passes them to the test
+//! harness, which plays the access point). The driver hosts a station
+//! (`superior_wifi::station`): `JOIN` gives it a WPA2-Personal network,
+//! which it finds, joins and keys; the frames it receives go to the
+//! station, which hands back Ethernet frames for the caller and 802.11
+//! frames for the radio; the caller's Ethernet frames go out sealed, and
+//! are dropped while the link is down. To the network server it is a
+//! network card like any other. A timer (a badged copy of the driver's
+//! notification) wakes it when the station has a step to try again.
+//!
 //! Slots: 0 the bus server, 1 the `nic` endpoint (receive), 2 a
 //! notification, 3 untyped memory (64 KiB).
 
@@ -47,10 +58,12 @@ use superior_driver::pool::Pool;
 use superior_driver::virtq::{self, Queue};
 use superior_driver::{DmaPage, Failure, Mmio, Pci, dma_barrier};
 
-use superior_objects::abi::{CapTransfer, Error, Syscall};
-use superior_objects::interfaces::nic::ring;
+use superior_objects::abi::{CapTransfer, Error, Syscall, TICK_HZ};
+use superior_objects::interfaces::nic::{link, ring};
 use superior_objects::interfaces::{Status, nic};
-use superior_sys::{USER_BASE, print_line, syscall, syscall_x};
+use superior_sys::{USER_BASE, print_line, syscall, syscall_x, ticks};
+use superior_wifi::sha1::Sha1;
+use superior_wifi::station::{Link, Station};
 
 const PCI: u64 = 0;
 const SERVICE: u64 = 1;
@@ -78,6 +91,9 @@ const WRITE: u64 = 2;
 const MAX_BAR_PAGES: u64 = 16;
 /// Every right, for keeping a granted capability.
 const ALL: u64 = 0x1f;
+/// The station's timer: this driver's notification, badged.
+const TIMER: u64 = 19;
+const TIMER_BADGE: u64 = 4;
 
 const BAR_VA: u64 = USER_BASE + 0x4000_0000;
 const DMA_VA: u64 = USER_BASE + 0x5000_0000;
@@ -151,6 +167,102 @@ struct Nic {
     tx_head: u32,
     /// Frames that went through the rings (of `sent` and `received`).
     by_ring: u64,
+    /// Radio mode's station (taken out while it runs), and the link it
+    /// last reported.
+    station: Option<Station>,
+    radio: bool,
+    shown: Link,
+}
+
+/// Ethernet frames the station has delivered, waiting for the caller
+/// (radio mode). Frames beyond its room are dropped, as a full device
+/// would.
+const UP_SLOTS: usize = 8;
+
+struct Up {
+    frames: [[u8; nic::MAX_FRAME as usize]; UP_SLOTS],
+    len: [usize; UP_SLOTS],
+    head: usize,
+    tail: usize,
+}
+
+impl Up {
+    fn push(&mut self, f: &[u8]) {
+        if self.tail - self.head == UP_SLOTS || f.len() > nic::MAX_FRAME as usize {
+            return;
+        }
+        let i = self.tail % UP_SLOTS;
+        self.frames[i][..f.len()].copy_from_slice(f);
+        self.len[i] = f.len();
+        self.tail += 1;
+    }
+
+    fn front(&self) -> Option<&[u8]> {
+        let i = self.head % UP_SLOTS;
+        (self.head != self.tail).then(|| &self.frames[i][..self.len[i]])
+    }
+
+    fn pop(&mut self) {
+        if self.head != self.tail {
+            self.head += 1;
+        }
+    }
+}
+
+struct UpCell(core::cell::UnsafeCell<Up>);
+// SAFETY: the driver has one thread.
+unsafe impl Sync for UpCell {}
+static UP: UpCell = UpCell(core::cell::UnsafeCell::new(Up {
+    frames: [[0; nic::MAX_FRAME as usize]; UP_SLOTS],
+    len: [0; UP_SLOTS],
+    head: 0,
+    tail: 0,
+}));
+
+fn up() -> &'static mut Up {
+    // SAFETY: one thread, and no caller keeps the reference across
+    // another call of `up`.
+    unsafe { &mut *UP.0.get() }
+}
+
+/// 802.11 frames the station hands back while it runs, sent after it.
+struct Outbox {
+    frames: [[u8; 512]; 4],
+    len: [usize; 4],
+    n: usize,
+}
+
+impl Outbox {
+    fn new() -> Self {
+        Outbox { frames: [[0; 512]; 4], len: [0; 4], n: 0 }
+    }
+
+    fn push(&mut self, f: &[u8]) {
+        if self.n < 4 && f.len() <= 512 {
+            self.frames[self.n][..f.len()].copy_from_slice(f);
+            self.len[self.n] = f.len();
+            self.n += 1;
+        }
+    }
+}
+
+/// The time the station counts in: milliseconds since boot.
+fn now_ms() -> u64 {
+    ticks() * 1000 / TICK_HZ
+}
+
+/// A cycle counter, for the station's seed.
+fn cycles() -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: rdtsc reads the time-stamp counter, nothing else.
+    return unsafe { core::arch::x86_64::_rdtsc() };
+    #[cfg(target_arch = "aarch64")]
+    {
+        let v: u64;
+        // SAFETY: reads the virtual counter, which EL0 may.
+        unsafe { core::arch::asm!("mrs {}, cntvct_el0", out(reg) v) };
+        v
+    }
 }
 
 /// Word `off` of the ring's header page.
@@ -199,7 +311,7 @@ fn buffers(slot: u64, va: u64) -> Result<Buffers, Failure> {
     Pool::new(UNTYPED, slot, va, DOMAIN, BUFFER)
 }
 
-fn start() -> Result<Nic, Failure> {
+fn start(radio: bool) -> Result<Nic, Failure> {
     let pci = Pci { slot: PCI };
     let (bdf, _) = pci.open(0x1af4, 0x1041, 0, DOMAIN)?;
     let mut bars = Bars {
@@ -311,7 +423,17 @@ fn start() -> Result<Nic, Failure> {
         rx_tail: 0,
         tx_head: 0,
         by_ring: 0,
+        station: None,
+        radio,
+        shown: Link::Idle,
     };
+    if radio {
+        let mac = nic.mac.to_be_bytes();
+        nic.station = Some(Station::new(mac[2..].try_into().unwrap()));
+        if syscall(Syscall::CapMint, NOTIFY, [TIMER, WRITE, TIMER_BADGE, 0]).status != 0 {
+            return Err(("making the station's timer", 0));
+        }
+    }
     // Sent frames are reaped when a buffer is wanted: no interrupts for
     // them unless frames wait for one (`Nic::before_sleep`).
     nic.tx.interrupts(false);
@@ -329,7 +451,8 @@ fn start() -> Result<Nic, Failure> {
     }
     let m = nic.mac;
     say!(
-        "ready: {:02x}:{:02x}.{}, MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}, interrupts on MSI-X vector 0 (message data {data:#x})",
+        "ready{}: {:02x}:{:02x}.{}, MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}, interrupts on MSI-X vector 0 (message data {data:#x})",
+        if radio { " as a Wi-Fi radio" } else { "" },
         bdf >> 8,
         bdf >> 3 & 0x1f,
         bdf & 7,
@@ -362,6 +485,20 @@ impl Nic {
 
     fn recv(&mut self) -> [u64; 4] {
         let attached = self.attached as u64;
+        if self.radio && !self.ring {
+            self.radio_rx();
+            let Some(f) = up().front() else {
+                return [Status::Empty as u64, 0, attached, 0];
+            };
+            if !self.map_lent(true) {
+                return [Status::Invalid as u64, 0, attached, 0];
+            }
+            // SAFETY: the lent page is mapped; a frame fits in it.
+            unsafe { core::ptr::copy_nonoverlapping(f.as_ptr(), LENT_VA as *mut u8, f.len()) };
+            let len = f.len() as u64;
+            up().pop();
+            return [Status::Ok as u64, len, attached, 0];
+        }
         if self.ring {
             // Frames go to the ring, in order.
             self.pump_rx();
@@ -412,8 +549,145 @@ impl Nic {
             self.tx_buf.give(i);
             return Status::Invalid;
         }
-        self.transmit(i, LENT_VA, len);
+        if self.radio {
+            // SAFETY: the lent page is mapped and holds `len` bytes.
+            let eth = unsafe { core::slice::from_raw_parts(LENT_VA as *const u8, len as usize) };
+            self.seal_and_send(i, eth);
+        } else {
+            self.transmit(i, LENT_VA, len);
+        }
         Status::Ok
+    }
+
+    /// Radio mode: seals Ethernet frame `eth` for the station's access
+    /// point and sends it through free transmit buffer `i`, or drops it
+    /// while the link is down.
+    fn seal_and_send(&mut self, i: usize, eth: &[u8]) {
+        let mut out = [0u8; (BUFFER - HEADER) as usize];
+        match self.station.as_mut().and_then(|st| st.send(eth, &mut out)) {
+            Some(n) => self.transmit(i, out.as_ptr() as u64, n as u64),
+            None => {
+                self.tx_buf.give(i);
+            }
+        }
+    }
+
+    /// Radio mode: an 802.11 frame the station handed back, to the radio.
+    fn radio_send(&mut self, f: &[u8]) {
+        if let Some(i) = self.free_buffer() {
+            self.transmit(i, f.as_ptr() as u64, f.len() as u64);
+        }
+    }
+
+    /// Radio mode: every frame the device has received, through the
+    /// station; its Ethernet frames wait in `UP` for the caller.
+    fn radio_rx(&mut self) {
+        let Some(mut st) = self.station.take() else { return };
+        let now = now_ms();
+        while let Some((i, len)) = self.rx.take_used() {
+            let len = (len as u64).saturating_sub(HEADER).min(BUFFER - HEADER) as usize;
+            let mut out = Outbox::new();
+            if let Some(va) = self.rx_buf.buffer(i as usize).map(|b| b.va) {
+                // SAFETY: the buffer is mapped and holds `len` bytes after
+                // virtio's header; it goes back to the device only after.
+                let f = unsafe { core::slice::from_raw_parts((va + HEADER) as *const u8, len) };
+                st.receive(f, now, &mut |r| out.push(r), &mut |e| up().push(e));
+                self.received += 1;
+            }
+            self.offer(i);
+            for k in 0..out.n {
+                self.radio_send(&out.frames[k][..out.len[k]]);
+            }
+        }
+        self.station = Some(st);
+    }
+
+    /// Radio mode, each time round the loop: frames received go through
+    /// the station, a step due is taken, the timer is set for the next,
+    /// and a caller with no ring hears of frames for it.
+    fn radio_poll(&mut self) {
+        if !self.radio {
+            return;
+        }
+        self.radio_rx();
+        let Some(mut st) = self.station.take() else { return };
+        let now = now_ms();
+        let mut out = Outbox::new();
+        st.poll(now, &mut |r| out.push(r));
+        let deadline = st.deadline();
+        let (link, bssid) = (st.link(), st.bssid());
+        let mut ssid = [0u8; 32];
+        let n = st.ssid().len();
+        ssid[..n].copy_from_slice(st.ssid());
+        self.station = Some(st);
+        for k in 0..out.n {
+            self.radio_send(&out.frames[k][..out.len[k]]);
+        }
+        if let Some(d) = deadline {
+            let wait = (d.saturating_sub(now) * TICK_HZ).div_ceil(1000).max(1);
+            syscall(Syscall::TimerSignal, TIMER, [wait, 0, 0, 0]);
+        }
+        if !self.ring && self.attached && up().front().is_some() {
+            syscall(Syscall::Signal, LISTENER, [0; 4]);
+        }
+        if link != self.shown {
+            self.shown = link;
+            let name = core::str::from_utf8(&ssid[..n]).unwrap_or("?");
+            let b = bssid;
+            match link {
+                Link::Idle => {}
+                Link::Scanning => say!("wifi: scanning for \"{name}\""),
+                Link::Authenticating => say!(
+                    "wifi: found \"{name}\" at {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} (WPA2-PSK, CCMP); authenticating",
+                    b[0], b[1], b[2], b[3], b[4], b[5]
+                ),
+                Link::Associating => say!("wifi: associating"),
+                Link::Keying => say!("wifi: associated; 4-way handshake"),
+                Link::Up => say!("wifi: keyed, link up: frames sealed with CCMP"),
+            }
+        }
+    }
+
+    /// Radio mode `JOIN`: the SSID and passphrase from the lent page.
+    fn join(&mut self, ssid_len: u64, pass_len: u64) -> Status {
+        if !self.radio {
+            return Status::NotFound;
+        }
+        if ssid_len > 32 || pass_len > 63 || !self.map_lent(false) {
+            return Status::Invalid;
+        }
+        // SAFETY: the lent page is mapped; 95 bytes fit in it.
+        let b = unsafe { core::slice::from_raw_parts(LENT_VA as *const u8, (ssid_len + pass_len) as usize) };
+        let (ssid, pass) = b.split_at(ssid_len as usize);
+        // The nonces' seed, from the clocks: an entropy source is still
+        // to come.
+        let mut seed = [0u8; 32];
+        let mut h = Sha1::new();
+        h.update(&ticks().to_le_bytes());
+        h.update(&cycles().to_le_bytes());
+        h.update(&self.mac.to_le_bytes());
+        let a = h.finish();
+        let mut h = Sha1::new();
+        h.update(&a);
+        h.update(&cycles().to_le_bytes());
+        seed[..20].copy_from_slice(&a);
+        seed[20..].copy_from_slice(&h.finish()[..12]);
+        let now = now_ms();
+        match self.station.as_mut().map(|st| st.join(ssid, pass, seed, now)) {
+            Some(true) => {
+                // Said here: an answer may come before the loop next runs.
+                say!("wifi: scanning for \"{}\"", core::str::from_utf8(ssid).unwrap_or("?"));
+                self.shown = Link::Scanning;
+                Status::Ok
+            }
+            _ => Status::Invalid,
+        }
+    }
+
+    /// Received frames waiting for the caller: in radio mode the
+    /// station's, else the device's.
+    fn held(&self) -> bool {
+        if self.radio { up().front().is_some() } else { self.rx.has_used() }
     }
 
     /// Sends the `len` bytes (14 to `MAX_FRAME`) at `from` through free
@@ -506,7 +780,32 @@ impl Nic {
     /// ring, as many as it has room for, and tells a sleeping caller.
     fn pump_rx(&mut self) {
         let mut moved = false;
-        while self.ring {
+        if self.radio {
+            self.radio_rx();
+            while self.ring {
+                let head = hdr(ring::RX_HEAD).load(Ordering::Acquire);
+                if ring::waiting(head, self.rx_tail, ring::RX_SLOTS) == ring::RX_SLOTS {
+                    break;
+                }
+                let Some(f) = up().front() else { break };
+                let at = self.rx_tail % ring::RX_SLOTS;
+                // SAFETY: the ring's pages are mapped; a frame fits in a slot.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        f.as_ptr(),
+                        Self::slot(ring::RX_PAGE, self.rx_tail, ring::RX_SLOTS) as *mut u8,
+                        f.len(),
+                    );
+                }
+                hdr(ring::RX_LEN + 4 * at as usize).store(f.len() as u32, Ordering::Relaxed);
+                up().pop();
+                self.rx_tail = self.rx_tail.wrapping_add(1);
+                hdr(ring::RX_TAIL).store(self.rx_tail, Ordering::Release);
+                self.by_ring += 1;
+                moved = true;
+            }
+        }
+        while self.ring && !self.radio {
             let head = hdr(ring::RX_HEAD).load(Ordering::Acquire);
             if ring::waiting(head, self.rx_tail, ring::RX_SLOTS) == ring::RX_SLOTS {
                 // Full: the rest wait in the device's buffers
@@ -561,7 +860,14 @@ impl Nic {
             // Read once: the caller may change it at any time.
             let len = hdr(ring::TX_LEN + 4 * at as usize).load(Ordering::Relaxed) as u64;
             let from = Self::slot(ring::TX_PAGE, self.tx_head, ring::TX_SLOTS);
-            if (14..=nic::MAX_FRAME).contains(&len) {
+            if (14..=nic::MAX_FRAME).contains(&len) && self.radio {
+                // Copied out first: the caller may change the slot.
+                let mut eth = [0u8; nic::MAX_FRAME as usize];
+                // SAFETY: the slot is mapped and `len` fits in it.
+                unsafe { core::ptr::copy_nonoverlapping(from as *const u8, eth.as_mut_ptr(), len as usize) };
+                self.seal_and_send(i, &eth[..len as usize]);
+                self.by_ring += 1;
+            } else if (14..=nic::MAX_FRAME).contains(&len) {
                 self.transmit(i, from, len);
                 self.by_ring += 1;
             } else {
@@ -586,7 +892,7 @@ impl Nic {
             hdr(ring::DRIVER_SLEEPS).store(1, Ordering::SeqCst);
             // Frames still with the device were kept from a full ring:
             // the caller rings the doorbell once it has taken some.
-            let held = self.rx.has_used();
+            let held = self.held();
             hdr(ring::RX_STALLED).store(held as u32, Ordering::SeqCst);
             fence(Ordering::SeqCst);
             // With frames stuck behind a full device, its interrupt when
@@ -596,7 +902,7 @@ impl Nic {
             let to_send = ring::waiting(self.tx_head, tail, ring::TX_SLOTS) != 0;
             let head = hdr(ring::RX_HEAD).load(Ordering::Acquire);
             let room = ring::waiting(head, self.rx_tail, ring::RX_SLOTS) < ring::RX_SLOTS;
-            let more = (to_send && (!stuck || self.tx.has_used())) || (room && self.rx.has_used());
+            let more = (to_send && (!stuck || self.tx.has_used())) || (room && (self.held() || self.rx.has_used()));
             if !more {
                 break;
             }
@@ -611,7 +917,7 @@ impl Nic {
             nic::ATTACH if cap == Some(LISTENER as u16) => {
                 self.attached = true;
                 // Frames may already be waiting.
-                if self.rx.has_used() {
+                if self.held() {
                     syscall(Syscall::Signal, LISTENER, [0; 4]);
                 }
                 status(Status::Ok)
@@ -620,6 +926,14 @@ impl Nic {
             nic::SEND if lent => status(self.send(m[1])),
             nic::RING_ATTACH => status(self.ring_attach(m[1], lent)),
             nic::RING_START => status(self.ring_start()),
+            nic::JOIN if lent => status(self.join(m[1], m[2])),
+            nic::LINK => match &self.station {
+                Some(st) => {
+                    let b = st.bssid();
+                    [Status::Ok as u64, st.link().code(), b.iter().fold(0, |v, &x| v << 8 | x as u64), 0]
+                }
+                None => [Status::Ok as u64, link::UP, 0, 0],
+            },
             _ => status(Status::Invalid),
         }
     }
@@ -631,7 +945,9 @@ impl Nic {
         syscall(Syscall::IrqAck, MSI, [0; 4]);
         if self.ring {
             hdr(ring::DRIVER_SLEEPS).store(0, Ordering::SeqCst);
-        } else if self.attached && self.rx.has_used() {
+        } else if self.attached && !self.radio && self.rx.has_used() {
+            // (A radio's frames go through the station first:
+            // `radio_poll` tells the listener.)
             syscall(Syscall::Signal, LISTENER, [0; 4]);
         }
     }
@@ -642,8 +958,8 @@ const IRQ: u64 = 1;
 const CALL: u64 = 2;
 
 #[unsafe(no_mangle)]
-pub extern "C" fn _start(_: u64) -> ! {
-    let nic = match start() {
+pub extern "C" fn _start(arg: u64) -> ! {
+    let nic = match start(arg == 1) {
         Ok(n) => RefCell::new(n),
         Err((what, code)) => {
             say!("[fail] {what} ({code:#x})");
@@ -698,6 +1014,7 @@ pub extern "C" fn _start(_: u64) -> ! {
     // Nothing can run: send the reply that is due and wait for the next
     // call or interrupt.
     let idle = || {
+        nic.borrow_mut().radio_poll();
         nic.borrow_mut().before_sleep();
         let r = match reply.take() {
             Some((m, doorbell)) => {

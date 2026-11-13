@@ -1,0 +1,243 @@
+//! The Wi-Fi test's far end: a WPA2-Personal access point
+//! (`superior_wifi::ap`) on the UDP socket QEMU's simulated radio sends its
+//! 802.11 frames to, one frame a datagram, with a small network behind it:
+//! a gateway that answers ARP, hands out an address by DHCP (its answers
+//! broadcast, so they go under the group key), answers pings and echoes
+//! UDP datagrams, fragments included.
+
+use std::net::UdpSocket;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+use superior_wifi::ap::{AccessPoint, Peer};
+use superior_wifi::frame::MAX;
+use superior_wifi::handshake::Gtk;
+
+pub const SSID: &[u8] = b"superior-test";
+pub const PASSPHRASE: &[u8] = b"correct horse battery staple";
+pub const BSSID: [u8; 6] = [0x02, 0x57, 0x49, 0x46, 0x49, 0x01];
+/// The access point listens here; QEMU's radio sends from `RADIO_PORT`.
+pub const AP_PORT: u16 = 47110;
+pub const RADIO_PORT: u16 = 47111;
+/// The network behind the access point.
+const GATEWAY_MAC: [u8; 6] = [0x02, 0x00, 0x5e, 0x00, 0x05, 0x01];
+const GATEWAY: [u8; 4] = [10, 0, 5, 1];
+const LEASED: [u8; 4] = [10, 0, 5, 30];
+const ECHO_PORT: u16 = 47001;
+
+/// What the access point saw, for the test to check.
+#[derive(Default)]
+pub struct Seen {
+    /// The station was keyed (the handshake finished).
+    pub keyed: AtomicBool,
+    /// Ethernet frames carried each way, and DHCP answers sent.
+    pub from_station: AtomicU64,
+    pub to_station: AtomicU64,
+    pub dhcp: AtomicU64,
+    /// Frames the access point refused.
+    pub refused: AtomicU64,
+}
+
+/// Runs the access point until `stop`.
+pub fn start(stop: Arc<AtomicBool>, seen: Arc<Seen>) -> Result<JoinHandle<()>, String> {
+    let sock = UdpSocket::bind(("127.0.0.1", AP_PORT)).map_err(|e| format!("access point socket: {e}"))?;
+    sock.set_read_timeout(Some(Duration::from_millis(10))).map_err(|e| e.to_string())?;
+    let mut seed = [0u8; 32];
+    getrandom::getrandom(&mut seed).map_err(|e| e.to_string())?;
+    let mut gtk = Gtk { index: 1, key: [0; 16] };
+    getrandom::getrandom(&mut gtk.key).map_err(|e| e.to_string())?;
+    Ok(std::thread::spawn(move || {
+        let mut ap = AccessPoint::new(BSSID, SSID, PASSPHRASE, gtk, seed);
+        let started = Instant::now();
+        let radio = ("127.0.0.1", RADIO_PORT);
+        let mut next_beacon = 0;
+        let mut buf = [0u8; 4096];
+        while !stop.load(Ordering::Relaxed) {
+            let now = started.elapsed().as_millis() as u64;
+            let mut out: Vec<Vec<u8>> = Vec::new();
+            if now >= next_beacon {
+                let mut b = [0u8; 200];
+                let n = ap.beacon(&mut b);
+                out.push(b[..n].to_vec());
+                next_beacon = now + 100;
+            }
+            ap.poll(now, &mut |f| out.push(f.to_vec()));
+            if let Ok(n) = sock.recv(&mut buf) {
+                let mut up: Vec<Vec<u8>> = Vec::new();
+                ap.receive(&buf[..n], now, &mut |f| out.push(f.to_vec()), &mut |e| up.push(e.to_vec()));
+                for e in up {
+                    seen.from_station.fetch_add(1, Ordering::Relaxed);
+                    if let Some(reply) = answer(&e, &seen) {
+                        let mut f = [0u8; MAX];
+                        if let Some(n) = ap.send(&reply, &mut f) {
+                            seen.to_station.fetch_add(1, Ordering::Relaxed);
+                            out.push(f[..n].to_vec());
+                        }
+                    }
+                }
+            }
+            if ap.peer() == Peer::Up {
+                seen.keyed.store(true, Ordering::Relaxed);
+            }
+            seen.refused.store(ap.refused, Ordering::Relaxed);
+            for f in out {
+                let _ = sock.send_to(&f, radio);
+            }
+        }
+    }))
+}
+
+fn checksum(b: &[u8], mut acc: u32) -> u16 {
+    for pair in b.chunks(2) {
+        acc += (pair[0] as u32) << 8 | pair.get(1).copied().unwrap_or(0) as u32;
+    }
+    while acc >> 16 != 0 {
+        acc = (acc & 0xffff) + (acc >> 16);
+    }
+    !(acc as u16)
+}
+
+/// An IPv4 packet from the gateway: header (no options) and `payload`.
+fn ipv4(proto: u8, src: [u8; 4], dst: [u8; 4], payload: &[u8]) -> Vec<u8> {
+    let mut p = vec![0x45, 0, 0, 0, 0, 0, 0x40, 0, 64, proto, 0, 0];
+    p[2..4].copy_from_slice(&((20 + payload.len()) as u16).to_be_bytes());
+    p.extend_from_slice(&src);
+    p.extend_from_slice(&dst);
+    let c = checksum(&p, 0);
+    p[10..12].copy_from_slice(&c.to_be_bytes());
+    p.extend_from_slice(payload);
+    p
+}
+
+fn ethernet(dst: [u8; 6], kind: u16, payload: &[u8]) -> Vec<u8> {
+    let mut e = dst.to_vec();
+    e.extend_from_slice(&GATEWAY_MAC);
+    e.extend_from_slice(&kind.to_be_bytes());
+    e.extend_from_slice(payload);
+    e
+}
+
+/// The gateway's answer to an Ethernet frame from the station, if any.
+fn answer(e: &[u8], seen: &Seen) -> Option<Vec<u8>> {
+    let (dst, src, kind, p) = superior_wifi::frame::ethernet(e)?;
+    let _ = dst;
+    match kind {
+        // ARP: a request (opcode 1) for the gateway's address.
+        0x0806 if p.len() >= 28 && p[6..8] == [0, 1] && p[24..28] == GATEWAY => {
+            let mut r = p[..28].to_vec();
+            r[7] = 2;
+            r[8..14].copy_from_slice(&GATEWAY_MAC);
+            r[14..18].copy_from_slice(&GATEWAY);
+            r[18..28].copy_from_slice(&p[8..18]);
+            Some(ethernet(src, 0x0806, &r))
+        }
+        0x0800 if p.len() >= 20 && p[0] >> 4 == 4 => {
+            let hl = (p[0] & 15) as usize * 4;
+            let total = (u16::from_be_bytes([p[2], p[3]]) as usize).min(p.len());
+            if total < hl {
+                return None;
+            }
+            let (proto, s, d) = (p[9], [p[12], p[13], p[14], p[15]], [p[16], p[17], p[18], p[19]]);
+            let frag = u16::from_be_bytes([p[6], p[7]]);
+            let first = frag & 0x1fff == 0;
+            let body = &p[hl..total];
+            if proto == 17 && first && body.len() >= 8 && body[2..4] == 67u16.to_be_bytes() {
+                return dhcp(&body[8..], seen);
+            }
+            if d != GATEWAY {
+                return None;
+            }
+            match proto {
+                // An echo request (type 8): the reply, type 0.
+                1 if first && body.first() == Some(&8) => {
+                    let mut r = body.to_vec();
+                    r[0] = 0;
+                    r[2..4].fill(0);
+                    let c = checksum(&r, 0);
+                    r[2..4].copy_from_slice(&c.to_be_bytes());
+                    Some(ethernet(src, 0x0800, &ipv4(1, GATEWAY, s, &r)))
+                }
+                // UDP to the echo port, and fragments of datagrams (which
+                // can only be UDP here): sent back with the addresses (and
+                // in the first fragment the ports) swapped, which leaves
+                // every checksum right.
+                17 => {
+                    if first && (body.len() < 8 || body[2..4] != ECHO_PORT.to_be_bytes()) {
+                        return None;
+                    }
+                    let mut r = p[..total].to_vec();
+                    r[12..16].copy_from_slice(&d);
+                    r[16..20].copy_from_slice(&s);
+                    if first {
+                        let (a, b) = ([r[hl], r[hl + 1]], [r[hl + 2], r[hl + 3]]);
+                        r[hl..hl + 2].copy_from_slice(&b);
+                        r[hl + 2..hl + 4].copy_from_slice(&a);
+                    }
+                    Some(ethernet(src, 0x0800, &r))
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// The DHCP server's answer to a DISCOVER (an OFFER) or a REQUEST (an
+/// ACK), broadcast.
+fn dhcp(m: &[u8], seen: &Seen) -> Option<Vec<u8>> {
+    if m.len() < 240 || m[0] != 1 || m[236..240] != [99, 130, 83, 99] {
+        return None;
+    }
+    let mut kind = 0;
+    let mut o = 240;
+    while o + 2 <= m.len() && m[o] != 255 {
+        if m[o] == 0 {
+            o += 1;
+            continue;
+        }
+        if m[o] == 53 && m[o + 1] == 1 {
+            kind = *m.get(o + 2)?;
+        }
+        o += 2 + m[o + 1] as usize;
+    }
+    let reply = match kind {
+        1 => 2, // DISCOVER: OFFER
+        3 => 5, // REQUEST: ACK
+        _ => return None,
+    };
+    let mut r = vec![0u8; 240];
+    r[0] = 2;
+    r[1] = 1;
+    r[2] = 6;
+    r[4..8].copy_from_slice(&m[4..8]); // xid
+    r[10..12].copy_from_slice(&m[10..12]); // flags
+    r[16..20].copy_from_slice(&LEASED);
+    r[20..24].copy_from_slice(&GATEWAY);
+    r[28..44].copy_from_slice(&m[28..44]); // chaddr
+    r[236..240].copy_from_slice(&[99, 130, 83, 99]);
+    r.extend_from_slice(&[53, 1, reply]);
+    r.extend_from_slice(&[54, 4]);
+    r.extend_from_slice(&GATEWAY);
+    r.extend_from_slice(&[51, 4, 0, 1, 0x51, 0x80]); // 86400 s
+    r.extend_from_slice(&[1, 4, 255, 255, 255, 0]);
+    r.extend_from_slice(&[3, 4]);
+    r.extend_from_slice(&GATEWAY);
+    r.extend_from_slice(&[6, 4]);
+    r.extend_from_slice(&GATEWAY);
+    r.push(255);
+    // UDP 67 to 68, its checksum over the pseudo-header.
+    let broadcast = [255; 4];
+    let mut u = vec![0, 67, 0, 68, 0, 0, 0, 0];
+    u[4..6].copy_from_slice(&((8 + r.len()) as u16).to_be_bytes());
+    u.extend_from_slice(&r);
+    let mut pseudo = GATEWAY.to_vec();
+    pseudo.extend_from_slice(&broadcast);
+    pseudo.extend_from_slice(&[0, 17]);
+    pseudo.extend_from_slice(&(u.len() as u16).to_be_bytes());
+    let acc = pseudo.chunks(2).map(|c| (c[0] as u32) << 8 | c[1] as u32).sum();
+    let c = checksum(&u, acc);
+    u[6..8].copy_from_slice(&(if c == 0 { 0xffff } else { c }).to_be_bytes());
+    seen.dhcp.fetch_add(1, Ordering::Relaxed);
+    Some(ethernet([0xff; 6], 0x0800, &ipv4(17, GATEWAY, broadcast, &u)))
+}

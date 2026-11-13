@@ -822,9 +822,33 @@ holds the rest):
   frame taken only if its packet number is above the last. The host tests check
   each primitive against its published vectors (FIPS 180 and 197, RFC 2202, 3394,
   3610 and 6070, IEEE 802.11 Annex J), then a whole handshake, a wrong
-  passphrase, forged, replayed and downgraded frames, and CCMP's refusals. QEMU
-  emulates no Wi-Fi card: a simulated radio and access point come next, so a
-  station can join and carry traffic in a test, ahead of a laptop's real card.
+  passphrase, forged, replayed and downgraded frames, and CCMP's refusals.
+- Wi-Fi joining, on a simulated radio (QEMU emulates no Wi-Fi card). The station
+  (`crates/wifi/src/station.rs`) is a state machine with no I/O of its own: it
+  probes for its network, takes an access point advertising WPA2 with CCMP and
+  PSK, authenticates (open system), associates offering the same RSN element,
+  runs the 4-way handshake in EAPOL frames (the only data frames it takes
+  unencrypted), and then seals Ethernet frames into data frames and opens the
+  ones it receives, under the temporal key or (to a group) the group key, each
+  with rising packet numbers. A step with no answer is tried again, then the
+  station scans afresh; a message 3 sent again because its message 4 was lost is
+  answered without installing its keys again (which would let frames be
+  replayed). Its access point counterpart (`crates/wifi/src/ap.rs`) serves one
+  station. Host tests join one to the other, also over a channel that loses
+  every other frame, with a wrong passphrase and for another SSID. The
+  virtio-net driver given `arg 1` treats its device as a radio whose frames are
+  802.11's, hosts the station, and still serves `nic` to the network server as
+  any card does, dropping frames while the link is down; `nic`'s new `JOIN` (an
+  SSID and passphrase in a lent page) and `LINK` (where joining has got to, and
+  the BSSID) are how a component tells it which network to join. `cargo xtask
+  wifi-test` connects the device over UDP to an access point in xtask with a
+  network behind it, on both ISAs: the client has the radio join, the station
+  must find the network, authenticate, associate and key, then the network
+  server lease an address by DHCP (answers broadcast, so under the group key),
+  ping the gateway and have it echo 40 UDP datagrams (some in fragments), and
+  the access point must have refused nothing. A laptop's real card, through
+  its driver and firmware, comes later; so do WPA3 (SAE), rekeying, and an
+  entropy source for the nonces (seeded from the clocks for now).
 - USB: an xHCI host controller driver (`user/xhci/`) and a HID driver for
   keyboards, mice and tablets (`user/hid/`).
   - The xHCI driver opens the first function of class 0c:03:30, resets the controller,

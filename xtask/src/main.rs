@@ -49,6 +49,8 @@
 //! QEMU is found through $QEMU (x86-64) or $QEMU_AARCH64, then the default
 //! Windows install path, then PATH.
 
+mod wifi_ap;
+
 use std::env;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -111,6 +113,9 @@ struct Image {
     /// The network device is this one instead, for a Linux driver (the
     /// Linux Driver Environment tests).
     linux_nic: Option<&'static str>,
+    /// A virtio network device standing in for a Wi-Fi radio: its frames
+    /// go over UDP to the test's access point (the Wi-Fi test).
+    radio: bool,
     /// A USB keyboard on an xHCI controller, typed on through QEMU's
     /// monitor (the keyboard test).
     keyboard: bool,
@@ -176,6 +181,7 @@ fn main() -> ExitCode {
                         .and_then(|_| net_test(a, "net"))
                         .and_then(|_| net_test(a, "lde"))
                         .and_then(|_| net_test(a, "lde-e100"))
+                        .and_then(|_| wifi_test(a))
                         .and_then(|_| display_test(a))
                         .and_then(|_| desktop_test(a))
                         .and_then(|_| windows_test(a))
@@ -217,6 +223,7 @@ fn main() -> ExitCode {
         Some("net-test") => net_test(arch, "net"),
         Some("lde-test") => net_test(arch, "lde"),
         Some("lde-e100-test") => net_test(arch, "lde-e100"),
+        Some("wifi-test") => wifi_test(arch),
         Some("display-test") => display_test(arch),
         Some("desktop-test") => desktop_test(arch),
         Some("windows-test") => windows_test(arch),
@@ -240,7 +247,7 @@ fn main() -> ExitCode {
         }
         Some("bench") => image(false, Arch::X86_64).and_then(|img| bench(&img)),
         _ => Err(
-            "usage: cargo xtask <idl | image | run | test | boot-test | shell-test | cm-test | supervise-test | drivers-test | memory-test | reboot-test | fs-test | nvme-test | ahci-test | net-test | lde-test | lde-e100-test | display-test | desktop-test | windows-test | toolkit-test | panel-test | resize-test | uefi-test | console-test | input-test | audio-test | tcp-test | keyboard-test | hotplug-test | suspend-test | verified-boot-test | ab-test | packages-test | bench | sel4-test> [x86_64 | aarch64]"
+            "usage: cargo xtask <idl | image | run | test | boot-test | shell-test | cm-test | supervise-test | drivers-test | memory-test | reboot-test | fs-test | nvme-test | ahci-test | net-test | lde-test | lde-e100-test | wifi-test | display-test | desktop-test | windows-test | toolkit-test | panel-test | resize-test | uefi-test | console-test | input-test | audio-test | tcp-test | keyboard-test | hotplug-test | suspend-test | verified-boot-test | ab-test | packages-test | bench | sel4-test> [x86_64 | aarch64]"
                 .into(),
         ),
     });
@@ -838,6 +845,7 @@ fn image_sealed(
         driver,
         net: matches!(manifest, "net" | "tcp") || linux_nic(manifest).is_some(),
         linux_nic: linux_nic(manifest).map(|l| l.1),
+        radio: manifest == "wifi",
         keyboard: matches!(manifest, "keyboard" | "input" | "windows" | "toolkit" | "panel" | "resize"),
         mouse: matches!(manifest, "input" | "windows" | "toolkit" | "panel" | "resize"),
         hotplug: manifest == "hotplug",
@@ -938,6 +946,7 @@ fn sel4_image() -> Result<Image, String> {
         driver: "virtio-blk",
         net: false,
         linux_nic: None,
+        radio: false,
         keyboard: false,
         mouse: false,
         hotplug: false,
@@ -1010,7 +1019,7 @@ fn qemu_command(img: &Image) -> Command {
             // Images with a disk are driver tests: they need an IOMMU,
             // which QEMU emulates (VT-d) only on its q35 machine, with
             // interrupt remapping.
-            if img.disk.is_some() || img.net || img.keyboard || img.hotplug || img.display || img.audio.is_some() {
+            if img.disk.is_some() || img.net || img.radio || img.keyboard || img.hotplug || img.display || img.audio.is_some() {
                 q.args(["-machine", "q35", "-device", "intel-iommu,intremap=on"]);
             }
             if img.disk.is_some() && img.driver == "ahci" {
@@ -1041,7 +1050,7 @@ fn qemu_command(img: &Image) -> Command {
             // Driver tests get an SMMUv3 in front of PCI.
             let machine = if img.sel4 {
                 SEL4_MACHINE
-            } else if img.disk.is_some() || img.net || img.keyboard || img.hotplug || img.display || img.audio.is_some() {
+            } else if img.disk.is_some() || img.net || img.radio || img.keyboard || img.hotplug || img.display || img.audio.is_some() {
                 "virt,highmem=off,gic-version=3,iommu=smmuv3"
             } else {
                 "virt,highmem=off,gic-version=3"
@@ -1167,6 +1176,20 @@ fn qemu_command(img: &Image) -> Command {
             // interrupt is a legacy line.
             img.linux_nic
                 .unwrap_or("virtio-net-pci,netdev=n0,disable-legacy=on,iommu_platform=on"),
+        ]);
+    }
+    if img.radio {
+        // The simulated radio: each frame one UDP datagram to the test's
+        // access point, and back.
+        q.args([
+            "-netdev",
+            &format!(
+                "socket,id=r0,udp=127.0.0.1:{},localaddr=127.0.0.1:{}",
+                wifi_ap::AP_PORT,
+                wifi_ap::RADIO_PORT
+            ),
+            "-device",
+            "virtio-net-pci,netdev=r0,disable-legacy=on,iommu_platform=on",
         ]);
     }
     if img.keyboard {
@@ -2008,6 +2031,61 @@ fn tcp_test(arch: Arch) -> Result<(), String> {
 
 /// The network test, with the native virtio driver (`net`) or with
 /// Linux's 8139cp driver in the Linux Driver Environment (`lde`).
+/// The Wi-Fi test: the virtio-net driver as a simulated radio hosting the
+/// station, the access point here (`wifi_ap`). The client has the radio
+/// join the network; the station must find it, authenticate, associate
+/// and finish the 4-way handshake, and then the network server lease an
+/// address by DHCP (its answers broadcast, under the group key), ping the
+/// gateway and have it echo UDP datagrams, some in fragments, every frame
+/// sealed with CCMP both ways.
+fn wifi_test(arch: Arch) -> Result<(), String> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let img = image_with(false, arch, "wifi")?;
+    let stop = Arc::new(AtomicBool::new(false));
+    let seen = Arc::new(wifi_ap::Seen::default());
+    let ap = wifi_ap::start(stop.clone(), seen.clone())?;
+    println!("== Wi-Fi test on {}", img.path.display());
+    let out = run_to_exit(&img, Duration::from_secs(120));
+    stop.store(true, Ordering::Relaxed);
+    let _ = ap.join();
+    let out = out?;
+    check_log(
+        "Wi-Fi test",
+        &out,
+        &[
+            "virtio-net: ready as a Wi-Fi radio:",
+            "[pass] wifi: a page of its own",
+            "[pass] wifi: the radio starts with no network (link 0)",
+            "[pass] wifi: a passphrase under 8 characters is refused",
+            "[pass] wifi: the radio is told to join \"superior-test\"",
+            "virtio-net: wifi: scanning for \"superior-test\"",
+            "virtio-net: wifi: found \"superior-test\" at 02:57:49:46:49:01 (WPA2-PSK, CCMP); authenticating",
+            "virtio-net: wifi: associating",
+            "virtio-net: wifi: associated; 4-way handshake",
+            "virtio-net: wifi: keyed, link up: frames sealed with CCMP",
+            "[pass] wifi: joined and keyed in",
+            "BSSID 02:57:49:46:49:01",
+            "net: leased 10.0.5.30/24 from 10.0.5.1 via 10.0.5.1",
+            "[pass] wifi: leased 10.0.5.30 (netmask /24) over Wi-Fi, the gateway 10.0.5.1",
+            "[pass] wifi: 10 of 10 pings to the gateway answered, every byte right",
+            "[pass] wifi: 40 of 40 UDP datagrams echoed by the gateway, every byte right (",
+        ],
+    )?;
+    if out.contains("[fail]") {
+        return Err("Wi-Fi test: a check failed".into());
+    }
+    let (from, to) = (seen.from_station.load(Ordering::Relaxed), seen.to_station.load(Ordering::Relaxed));
+    let (dhcp, refused) = (seen.dhcp.load(Ordering::Relaxed), seen.refused.load(Ordering::Relaxed));
+    println!(
+        "== access point: station keyed, {from} frames from it and {to} to it under CCMP, {dhcp} DHCP answers broadcast under the group key, {refused} frames refused"
+    );
+    if !seen.keyed.load(Ordering::Relaxed) || from == 0 || to == 0 || dhcp < 2 || refused != 0 {
+        return Err("Wi-Fi test: the access point did not see the station keyed and carrying frames".into());
+    }
+    println!("== Wi-Fi test passed ({})", arch.name());
+    Ok(())
+}
+
 fn net_test(arch: Arch, manifest: &str) -> Result<(), String> {
     use std::collections::HashMap;
     use std::net::UdpSocket;
