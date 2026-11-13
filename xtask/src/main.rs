@@ -3383,6 +3383,12 @@ fn check_layers(
 fn greeter_sized(size: (usize, usize)) -> Layer {
     let (mut ui, ..) = greeter_ui();
     ui.resize(size.0 as u32, size.1 as u32);
+    greeter_drawn(&ui)
+}
+
+/// The greeter's window as `ui` draws it, focused.
+fn greeter_drawn(ui: &superior_toolkit::Ui) -> Layer {
+    let size = (ui.w as usize, ui.h as usize);
     let mut pixels = vec![0u32; size.0 * size.1];
     ui.draw(&mut superior_toolkit::Surface { px: &mut pixels, w: size.0 as u32, h: size.1 as u32 });
     Layer {
@@ -3423,7 +3429,34 @@ fn resize_pictures() -> Vec<(Layer, Option<Area>, (usize, usize))> {
         (greeter_sized((380, 184)), None, RESIZE_OUT),
         // Asked for 130x64, it takes the least it can: 200x124.
         (greeter_sized((200, 124)), None, RESIZE_IN),
+        (greeter_typed(false), None, TOOLKIT_FIELD),
+        (greeter_typed(true), None, TOOLKIT_FIELD),
     ]
+}
+
+/// The name the resize test types into the narrowed greeter: wider than
+/// its field, which shows 14 characters.
+const LONG_NAME: &str = "abcdefghijklmnopq";
+
+/// The greeter at its least size, its field pressed and `LONG_NAME` typed
+/// (scrolled to show its end), then with Home pressed (`home`).
+fn greeter_typed(home: bool) -> Layer {
+    use superior_toolkit::Event;
+    let (mut ui, field, ..) = greeter_ui();
+    ui.resize(200, 124);
+    ui.event(Event::Focus(true));
+    let (x, y) = ((TOOLKIT_FIELD.0 - GREETER_AT.0) as i32, (TOOLKIT_FIELD.1 - GREETER_AT.1) as i32);
+    for buttons in [0, 1, 0] {
+        ui.event(Event::Pointer { x, y, buttons });
+    }
+    let usages = LONG_NAME.bytes().map(|c| 4 + (c - b'a') as u64).chain(home.then_some(74));
+    for usage in usages {
+        ui.event(Event::Key { usage, down: true, modifiers: 0 });
+        ui.event(Event::Key { usage, down: false, modifiers: 0 });
+    }
+    assert_eq!(ui.text(field), LONG_NAME);
+    assert_eq!(ui.widget(field).scroll, if home { 0 } else { 3 });
+    greeter_drawn(&ui)
 }
 
 fn resize_act(act: &Act, arch: Arch) -> Result<Option<String>, String> {
@@ -3447,8 +3480,9 @@ fn resize_act(act: &Act, arch: Arch) -> Result<Option<String>, String> {
 /// Through QEMU's monitor the host drags its frame's bottom-right corner
 /// out (an outline shows the size asked for; let go, the greeter draws
 /// itself at that size and sets it), then in past the least it takes (it
-/// takes that), then closes it. Three screenshots must have every pixel
-/// right.
+/// takes that), types a name wider than its field there (it scrolls to
+/// show the cursor, and back with Home), then closes it. Five screenshots
+/// must have every pixel right.
 fn resize_test(arch: Arch) -> Result<(), String> {
     use Act::*;
     let img = image_with(false, arch, "resize")?;
@@ -3472,7 +3506,12 @@ fn resize_test(arch: Arch) -> Result<(), String> {
         ),
         (
             vec!["greeter: resized to 200x124 (status 0)"],
-            vec![Shot(3), to(RESIZE_IN, RESIZE_CLOSE), Button(true), Button(false)],
+            vec![Shot(3), to(RESIZE_IN, TOOLKIT_FIELD), Button(true), Button(false), Type(LONG_NAME)],
+        ),
+        (vec!["greeter: the field holds \"abcdefghijklmnopq\", the cursor at 17"], vec![Shot(4), Key("home")]),
+        (
+            vec!["greeter: the field holds \"abcdefghijklmnopq\", the cursor at 0"],
+            vec![Shot(5), to(TOOLKIT_FIELD, RESIZE_CLOSE), Button(true), Button(false)],
         ),
         (vec!["toolkit: the greeter's window is gone"], vec![]),
     ];
@@ -3485,6 +3524,8 @@ fn resize_test(arch: Arch) -> Result<(), String> {
         "compositor: window 0: asking for 130x64",
         "compositor: window 0 resized to 200x124",
         "greeter: resized to 200x124 (status 0)",
+        "greeter: the field holds \"abcdefghijklmnopq\", the cursor at 17",
+        "greeter: the field holds \"abcdefghijklmnopq\", the cursor at 0",
         "compositor: window 0: its close box was pressed",
         "greeter: closed",
         "[cm] watcher asked to shut down (pass)",

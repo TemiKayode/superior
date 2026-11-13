@@ -8,7 +8,8 @@
 //! over it; a field pressed takes the keyboard, with its cursor where it
 //! was pressed, and keys typed to it edit its text at the cursor (letters,
 //! digits, space and some punctuation, Shift for capitals, Backspace and
-//! Delete; the arrows, Home and End move the cursor). No heap: a `Ui` holds up to [`MAX_WIDGETS`],
+//! Delete; the arrows, Home and End move the cursor; text wider than the
+//! field scrolls to keep the cursor shown). No heap: a `Ui` holds up to [`MAX_WIDGETS`],
 //! each text up to [`MAX_TEXT`] bytes.
 //!
 //! The host draws the same to check the screenshots of the toolkit test,
@@ -211,6 +212,28 @@ pub struct Widget {
     pub selected: bool,
     /// A field's cursor: the byte of its text it is before.
     pub cursor: usize,
+    /// A field's first character shown, when its text is wider than it.
+    pub scroll: usize,
+}
+
+impl Widget {
+    /// How many characters a field shows (with room for the cursor after
+    /// the last).
+    pub fn shown(&self) -> usize {
+        (self.rect.w.saturating_sub(FIELD_INSET + 1) / STEP) as usize
+    }
+
+    /// Scrolls a field as little as keeps its cursor shown, and as much
+    /// of its text as fits.
+    fn keep_cursor_shown(&mut self) {
+        let n = self.shown();
+        if self.cursor < self.scroll {
+            self.scroll = self.cursor;
+        } else if self.cursor > self.scroll + n {
+            self.scroll = self.cursor - n;
+        }
+        self.scroll = self.scroll.min(self.text.len().saturating_sub(n));
+    }
 }
 
 /// A widget's number in its [`Ui`], in the order added.
@@ -300,7 +323,7 @@ pub struct Ui {
 impl Ui {
     /// A column, top to bottom.
     pub fn new(w: u32, h: u32) -> Ui {
-        let none = Widget { kind: Kind::Label, rect: Rect::NONE, text: Text::EMPTY, selected: false, cursor: 0 };
+        let none = Widget { kind: Kind::Label, rect: Rect::NONE, text: Text::EMPTY, selected: false, cursor: 0, scroll: 0 };
         Ui {
             w,
             h,
@@ -343,7 +366,8 @@ impl Ui {
             r
         };
         let text = Text::new(text);
-        self.widgets[self.len] = Widget { kind, rect, text, selected: false, cursor: text.len() };
+        self.widgets[self.len] = Widget { kind, rect, text, selected: false, cursor: text.len(), scroll: 0 };
+        self.widgets[self.len].keep_cursor_shown();
         self.len += 1;
         self.len - 1
     }
@@ -358,6 +382,7 @@ impl Ui {
         for widget in &mut self.widgets[..self.len] {
             if widget.kind != Kind::Button {
                 widget.rect.w = w.saturating_sub(2 * PAD);
+                widget.keep_cursor_shown();
             }
         }
     }
@@ -418,6 +443,7 @@ impl Ui {
         }
         self.widgets[id].text = t;
         self.widgets[id].cursor = t.len();
+        self.widgets[id].keep_cursor_shown();
         self.widgets[id].rect
     }
 
@@ -439,7 +465,7 @@ impl Ui {
     }
 
     fn draw_widget(&self, s: &mut Surface, id: Id) {
-        let Widget { kind, rect: r, text, selected, cursor } = self.widgets[id];
+        let Widget { kind, rect: r, text, selected, cursor, scroll } = self.widgets[id];
         let t = text.as_bytes();
         let th = font::HEIGHT * SCALE;
         match kind {
@@ -467,11 +493,12 @@ impl Ui {
                 s.fill(r, FIELD);
                 s.outline(r, if keyboard { FOCUS_EDGE } else { EDGE });
                 let (tx, ty) = (r.x + FIELD_INSET, r.y + (r.h - th) / 2);
-                s.text(tx, ty, t, SCALE, INK);
+                let shown = &t[scroll.min(t.len())..(scroll + self.widgets[id].shown()).min(t.len())];
+                s.text(tx, ty, shown, SCALE, INK);
                 if keyboard {
                     // The cursor, in the gap before the character it is
                     // before (or after the last one).
-                    let cx = tx + cursor as u32 * STEP - SCALE;
+                    let cx = tx + (cursor - scroll) as u32 * STEP - SCALE;
                     s.fill(Rect { x: cx, y: ty - 1, w: SCALE, h: th + 2 }, INK);
                 }
             }
@@ -523,7 +550,7 @@ impl Ui {
                         // The cursor goes to the gap nearest the press.
                         let w = &mut self.widgets[f];
                         let from = x - (w.rect.x + FIELD_INSET) as i32 + STEP as i32 / 2;
-                        let cursor = (from.max(0) as u32 / STEP).min(w.text.len() as u32) as usize;
+                        let cursor = (w.scroll + (from.max(0) as u32 / STEP) as usize).min(w.text.len());
                         if field != self.field || cursor != w.cursor {
                             w.cursor = cursor;
                             r.damage = r.damage.union(self.rect(self.field)).union(self.rect(field));
@@ -552,8 +579,8 @@ impl Ui {
             }
             Event::Key { usage, down: true, modifiers } => {
                 if let Some(id) = self.keyboard() {
-                    let Widget { text, cursor, .. } = &mut self.widgets[id];
-                    let before = *cursor;
+                    let Widget { text, cursor, scroll, .. } = &mut self.widgets[id];
+                    let before = (*cursor, *scroll);
                     let changed = match usage {
                         BACKSPACE => *cursor > 0 && text.remove(*cursor - 1) && {
                             *cursor -= 1;
@@ -585,7 +612,9 @@ impl Ui {
                             true
                         },
                     };
-                    if changed || *cursor != before {
+                    self.widgets[id].keep_cursor_shown();
+                    let Widget { cursor, scroll, .. } = self.widgets[id];
+                    if changed || (cursor, scroll) != before {
                         r.damage = self.widgets[id].rect;
                     }
                 }
@@ -811,6 +840,54 @@ mod tests {
         assert_eq!(ui.widget(field).rect, Rect { x: 8, y: 32, w: 364, h: 26 });
         assert_eq!(ui.widget(button).rect, Rect { x: 8, y: 66, w: 82, h: 26 }, "a button keeps its own width");
         assert_eq!(ui.widget(out).rect.w, 364);
+    }
+
+    #[test]
+    fn text_wider_than_its_field_scrolls_to_keep_the_cursor_shown() {
+        let (mut ui, field, ..) = greeter();
+        press(&mut ui, 100, 40);
+        ui.event(Event::Focus(true));
+        // 264 pixels wide: 21 characters, a character every 12 pixels.
+        assert_eq!(ui.widget(field).shown(), 21);
+        for u in 4..29 {
+            key(&mut ui, u, 0);
+        }
+        let w = ui.widget(field);
+        assert_eq!((w.text.len(), w.cursor, w.scroll), (25, 25, 4));
+        // The cursor moves within what is shown without scrolling...
+        key(&mut ui, LEFT, 0);
+        assert_eq!((ui.cursor(field), ui.widget(field).scroll), (24, 4));
+        // ...and past it, scrolling as little as shows it.
+        key(&mut ui, HOME, 0);
+        assert_eq!(ui.widget(field).scroll, 0);
+        for _ in 0..22 {
+            key(&mut ui, RIGHT, 0);
+        }
+        assert_eq!((ui.cursor(field), ui.widget(field).scroll), (22, 1));
+        // A press counts from the first character shown.
+        press(&mut ui, 14 + 1, 40);
+        assert_eq!(ui.cursor(field), 1);
+        key(&mut ui, END, 0);
+        // Drawn from the first character shown, 'e', to the 21st, 'y'.
+        let mut px = [0u32; 280 * 124];
+        let mut s = Surface { px: &mut px, w: 280, h: 124 };
+        ui.draw(&mut s);
+        let ty = 32 + (26 - 14) / 2;
+        for dy in 0..14 {
+            for dx in 0..21 * 12 - 2 {
+                let want = if font::text_lit(b"efghijklmnopqrstuvwxy", SCALE, dx, dy) { INK } else { FIELD };
+                assert_eq!(s.px[((ty + dy) * 280 + 14 + dx) as usize], want, "({dx}, {dy})");
+            }
+        }
+        // Text taken out scrolls back to show as much as fits.
+        key(&mut ui, BACKSPACE, 0);
+        assert_eq!((ui.cursor(field), ui.widget(field).scroll), (24, 3));
+        // A narrower window shows fewer.
+        ui.resize(200, 124);
+        assert_eq!(ui.widget(field).shown(), 14);
+        assert_eq!(ui.widget(field).scroll, 10);
+        ui.resize(380, 184);
+        assert_eq!(ui.widget(field).scroll, 0, "all of it fits again");
     }
 
     #[test]
