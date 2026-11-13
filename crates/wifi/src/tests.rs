@@ -400,3 +400,138 @@ fn a_message_3_sent_again_is_answered_but_its_keys_not_reinstalled() {
     // And no new handshake over keys in use.
     assert_eq!(sta.receive(ap.start().bytes()).err(), Some(Error::State));
 }
+
+#[test]
+fn keys_are_renewed_pairwise_then_group_and_resends_install_nothing() {
+    let (mut ap, mut sta) = pair(b"correct horse");
+    let m2 = sta.receive(ap.start().bytes()).unwrap();
+    let m3 = ap.receive(m2.bytes()).unwrap().unwrap();
+    let m4 = sta.receive(m3.bytes()).unwrap();
+    assert!(matches!(ap.receive(m4.bytes()), Ok(None)));
+    let first = sta.keys().unwrap();
+    assert_eq!(sta.installs(), 1);
+    // A rekeying needs a fresh nonce given first.
+    assert!(sta.needs_nonce());
+    sta.renew([0x5f; 32]);
+    let m1 = ap.rekey([0xa2; 32]).expect("rekeying starts");
+    assert!(ap.rekey([0xa3; 32]).is_none(), "one at a time");
+    let m2 = sta.receive(m1.bytes()).unwrap();
+    assert_eq!(sta.keys(), Some(first), "the old keys carry on until message 3");
+    let m3 = ap.receive(m2.bytes()).unwrap().unwrap();
+    assert!(ap.pending_tk().is_some());
+    let _lost_m4 = sta.receive(m3.bytes()).unwrap();
+    let renewed = sta.keys().unwrap();
+    assert_ne!(renewed.tk, first.tk);
+    assert_eq!(renewed.gtk, GTK);
+    assert_eq!(sta.installs(), 2);
+    let m4 = sta.receive(ap.retry().unwrap().bytes()).unwrap();
+    assert_eq!(sta.installs(), 2, "message 3 again installs nothing");
+    assert!(matches!(ap.receive(m4.bytes()), Ok(None)));
+    assert_eq!(ap.tk(), Some(renewed.tk));
+    assert!(!ap.rekeying());
+    // Without a new nonce, no further pairwise rekeying is taken.
+    assert_eq!(sta.receive(ap.rekey([0xa4; 32]).unwrap().bytes()).err(), Some(Error::State));
+    let (mut ap, mut sta) = keyed_pair();
+    // The group key: one message, confirmed.
+    let new = Gtk { index: 2, key: [0x78; 16] };
+    let g1 = ap.rekey_group(new).unwrap();
+    let g2 = sta.receive(g1.bytes()).unwrap();
+    assert_eq!(sta.keys().unwrap().gtk, new);
+    let installs = sta.installs();
+    // Its confirmation lost: sent again, answered, not installed again.
+    let g2 = {
+        let _ = g2;
+        sta.receive(ap.retry().unwrap().bytes()).unwrap()
+    };
+    assert_eq!(sta.installs(), installs);
+    assert_eq!(ap.gtk(), GTK, "the old group key until confirmed");
+    assert!(matches!(ap.receive(g2.bytes()), Ok(None)));
+    assert_eq!(ap.gtk(), new);
+    assert!(ap.retry().is_none());
+    // A forged group key message is refused.
+    let mut forged = ap.rekey_group(Gtk { index: 1, key: [0x79; 16] }).unwrap().bytes().to_vec();
+    forged[120] ^= 1;
+    assert_eq!(sta.receive(&forged).err(), Some(Error::Mic));
+    assert_eq!(sta.keys().unwrap().gtk, new);
+}
+
+/// An authenticator and supplicant keyed with each other.
+fn keyed_pair() -> (Authenticator, Supplicant) {
+    let (mut ap, mut sta) = pair(b"correct horse");
+    let m2 = sta.receive(ap.start().bytes()).unwrap();
+    let m3 = ap.receive(m2.bytes()).unwrap().unwrap();
+    let m4 = sta.receive(m3.bytes()).unwrap();
+    assert!(matches!(ap.receive(m4.bytes()), Ok(None)));
+    (ap, sta)
+}
+
+/// Sends one frame each way (the access point's alternately to the station
+/// and broadcast) and runs the channel 10 ms; returns the frames sent.
+fn exchange(air: &mut air::Air, k: usize) -> usize {
+    let mut f = [0u8; crate::frame::MAX];
+    let mut sent = 0;
+    let (e, n) = ethernet_frame(air::BSSID, air::STA, &[k as u8; 40]);
+    if let Some(len) = air.sta.send(&e[..n], &mut f) {
+        air.to_ap.push(f[..len].to_vec());
+        sent += 1;
+    }
+    let da = if k % 2 == 0 { air::STA } else { [0xff; 6] };
+    let (e, n) = ethernet_frame(da, air::BSSID, &[k as u8; 40]);
+    if let Some(len) = air.ap.send(&e[..n], &mut f) {
+        air.to_sta.push(f[..len].to_vec());
+        sent += 1;
+    }
+    air.run(10);
+    sent
+}
+
+#[test]
+fn rekeying_while_frames_flow_loses_none() {
+    use crate::handshake::Gtk;
+    let mut air = air::Air::new(b"correct horse");
+    air.sta.join(b"superior", b"correct horse", [7; 32], 0);
+    air.run(200);
+    assert!(air.joined());
+    let mut sent = 0;
+    for k in 0..60 {
+        let now = air.now;
+        match k {
+            10 | 40 => assert!(air.ap.rekey(now, &mut |f| air.to_sta.push(f.to_vec()))),
+            25 => assert!(air.ap.rekey_group(Gtk { index: 2, key: [0x48; 16] }, now, &mut |f| air.to_sta.push(f.to_vec()))),
+            50 => assert!(air.ap.rekey_group(Gtk { index: 1, key: [0x49; 16] }, now, &mut |f| air.to_sta.push(f.to_vec()))),
+            _ => {}
+        }
+        sent += exchange(&mut air, k);
+    }
+    air.run(50);
+    assert_eq!((air.sta.rekeys, air.sta.group_rekeys), (2, 2));
+    assert_eq!((air.ap.rekeys, air.ap.group_rekeys), (2, 2));
+    assert!(!air.ap.rekeying());
+    assert_eq!((air.sta.refused, air.ap.refused), (0, 0));
+    assert_eq!(air.sta_up.len() + air.ap_up.len(), sent, "every frame delivered");
+    assert_eq!(sent, 120);
+}
+
+#[test]
+fn rekeying_survives_losing_every_other_frame() {
+    use crate::handshake::Gtk;
+    let mut air = air::Air::new(b"correct horse");
+    air.sta.join(b"superior", b"correct horse", [7; 32], 0);
+    air.run(200);
+    assert!(air.joined());
+    air.lossy = true;
+    let now = air.now;
+    assert!(air.ap.rekey(now, &mut |f| air.to_sta.push(f.to_vec())));
+    air.run(5000);
+    let now = air.now;
+    assert!(air.ap.rekey_group(Gtk { index: 2, key: [0x48; 16] }, now, &mut |f| air.to_sta.push(f.to_vec())));
+    air.run(5000);
+    assert_eq!((air.ap.rekeys, air.ap.group_rekeys), (1, 1));
+    assert_eq!((air.sta.rekeys, air.sta.group_rekeys), (1, 1));
+    // Frames still flow both ways under the new keys.
+    air.lossy = false;
+    let before = air.sta_up.len() + air.ap_up.len();
+    let sent = (0..4).map(|k| exchange(&mut air, k)).sum::<usize>();
+    assert_eq!(air.sta_up.len() + air.ap_up.len() - before, sent);
+    assert_eq!(sent, 8);
+}

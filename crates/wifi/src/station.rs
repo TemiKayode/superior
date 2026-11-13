@@ -16,6 +16,13 @@
 //! no answer is tried again a few times, then the station scans afresh;
 //! so does a deauthentication or disassociation from its access point.
 //!
+//! The access point may renew the keys while the link is up (see
+//! [`crate::handshake`]); handshake frames then travel sealed under the
+//! keys in place. A new temporal key is used for sending as soon as it is
+//! installed, while the old one still opens frames the access point sent
+//! before it switched (until one comes under the new key); group keys are
+//! held by key ID, so frames under the outgoing one still open.
+//!
 //! Times are in milliseconds, of any clock that only goes forward.
 
 use crate::ccmp;
@@ -66,12 +73,20 @@ pub struct Station {
     keys: Option<Keys>,
     pn: u64,
     rx_pn: Option<u64>,
-    group_pn: Option<u64>,
+    /// The previous temporal key after a rekeying, and its last packet
+    /// number, until a frame comes under the new one.
+    old_tk: Option<([u8; 16], Option<u64>)>,
+    /// Group keys by key ID, each with its last packet number.
+    groups: [Option<([u8; 16], Option<u64>)>; 4],
+    installs: u32,
     seq: u16,
     deadline: u64,
     tries: u32,
     /// Frames refused (forged, replayed, unencrypted after keying).
     pub refused: u64,
+    /// Rekeyings since the link came up: pairwise, and group.
+    pub rekeys: u32,
+    pub group_rekeys: u32,
 }
 
 impl Station {
@@ -91,11 +106,15 @@ impl Station {
             keys: None,
             pn: 0,
             rx_pn: None,
-            group_pn: None,
+            old_tk: None,
+            groups: [None; 4],
+            installs: 0,
             seq: 0,
             deadline: 0,
             tries: 0,
             refused: 0,
+            rekeys: 0,
+            group_rekeys: 0,
         }
     }
 
@@ -119,7 +138,7 @@ impl Station {
         self.link = Link::Scanning;
         self.supplicant = None;
         self.keys = None;
-        (self.rx_pn, self.group_pn) = (None, None);
+        (self.rx_pn, self.old_tk, self.groups, self.installs) = (None, None, [None; 4], 0);
         self.deadline = now;
         self.tries = 0;
     }
@@ -276,7 +295,7 @@ impl Station {
             match frame::snap(&f[HEADER..]) {
                 // While up, a message 3 sent again (its message 4 lost)
                 // is answered again.
-                Some((EAPOL, eapol)) if matches!(self.link, Link::Keying | Link::Up) && !group => self.eapol(eapol, now, radio),
+                Some((EAPOL, eapol)) if matches!(self.link, Link::Keying | Link::Up) && !group => self.eapol(eapol, false, now, radio),
                 _ => self.refused += 1,
             }
             return;
@@ -287,15 +306,39 @@ impl Station {
         let mut copy = [0u8; MAX];
         let Some(copy) = copy.get_mut(..f.len()) else { return };
         copy.copy_from_slice(f);
-        let (key, last) = if group { (&keys.gtk.key, &mut self.group_pn) } else { (&keys.tk, &mut self.rx_pn) };
-        let Ok((range, pn)) = ccmp::open(key, copy, *last) else {
+        let opened = if group {
+            let id = ccmp::header_len(copy).and_then(|h| copy.get(h + 3)).map_or(0, |b| (b >> 6) as usize);
+            match self.groups[id] {
+                Some((key, last)) => ccmp::open(&key, copy, last).inspect(|r| self.groups[id] = Some((key, Some(r.1)))),
+                None => Err(ccmp::Refused::Forged),
+            }
+        } else {
+            match ccmp::open(&keys.tk, copy, self.rx_pn) {
+                Ok(r) => {
+                    // The access point has switched to the new key.
+                    self.old_tk = None;
+                    self.rx_pn = Some(r.1);
+                    Ok(r)
+                }
+                Err(_) if self.old_tk.is_some() => {
+                    copy.copy_from_slice(f);
+                    let (key, last) = self.old_tk.unwrap();
+                    ccmp::open(&key, copy, last).inspect(|r| self.old_tk = Some((key, Some(r.1))))
+                }
+                Err(e) => Err(e),
+            }
+        };
+        let Ok((range, _)) = opened else {
             self.refused += 1;
             return;
         };
-        *last = Some(pn);
         if let Some((kind, payload)) = frame::snap(&copy[range]) {
             if kind == EAPOL {
-                return; // no rekeying yet
+                // A rekeying, under the keys in place.
+                if !group {
+                    self.eapol(payload, true, now, radio);
+                }
+                return;
             }
             let mut eth = [0u8; 1514];
             if let Some(n) = to_ethernet(&mut eth, &da, &sa, kind, payload) {
@@ -304,23 +347,72 @@ impl Station {
         }
     }
 
-    fn eapol(&mut self, eapol: &[u8], now: u64, radio: &mut dyn FnMut(&[u8])) {
+    fn eapol(&mut self, eapol: &[u8], sealed: bool, now: u64, radio: &mut dyn FnMut(&[u8])) {
         let Some(s) = self.supplicant.as_mut() else { return };
         let Ok(reply) = s.receive(eapol) else {
             self.refused += 1;
             return;
         };
-        let keys = s.keys();
+        let (keys, installs) = (s.keys(), s.installs());
         let mut f = [0u8; 400];
         let seq = self.next_seq();
         let n = header(&mut f, DATA, TO_DS, &self.bssid, &self.mac, &self.bssid, seq);
         let Some(b) = data_body(&mut f[n..], EAPOL, reply.bytes()) else { return };
-        radio(&f[..n + b]);
-        if let Some(keys) = keys.filter(|_| self.link == Link::Keying) {
-            self.keys = Some(keys);
-            self.link = Link::Up;
-            self.pn = 0;
-            self.deadline = now;
+        // Sealed if what it answers was (a rekeying), under the keys in place
+        // (so a message 4 goes under the old key, before the new is installed).
+        match self.keys.filter(|_| sealed && self.link == Link::Up) {
+            Some(k) => {
+                let mut out = [0u8; 400 + ccmp::HEADER + ccmp::MIC];
+                self.pn += 1;
+                if let Some(m) = ccmp::seal(&k.tk, self.pn, 0, &f[..n], &f[n..n + b], &mut out) {
+                    radio(&out[..m]);
+                }
+            }
+            None => radio(&f[..n + b]),
+        }
+        if installs != self.installs {
+            self.installs = installs;
+            if let Some(new) = keys {
+                self.install(new, now);
+            }
+        }
+        if self.link == Link::Up && self.supplicant.as_ref().is_some_and(|s| s.needs_nonce()) {
+            let n = self.nonce();
+            if let Some(s) = self.supplicant.as_mut() {
+                s.renew(n);
+            }
+        }
+    }
+
+    /// Puts keys the handshake installed in use: the first, bringing the
+    /// link up, or renewed ones.
+    fn install(&mut self, new: Keys, now: u64) {
+        let g = (new.gtk.index & 3) as usize;
+        match self.keys.filter(|_| self.link == Link::Up) {
+            None => {
+                self.keys = Some(new);
+                self.link = Link::Up;
+                self.pn = 0;
+                (self.rx_pn, self.old_tk, self.groups) = (None, None, [None; 4]);
+                self.groups[g] = Some((new.gtk.key, None));
+                (self.rekeys, self.group_rekeys) = (0, 0);
+                self.deadline = now;
+            }
+            Some(old) => {
+                if new.tk != old.tk {
+                    self.old_tk = Some((old.tk, self.rx_pn));
+                    self.rx_pn = None;
+                    self.pn = 0;
+                    self.rekeys += 1;
+                }
+                if new.gtk != old.gtk {
+                    if self.groups[g].map(|k| k.0) != Some(new.gtk.key) {
+                        self.groups[g] = Some((new.gtk.key, None));
+                    }
+                    self.group_rekeys += 1;
+                }
+                self.keys = Some(new);
+            }
         }
     }
 

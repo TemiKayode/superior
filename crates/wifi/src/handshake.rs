@@ -13,6 +13,15 @@
 //! downgrade shows); message 4 confirms. Every frame after message 1 has
 //! its MIC checked, and replay counters only go up.
 //!
+//! Keys are renewed while the link is up: the access point starts the
+//! 4-way handshake again with a new nonce (the station answers with a new
+//! one of its own, and the old keys carry data until message 3 installs
+//! the new), and replaces the group key with the group key handshake
+//! (12.7.7): one signed frame with the new GTK wrapped under the KEK,
+//! answered by a signed confirmation. A message sent again because its
+//! answer was lost is answered again, but keys already installed are not
+//! installed again (that would start their packet numbers over).
+//!
 //! Frames are EAPOL-Key frames (802.1X, version 2, descriptor 2, key
 //! descriptor version 2: HMAC-SHA1 MICs, AES key wrap), as carried after
 //! an LLC header with EtherType 0x888e.
@@ -195,6 +204,15 @@ fn elements(mut kd: &[u8]) -> impl Iterator<Item = (u8, &[u8])> {
     })
 }
 
+/// The group key in key data: the GTK KDE (OUI 00-0f-ac, type 1, key ID,
+/// reserved, key).
+fn gtk_kde(kd: &[u8]) -> Option<Gtk> {
+    elements(kd).find_map(|(t, body)| {
+        (t == 0xdd && body.len() == 6 + 16 && body[..4] == [0x00, 0x0f, 0xac, 1])
+            .then(|| Gtk { index: body[4] & 3, key: body[6..].try_into().unwrap() })
+    })
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Step {
     /// The station waits for message 1 (or a new one), the access point
@@ -240,6 +258,11 @@ pub struct Supplicant {
     replay: Option<u64>,
     keys: Option<Keys>,
     step: Step,
+    /// The nonce for the next rekeying, given in advance ([`renew`]).
+    ///
+    /// [`renew`]: Supplicant::renew
+    next: Option<[u8; 32]>,
+    installs: u32,
 }
 
 impl Supplicant {
@@ -258,7 +281,55 @@ impl Supplicant {
             replay: None,
             keys: None,
             step: Step::Start,
+            next: None,
+            installs: 0,
         }
+    }
+
+    /// A fresh nonce for the access point's next rekeying: without one, a
+    /// message 1 after keys are installed is refused.
+    pub fn renew(&mut self, snonce: [u8; 32]) {
+        self.next = Some(snonce);
+    }
+
+    /// Whether the next rekeying still wants a nonce.
+    pub fn needs_nonce(&self) -> bool {
+        self.next.is_none()
+    }
+
+    /// How many times keys have been installed (the first time, then once
+    /// for every rekeying, pairwise or group): changes when [`keys`] does.
+    ///
+    /// [`keys`]: Supplicant::keys
+    pub fn installs(&self) -> u32 {
+        self.installs
+    }
+
+    /// The group key handshake's message 1: a new group key, under the
+    /// pairwise keys in place.
+    fn group(&mut self, f: &[u8], k: &Key) -> Result<Frame, Error> {
+        let (Some(ptk), Some(mut keys)) = (self.ptk, self.keys) else {
+            return Err(Error::State);
+        };
+        if self.step != Step::Done || k.info & (ACK | MIC | SECURE | ENCRYPTED) != ACK | MIC | SECURE | ENCRYPTED {
+            return Err(Error::State);
+        }
+        if !mic_ok(f, &ptk.kck) {
+            return Err(Error::Mic);
+        }
+        let mut plain = [0u8; MAX_KEY_DATA];
+        let n = k.key_data.len().checked_sub(8).ok_or(Error::KeyData)?;
+        if !key_unwrap(&ptk.kek, k.key_data, &mut plain) {
+            return Err(Error::KeyData);
+        }
+        let gtk = gtk_kde(&plain[..n]).ok_or(Error::KeyData)?;
+        self.replay = Some(k.replay);
+        if gtk != keys.gtk {
+            keys.gtk = gtk;
+            self.keys = Some(keys);
+            self.installs += 1;
+        }
+        Ok(Frame::build(VERSION_2 | MIC | SECURE, 0, k.replay, &[0; 32], &[]).sign(&ptk.kck))
     }
 
     /// Takes a frame from the access point: returns the answer to send.
@@ -267,14 +338,18 @@ impl Supplicant {
         if self.replay.is_some_and(|r| k.replay <= r) {
             return Err(Error::Replay);
         }
+        if k.info & PAIRWISE == 0 {
+            return self.group(f, &k);
+        }
         if k.info & (PAIRWISE | ACK) != PAIRWISE | ACK {
             return Err(Error::State);
         }
         if k.info & MIC == 0 {
-            // Message 1: a nonce, unsigned. A new one starts over, until
-            // keys are installed (rekeying is not done).
+            // Message 1: a nonce, unsigned. A new one starts over; once
+            // keys are installed it starts a rekeying, with the nonce
+            // given for it (the keys in place carry on until message 3).
             if self.step == Step::Done {
-                return Err(Error::State);
+                self.snonce = self.next.take().ok_or(Error::State)?;
             }
             let ptk = ptk(&self.pmk, &self.aa, &self.spa, &k.nonce, &self.snonce);
             self.anonce = k.nonce;
@@ -303,17 +378,9 @@ impl Supplicant {
         if !key_unwrap(&ptk.kek, k.key_data, &mut plain) {
             return Err(Error::KeyData);
         }
-        let (mut rsne_ok, mut gtk) = (false, None);
-        for (t, body) in elements(&plain[..n]) {
-            match t {
-                0x30 => rsne_ok = body.len() + 2 == self.theirs.n && body == &self.theirs.get()[2..],
-                // The GTK KDE: OUI 00-0f-ac, type 1, key ID, reserved, key.
-                0xdd if body.len() == 6 + 16 && body[..4] == [0x00, 0x0f, 0xac, 1] => {
-                    gtk = Some(Gtk { index: body[4] & 3, key: body[6..].try_into().unwrap() });
-                }
-                _ => {}
-            }
-        }
+        let theirs = self.theirs.get();
+        let rsne_ok = elements(&plain[..n]).any(|(t, body)| t == 0x30 && body.len() + 2 == theirs.len() && body == &theirs[2..]);
+        let gtk = gtk_kde(&plain[..n]);
         if !rsne_ok {
             return Err(Error::Rsne);
         }
@@ -322,6 +389,7 @@ impl Supplicant {
         if self.step != Step::Done {
             self.keys = Some(Keys { tk: ptk.tk, gtk });
             self.step = Step::Done;
+            self.installs += 1;
         }
         Ok(Frame::build(VERSION_2 | PAIRWISE | MIC | SECURE, 0, k.replay, &[0; 32], &[]).sign(&ptk.kck))
     }
@@ -343,13 +411,80 @@ pub struct Authenticator {
     replay: u64,
     ptk: Option<Ptk>,
     step: Step,
+    /// The pairwise keys in use while a rekeying is under way.
+    current: Option<Ptk>,
+    /// A new group key being delivered.
+    group: Option<Gtk>,
 }
 
 impl Authenticator {
     /// Access point `aa`, advertising `rsne`, for station `spa`, with nonce
     /// `anonce` (fresh random bytes) and group key `gtk`.
     pub fn new(pmk: [u8; 32], aa: [u8; 6], spa: [u8; 6], anonce: [u8; 32], rsne: &[u8], gtk: Gtk) -> Self {
-        Authenticator { pmk, aa, spa, anonce, rsne: Rsne::new(rsne), gtk, replay: 0, ptk: None, step: Step::Start }
+        Authenticator {
+            pmk,
+            aa,
+            spa,
+            anonce,
+            rsne: Rsne::new(rsne),
+            gtk,
+            replay: 0,
+            ptk: None,
+            step: Step::Start,
+            current: None,
+            group: None,
+        }
+    }
+
+    /// Starts renewing the pairwise keys, with new nonce `anonce`: message
+    /// 1 again. `None` unless keyed with nothing else under way.
+    pub fn rekey(&mut self, anonce: [u8; 32]) -> Option<Frame> {
+        if self.step != Step::Done || self.group.is_some() {
+            return None;
+        }
+        self.current = self.ptk;
+        self.anonce = anonce;
+        Some(self.start())
+    }
+
+    /// Starts replacing the group key with `gtk`: the group key
+    /// handshake's message 1. `None` unless keyed with nothing else under
+    /// way.
+    pub fn rekey_group(&mut self, gtk: Gtk) -> Option<Frame> {
+        let ptk = self.ptk.filter(|_| self.step == Step::Done && self.group.is_none())?;
+        self.group = Some(gtk);
+        Some(self.group_message(&ptk))
+    }
+
+    /// The group key in use (the new one once the station has confirmed
+    /// it).
+    pub fn gtk(&self) -> Gtk {
+        self.gtk
+    }
+
+    /// Whether a rekeying (pairwise or group) is under way.
+    pub fn rekeying(&self) -> bool {
+        self.current.is_some() || self.group.is_some()
+    }
+
+    /// The new temporal key of a pairwise rekeying under way, once the
+    /// station has answered message 1: the station's frames come under it
+    /// once it has installed it, which may be before its message 4
+    /// arrives (or if that is lost).
+    pub fn pending_tk(&self) -> Option<[u8; 16]> {
+        self.ptk.filter(|_| self.step == Step::Keyed && self.current.is_some()).map(|p| p.tk)
+    }
+
+    fn group_message(&mut self, ptk: &Ptk) -> Frame {
+        self.replay += 1;
+        let gtk = self.group.unwrap_or(self.gtk);
+        let mut plain = [0u8; 24];
+        plain[..8].copy_from_slice(&[0xdd, 22, 0x00, 0x0f, 0xac, 1, gtk.index & 3, 0]);
+        plain[8..].copy_from_slice(&gtk.key);
+        let mut wrapped = [0u8; 32];
+        key_wrap(&ptk.kek, &plain, &mut wrapped);
+        let info = VERSION_2 | ACK | MIC | SECURE | ENCRYPTED;
+        Frame::build(info, 0, self.replay, &[0; 32], &wrapped).sign(&ptk.kck)
     }
 
     /// Message 1 (sent again, with a higher replay counter, if no answer
@@ -362,11 +497,13 @@ impl Authenticator {
 
     /// What to send when the station has not answered: message 1 again
     /// before message 2 came, message 3 again (with a higher replay
-    /// counter) before message 4 came; nothing once done.
+    /// counter) before message 4 came, the group key's message again
+    /// before its confirmation came; nothing once done.
     pub fn retry(&mut self) -> Option<Frame> {
         match (self.step, self.ptk) {
             (Step::Start, _) => Some(self.start()),
             (Step::Keyed, Some(ptk)) => Some(self.message3(&ptk)),
+            (Step::Done, Some(ptk)) if self.group.is_some() => Some(self.group_message(&ptk)),
             _ => None,
         }
     }
@@ -400,6 +537,18 @@ impl Authenticator {
         if k.replay != self.replay {
             return Err(Error::Replay);
         }
+        if k.info & PAIRWISE == 0 {
+            // The group key's confirmation: the new key is in use.
+            let ptk = self.ptk.ok_or(Error::State)?;
+            if self.step != Step::Done || self.group.is_none() || k.info & (MIC | ACK | SECURE) != MIC | SECURE {
+                return Err(Error::State);
+            }
+            if !mic_ok(f, &ptk.kck) {
+                return Err(Error::Mic);
+            }
+            self.gtk = self.group.take().unwrap_or(self.gtk);
+            return Ok(None);
+        }
         if k.info & (PAIRWISE | MIC | ACK) != PAIRWISE | MIC {
             return Err(Error::State);
         }
@@ -425,6 +574,7 @@ impl Authenticator {
                     return Err(Error::Mic);
                 }
                 self.step = Step::Done;
+                self.current = None;
                 Ok(None)
             }
             Step::Done => Err(Error::State),

@@ -158,6 +158,54 @@ pub fn idle_wait() {
     x86_64::instructions::interrupts::disable();
 }
 
+/// The time-stamp counter, for the entropy pool's timings.
+pub fn cycles() -> u64 {
+    // SAFETY: rdtsc reads the counter, nothing else.
+    unsafe { core::arch::x86_64::_rdtsc() }
+}
+
+/// Which random instruction the CPU has: RDSEED (straight from its noise
+/// source) is preferred to RDRAND (a generator it reseeds).
+pub fn random_source() -> Option<&'static str> {
+    use core::arch::x86_64::{__cpuid, __cpuid_count};
+    #[allow(unused_unsafe)]
+    // SAFETY: CPUID is always there on x86-64.
+    let (leaf1, leaf7) = unsafe { (__cpuid(1), __cpuid_count(7, 0)) };
+    if leaf7.ebx & 1 << 18 != 0 {
+        Some("RDSEED")
+    } else if leaf1.ecx & 1 << 30 != 0 {
+        Some("RDRAND")
+    } else {
+        None
+    }
+}
+
+/// A word from the CPU's random instruction, retried a few times (it can
+/// run dry for a moment); `None` without one.
+pub fn random_word() -> Option<u64> {
+    let seed = match random_source()? {
+        "RDSEED" => true,
+        _ => false,
+    };
+    for _ in 0..32 {
+        let (v, ok): (u64, u8);
+        // SAFETY: the instruction is there (CPUID said so); it only sets
+        // the register and the carry flag.
+        unsafe {
+            if seed {
+                core::arch::asm!("rdseed {}", "setc {}", out(reg) v, out(reg_byte) ok, options(nomem, nostack));
+            } else {
+                core::arch::asm!("rdrand {}", "setc {}", out(reg) v, out(reg_byte) ok, options(nomem, nostack));
+            }
+        }
+        if ok == 1 {
+            return Some(v);
+        }
+        core::hint::spin_loop();
+    }
+    None
+}
+
 pub fn irq_routable(line: u8) -> bool {
     interrupts::irq_routable(line)
 }

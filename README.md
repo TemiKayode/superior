@@ -847,8 +847,33 @@ holds the rest):
   server lease an address by DHCP (answers broadcast, so under the group key),
   ping the gateway and have it echo 40 UDP datagrams (some in fragments), and
   the access point must have refused nothing. A laptop's real card, through
-  its driver and firmware, comes later; so do WPA3 (SAE), rekeying, and an
-  entropy source for the nonces (seeded from the clocks for now).
+  its driver and firmware, comes later; so do WPA3 (SAE) and scanning for every
+  network in range.
+- Rekeying: once keyed, the access point can renew the pairwise keys (the 4-way
+  handshake again, under the keys in use, the station answering with a nonce
+  of its own given in advance) and the group key (the group key handshake: one
+  signed frame with the new key wrapped, and a signed confirmation). Neither
+  side drops frames over the switch: the station sends under a new temporal
+  key as soon as it is installed and still opens frames under the old one
+  until the access point catches up, which in turn opens the station's frames
+  under the pending key; group keys are held by key ID, the old one opening
+  frames until it is replaced. A message sent again because its answer was
+  lost is answered without installing its keys again. Host tests renew both
+  while frames flow both ways (none lost) and over a channel losing every other
+  frame. In `wifi-test` the access point renews the pairwise keys and the
+  group key in turn every 20 frames from the station, then asks for the
+  station's address by a broadcast ARP request under the new group key; the
+  client checks it went on without losing a datagram, and `nic`'s `LINK` now
+  also says how many times the keys were renewed.
+- Random numbers: the `Random` system call gives 32 bytes from the kernel's
+  entropy pool (`kernel/src/entropy.rs`), seeded at boot from the CPU's random
+  instruction where it has one (RDSEED or RDRAND on x86-64, RNDR on AArch64)
+  and the cycle counter's jitter, and fed the counter at every interrupt.
+  Each draw hashes it all (SHA-256) into a value that gives both the output
+  and the next key and is not kept, so a later state does not give earlier
+  output away. The Wi-Fi station's nonces come from it; `wifi-test` runs on a
+  CPU with the random instruction (QEMU's `qemu64,+rdrand,+rdseed` and `max`)
+  and checks the kernel seeded from it.
 - USB: an xHCI host controller driver (`user/xhci/`) and a HID driver for
   keyboards, mice and tablets (`user/hid/`).
   - The xHCI driver opens the first function of class 0c:03:30, resets the controller,

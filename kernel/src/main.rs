@@ -23,6 +23,7 @@ mod arch;
 #[path = "arch/x86_64/mod.rs"]
 mod arch;
 
+mod entropy;
 mod iommu;
 mod memory;
 mod smp;
@@ -124,6 +125,10 @@ fn kernel_start(untyped_caps: usize) -> ! {
     match arch::iommu_init() {
         Some(name) => kprintln!("[ok] IOMMU: {name}, all DMA blocked until bound"),
         None => kprintln!("[ok] no IOMMU"),
+    }
+    match entropy::init() {
+        Some(source) => kprintln!("[ok] entropy: seeded from {source} and the cycle counter's jitter"),
+        None => kprintln!("[ok] entropy: no random instruction; seeded from the cycle counter's jitter and interrupt timings"),
     }
     #[cfg(feature = "selftest")]
     selftest(untyped_caps);

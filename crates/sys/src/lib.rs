@@ -92,6 +92,20 @@ pub fn ticks() -> u64 {
     syscall(Syscall::Ticks, 0, [0; MSG_WORDS]).msg[0]
 }
 
+/// 32 random bytes from the kernel's entropy pool (`Random`), for keys
+/// and nonces; `None` where the kernel has none (seL4).
+pub fn random() -> Option<[u8; 32]> {
+    let r = syscall(Syscall::Random, 0, [0; MSG_WORDS]);
+    if r.status != 0 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, w) in r.msg.iter().take(4).enumerate() {
+        out[i * 8..i * 8 + 8].copy_from_slice(&w.to_le_bytes());
+    }
+    Some(out)
+}
+
 /// Blocks for `n` ticks without spending a CPU on it (`Sleep`). Where
 /// there is no `Sleep` (on seL4), yields until the time has passed.
 pub fn sleep(n: u64) {

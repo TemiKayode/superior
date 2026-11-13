@@ -7,7 +7,11 @@
 //! point's side of the 4-way handshake ([`Authenticator`]), and then
 //! carries Ethernet frames both ways: the station's, opened under the
 //! temporal key, and its own, sealed with the temporal key to the station
-//! or the group key to a group.
+//! or the group key to a group. Once the station is keyed it can renew the
+//! pairwise keys ([`AccessPoint::rekey`]) or the group key
+//! ([`AccessPoint::rekey_group`]), the handshake's frames then sealed
+//! under the keys in place; it switches to new keys when the station
+//! confirms them.
 //!
 //! [`Station`]: crate::station::Station
 
@@ -44,10 +48,15 @@ pub struct AccessPoint {
     pn: u64,
     group_pn: u64,
     rx_pn: Option<u64>,
+    /// The last packet number taken under a pending new temporal key.
+    pending_pn: Option<u64>,
     seq: u16,
     resend: u64,
     /// Data frames refused: forged, replayed, or in the clear.
     pub refused: u64,
+    /// Rekeyings finished: pairwise, and group.
+    pub rekeys: u32,
+    pub group_rekeys: u32,
 }
 
 impl AccessPoint {
@@ -70,9 +79,12 @@ impl AccessPoint {
             pn: 0,
             group_pn: 0,
             rx_pn: None,
+            pending_pn: None,
             seq: 0,
             resend: 0,
             refused: 0,
+            rekeys: 0,
+            group_rekeys: 0,
         }
     }
 
@@ -118,19 +130,70 @@ impl AccessPoint {
         radio(&f[..n + body.len()]);
     }
 
+    /// A handshake frame to the station: in the clear while it is being
+    /// keyed, sealed under the temporal key in use once it is.
     fn eapol(&mut self, eapol: &[u8], radio: &mut dyn FnMut(&[u8])) {
         let mut f = [0u8; 400];
         let seq = self.next_seq();
         let n = header(&mut f, DATA, FROM_DS, &self.station, &self.bssid, &self.bssid, seq);
-        if let Some(b) = data_body(&mut f[n..], EAPOL, eapol) {
+        let Some(b) = data_body(&mut f[n..], EAPOL, eapol) else { return };
+        if self.peer == Peer::Up {
+            let mut out = [0u8; 400 + ccmp::HEADER + ccmp::MIC];
+            self.pn += 1;
+            if let Some(m) = ccmp::seal(&self.tk, self.pn, 0, &f[..n], &f[n..n + b], &mut out) {
+                radio(&out[..m]);
+            }
+        } else {
             radio(&f[..n + b]);
         }
     }
 
+    /// Starts renewing the station's pairwise keys (a new 4-way handshake
+    /// under the keys in use). False unless it is keyed with no rekeying
+    /// under way.
+    pub fn rekey(&mut self, now: u64, radio: &mut dyn FnMut(&[u8])) -> bool {
+        if self.peer != Peer::Up {
+            return false;
+        }
+        let anonce = self.nonce();
+        let Some(m1) = self.auth.as_mut().and_then(|a| a.rekey(anonce)) else { return false };
+        self.pending_pn = None;
+        self.resend = now + RESEND_MS;
+        self.eapol(m1.bytes(), radio);
+        true
+    }
+
+    /// Starts replacing the group key with `gtk` (whose key ID should
+    /// differ from the one in use, so frames under either open). The old
+    /// key carries group frames until the station confirms the new one.
+    /// False unless it is keyed with no rekeying under way.
+    pub fn rekey_group(&mut self, gtk: Gtk, now: u64, radio: &mut dyn FnMut(&[u8])) -> bool {
+        if self.peer != Peer::Up {
+            return false;
+        }
+        let Some(m) = self.auth.as_mut().and_then(|a| a.rekey_group(gtk)) else { return false };
+        self.resend = now + RESEND_MS;
+        self.eapol(m.bytes(), radio);
+        true
+    }
+
+    /// Whether a rekeying is under way.
+    pub fn rekeying(&self) -> bool {
+        self.auth.as_ref().is_some_and(|a| a.rekeying())
+    }
+
+    /// A fresh nonce, from the seed and a counter.
+    fn nonce(&mut self) -> [u8; 32] {
+        self.nonces += 1;
+        let mut n = [0u8; 32];
+        prf(&self.seed, b"Init Counter", &[&self.bssid, &self.nonces.to_be_bytes()], &mut n);
+        n
+    }
+
     /// Sends the handshake's last message again if the station has not
-    /// answered it (message 1, or message 3).
+    /// answered it (message 1, message 3, or a group key's message).
     pub fn poll(&mut self, now: u64, radio: &mut dyn FnMut(&[u8])) {
-        if self.peer != Peer::Keying || now < self.resend {
+        if !matches!(self.peer, Peer::Keying | Peer::Up) || now < self.resend {
             return;
         }
         if let Some(m) = self.auth.as_mut().and_then(|a| a.retry()) {
@@ -177,9 +240,7 @@ impl AccessPoint {
                 let mut resp = [cap[0], cap[1], 0, 0, 1, 0xc0, RATES, 8, 0, 0, 0, 0, 0, 0, 0, 0];
                 resp[8..].copy_from_slice(&RATE_SET);
                 self.reply(ASSOC_RESP, &resp, radio);
-                self.nonces += 1;
-                let mut anonce = [0u8; 32];
-                prf(&self.seed, b"Init Counter", &[&self.bssid, &self.nonces.to_be_bytes()], &mut anonce);
+                let anonce = self.nonce();
                 self.auth = Some(Authenticator::new(self.pmk, self.bssid, sa, anonce, &RSNE_PSK_CCMP, self.gtk));
                 self.peer = Peer::Keying;
                 self.rx_pn = None;
@@ -199,21 +260,7 @@ impl AccessPoint {
     fn data(&mut self, f: &[u8], fc1: u8, sa: [u8; 6], da: [u8; 6], now: u64, radio: &mut dyn FnMut(&[u8]), up: &mut dyn FnMut(&[u8])) {
         if fc1 & PROTECTED == 0 {
             match frame::snap(&f[HEADER..]) {
-                Some((EAPOL, eapol)) if self.peer == Peer::Keying => {
-                    let Some(a) = self.auth.as_mut() else { return };
-                    match a.receive(eapol) {
-                        Ok(Some(m3)) => {
-                            self.resend = now + RESEND_MS;
-                            self.eapol(m3.bytes(), radio);
-                        }
-                        Ok(None) => {
-                            self.tk = a.tk().unwrap_or([0; 16]);
-                            self.peer = Peer::Up;
-                            self.pn = 0;
-                        }
-                        Err(_) => self.refused += 1,
-                    }
-                }
+                Some((EAPOL, eapol)) if self.peer == Peer::Keying => self.handshake(eapol, now, radio),
                 _ => self.refused += 1,
             }
             return;
@@ -224,16 +271,63 @@ impl AccessPoint {
         let mut copy = [0u8; MAX];
         let Some(copy) = copy.get_mut(..f.len()) else { return };
         copy.copy_from_slice(f);
-        let Ok((range, pn)) = ccmp::open(&self.tk, copy, self.rx_pn) else {
+        // Under the key in use, or during a rekeying under the new one,
+        // which the station uses as soon as it has installed it.
+        let opened = match ccmp::open(&self.tk, copy, self.rx_pn) {
+            Ok(r) => {
+                self.rx_pn = Some(r.1);
+                Ok(r)
+            }
+            Err(e) => match self.auth.as_ref().and_then(|a| a.pending_tk()) {
+                Some(tk) => {
+                    copy.copy_from_slice(f);
+                    ccmp::open(&tk, copy, self.pending_pn).inspect(|r| self.pending_pn = Some(r.1))
+                }
+                None => Err(e),
+            },
+        };
+        let Ok((range, _)) = opened else {
             self.refused += 1;
             return;
         };
-        self.rx_pn = Some(pn);
         if let Some((kind, payload)) = frame::snap(&copy[range]) {
+            if kind == EAPOL {
+                self.handshake(payload, now, radio);
+                return;
+            }
             let mut eth = [0u8; 1514];
             if let Some(n) = to_ethernet(&mut eth, &da, &sa, kind, payload) {
                 up(&eth[..n]);
             }
+        }
+    }
+
+    /// A handshake frame from the station: answered, and new keys put in
+    /// use once the station has confirmed them.
+    fn handshake(&mut self, eapol: &[u8], now: u64, radio: &mut dyn FnMut(&[u8])) {
+        let Some(a) = self.auth.as_mut() else { return };
+        match a.receive(eapol) {
+            Ok(Some(m3)) => {
+                self.resend = now + RESEND_MS;
+                self.eapol(m3.bytes(), radio);
+            }
+            Ok(None) => {
+                let (tk, gtk) = (a.tk().unwrap_or([0; 16]), a.gtk());
+                if self.peer == Peer::Keying {
+                    self.peer = Peer::Up;
+                    (self.tk, self.pn, self.rx_pn) = (tk, 0, None);
+                } else if tk != self.tk {
+                    // The station's frames under the new key so far.
+                    (self.tk, self.pn, self.rx_pn) = (tk, 0, self.pending_pn);
+                    self.pending_pn = None;
+                    self.rekeys += 1;
+                }
+                if gtk != self.gtk {
+                    (self.gtk, self.group_pn) = (gtk, 0);
+                    self.group_rekeys += 1;
+                }
+            }
+            Err(_) => self.refused += 1,
         }
     }
 

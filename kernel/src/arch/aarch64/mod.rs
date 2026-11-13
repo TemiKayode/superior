@@ -330,6 +330,38 @@ pub fn idle_wait() {
     };
 }
 
+/// The virtual counter, for the entropy pool's timings.
+pub fn cycles() -> u64 {
+    timer::counter()
+}
+
+/// RNDR, if the CPU has it (FEAT_RNG: ID_AA64ISAR0_EL1 bits 63:60).
+pub fn random_source() -> Option<&'static str> {
+    let isar0: u64;
+    // SAFETY: reading an ID register has no side effect.
+    unsafe { core::arch::asm!("mrs {}, id_aa64isar0_el1", out(reg) isar0, options(nomem, nostack)) };
+    (isar0 >> 60 != 0).then_some("RNDR")
+}
+
+/// A word from RNDR, retried a few times (it fails, setting Z, when it
+/// cannot give one at once); `None` without it.
+pub fn random_word() -> Option<u64> {
+    random_source()?;
+    for _ in 0..32 {
+        let (v, nzcv): (u64, u64);
+        // SAFETY: RNDR is there (the ID register said so); it only sets
+        // the register and the flags. s3_3_c2_c4_0 is RNDR.
+        unsafe {
+            core::arch::asm!("mrs {}, s3_3_c2_c4_0", "mrs {}, nzcv", out(reg) v, out(reg) nzcv, options(nomem, nostack))
+        };
+        if nzcv & 1 << 30 == 0 {
+            return Some(v);
+        }
+        core::hint::spin_loop();
+    }
+    None
+}
+
 /// MSI lines: one LPI each, through the ITS (none without one).
 fn msi_lines() -> core::ops::Range<u8> {
     let count = if gic::its_present() { gic::MSI_COUNT } else { 0 };

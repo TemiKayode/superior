@@ -224,8 +224,11 @@ pub mod nic {
     /// `Invalid` if either is out of range, `NotFound` from a wired card.
     /// A restarted radio has forgotten the network.
     pub const JOIN: u64 = 7;
-    /// `[LINK]`: reply `[status, link, BSSID (as INFO gives a MAC), 0]`,
-    /// `link` one of [`link`]'s. A wired card is always [`link::UP`].
+    /// `[LINK]`: reply `[status, link, BSSID (as INFO gives a MAC),
+    /// rekeys]`, `link` one of [`link`]'s, `rekeys` the times the access
+    /// point has renewed the keys since the link came up: pairwise in the
+    /// high 32 bits, group in the low. A wired card is always
+    /// [`link::UP`], with 0.
     pub const LINK: u64 = 8;
     /// Where a radio's joining has got to.
     pub mod link {

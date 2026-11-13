@@ -681,6 +681,12 @@ pub fn handle_syscall(frame: &mut UserFrame) -> Exit {
             k.ipc.set_msg_of(cur, [ticks, 0, 0, 0]);
             Ok(())
         }
+        Some(Syscall::Random) => {
+            let r = crate::entropy::draw();
+            let w = |i: usize| u64::from_le_bytes(r[i * 8..i * 8 + 8].try_into().unwrap_or([0; 8]));
+            k.ipc.set_msg_of(cur, [w(0), w(1), w(2), w(3)]);
+            Ok(())
+        }
         Some(Syscall::IrqMsiMessage) => irq_msi_message(k, cur, &a),
         Some(Syscall::FrameDmaAddress) => frame_dma_address(k, cur, a.a0),
         Some(Syscall::DeviceFrame) => device_frame(k, cur, &a),
@@ -739,6 +745,7 @@ pub fn handle_syscall(frame: &mut UserFrame) -> Exit {
 /// budget refills, the timer notification and `TimerSignal`s), the others'
 /// only charge and slice their own threads.
 pub fn handle_timer(frame: &mut UserFrame) -> Exit {
+    crate::entropy::interrupt(0xff);
     let mut guard = lock_kernel();
     let k = &mut *guard;
     let global = arch::cpu_id() == 0;
@@ -950,6 +957,7 @@ fn reboot_allowed(k: &Kernel, cur: Tid, slot: u64) -> Result<(), u64> {
 /// the notification bound to its line. Like the timer, it can arrive in
 /// user mode or while the kernel idles.
 pub fn handle_irq(frame: &mut UserFrame, line: u8) -> Exit {
+    crate::entropy::interrupt(line);
     let mut guard = lock_kernel();
     let k = &mut *guard;
     let bound = k.irq_ntfn.get(line as usize).copied().flatten();

@@ -3,7 +3,11 @@
 //! 802.11 frames to, one frame a datagram, with a small network behind it:
 //! a gateway that answers ARP, hands out an address by DHCP (its answers
 //! broadcast, so they go under the group key), answers pings and echoes
-//! UDP datagrams, fragments included.
+//! UDP datagrams, fragments included. While the station's frames come, the
+//! access point renews the keys: the pairwise keys and the group key in
+//! turn, every `REKEY_EVERY` frames; after a new group key it asks for the
+//! station's address by a broadcast ARP request, so a frame under the new
+//! group key needs an answer.
 
 use std::net::UdpSocket;
 use std::sync::Arc;
@@ -25,6 +29,8 @@ const GATEWAY_MAC: [u8; 6] = [0x02, 0x00, 0x5e, 0x00, 0x05, 0x01];
 const GATEWAY: [u8; 4] = [10, 0, 5, 1];
 const LEASED: [u8; 4] = [10, 0, 5, 30];
 const ECHO_PORT: u16 = 47001;
+/// Frames from the station between rekeyings.
+const REKEY_EVERY: u64 = 20;
 
 /// What the access point saw, for the test to check.
 #[derive(Default)]
@@ -37,6 +43,11 @@ pub struct Seen {
     pub dhcp: AtomicU64,
     /// Frames the access point refused.
     pub refused: AtomicU64,
+    /// Rekeyings finished (pairwise, group), and the station's ARP answers
+    /// to the gateway's broadcast requests after a new group key.
+    pub rekeys: AtomicU64,
+    pub group_rekeys: AtomicU64,
+    pub arp_answers: AtomicU64,
 }
 
 /// Runs the access point until `stop`.
@@ -47,8 +58,13 @@ pub fn start(stop: Arc<AtomicBool>, seen: Arc<Seen>) -> Result<JoinHandle<()>, S
     getrandom::getrandom(&mut seed).map_err(|e| e.to_string())?;
     let mut gtk = Gtk { index: 1, key: [0; 16] };
     getrandom::getrandom(&mut gtk.key).map_err(|e| e.to_string())?;
+    let mut later_gtks = [[0u8; 16]; 8];
+    for k in later_gtks.iter_mut() {
+        getrandom::getrandom(k).map_err(|e| e.to_string())?;
+    }
     Ok(std::thread::spawn(move || {
         let mut ap = AccessPoint::new(BSSID, SSID, PASSPHRASE, gtk, seed);
+        let (mut next_rekey, mut rekeyings, mut group_rekeys) = (REKEY_EVERY, 0usize, 0);
         let started = Instant::now();
         let radio = ("127.0.0.1", RADIO_PORT);
         let mut next_beacon = 0;
@@ -67,7 +83,22 @@ pub fn start(stop: Arc<AtomicBool>, seen: Arc<Seen>) -> Result<JoinHandle<()>, S
                 let mut up: Vec<Vec<u8>> = Vec::new();
                 ap.receive(&buf[..n], now, &mut |f| out.push(f.to_vec()), &mut |e| up.push(e.to_vec()));
                 for e in up {
-                    seen.from_station.fetch_add(1, Ordering::Relaxed);
+                    let from = seen.from_station.fetch_add(1, Ordering::Relaxed) + 1;
+                    if from >= next_rekey && !ap.rekeying() {
+                        // The pairwise keys and the group key in turn, the
+                        // group key's ID alternating between 1 and 2.
+                        let radio = &mut |f: &[u8]| out.push(f.to_vec());
+                        let started = if rekeyings % 2 == 0 {
+                            ap.rekey(now, radio)
+                        } else {
+                            let key = later_gtks[(rekeyings / 2) % later_gtks.len()];
+                            ap.rekey_group(Gtk { index: 2 - (rekeyings / 2 % 2) as u8, key }, now, radio)
+                        };
+                        if started {
+                            rekeyings += 1;
+                            next_rekey = from + REKEY_EVERY;
+                        }
+                    }
                     if let Some(reply) = answer(&e, &seen) {
                         let mut f = [0u8; MAX];
                         if let Some(n) = ap.send(&reply, &mut f) {
@@ -80,6 +111,16 @@ pub fn start(stop: Arc<AtomicBool>, seen: Arc<Seen>) -> Result<JoinHandle<()>, S
             if ap.peer() == Peer::Up {
                 seen.keyed.store(true, Ordering::Relaxed);
             }
+            if ap.group_rekeys > group_rekeys {
+                // The new group key in use: who has the leased address?
+                group_rekeys = ap.group_rekeys;
+                let mut f = [0u8; MAX];
+                if let Some(n) = ap.send(&arp_request(), &mut f) {
+                    out.push(f[..n].to_vec());
+                }
+            }
+            seen.rekeys.store(ap.rekeys as u64, Ordering::Relaxed);
+            seen.group_rekeys.store(ap.group_rekeys as u64, Ordering::Relaxed);
             seen.refused.store(ap.refused, Ordering::Relaxed);
             for f in out {
                 let _ = sock.send_to(&f, radio);
@@ -118,12 +159,27 @@ fn ethernet(dst: [u8; 6], kind: u16, payload: &[u8]) -> Vec<u8> {
     e
 }
 
+/// A broadcast ARP request from the gateway for the leased address.
+fn arp_request() -> Vec<u8> {
+    let mut r = vec![0, 1, 8, 0, 6, 4, 0, 1];
+    r.extend_from_slice(&GATEWAY_MAC);
+    r.extend_from_slice(&GATEWAY);
+    r.extend_from_slice(&[0; 6]);
+    r.extend_from_slice(&LEASED);
+    ethernet([0xff; 6], 0x0806, &r)
+}
+
 /// The gateway's answer to an Ethernet frame from the station, if any.
 fn answer(e: &[u8], seen: &Seen) -> Option<Vec<u8>> {
     let (dst, src, kind, p) = superior_wifi::frame::ethernet(e)?;
     let _ = dst;
     match kind {
         // ARP: a request (opcode 1) for the gateway's address.
+        // ARP: the station's answer (opcode 2) to the gateway's request.
+        0x0806 if p.len() >= 28 && p[6..8] == [0, 2] && p[14..18] == LEASED && p[24..28] == GATEWAY => {
+            seen.arp_answers.fetch_add(1, Ordering::Relaxed);
+            None
+        }
         0x0806 if p.len() >= 28 && p[6..8] == [0, 1] && p[24..28] == GATEWAY => {
             let mut r = p[..28].to_vec();
             r[7] = 2;

@@ -1043,6 +1043,10 @@ fn qemu_command(img: &Image) -> Command {
                     .args(["-m", "512M"]);
             }
             q.args(["-device", "isa-debug-exit,iobase=0xf4,iosize=0x04"]);
+            if img.radio {
+                // A CPU with random instructions, for the entropy pool.
+                q.args(["-cpu", "qemu64,+rdrand,+rdseed"]);
+            }
         }
         Arch::Aarch64 => {
             // highmem=off keeps PCI's ECAM window below 4 GiB, where the
@@ -1055,7 +1059,9 @@ fn qemu_command(img: &Image) -> Command {
             } else {
                 "virt,highmem=off,gic-version=3"
             };
-            q.args(["-machine", machine, "-cpu", "cortex-a72", "-kernel"])
+            // The radio's test wants RNDR (FEAT_RNG), which "max" has.
+            let cpu = if img.radio { "max" } else { "cortex-a72" };
+            q.args(["-machine", machine, "-cpu", cpu, "-kernel"])
                 .arg(&img.path);
             if img.sel4 {
                 // The shell's exit is a semihosting call from user mode.
@@ -2053,8 +2059,13 @@ fn wifi_test(arch: Arch) -> Result<(), String> {
         "Wi-Fi test",
         &out,
         &[
+            match arch {
+                Arch::X86_64 => "[ok] entropy: seeded from RDSEED and the cycle counter's jitter",
+                Arch::Aarch64 => "[ok] entropy: seeded from RNDR and the cycle counter's jitter",
+            },
             "virtio-net: ready as a Wi-Fi radio:",
             "[pass] wifi: a page of its own",
+            "[pass] wifi: the kernel gives random bytes, a fresh 32 at every draw",
             "[pass] wifi: the radio starts with no network (link 0)",
             "[pass] wifi: a passphrase under 8 characters is refused",
             "[pass] wifi: the radio is told to join \"superior-test\"",
@@ -2069,6 +2080,9 @@ fn wifi_test(arch: Arch) -> Result<(), String> {
             "[pass] wifi: leased 10.0.5.30 (netmask /24) over Wi-Fi, the gateway 10.0.5.1",
             "[pass] wifi: 10 of 10 pings to the gateway answered, every byte right",
             "[pass] wifi: 40 of 40 UDP datagrams echoed by the gateway, every byte right (",
+            "virtio-net: wifi: pairwise keys renewed (1 so far)",
+            "virtio-net: wifi: group key renewed (1 so far)",
+            "[pass] wifi: the keys were renewed under way,",
         ],
     )?;
     if out.contains("[fail]") {
@@ -2076,11 +2090,22 @@ fn wifi_test(arch: Arch) -> Result<(), String> {
     }
     let (from, to) = (seen.from_station.load(Ordering::Relaxed), seen.to_station.load(Ordering::Relaxed));
     let (dhcp, refused) = (seen.dhcp.load(Ordering::Relaxed), seen.refused.load(Ordering::Relaxed));
+    let (rekeys, group_rekeys, arp) = (
+        seen.rekeys.load(Ordering::Relaxed),
+        seen.group_rekeys.load(Ordering::Relaxed),
+        seen.arp_answers.load(Ordering::Relaxed),
+    );
     println!(
         "== access point: station keyed, {from} frames from it and {to} to it under CCMP, {dhcp} DHCP answers broadcast under the group key, {refused} frames refused"
     );
+    println!(
+        "== access point: keys renewed {rekeys} times pairwise and {group_rekeys} times the group key; the station answered {arp} broadcast ARP requests sent under a new group key"
+    );
     if !seen.keyed.load(Ordering::Relaxed) || from == 0 || to == 0 || dhcp < 2 || refused != 0 {
         return Err("Wi-Fi test: the access point did not see the station keyed and carrying frames".into());
+    }
+    if rekeys == 0 || group_rekeys == 0 || arp == 0 {
+        return Err("Wi-Fi test: the keys were not renewed, or the station did not answer under a new group key".into());
     }
     println!("== Wi-Fi test passed ({})", arch.name());
     Ok(())

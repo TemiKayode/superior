@@ -262,6 +262,11 @@ pub enum Syscall {
     /// untyped capability in `rdi` (as for `Reboot`); `InvalidCapability`
     /// otherwise. Devices are the drivers' to quiesce first.
     Suspend = 49,
+    /// 32 random bytes, in message words 0 to 3 (little-endian), from the
+    /// kernel's entropy pool: seeded from the CPU's random instruction
+    /// where it has one and the cycle counter's jitter, and fed interrupt
+    /// timings. For keys and nonces; it needs no capability.
+    Random = 50,
     /// Maps the frame in slot `rdi` at page-aligned `rsi` in the address
     /// space in slot `r8` (Write right). `rdx` = [`MAP_WRITE`] and/or
     /// [`MAP_EXEC`], never both. Needs the frame's Map right, plus Write
@@ -336,6 +341,7 @@ impl Syscall {
             47 => Syscall::ReplyTo,
             48 => Syscall::UntypedInfo,
             49 => Syscall::Suspend,
+            50 => Syscall::Random,
             42 => Syscall::IoFaults,
             0x100 => Syscall::DebugPutStr,
             0x101 => Syscall::DebugSelftestDone,

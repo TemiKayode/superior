@@ -62,7 +62,6 @@ use superior_objects::abi::{CapTransfer, Error, Syscall, TICK_HZ};
 use superior_objects::interfaces::nic::{link, ring};
 use superior_objects::interfaces::{Status, nic};
 use superior_sys::{USER_BASE, print_line, syscall, syscall_x, ticks};
-use superior_wifi::sha1::Sha1;
 use superior_wifi::station::{Link, Station};
 
 const PCI: u64 = 0;
@@ -172,6 +171,8 @@ struct Nic {
     station: Option<Station>,
     radio: bool,
     shown: Link,
+    /// The rekeyings (pairwise, group) last reported.
+    shown_rekeys: (u32, u32),
 }
 
 /// Ethernet frames the station has delivered, waiting for the caller
@@ -249,20 +250,6 @@ impl Outbox {
 /// The time the station counts in: milliseconds since boot.
 fn now_ms() -> u64 {
     ticks() * 1000 / TICK_HZ
-}
-
-/// A cycle counter, for the station's seed.
-fn cycles() -> u64 {
-    #[cfg(target_arch = "x86_64")]
-    // SAFETY: rdtsc reads the time-stamp counter, nothing else.
-    return unsafe { core::arch::x86_64::_rdtsc() };
-    #[cfg(target_arch = "aarch64")]
-    {
-        let v: u64;
-        // SAFETY: reads the virtual counter, which EL0 may.
-        unsafe { core::arch::asm!("mrs {}, cntvct_el0", out(reg) v) };
-        v
-    }
 }
 
 /// Word `off` of the ring's header page.
@@ -426,6 +413,7 @@ fn start(radio: bool) -> Result<Nic, Failure> {
         station: None,
         radio,
         shown: Link::Idle,
+        shown_rekeys: (0, 0),
     };
     if radio {
         let mac = nic.mac.to_be_bytes();
@@ -616,6 +604,7 @@ impl Nic {
         st.poll(now, &mut |r| out.push(r));
         let deadline = st.deadline();
         let (link, bssid) = (st.link(), st.bssid());
+        let rekeys = (st.rekeys, st.group_rekeys);
         let mut ssid = [0u8; 32];
         let n = st.ssid().len();
         ssid[..n].copy_from_slice(st.ssid());
@@ -630,11 +619,16 @@ impl Nic {
         if !self.ring && self.attached && up().front().is_some() {
             syscall(Syscall::Signal, LISTENER, [0; 4]);
         }
-        if link != self.shown {
-            self.shown = link;
+        // Every step passed since the last report (several can pass in one
+        // batch of frames), or the one gone back to.
+        let from = if link.code() > self.shown.code() { self.shown.code() + 1 } else { link.code() };
+        for step in [Link::Idle, Link::Scanning, Link::Authenticating, Link::Associating, Link::Keying, Link::Up] {
+            if link == self.shown || step.code() < from || step.code() > link.code() {
+                continue;
+            }
             let name = core::str::from_utf8(&ssid[..n]).unwrap_or("?");
             let b = bssid;
-            match link {
+            match step {
                 Link::Idle => {}
                 Link::Scanning => say!("wifi: scanning for \"{name}\""),
                 Link::Authenticating => say!(
@@ -645,6 +639,16 @@ impl Nic {
                 Link::Keying => say!("wifi: associated; 4-way handshake"),
                 Link::Up => say!("wifi: keyed, link up: frames sealed with CCMP"),
             }
+        }
+        self.shown = link;
+        if rekeys != self.shown_rekeys {
+            if rekeys.0 > self.shown_rekeys.0 {
+                say!("wifi: pairwise keys renewed ({} so far)", rekeys.0);
+            }
+            if rekeys.1 > self.shown_rekeys.1 {
+                say!("wifi: group key renewed ({} so far)", rekeys.1);
+            }
+            self.shown_rekeys = rekeys;
         }
     }
 
@@ -659,19 +663,10 @@ impl Nic {
         // SAFETY: the lent page is mapped; 95 bytes fit in it.
         let b = unsafe { core::slice::from_raw_parts(LENT_VA as *const u8, (ssid_len + pass_len) as usize) };
         let (ssid, pass) = b.split_at(ssid_len as usize);
-        // The nonces' seed, from the clocks: an entropy source is still
-        // to come.
-        let mut seed = [0u8; 32];
-        let mut h = Sha1::new();
-        h.update(&ticks().to_le_bytes());
-        h.update(&cycles().to_le_bytes());
-        h.update(&self.mac.to_le_bytes());
-        let a = h.finish();
-        let mut h = Sha1::new();
-        h.update(&a);
-        h.update(&cycles().to_le_bytes());
-        seed[..20].copy_from_slice(&a);
-        seed[20..].copy_from_slice(&h.finish()[..12]);
+        // The nonces' seed, from the kernel's entropy pool.
+        let Some(seed) = superior_sys::random() else {
+            return Status::Invalid;
+        };
         let now = now_ms();
         match self.station.as_mut().map(|st| st.join(ssid, pass, seed, now)) {
             Some(true) => {
@@ -930,7 +925,8 @@ impl Nic {
             nic::LINK => match &self.station {
                 Some(st) => {
                     let b = st.bssid();
-                    [Status::Ok as u64, st.link().code(), b.iter().fold(0, |v, &x| v << 8 | x as u64), 0]
+                    let rekeys = (st.rekeys as u64) << 32 | st.group_rekeys as u64;
+                    [Status::Ok as u64, st.link().code(), b.iter().fold(0, |v, &x| v << 8 | x as u64), rekeys]
                 }
                 None => [Status::Ok as u64, link::UP, 0, 0],
             },

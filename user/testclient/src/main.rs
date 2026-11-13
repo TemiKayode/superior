@@ -4139,6 +4139,12 @@ fn wifi_client() -> ! {
     let made = syscall(Syscall::Retype, NET_MEMORY, [ObjectType::Frame as u64, 0, NET_PAGE, 0]);
     let mapped = syscall(Syscall::FrameMap, NET_PAGE, [NET_PAGE_VA, 1, 0, 0]);
     t.check(made.status == 0 && mapped.status == 0, format_args!("a page of its own"));
+    // The nonces come from the kernel's entropy pool.
+    let (r1, r2) = (superior_sys::random(), superior_sys::random());
+    t.check(
+        matches!((r1, r2), (Some(a), Some(b)) if a != b && a != [0; 32] && b != [0; 32]),
+        format_args!("the kernel gives random bytes, a fresh 32 at every draw"),
+    );
     let link = || syscall(Syscall::Call, RADIO, [nic::LINK, 0, 0, 0]).msg;
     let before = link();
     t.check(
@@ -4236,6 +4242,14 @@ fn wifi_client() -> ! {
     t.check(
         echoed == WIFI_ECHOES && fragmented > 0,
         format_args!("{echoed} of {WIFI_ECHOES} UDP datagrams echoed by the gateway, every byte right ({fragmented} of them in fragments)"),
+    );
+    // The access point renewed the keys while those went to and fro (it
+    // does after so many frames), and none was lost to it.
+    let l = link();
+    let (pairwise, group) = (l[3] >> 32, l[3] & 0xffff_ffff);
+    t.check(
+        l[1] == nic::link::UP && pairwise >= 1 && group >= 1,
+        format_args!("the keys were renewed under way, {pairwise} times pairwise and {group} the group key, the link still up"),
     );
     syscall(Syscall::Call, NET_CONTROL, [OP_SHUTDOWN, t.0, 0, 0]);
     superior_sys::park()
