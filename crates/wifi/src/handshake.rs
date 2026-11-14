@@ -22,14 +22,21 @@
 //! answer was lost is answered again, but keys already installed are not
 //! installed again (that would start their packet numbers over).
 //!
-//! Frames are EAPOL-Key frames (802.1X, version 2, descriptor 2, key
-//! descriptor version 2: HMAC-SHA1 MICs, AES key wrap), as carried after
-//! an LLC header with EtherType 0x888e.
+//! Frames are EAPOL-Key frames (802.1X, version 2, descriptor 2), as
+//! carried after an LLC header with EtherType 0x888e. What the keys come
+//! from and how frames are signed depends on the key management suite
+//! ([`Akm`]): with WPA2's PSK the PMK is the passphrase's, the PTK comes
+//! from the SHA-1 PRF and MICs are HMAC-SHA1 (key descriptor version 2);
+//! with WPA3's SAE the PMK is the one SAE agreed ([`crate::sae`]), the PTK
+//! comes from the SHA-256 KDF and MICs are AES-CMAC (version 0, "defined
+//! by the AKM"), and message 3 also carries the integrity group key
+//! (IGTK), as management frame protection, which WPA3 requires, wants.
 //!
 //! [`psk`]: crate::sha1::psk
 
-use crate::aes::{key_unwrap, key_wrap};
+use crate::aes::{cmac, key_unwrap, key_wrap};
 use crate::sha1::{hmac_sha1, prf};
+use crate::sha256::kdf_sha256;
 
 /// Key information bits.
 const VERSION_2: u16 = 2;
@@ -55,6 +62,40 @@ const MAX_RSNE: usize = 64;
 pub const RSNE_PSK_CCMP: [u8; 22] = [
     0x30, 20, 1, 0, 0x00, 0x0f, 0xac, 4, 1, 0, 0x00, 0x0f, 0xac, 4, 1, 0, 0x00, 0x0f, 0xac, 2, 0, 0,
 ];
+
+/// The RSN element of WPA3-Personal: CCMP, SAE as key management, and
+/// management frame protection required and capable (capabilities bits 6
+/// and 7).
+pub const RSNE_SAE: [u8; 22] = [
+    0x30, 20, 1, 0, 0x00, 0x0f, 0xac, 4, 1, 0, 0x00, 0x0f, 0xac, 4, 1, 0, 0x00, 0x0f, 0xac, 8, 0xc0, 0,
+];
+
+/// The key management suite a handshake runs under.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Akm {
+    /// WPA2-Personal: a pre-shared key from the passphrase.
+    Psk,
+    /// WPA3-Personal: the PMK from SAE.
+    Sae,
+}
+
+impl Akm {
+    /// The key descriptor version in key information.
+    fn version(self) -> u16 {
+        match self {
+            Akm::Psk => VERSION_2,
+            Akm::Sae => 0,
+        }
+    }
+
+    /// The RSN element a station offers for it.
+    pub fn rsne(self) -> &'static [u8] {
+        match self {
+            Akm::Psk => &RSNE_PSK_CCMP,
+            Akm::Sae => &RSNE_SAE,
+        }
+    }
+}
 
 /// Why a handshake frame was refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -104,9 +145,9 @@ impl Frame {
 
     /// Signs the frame with `kck`: the MIC over the whole frame with the
     /// MIC field zero.
-    fn sign(mut self, kck: &[u8; 16]) -> Frame {
-        let mic = hmac_sha1(kck, &[self.bytes()]);
-        self.buf[MIC_AT..MIC_AT + 16].copy_from_slice(&mic[..16]);
+    fn sign(mut self, akm: Akm, kck: &[u8; 16]) -> Frame {
+        let mic = mic(akm, kck, self.bytes());
+        self.buf[MIC_AT..MIC_AT + 16].copy_from_slice(&mic);
         self
     }
 }
@@ -129,7 +170,7 @@ fn parse(f: &[u8]) -> Result<Key<'_>, Error> {
         return Err(Error::Malformed);
     }
     let info = u16::from_be_bytes([f[5], f[6]]);
-    if info & 7 != VERSION_2 {
+    if info & 7 != VERSION_2 && info & 7 != 0 {
         return Err(Error::Malformed);
     }
     Ok(Key {
@@ -142,7 +183,15 @@ fn parse(f: &[u8]) -> Result<Key<'_>, Error> {
 
 /// Whether frame `f` (of `body` bytes after its 802.1X header) has the
 /// right MIC under `kck`.
-fn mic_ok(f: &[u8], kck: &[u8; 16]) -> bool {
+/// A frame's MIC under `kck`: HMAC-SHA1's first 16 bytes, or AES-CMAC.
+fn mic(akm: Akm, kck: &[u8; 16], f: &[u8]) -> [u8; 16] {
+    match akm {
+        Akm::Psk => hmac_sha1(kck, &[f])[..16].try_into().unwrap(),
+        Akm::Sae => cmac(kck, f),
+    }
+}
+
+fn mic_ok(akm: Akm, f: &[u8], kck: &[u8; 16]) -> bool {
     let len = 4 + u16::from_be_bytes([f[2], f[3]]) as usize;
     let mut copy = [0u8; MAX_FRAME];
     if len > MAX_FRAME {
@@ -150,7 +199,7 @@ fn mic_ok(f: &[u8], kck: &[u8; 16]) -> bool {
     }
     copy[..len].copy_from_slice(&f[..len]);
     copy[MIC_AT..MIC_AT + 16].fill(0);
-    let mic = hmac_sha1(kck, &[&copy[..len]]);
+    let mic = mic(akm, kck, &copy[..len]);
     (0..16).fold(0, |d, i| d | (mic[i] ^ f[MIC_AT + i])) == 0
 }
 
@@ -165,10 +214,18 @@ pub struct Ptk {
 /// The PTK (12.7.1.3): 48 bytes of the PRF under the PMK of the two
 /// addresses and the two nonces, each pair lower first.
 pub fn ptk(pmk: &[u8; 32], aa: &[u8; 6], spa: &[u8; 6], anonce: &[u8; 32], snonce: &[u8; 32]) -> Ptk {
+    ptk_for(Akm::Psk, pmk, aa, spa, anonce, snonce)
+}
+
+/// The PTK under `akm`: SHA-1's PRF for PSK, the SHA-256 KDF for SAE.
+pub fn ptk_for(akm: Akm, pmk: &[u8; 32], aa: &[u8; 6], spa: &[u8; 6], anonce: &[u8; 32], snonce: &[u8; 32]) -> Ptk {
     let (a1, a2) = if aa < spa { (aa, spa) } else { (spa, aa) };
     let (n1, n2) = if anonce < snonce { (anonce, snonce) } else { (snonce, anonce) };
     let mut k = [0u8; 48];
-    prf(pmk, b"Pairwise key expansion", &[a1, a2, n1, n2], &mut k);
+    match akm {
+        Akm::Psk => prf(pmk, b"Pairwise key expansion", &[a1, a2, n1, n2], &mut k),
+        Akm::Sae => kdf_sha256(pmk, b"Pairwise key expansion", &[a1, a2, n1, n2], &mut k),
+    }
     Ptk {
         kck: k[..16].try_into().unwrap(),
         kek: k[16..32].try_into().unwrap(),
@@ -183,12 +240,22 @@ pub struct Gtk {
     pub key: [u8; 16],
 }
 
+/// The integrity group key, for management frames to a group (BIP), as
+/// message 3 delivers it under SAE.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Igtk {
+    /// Its key ID: 4 or 5.
+    pub index: u16,
+    pub key: [u8; 16],
+}
+
 /// What a finished handshake gives the station: the keys for unicast and
-/// group data frames.
+/// group data frames, and under SAE the integrity group key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Keys {
     pub tk: [u8; 16],
     pub gtk: Gtk,
+    pub igtk: Option<Igtk>,
 }
 
 /// Elements and KDEs in key data: each one's type and contents.
@@ -201,6 +268,15 @@ fn elements(mut kd: &[u8]) -> impl Iterator<Item = (u8, &[u8])> {
         let body = kd.get(2..2 + n as usize)?;
         kd = &kd[2 + n as usize..];
         Some((t, body))
+    })
+}
+
+/// The integrity group key in key data: the IGTK KDE (OUI 00-0f-ac, type
+/// 9, key ID (2 bytes), packet number (6), key).
+fn igtk_kde(kd: &[u8]) -> Option<Igtk> {
+    elements(kd).find_map(|(t, body)| {
+        (t == 0xdd && body.len() == 4 + 2 + 6 + 16 && body[..4] == [0x00, 0x0f, 0xac, 9])
+            .then(|| Igtk { index: u16::from_le_bytes([body[4], body[5]]), key: body[12..].try_into().unwrap() })
     })
 }
 
@@ -245,6 +321,7 @@ impl Rsne {
 
 /// The station's side.
 pub struct Supplicant {
+    akm: Akm,
     pmk: [u8; 32],
     spa: [u8; 6],
     aa: [u8; 6],
@@ -268,8 +345,9 @@ pub struct Supplicant {
 impl Supplicant {
     /// A station with address `spa` joining access point `aa`, with nonce
     /// `snonce` (fresh random bytes, which the caller supplies).
-    pub fn new(pmk: [u8; 32], spa: [u8; 6], aa: [u8; 6], snonce: [u8; 32], own: &[u8], advertised: &[u8]) -> Self {
+    pub fn new(akm: Akm, pmk: [u8; 32], spa: [u8; 6], aa: [u8; 6], snonce: [u8; 32], own: &[u8], advertised: &[u8]) -> Self {
         Supplicant {
+            akm,
             pmk,
             spa,
             aa,
@@ -314,7 +392,7 @@ impl Supplicant {
         if self.step != Step::Done || k.info & (ACK | MIC | SECURE | ENCRYPTED) != ACK | MIC | SECURE | ENCRYPTED {
             return Err(Error::State);
         }
-        if !mic_ok(f, &ptk.kck) {
+        if !mic_ok(self.akm, f, &ptk.kck) {
             return Err(Error::Mic);
         }
         let mut plain = [0u8; MAX_KEY_DATA];
@@ -329,12 +407,15 @@ impl Supplicant {
             self.keys = Some(keys);
             self.installs += 1;
         }
-        Ok(Frame::build(VERSION_2 | MIC | SECURE, 0, k.replay, &[0; 32], &[]).sign(&ptk.kck))
+        Ok(Frame::build(self.akm.version() | MIC | SECURE, 0, k.replay, &[0; 32], &[]).sign(self.akm, &ptk.kck))
     }
 
     /// Takes a frame from the access point: returns the answer to send.
     pub fn receive(&mut self, f: &[u8]) -> Result<Frame, Error> {
         let k = parse(f)?;
+        if k.info & 7 != self.akm.version() {
+            return Err(Error::Malformed);
+        }
         if self.replay.is_some_and(|r| k.replay <= r) {
             return Err(Error::Replay);
         }
@@ -351,13 +432,13 @@ impl Supplicant {
             if self.step == Step::Done {
                 self.snonce = self.next.take().ok_or(Error::State)?;
             }
-            let ptk = ptk(&self.pmk, &self.aa, &self.spa, &k.nonce, &self.snonce);
+            let ptk = ptk_for(self.akm, &self.pmk, &self.aa, &self.spa, &k.nonce, &self.snonce);
             self.anonce = k.nonce;
             self.ptk = Some(ptk);
             self.replay = Some(k.replay);
             self.step = Step::Keyed;
-            let info = VERSION_2 | PAIRWISE | MIC;
-            return Ok(Frame::build(info, 0, k.replay, &self.snonce, self.own.get()).sign(&ptk.kck));
+            let info = self.akm.version() | PAIRWISE | MIC;
+            return Ok(Frame::build(info, 0, k.replay, &self.snonce, self.own.get()).sign(self.akm, &ptk.kck));
         }
         // Message 3: signed, installing, with the group key encrypted. One
         // sent again (message 4 was lost) is answered again, but its keys
@@ -367,7 +448,7 @@ impl Supplicant {
         if self.step == Step::Start || k.info & (INSTALL | SECURE | ENCRYPTED) != INSTALL | SECURE | ENCRYPTED {
             return Err(Error::State);
         }
-        if !mic_ok(f, &ptk.kck) {
+        if !mic_ok(self.akm, f, &ptk.kck) {
             return Err(Error::Mic);
         }
         if k.nonce != self.anonce {
@@ -385,13 +466,18 @@ impl Supplicant {
             return Err(Error::Rsne);
         }
         let gtk = gtk.ok_or(Error::KeyData)?;
+        // Under SAE management frames are protected: the IGTK must come.
+        let igtk = igtk_kde(&plain[..n]);
+        if self.akm == Akm::Sae && igtk.is_none() {
+            return Err(Error::KeyData);
+        }
         self.replay = Some(k.replay);
         if self.step != Step::Done {
-            self.keys = Some(Keys { tk: ptk.tk, gtk });
+            self.keys = Some(Keys { tk: ptk.tk, gtk, igtk });
             self.step = Step::Done;
             self.installs += 1;
         }
-        Ok(Frame::build(VERSION_2 | PAIRWISE | MIC | SECURE, 0, k.replay, &[0; 32], &[]).sign(&ptk.kck))
+        Ok(Frame::build(self.akm.version() | PAIRWISE | MIC | SECURE, 0, k.replay, &[0; 32], &[]).sign(self.akm, &ptk.kck))
     }
 
     /// The keys, once message 3 has been taken.
@@ -402,6 +488,8 @@ impl Supplicant {
 
 /// The access point's side, for one station.
 pub struct Authenticator {
+    akm: Akm,
+    igtk: Option<Igtk>,
     pmk: [u8; 32],
     aa: [u8; 6],
     spa: [u8; 6],
@@ -420,8 +508,10 @@ pub struct Authenticator {
 impl Authenticator {
     /// Access point `aa`, advertising `rsne`, for station `spa`, with nonce
     /// `anonce` (fresh random bytes) and group key `gtk`.
-    pub fn new(pmk: [u8; 32], aa: [u8; 6], spa: [u8; 6], anonce: [u8; 32], rsne: &[u8], gtk: Gtk) -> Self {
+    pub fn new(akm: Akm, pmk: [u8; 32], aa: [u8; 6], spa: [u8; 6], anonce: [u8; 32], rsne: &[u8], gtk: Gtk) -> Self {
         Authenticator {
+            akm,
+            igtk: None,
             pmk,
             aa,
             spa,
@@ -434,6 +524,12 @@ impl Authenticator {
             current: None,
             group: None,
         }
+    }
+
+    /// The integrity group key message 3 delivers (under SAE).
+    pub fn with_igtk(mut self, igtk: Igtk) -> Self {
+        self.igtk = Some(igtk);
+        self
     }
 
     /// Starts renewing the pairwise keys, with new nonce `anonce`: message
@@ -483,8 +579,8 @@ impl Authenticator {
         plain[8..].copy_from_slice(&gtk.key);
         let mut wrapped = [0u8; 32];
         key_wrap(&ptk.kek, &plain, &mut wrapped);
-        let info = VERSION_2 | ACK | MIC | SECURE | ENCRYPTED;
-        Frame::build(info, 0, self.replay, &[0; 32], &wrapped).sign(&ptk.kck)
+        let info = self.akm.version() | ACK | MIC | SECURE | ENCRYPTED;
+        Frame::build(info, 0, self.replay, &[0; 32], &wrapped).sign(self.akm, &ptk.kck)
     }
 
     /// Message 1 (sent again, with a higher replay counter, if no answer
@@ -492,7 +588,7 @@ impl Authenticator {
     pub fn start(&mut self) -> Frame {
         self.replay += 1;
         self.step = Step::Start;
-        Frame::build(VERSION_2 | PAIRWISE | ACK, 16, self.replay, &self.anonce, &[])
+        Frame::build(self.akm.version() | PAIRWISE | ACK, 16, self.replay, &self.anonce, &[])
     }
 
     /// What to send when the station has not answered: message 1 again
@@ -520,20 +616,31 @@ impl Authenticator {
         plain[n..n + 8].copy_from_slice(&kde);
         plain[n + 8..n + 24].copy_from_slice(&self.gtk.key);
         n += 24;
+        if let Some(igtk) = self.igtk.filter(|_| self.akm == Akm::Sae) {
+            // The IGTK KDE: key ID, packet number 0, key.
+            let id = igtk.index.to_le_bytes();
+            plain[n..n + 12].copy_from_slice(&[0xdd, 28, 0x00, 0x0f, 0xac, 9, id[0], id[1], 0, 0, 0, 0]);
+            plain[n + 12..n + 14].fill(0);
+            plain[n + 14..n + 30].copy_from_slice(&igtk.key);
+            n += 30;
+        }
         if n % 8 != 0 {
             plain[n] = 0xdd;
             n = n.next_multiple_of(8);
         }
         let mut wrapped = [0u8; MAX_KEY_DATA];
         key_wrap(&ptk.kek, &plain[..n], &mut wrapped);
-        let info = VERSION_2 | PAIRWISE | INSTALL | ACK | MIC | SECURE | ENCRYPTED;
-        Frame::build(info, 16, self.replay, &self.anonce, &wrapped[..n + 8]).sign(&ptk.kck)
+        let info = self.akm.version() | PAIRWISE | INSTALL | ACK | MIC | SECURE | ENCRYPTED;
+        Frame::build(info, 16, self.replay, &self.anonce, &wrapped[..n + 8]).sign(self.akm, &ptk.kck)
     }
 
     /// Takes a frame from the station: message 2 is answered with message
     /// 3; message 4 finishes (no answer).
     pub fn receive(&mut self, f: &[u8]) -> Result<Option<Frame>, Error> {
         let k = parse(f)?;
+        if k.info & 7 != self.akm.version() {
+            return Err(Error::Malformed);
+        }
         if k.replay != self.replay {
             return Err(Error::Replay);
         }
@@ -543,7 +650,7 @@ impl Authenticator {
             if self.step != Step::Done || self.group.is_none() || k.info & (MIC | ACK | SECURE) != MIC | SECURE {
                 return Err(Error::State);
             }
-            if !mic_ok(f, &ptk.kck) {
+            if !mic_ok(self.akm, f, &ptk.kck) {
                 return Err(Error::Mic);
             }
             self.gtk = self.group.take().unwrap_or(self.gtk);
@@ -554,11 +661,11 @@ impl Authenticator {
         }
         match self.step {
             Step::Start => {
-                let ptk = ptk(&self.pmk, &self.aa, &self.spa, &self.anonce, &k.nonce);
-                if !mic_ok(f, &ptk.kck) {
+                let ptk = ptk_for(self.akm, &self.pmk, &self.aa, &self.spa, &self.anonce, &k.nonce);
+                if !mic_ok(self.akm, f, &ptk.kck) {
                     return Err(Error::Mic);
                 }
-                if k.key_data != RSNE_PSK_CCMP {
+                if k.key_data != self.akm.rsne() {
                     return Err(Error::Rsne);
                 }
                 self.ptk = Some(ptk);
@@ -570,7 +677,7 @@ impl Authenticator {
                 if k.info & SECURE == 0 {
                     return Err(Error::State);
                 }
-                if !mic_ok(f, &ptk.kck) {
+                if !mic_ok(self.akm, f, &ptk.kck) {
                     return Err(Error::Mic);
                 }
                 self.step = Step::Done;

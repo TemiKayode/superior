@@ -1,10 +1,13 @@
-//! Wi-Fi security for Superior's station: WPA2-Personal, `no_std` and
+//! Wi-Fi for Superior's station: WPA2- and WPA3-Personal, `no_std` and
 //! allocation-free so a component can use it, and kept apart so host tests
 //! can check it against the published test vectors.
 //!
 //! - [`sha1`]: SHA-1, HMAC-SHA1, PBKDF2, the passphrase's pairwise master
 //!   key ([`sha1::psk`]) and 802.11's PRF.
-//! - [`aes`]: AES-128, CCM and AES key wrap.
+//! - [`sha256`]: HMAC-SHA256 and 802.11's SHA-256 key derivation.
+//! - [`aes`]: AES-128, CCM, AES key wrap and AES-CMAC.
+//! - [`p256`]: the NIST P-256 curve, SAE's group 19.
+//! - [`sae`]: SAE, WPA3's password exchange.
 //! - [`handshake`]: the 4-way handshake, the station's side and the access
 //!   point's.
 //! - [`ccmp`]: data frames sealed and opened under the temporal key.
@@ -22,7 +25,10 @@ pub mod ap;
 pub mod ccmp;
 pub mod frame;
 pub mod handshake;
+pub mod p256;
+pub mod sae;
 pub mod sha1;
+pub mod sha256;
 pub mod station;
 
 #[cfg(test)]

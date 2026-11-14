@@ -847,7 +847,27 @@ holds the rest):
   server lease an address by DHCP (answers broadcast, so under the group key),
   ping the gateway and have it echo 40 UDP datagrams (some in fragments), and
   the access point must have refused nothing. A laptop's real card, through
-  its driver and firmware, comes later; so does WPA3 (SAE).
+  its driver and firmware, comes later.
+- WPA3-Personal: SAE (`crates/wifi/src/sae.rs`) on group 19, with P-256
+  arithmetic of its own (`p256.rs`: Montgomery multiplication, constants
+  derived from the moduli at compile time, Jacobian points), SHA-256's HMAC and
+  key derivation, and AES-CMAC. The password element is found by hunting and
+  pecking (all 40 tries always made); commit and confirm give both sides the
+  PMK, which an eavesdropper cannot test passwords against offline. The 4-way
+  handshake takes the suite: under SAE its PTK comes from the SHA-256 KDF, its
+  MICs are AES-CMAC (key descriptor version 0) and message 3 also delivers
+  the integrity group key. Management frames are protected: once keyed, the
+  station obeys a deauthentication or disassociation only if it comes sealed
+  under the temporal key (CCMP now seals management frames too). The station
+  prefers SAE where an access point offers both. Host tests check P-256
+  against known multiples of the generator, HMAC-SHA256 and CMAC against
+  their RFCs, SAE peers agreeing (and refusing another password, a reflected
+  commit, a bad group, scalar or element), joins by SAE over a clean and a
+  lossy channel, transition mode, and forged versus sealed
+  deauthentications. In `wifi-test` a second, WPA3-only access point serves
+  the same network: the client joins it after the WPA2 checks, the harness
+  forges an unprotected deauthentication, and the station ignores it and
+  pings on.
 - Surveying the networks in range: the station's `survey` sends probe
   requests for any SSID (two, 200 ms apart) and for 400 ms records every
   beacon and probe response it hears, linked or not: BSSID, SSID, channel, the

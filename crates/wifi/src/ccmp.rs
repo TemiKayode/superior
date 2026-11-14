@@ -4,7 +4,10 @@
 //! an 8-byte CCMP header carrying the 48-bit packet number follows it,
 //! then the encrypted body and an 8-byte MIC. A receiver takes a frame
 //! only if its packet number is above the last it took, so a recorded
-//! frame cannot be replayed.
+//! frame cannot be replayed. Robust management frames (a
+//! deauthentication, say, under management frame protection) are sealed
+//! the same way, their header's subtype authenticated and the nonce
+//! marked as a management frame's.
 
 use crate::aes::{Aes128, ccm_open, ccm_seal};
 
@@ -23,13 +26,16 @@ pub enum Refused {
     Forged,
 }
 
-/// The length of a data frame's 802.11 header, from its frame control
-/// field: 24 bytes, 30 with a fourth address (to and from the DS), 2 more
-/// for QoS.
+/// The length of a data or management frame's 802.11 header, from its
+/// frame control field: 24 bytes, for a data frame 30 with a fourth
+/// address (to and from the DS) and 2 more for QoS.
 pub fn header_len(frame: &[u8]) -> Option<usize> {
     let (&fc0, &fc1) = (frame.first()?, frame.get(1)?);
+    if fc0 >> 2 & 3 == 0 {
+        return (frame.len() >= 24).then_some(24); // management
+    }
     if fc0 >> 2 & 3 != 2 {
-        return None; // not a data frame
+        return None; // a control frame
     }
     let mut n = 24;
     if fc1 & 3 == 3 {
@@ -44,17 +50,18 @@ pub fn header_len(frame: &[u8]) -> Option<usize> {
 /// The additional authenticated data and nonce for a frame with 802.11
 /// header `h` and packet number `pn`.
 fn aad_nonce(h: &[u8], pn: u64) -> ([u8; 30], usize, [u8; 13]) {
-    let qos = h[0] & 0x80 != 0;
+    let mgmt = h[0] >> 2 & 3 == 0;
+    let qos = !mgmt && h[0] & 0x80 != 0;
     let mut aad = [0u8; 30];
-    // Frame control: a data frame's subtype bits masked, as are retry,
-    // power management and more data (and order in a QoS frame); the
-    // protected bit set.
-    aad[0] = h[0] & 0x8f;
+    // Frame control: a data frame's subtype bits masked (a management
+    // frame's kept), as are retry, power management and more data (and
+    // order in a QoS frame); the protected bit set.
+    aad[0] = if mgmt { h[0] } else { h[0] & 0x8f };
     aad[1] = (h[1] & !0x38 & if qos { !0x80 } else { 0xff }) | 0x40;
     aad[2..20].copy_from_slice(&h[4..22]); // addresses 1, 2 and 3
     aad[20] = h[22] & 0x0f; // the fragment number, not the sequence number
     let mut n = 22;
-    if h[1] & 3 == 3 {
+    if !mgmt && h[1] & 3 == 3 {
         aad[n..n + 6].copy_from_slice(&h[24..30]);
         n += 6;
     }
@@ -66,7 +73,7 @@ fn aad_nonce(h: &[u8], pn: u64) -> ([u8; 30], usize, [u8; 13]) {
         n += 2;
     }
     let mut nonce = [0u8; 13];
-    nonce[0] = priority;
+    nonce[0] = priority | (mgmt as u8) << 4;
     nonce[1..7].copy_from_slice(&h[10..16]); // address 2, the sender
     nonce[7..].copy_from_slice(&pn.to_be_bytes()[2..]);
     (aad, n, nonce)

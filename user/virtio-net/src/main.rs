@@ -66,6 +66,7 @@ use superior_objects::abi::{CapTransfer, Error, Syscall, TICK_HZ};
 use superior_objects::interfaces::nic::{link, ring};
 use superior_objects::interfaces::{Status, nic};
 use superior_sys::{USER_BASE, print_line, syscall, syscall_x, ticks};
+use superior_wifi::handshake::Akm;
 use superior_wifi::station::{Link, Station};
 
 const PCI: u64 = 0;
@@ -179,6 +180,8 @@ struct Nic {
     shown_rekeys: (u32, u32),
     /// A survey was under way when last looked at.
     surveying: bool,
+    /// Forged deauthentications ignored, as last reported.
+    shown_ignored: u32,
 }
 
 /// Ethernet frames the station has delivered, waiting for the caller
@@ -421,6 +424,7 @@ fn start(radio: bool) -> Result<Nic, Failure> {
         shown: Link::Idle,
         shown_rekeys: (0, 0),
         surveying: false,
+        shown_ignored: 0,
     };
     if radio {
         let mac = nic.mac.to_be_bytes();
@@ -614,6 +618,7 @@ impl Nic {
         let deadline = st.deadline();
         let (link, bssid) = (st.link(), st.bssid());
         let rekeys = (st.rekeys, st.group_rekeys);
+        let (akm, ignored) = (st.akm(), st.ignored_deauths);
         let surveyed = (self.surveying && !st.surveying()).then(|| st.networks().count());
         let mut ssid = [0u8; 32];
         let n = st.ssid().len();
@@ -642,8 +647,10 @@ impl Nic {
                 Link::Idle => {}
                 Link::Scanning => say!("wifi: scanning for \"{name}\""),
                 Link::Authenticating => say!(
-                    "wifi: found \"{name}\" at {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} (WPA2-PSK, CCMP); authenticating",
-                    b[0], b[1], b[2], b[3], b[4], b[5]
+                    "wifi: found \"{name}\" at {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} ({}, CCMP); authenticating{}",
+                    b[0], b[1], b[2], b[3], b[4], b[5],
+                    if akm == Akm::Sae { "WPA3-SAE" } else { "WPA2-PSK" },
+                    if akm == Akm::Sae { " by SAE" } else { "" }
                 ),
                 Link::Associating => say!("wifi: associating"),
                 Link::Keying => say!("wifi: associated; 4-way handshake"),
@@ -654,6 +661,10 @@ impl Nic {
         if let Some(n) = surveyed {
             self.surveying = false;
             say!("wifi: survey done: {n} networks in range");
+        }
+        if ignored > self.shown_ignored {
+            self.shown_ignored = ignored;
+            say!("wifi: ignored an unprotected deauthentication (management frames are protected)");
         }
         if rekeys != self.shown_rekeys {
             if rekeys.0 > self.shown_rekeys.0 {
@@ -987,7 +998,13 @@ impl Nic {
                 Some(st) => {
                     let b = st.bssid();
                     let rekeys = (st.rekeys as u64) << 32 | st.group_rekeys as u64;
-                    [Status::Ok as u64, st.link().code(), b.iter().fold(0, |v, &x| v << 8 | x as u64), rekeys]
+                    let suite = match (st.link(), st.akm()) {
+                        (Link::Idle | Link::Scanning, _) => nic::suite::NONE,
+                        (_, Akm::Psk) => nic::suite::WPA2_PSK,
+                        (_, Akm::Sae) => nic::suite::WPA3_SAE,
+                    };
+                    let bssid = b.iter().fold(0, |v, &x| v << 8 | x as u64);
+                    [Status::Ok as u64, st.link().code(), bssid | suite << 48, rekeys]
                 }
                 None => [Status::Ok as u64, link::UP, 0, 0],
             },

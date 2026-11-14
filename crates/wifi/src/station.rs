@@ -4,11 +4,17 @@
 //! radio the 802.11 frames it hands back and the network server the
 //! Ethernet frames it delivers.
 //!
-//! Joining a WPA2-Personal network: probe requests for its SSID until an
-//! access point answers (a probe response, or a beacon) advertising WPA2
-//! with CCMP and PSK; open system authentication; association, offering
-//! the same RSN element; then the 4-way handshake ([`crate::handshake`])
-//! in EAPOL frames, which are the only data frames taken unencrypted.
+//! Joining a WPA2- or WPA3-Personal network: probe requests for its SSID
+//! until an access point answers (a probe response, or a beacon)
+//! advertising CCMP with PSK or SAE (SAE preferred when both are offered);
+//! authentication, open system for PSK or SAE's commit and confirm
+//! exchange ([`crate::sae`], which yields the PMK); association, offering
+//! the RSN element of the suite chosen; then the 4-way handshake
+//! ([`crate::handshake`]) in EAPOL frames, which are the only data frames
+//! taken unencrypted. Under SAE management frame protection is on: once
+//! keyed, a deauthentication or disassociation is obeyed only if it comes
+//! sealed under the temporal key, so a forged one cannot knock the
+//! station off.
 //! Once keyed the link is up: Ethernet frames go out as data frames to the
 //! access point sealed with the temporal key, and data frames in are
 //! taken only sealed, under the temporal key (to the station) or the group
@@ -34,7 +40,8 @@
 
 use crate::ccmp;
 use crate::frame::{self, *};
-use crate::handshake::{Keys, RSNE_PSK_CCMP, Supplicant};
+use crate::handshake::{Akm, Keys, Supplicant};
+use crate::sae::Sae;
 use crate::sha1::{prf, psk};
 
 /// Where joining has got to.
@@ -142,7 +149,16 @@ pub struct Station {
     mac: [u8; 6],
     ssid: [u8; 32],
     ssid_len: usize,
+    /// The passphrase's PSK, and the passphrase itself (SAE's password).
+    psk: [u8; 32],
+    password: [u8; 63],
+    password_len: usize,
+    /// The suite chosen for the network found, and its PMK once known.
+    akm: Akm,
     pmk: [u8; 32],
+    sae: Option<Sae>,
+    /// The last packet number of a sealed management frame taken.
+    mgmt_pn: Option<u64>,
     seed: [u8; 32],
     nonces: u32,
     link: Link,
@@ -164,6 +180,9 @@ pub struct Station {
     tries: u32,
     /// Frames refused (forged, replayed, unencrypted after keying).
     pub refused: u64,
+    /// Unprotected deauthentications and disassociations ignored under
+    /// management frame protection (forgeries, as far as it can tell).
+    pub ignored_deauths: u32,
     /// Rekeyings since the link came up: pairwise, and group.
     pub rekeys: u32,
     pub group_rekeys: u32,
@@ -180,7 +199,13 @@ impl Station {
             mac,
             ssid: [0; 32],
             ssid_len: 0,
+            psk: [0; 32],
+            password: [0; 63],
+            password_len: 0,
+            akm: Akm::Psk,
             pmk: [0; 32],
+            sae: None,
+            mgmt_pn: None,
             seed: [0; 32],
             nonces: 0,
             link: Link::Idle,
@@ -198,6 +223,7 @@ impl Station {
             deadline: 0,
             tries: 0,
             refused: 0,
+            ignored_deauths: 0,
             rekeys: 0,
             group_rekeys: 0,
             survey: None,
@@ -299,7 +325,9 @@ impl Station {
         }
         self.ssid[..ssid.len()].copy_from_slice(ssid);
         self.ssid_len = ssid.len();
-        self.pmk = psk(passphrase, ssid);
+        self.psk = psk(passphrase, ssid);
+        self.password[..passphrase.len()].copy_from_slice(passphrase);
+        self.password_len = passphrase.len();
         self.seed = seed;
         self.scan(now);
         true
@@ -308,6 +336,7 @@ impl Station {
     fn scan(&mut self, now: u64) {
         self.link = Link::Scanning;
         self.supplicant = None;
+        (self.sae, self.mgmt_pn) = (None, None);
         self.keys = None;
         (self.rx_pn, self.old_tk, self.groups, self.installs) = (None, None, [None; 4], 0);
         self.deadline = now;
@@ -320,6 +349,11 @@ impl Station {
 
     pub fn bssid(&self) -> [u8; 6] {
         self.bssid
+    }
+
+    /// The suite chosen for the network being joined (or joined).
+    pub fn akm(&self) -> Akm {
+        self.akm
     }
 
     pub fn ssid(&self) -> &[u8] {
@@ -375,13 +409,55 @@ impl Station {
         radio(&f[..n]);
     }
 
+    /// Authentication, first or again: open system's request, or SAE's
+    /// commit (the same one again until the access point's commit comes),
+    /// then its confirm.
     fn authenticate(&mut self, radio: &mut dyn FnMut(&[u8])) {
-        let mut f = [0u8; 32];
+        if self.akm == Akm::Psk {
+            self.auth_frame(&[0, 0, 1, 0, 0, 0], &[], radio);
+            return;
+        }
+        if self.sae.is_none() {
+            // A few draws, in case one gives an unusable scalar.
+            for _ in 0..4 {
+                let mut r = [0u8; 64];
+                r[..32].copy_from_slice(&self.nonce());
+                r[32..].copy_from_slice(&self.nonce());
+                self.sae = Sae::new(&self.password[..self.password_len], &self.mac, &self.bssid, &r);
+                if self.sae.is_some() {
+                    break;
+                }
+            }
+        }
+        let Some(sae) = self.sae.as_mut() else { return };
+        match sae.confirm() {
+            // The access point's commit came: our confirm again.
+            Some(c) => self.auth_frame(&[3, 0, 2, 0, 0, 0], &c, radio),
+            None => {
+                let c = sae.commit();
+                self.auth_frame(&[3, 0, 1, 0, 0, 0], &c, radio);
+            }
+        }
+    }
+
+    /// An authentication frame to the access point: algorithm, transaction
+    /// and status (`head`), then `body`.
+    fn auth_frame(&mut self, head: &[u8; 6], body: &[u8], radio: &mut dyn FnMut(&[u8])) {
+        let mut f = [0u8; 160];
         let seq = self.next_seq();
         let n = header(&mut f, AUTH, 0, &self.bssid, &self.mac, &self.bssid, seq);
-        // Open system, transaction 1, status 0.
-        f[n..n + 6].copy_from_slice(&[0, 0, 1, 0, 0, 0]);
-        radio(&f[..n + 6]);
+        f[n..n + 6].copy_from_slice(head);
+        f[n + 6..n + 6 + body.len()].copy_from_slice(body);
+        radio(&f[..n + 6 + body.len()]);
+    }
+
+    /// Authenticated: on to association.
+    fn authenticated(&mut self, pmk: [u8; 32], now: u64, radio: &mut dyn FnMut(&[u8])) {
+        self.pmk = pmk;
+        self.link = Link::Associating;
+        self.tries = 0;
+        self.deadline = now;
+        self.poll(now, radio);
     }
 
     fn associate(&mut self, radio: &mut dyn FnMut(&[u8])) {
@@ -393,8 +469,9 @@ impl Station {
         n += 4;
         n = element(&mut f, n, SSID, &self.ssid[..self.ssid_len]);
         n = element(&mut f, n, RATES, &RATE_SET);
-        f[n..n + RSNE_PSK_CCMP.len()].copy_from_slice(&RSNE_PSK_CCMP);
-        n += RSNE_PSK_CCMP.len();
+        let rsne = self.akm.rsne();
+        f[n..n + rsne.len()].copy_from_slice(rsne);
+        n += rsne.len();
         radio(&f[..n]);
     }
 
@@ -428,10 +505,17 @@ impl Station {
                 let Some(elems) = body.get(12..) else { return };
                 let ssid = frame::elements(elems).find(|e| e.0 == SSID).map(|e| e.1);
                 let rsne = find_element(elems, RSN);
-                if ssid != Some(self.ssid()) || rsne != Some(&RSNE_PSK_CCMP[..]) {
-                    return; // another network, or not WPA2-PSK with CCMP
+                let akm = match Security::of(u16::from_le_bytes([body[10], body[11]]), rsne) {
+                    Security::Wpa3Sae | Security::Wpa2Wpa3 => Akm::Sae,
+                    Security::Wpa2Psk => Akm::Psk,
+                    _ => return, // not WPA2- or WPA3-Personal with CCMP
+                };
+                if ssid != Some(self.ssid()) || rsne.is_none_or(|e| e.len() > 64) {
+                    return; // another network
                 }
                 let rsne = rsne.unwrap();
+                self.akm = akm;
+                self.sae = None;
                 self.rsne[..rsne.len()].copy_from_slice(rsne);
                 self.rsne_len = rsne.len();
                 self.bssid = a3;
@@ -440,26 +524,60 @@ impl Station {
                 self.deadline = now;
                 self.poll(now, radio);
             }
-            AUTH if to_us && a2 == self.bssid && self.link == Link::Authenticating => {
-                if body.len() >= 6 && body[..6] == [0, 0, 2, 0, 0, 0] {
-                    self.link = Link::Associating;
-                    self.tries = 0;
-                    self.deadline = now;
-                    self.poll(now, radio);
+            AUTH if to_us && a2 == self.bssid && self.link == Link::Authenticating && body.len() >= 6 => {
+                match (self.akm, &body[..6]) {
+                    (Akm::Psk, [0, 0, 2, 0, 0, 0]) => self.authenticated(self.psk, now, radio),
+                    // SAE: the access point's commit, answered with our
+                    // confirm; then its confirm, which gives the PMK.
+                    (Akm::Sae, [3, 0, 1, 0, 0, 0]) => {
+                        let Some(s) = self.sae.as_mut() else { return };
+                        match s.receive_commit(&body[6..]) {
+                            Ok(c) => {
+                                self.auth_frame(&[3, 0, 2, 0, 0, 0], &c, radio);
+                                self.deadline = now + STEP_MS;
+                            }
+                            Err(_) => self.refused += 1,
+                        }
+                    }
+                    (Akm::Sae, [3, 0, 2, 0, 0, 0]) => {
+                        let Some(s) = self.sae.as_mut() else { return };
+                        match s.receive_confirm(&body[6..]).map(|_| s.pmk()) {
+                            Ok(Some(pmk)) => self.authenticated(pmk, now, radio),
+                            _ => self.refused += 1,
+                        }
+                    }
+                    _ => {}
                 }
             }
             ASSOC_RESP if to_us && a2 == self.bssid && self.link == Link::Associating => {
                 if body.len() >= 6 && body[2..4] == [0, 0] {
                     let snonce = self.nonce();
                     let theirs = &self.rsne[..self.rsne_len];
-                    self.supplicant = Some(Supplicant::new(self.pmk, self.mac, self.bssid, snonce, &RSNE_PSK_CCMP, theirs));
+                    self.supplicant = Some(Supplicant::new(self.akm, self.pmk, self.mac, self.bssid, snonce, self.akm.rsne(), theirs));
                     self.link = Link::Keying;
                     self.deadline = now + KEYING_MS;
                 } else {
                     self.scan(now);
                 }
             }
-            DEAUTH | DISASSOC if to_us && a2 == self.bssid && self.link != Link::Scanning => self.scan(now),
+            DEAUTH | DISASSOC if to_us && a2 == self.bssid && self.link != Link::Scanning => {
+                // Under management frame protection, only a sealed one.
+                if self.akm == Akm::Sae && self.link == Link::Up {
+                    let Some(keys) = self.keys else { return };
+                    let mut copy = [0u8; 64];
+                    let Some(copy) = copy.get_mut(..f.len()) else { return };
+                    copy.copy_from_slice(f);
+                    match ccmp::open(&keys.tk, copy, self.mgmt_pn) {
+                        Ok((_, pn)) if fc1 & PROTECTED != 0 => self.mgmt_pn = Some(pn),
+                        _ => {
+                            self.refused += 1;
+                            self.ignored_deauths += (fc1 & PROTECTED == 0) as u32;
+                            return;
+                        }
+                    }
+                }
+                self.scan(now);
+            }
             DATA if fc1 & (TO_DS | FROM_DS) == FROM_DS && a2 == self.bssid => {
                 self.data(f, fc1, a1, a3, now, radio, up);
             }

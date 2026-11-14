@@ -4171,8 +4171,8 @@ fn wifi_survey() -> Option<(Networks, bool)> {
 /// SSID, security, channel, signal (dBm).
 const WIFI_IN_RANGE: [(&[u8], u8, u8, i8); 3] = [
     (b"superior-test", nic::security::WPA2_PSK, 6, -45),
+    (b"superior-wpa3", nic::security::WPA3_SAE, 6, -60),
     (b"superior-guest", nic::security::OPEN, 11, -71),
-    (b"neighbour-wpa3", nic::security::WPA3_SAE, 1, -80),
 ];
 
 /// Whether a survey found just the networks the harness puts in range, in
@@ -4209,7 +4209,7 @@ fn wifi_client() -> ! {
     t.check(
         survey.is_some() && wifi_found_all(&found),
         format_args!(
-            "a survey finds the {} networks in range, strongest first: superior-test (WPA2-PSK, ch 6, -45 dBm), superior-guest (open, ch 11, -71), neighbour-wpa3 (WPA3-SAE, ch 1, -80)",
+            "a survey finds the {} networks in range, strongest first: superior-test (WPA2-PSK, ch 6, -45 dBm), superior-wpa3 (WPA3-SAE, ch 6, -60), superior-guest (open, ch 11, -71)",
             found.1
         ),
     );
@@ -4323,6 +4323,48 @@ fn wifi_client() -> ! {
     t.check(
         again.is_some_and(|(f, _)| wifi_found_all(&f)) && link()[1] == nic::link::UP,
         format_args!("a survey while linked finds the same networks, and the link stays up"),
+    );
+    // WPA3: the same network through the SAE-only access point.
+    t.check(
+        wifi_join(b"superior-wpa3", WIFI_PASSPHRASE) == OK,
+        format_args!("the radio is told to join \"superior-wpa3\""),
+    );
+    let start = ticks();
+    let mut l = link();
+    while l[1] != nic::link::UP && ticks() < start + LINK_TICKS {
+        superior_sys::sleep(5);
+        l = link();
+    }
+    let b = l[2].to_be_bytes();
+    t.check(
+        l[0] == OK && l[1] == nic::link::UP && l[2] >> 48 == nic::suite::WPA3_SAE,
+        format_args!(
+            "joined by SAE and keyed in {} ms: BSSID {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}, WPA3-SAE",
+            (ticks() - start) * 10,
+            b[2], b[3], b[4], b[5], b[6], b[7]
+        ),
+    );
+    // The harness forges a deauthentication now; it must change nothing.
+    superior_sys::sleep(30);
+    let mut answered = 0;
+    if let Some(mut s) = Sock::new(false) {
+        for seq in 0..WIFI_PINGS {
+            let to = gw | seq;
+            answered += s.exchange(
+                to,
+                56,
+                |b| {
+                    for (j, x) in b[..56].iter_mut().enumerate() {
+                        *x = echo_byte(seq, j as u64);
+                    }
+                },
+                |len, b, from| from == to && len == 56 && b.iter().enumerate().all(|(j, &x)| x == echo_byte(seq, j as u64)),
+            ) as u64;
+        }
+    }
+    t.check(
+        answered == WIFI_PINGS && link()[1] == nic::link::UP,
+        format_args!("{answered} of {WIFI_PINGS} pings answered over WPA3, the link up through a forged deauthentication"),
     );
     syscall(Syscall::Call, NET_CONTROL, [OP_SHUTDOWN, t.0, 0, 0]);
     superior_sys::park()

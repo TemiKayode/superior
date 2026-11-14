@@ -2089,8 +2089,16 @@ fn wifi_test(arch: Arch) -> Result<(), String> {
             "virtio-net: wifi: group key renewed (1 so far)",
             "[pass] wifi: the keys were renewed under way,",
             "[pass] wifi: a survey while linked finds the same networks, and the link stays up",
+            "[pass] wifi: the radio is told to join \"superior-wpa3\"",
+            "virtio-net: wifi: found \"superior-wpa3\" at 02:57:49:46:49:03 (WPA3-SAE, CCMP); authenticating by SAE",
+            "virtio-net: wifi: keyed, link up: frames sealed with CCMP",
+            "[pass] wifi: joined by SAE and keyed in",
+            "[pass] wifi: 10 of 10 pings answered over WPA3, the link up through a forged deauthentication",
         ],
     )?;
+    if !out.contains("virtio-net: wifi: ignored an unprotected deauthentication (management frames are protected)") {
+        return Err("Wi-Fi test: the station did not report ignoring the forged deauthentication".into());
+    }
     if out.contains("[fail]") {
         return Err("Wi-Fi test: a check failed".into());
     }
@@ -2112,6 +2120,17 @@ fn wifi_test(arch: Arch) -> Result<(), String> {
     }
     if rekeys == 0 || group_rekeys == 0 || arp == 0 {
         return Err("Wi-Fi test: the keys were not renewed, or the station did not answer under a new group key".into());
+    }
+    let (wpa3_from, forged, wpa3_refused) = (
+        seen.wpa3_from_station.load(Ordering::Relaxed),
+        seen.forged_deauths.load(Ordering::Relaxed),
+        seen.wpa3_refused.load(Ordering::Relaxed),
+    );
+    println!(
+        "== WPA3 access point: station keyed by SAE, {wpa3_from} frames from it, {forged} forged deauthentication sent, {wpa3_refused} frames refused"
+    );
+    if !seen.wpa3_keyed.load(Ordering::Relaxed) || wpa3_from == 0 || forged == 0 || wpa3_refused != 0 {
+        return Err("Wi-Fi test: the WPA3 access point did not see the station keyed by SAE and carrying frames".into());
     }
     println!("== Wi-Fi test passed ({})", arch.name());
     Ok(())

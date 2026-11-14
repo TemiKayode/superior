@@ -9,10 +9,13 @@
 //! station's address by a broadcast ARP request, so a frame under the new
 //! group key needs an answer.
 //!
-//! Two more networks are in range, beaconing only: an open one and a
-//! WPA3-only one, on other channels and fainter, for the station's
-//! survey. Every datagram to the radio starts with the signal strength it
-//! is "heard" at (dBm, one signed byte), as a real radio reports it.
+//! A second access point, WPA3-only (SAE, management frames protected),
+//! serves the same network as "superior-wpa3": once a station has joined
+//! it, it is sent a forged (unprotected) deauthentication, which it must
+//! ignore. An open network beacons too, on another channel and fainter,
+//! for the station's survey. Every datagram to the radio starts with the
+//! signal strength it is "heard" at (dBm, one signed byte), as a real
+//! radio reports it.
 
 use std::net::UdpSocket;
 use std::sync::Arc;
@@ -38,6 +41,10 @@ const ECHO_PORT: u16 = 47001;
 const REKEY_EVERY: u64 = 20;
 /// The access point's signal at the radio, in dBm.
 const SIGNAL: i8 = -45;
+/// The WPA3 access point.
+pub const WPA3_SSID: &[u8] = b"superior-wpa3";
+pub const WPA3_BSSID: [u8; 6] = [0x02, 0x57, 0x49, 0x46, 0x49, 0x03];
+const WPA3_SIGNAL: i8 = -60;
 
 /// A network in range that only beacons: BSSID, SSID, capability, RSN
 /// element (if any), channel, signal.
@@ -50,13 +57,14 @@ struct Neighbour {
     signal: i8,
 }
 
-/// WPA3-Personal only: SAE, management frame protection required.
-const RSNE_SAE: [u8; 22] = [0x30, 20, 1, 0, 0x00, 0x0f, 0xac, 4, 1, 0, 0x00, 0x0f, 0xac, 4, 1, 0, 0x00, 0x0f, 0xac, 8, 0xc0, 0];
-
-const NEIGHBOURS: [Neighbour; 2] = [
-    Neighbour { bssid: [0x02, 0x57, 0x49, 0x46, 0x49, 0x02], ssid: b"superior-guest", capability: 0x0001, rsne: None, channel: 11, signal: -71 },
-    Neighbour { bssid: [0x02, 0x4e, 0x45, 0x49, 0x47, 0x03], ssid: b"neighbour-wpa3", capability: 0x0011, rsne: Some(&RSNE_SAE), channel: 1, signal: -80 },
-];
+const NEIGHBOURS: [Neighbour; 1] = [Neighbour {
+    bssid: [0x02, 0x57, 0x49, 0x46, 0x49, 0x02],
+    ssid: b"superior-guest",
+    capability: 0x0001,
+    rsne: None,
+    channel: 11,
+    signal: -71,
+}];
 
 impl Neighbour {
     /// Its beacon, with the signal byte before it.
@@ -96,6 +104,12 @@ pub struct Seen {
     pub rekeys: AtomicU64,
     pub group_rekeys: AtomicU64,
     pub arp_answers: AtomicU64,
+    /// The WPA3 access point: the station keyed by SAE, frames carried
+    /// from it, forged deauthentications sent, frames refused.
+    pub wpa3_keyed: AtomicBool,
+    pub wpa3_from_station: AtomicU64,
+    pub forged_deauths: AtomicU64,
+    pub wpa3_refused: AtomicU64,
 }
 
 /// Runs the access point until `stop`.
@@ -106,12 +120,17 @@ pub fn start(stop: Arc<AtomicBool>, seen: Arc<Seen>) -> Result<JoinHandle<()>, S
     getrandom::getrandom(&mut seed).map_err(|e| e.to_string())?;
     let mut gtk = Gtk { index: 1, key: [0; 16] };
     getrandom::getrandom(&mut gtk.key).map_err(|e| e.to_string())?;
+    let mut seed3 = [0u8; 32];
+    getrandom::getrandom(&mut seed3).map_err(|e| e.to_string())?;
+    let mut gtk3 = Gtk { index: 1, key: [0; 16] };
+    getrandom::getrandom(&mut gtk3.key).map_err(|e| e.to_string())?;
     let mut later_gtks = [[0u8; 16]; 8];
     for k in later_gtks.iter_mut() {
         getrandom::getrandom(k).map_err(|e| e.to_string())?;
     }
     Ok(std::thread::spawn(move || {
         let mut ap = AccessPoint::new(BSSID, SSID, PASSPHRASE, gtk, seed);
+        let mut ap3 = AccessPoint::new(WPA3_BSSID, WPA3_SSID, PASSPHRASE, gtk3, seed3).offering(false, true);
         let (mut next_rekey, mut rekeyings, mut group_rekeys) = (REKEY_EVERY, 0usize, 0);
         let started = Instant::now();
         let radio = ("127.0.0.1", RADIO_PORT);
@@ -121,17 +140,32 @@ pub fn start(stop: Arc<AtomicBool>, seen: Arc<Seen>) -> Result<JoinHandle<()>, S
         while !stop.load(Ordering::Relaxed) {
             let now = started.elapsed().as_millis() as u64;
             let mut out: Vec<Vec<u8>> = Vec::new();
+            let mut out3: Vec<Vec<u8>> = Vec::new();
             let mut neighbours = Vec::new();
             if now >= next_beacon {
                 let mut b = [0u8; 200];
                 let n = ap.beacon(&mut b);
                 out.push(b[..n].to_vec());
+                let n = ap3.beacon(&mut b);
+                out3.push(b[..n].to_vec());
                 next_beacon = now + 100;
                 beacons = beacons.wrapping_add(1);
                 neighbours.extend(NEIGHBOURS.iter().map(|nb| nb.beacon(beacons)));
             }
             ap.poll(now, &mut |f| out.push(f.to_vec()));
+            ap3.poll(now, &mut |f| out3.push(f.to_vec()));
             if let Ok(n) = sock.recv(&mut buf) {
+                let mut up3: Vec<Vec<u8>> = Vec::new();
+                ap3.receive(&buf[..n], now, &mut |f| out3.push(f.to_vec()), &mut |e| up3.push(e.to_vec()));
+                for e in up3 {
+                    seen.wpa3_from_station.fetch_add(1, Ordering::Relaxed);
+                    if let Some(reply) = answer(&e, &seen) {
+                        let mut f = [0u8; MAX];
+                        if let Some(n) = ap3.send(&reply, &mut f) {
+                            out3.push(f[..n].to_vec());
+                        }
+                    }
+                }
                 let mut up: Vec<Vec<u8>> = Vec::new();
                 ap.receive(&buf[..n], now, &mut |f| out.push(f.to_vec()), &mut |e| up.push(e.to_vec()));
                 for e in up {
@@ -174,10 +208,22 @@ pub fn start(stop: Arc<AtomicBool>, seen: Arc<Seen>) -> Result<JoinHandle<()>, S
             seen.rekeys.store(ap.rekeys as u64, Ordering::Relaxed);
             seen.group_rekeys.store(ap.group_rekeys as u64, Ordering::Relaxed);
             seen.refused.store(ap.refused, Ordering::Relaxed);
-            for f in out {
-                let mut d = vec![SIGNAL as u8];
-                d.extend_from_slice(&f);
-                let _ = sock.send_to(&d, radio);
+            if ap3.peer() == Peer::Up && !seen.wpa3_keyed.swap(true, Ordering::Relaxed) {
+                // Keyed by SAE: a deauthentication forged in its name,
+                // unprotected, which the station must not obey.
+                let mut f = [0u8; 26];
+                let n = superior_wifi::frame::header(&mut f, superior_wifi::frame::DEAUTH, 0, &ap3.station(), &WPA3_BSSID, &WPA3_BSSID, 0);
+                f[n..n + 2].copy_from_slice(&[7, 0]);
+                out3.push(f.to_vec());
+                seen.forged_deauths.fetch_add(1, Ordering::Relaxed);
+            }
+            seen.wpa3_refused.store(ap3.refused, Ordering::Relaxed);
+            for (frames, signal) in [(out, SIGNAL), (out3, WPA3_SIGNAL)] {
+                for f in frames {
+                    let mut d = vec![signal as u8];
+                    d.extend_from_slice(&f);
+                    let _ = sock.send_to(&d, radio);
+                }
             }
             for d in neighbours {
                 let _ = sock.send_to(&d, radio);

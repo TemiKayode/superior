@@ -219,6 +219,43 @@ pub fn ccm_open(aes: &Aes128, nonce: &[u8; 13], aad: &[u8], data: &mut [u8], tag
 
 const WRAP_IV: [u8; 8] = [0xa6; 8];
 
+/// AES-CMAC (RFC 4493) of `data` under `key`: the MIC of EAPOL-Key frames
+/// under SAE's key hierarchy.
+pub fn cmac(key: &[u8; 16], data: &[u8]) -> [u8; 16] {
+    let aes = Aes128::new(key);
+    let dbl = |b: [u8; 16]| {
+        let v = u128::from_be_bytes(b);
+        ((v << 1) ^ if v >> 127 == 1 { 0x87 } else { 0 }).to_be_bytes()
+    };
+    let mut l = [0u8; 16];
+    aes.encrypt(&mut l);
+    let k1 = dbl(l);
+    let k2 = dbl(k1);
+    let blocks = data.len().div_ceil(16).max(1);
+    let mut x = [0u8; 16];
+    for i in 0..blocks {
+        let chunk = &data[i * 16..data.len().min(i * 16 + 16)];
+        let mut b = [0u8; 16];
+        b[..chunk.len()].copy_from_slice(chunk);
+        if i == blocks - 1 {
+            let sub = if chunk.len() == 16 {
+                k1
+            } else {
+                b[chunk.len()] = 0x80;
+                k2
+            };
+            for j in 0..16 {
+                b[j] ^= sub[j];
+            }
+        }
+        for j in 0..16 {
+            x[j] ^= b[j];
+        }
+        aes.encrypt(&mut x);
+    }
+    x
+}
+
 /// AES key wrap of `data` (a multiple of 8 bytes, 16 or more) under `kek`
 /// into `out`, 8 bytes longer.
 pub fn key_wrap(kek: &[u8; 16], data: &[u8], out: &mut [u8]) {

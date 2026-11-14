@@ -1,6 +1,6 @@
 [package]
 name = "superior-wifi"
-description = "Wi-Fi security for Superior's station that host tests can check: WPA2-Personal's key derivation, 4-way handshake and CCMP."
+description = "Wi-Fi for Superior's station that host tests can check: WPA2- and WPA3-Personal (SAE on P-256), the 4-way handshake, CCMP, joining, rekeying and surveys."
 version.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -8,3 +8,4 @@ edition = "2024"
 publish = false
 
 [dependencies]
+superior-objects = { path = "../objects" }

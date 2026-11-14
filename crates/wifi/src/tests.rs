@@ -3,7 +3,7 @@
 
 use crate::aes::{Aes128, ccm_open, ccm_seal, key_unwrap, key_wrap};
 use crate::ccmp::{self, Refused};
-use crate::handshake::{Authenticator, Error, Gtk, RSNE_PSK_CCMP, Supplicant, ptk};
+use crate::handshake::{Akm, Authenticator, Error, Gtk, RSNE_PSK_CCMP, Supplicant, ptk};
 use crate::sha1::{hmac_sha1, pbkdf2_sha1, prf, psk, sha1};
 
 fn hex<const N: usize>(s: &str) -> [u8; N] {
@@ -130,8 +130,8 @@ const SPA: [u8; 6] = [0x52, 0x54, 0, 0x12, 0x34, 0x56];
 const GTK: Gtk = Gtk { index: 1, key: [0x77; 16] };
 
 fn pair(pass: &[u8]) -> (Authenticator, Supplicant) {
-    let ap = Authenticator::new(psk(b"correct horse", b"superior"), AA, SPA, [0xa1; 32], &RSNE_PSK_CCMP, GTK);
-    let sta = Supplicant::new(psk(pass, b"superior"), SPA, AA, [0x5e; 32], &RSNE_PSK_CCMP, &RSNE_PSK_CCMP);
+    let ap = Authenticator::new(Akm::Psk, psk(b"correct horse", b"superior"), AA, SPA, [0xa1; 32], &RSNE_PSK_CCMP, GTK);
+    let sta = Supplicant::new(Akm::Psk, psk(pass, b"superior"), SPA, AA, [0x5e; 32], &RSNE_PSK_CCMP, &RSNE_PSK_CCMP);
     (ap, sta)
 }
 
@@ -183,8 +183,8 @@ fn a_downgraded_rsn_element_is_refused() {
     // point's real one with TKIP), so message 3's does not match.
     let mut tkip = RSNE_PSK_CCMP;
     tkip[13] = 2;
-    let mut ap = Authenticator::new(psk(b"correct horse", b"superior"), AA, SPA, [0xa1; 32], &RSNE_PSK_CCMP, GTK);
-    let mut sta = Supplicant::new(psk(b"correct horse", b"superior"), SPA, AA, [0x5e; 32], &RSNE_PSK_CCMP, &tkip);
+    let mut ap = Authenticator::new(Akm::Psk, psk(b"correct horse", b"superior"), AA, SPA, [0xa1; 32], &RSNE_PSK_CCMP, GTK);
+    let mut sta = Supplicant::new(Akm::Psk, psk(b"correct horse", b"superior"), SPA, AA, [0x5e; 32], &RSNE_PSK_CCMP, &tkip);
     let m2 = sta.receive(ap.start().bytes()).unwrap();
     let m3 = ap.receive(m2.bytes()).unwrap().unwrap();
     assert_eq!(sta.receive(m3.bytes()).err(), Some(Error::Rsne));
@@ -258,10 +258,15 @@ mod air {
 
     impl Air {
         pub fn new(ap_pass: &[u8]) -> Air {
+            Air::offering(ap_pass, true, false)
+        }
+
+        /// With an access point offering WPA2-PSK and/or WPA3-SAE.
+        pub fn offering(ap_pass: &[u8], psk: bool, sae: bool) -> Air {
             let gtk = Gtk { index: 1, key: [0x47; 16] };
             Air {
                 sta: Station::new(STA),
-                ap: AccessPoint::new(BSSID, b"superior", ap_pass, gtk, [9; 32]),
+                ap: AccessPoint::new(BSSID, b"superior", ap_pass, gtk, [9; 32]).offering(psk, sae),
                 to_ap: Vec::new(),
                 to_sta: Vec::new(),
                 sta_up: Vec::new(),
@@ -617,4 +622,207 @@ fn a_survey_lists_every_network_heard_strongest_first() {
     assert!(air.joined() && !air.sta.surveying());
     assert_eq!(air.sta.networks().count(), 1);
     assert_eq!(air.sta_up.len() + air.ap_up.len(), sent);
+}
+
+fn unhex<const L: usize>(s: &str) -> [u8; L] {
+    let s: std::vec::Vec<u8> = s.bytes().filter(|c| !c.is_ascii_whitespace()).collect();
+    assert_eq!(s.len(), 2 * L);
+    core::array::from_fn(|i| u8::from_str_radix(core::str::from_utf8(&s[2 * i..2 * i + 2]).unwrap(), 16).unwrap())
+}
+
+#[test]
+fn hmac_sha256_and_cmac_match_their_rfcs() {
+    use crate::aes::cmac;
+    use crate::sha256::hmac_sha256;
+    // RFC 4231, test case 2.
+    assert_eq!(
+        hmac_sha256(b"Jefe", &[b"what do ya ", b"want for nothing?"]),
+        unhex::<32>("5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843")
+    );
+    // RFC 4493: the empty message, and one block.
+    let key = unhex::<16>("2b7e151628aed2a6abf7158809cf4f3c");
+    assert_eq!(cmac(&key, &[]), unhex::<16>("bb1d6929e95937287fa37d129b756746"));
+    assert_eq!(cmac(&key, &unhex::<16>("6bc1bee22e409f96e93d7e117393172a")), unhex::<16>("070a16b46b4d4144f79bdd9dd04a287c"));
+    // 40 bytes (a partial last block).
+    let m40 = unhex::<40>("6bc1bee22e409f96e93d7e117393172aae2d8a571e03ac9c9eb76fac45af8e5130c81c46a35ce411");
+    assert_eq!(cmac(&key, &m40), unhex::<16>("dfa66747de9ae63030ca32611497c827"));
+}
+
+#[test]
+fn p256_points_add_up() {
+    use crate::p256::{Affine, N, Point, from_be};
+    let g = Affine::generator();
+    assert!(g.on_curve());
+    let gp = g.point();
+    let two = gp.double().affine().unwrap();
+    assert_eq!(two.x, from_be(&unhex("7cf27b188d034f7e8a52380304b51ac3c08969e277f21b35a60b48fc47669978")));
+    assert_eq!(two.y, from_be(&unhex("07775510db8ed040293d9ac69f7430dbba7dade63ce982299e04b79d227873d1")));
+    let three = gp.mul(&[3, 0, 0, 0]).affine().unwrap();
+    assert_eq!(three.x, from_be(&unhex("5ecbe4d1a6330a44c8f7ef951d4bf165e6c6b721efada985fb41661bc6e7fd6c")));
+    assert_eq!(three.y, from_be(&unhex("8734640c4998ff7e374b06ce1a64a2ecd82ab036384fb83d9a79b127a27d5032")));
+    assert_eq!(gp.add(&gp).affine(), Some(two), "adding a point to itself doubles it");
+    assert!(gp.mul(&N).is_infinity(), "n·G is the point at infinity");
+    let n1 = [N[0] - 1, N[1], N[2], N[3]];
+    assert_eq!(gp.mul(&n1).affine(), Some(g.neg()));
+    assert_eq!(gp.add(&g.neg().point()), Point::INFINITY);
+    // (a·G)·b = (b·G)·a.
+    let a = from_be(&[0x5a; 32]);
+    let b = from_be(&[0xc3; 32]);
+    let ab = gp.mul(&a).mul(&b).affine().unwrap();
+    assert_eq!(gp.mul(&b).mul(&a).affine().unwrap(), ab);
+    assert!(ab.on_curve());
+    assert_eq!(Affine::decode(&ab.encode()), Some(ab));
+    let mut off = ab.encode();
+    off[63] ^= 1;
+    assert_eq!(Affine::decode(&off), None, "off the curve");
+}
+
+/// SAE's 64 random bytes: `rand` all `r`, `mask` all `m`.
+fn random(r: u8, m: u8) -> [u8; 64] {
+    core::array::from_fn(|i| if i < 32 { r } else { m })
+}
+
+#[test]
+fn sae_peers_reach_the_same_pmk_and_refuse_what_they_should() {
+    use crate::sae::{Error as SaeError, Sae};
+    let (a, b) = ([0x82, 0x7b, 0x91, 0x9d, 0xd4, 0xb9], [0x1e, 0xec, 0x49, 0xea, 0x64, 0x88]);
+    let mut sta = Sae::new(b"mekmitasdigoat", &a, &b, &random(0x21, 0x43)).unwrap();
+    let r = random(0x65, 0x87);
+    let mut ap = Sae::new(b"mekmitasdigoat", &b, &a, &r).unwrap();
+    assert_eq!(sta.receive_confirm(&[0; 34]).err(), Some(SaeError::State));
+    let c_sta = sta.receive_commit(&ap.commit()).unwrap();
+    let c_ap = ap.receive_commit(&sta.commit()).unwrap();
+    assert_eq!(sta.pmk(), None, "not before the confirm");
+    ap.receive_confirm(&c_sta).unwrap();
+    sta.receive_confirm(&c_ap).unwrap();
+    assert_eq!(sta.pmk(), ap.pmk());
+    assert!(sta.pmk().is_some());
+    assert_eq!(sta.pmkid(), ap.pmkid());
+    // Another password: the confirm does not hold.
+    let mut wrong = Sae::new(b"another password", &b, &a, &r).unwrap();
+    let mut sta2 = Sae::new(b"mekmitasdigoat", &a, &b, &random(0x21, 0x43)).unwrap();
+    let c2 = sta2.receive_commit(&wrong.commit()).unwrap();
+    let cw = wrong.receive_commit(&sta2.commit()).unwrap();
+    assert_eq!(wrong.receive_confirm(&c2).err(), Some(SaeError::Confirm));
+    assert_eq!(sta2.receive_confirm(&cw).err(), Some(SaeError::Confirm));
+    // Our own commit reflected, a bad group, scalar or element.
+    let own = sta2.commit();
+    assert_eq!(sta2.receive_commit(&own).err(), Some(SaeError::Reflection));
+    let mut bad = ap.commit();
+    bad[0] = 20;
+    assert_eq!(sta2.receive_commit(&bad).err(), Some(SaeError::Group));
+    let mut bad = ap.commit();
+    bad[2..34].fill(0);
+    assert_eq!(sta2.receive_commit(&bad).err(), Some(SaeError::Scalar));
+    let mut bad = ap.commit();
+    bad[97] ^= 1;
+    assert_eq!(sta2.receive_commit(&bad).err(), Some(SaeError::Element));
+    assert_eq!(sta2.receive_commit(&ap.commit()[..50]).err(), Some(SaeError::Malformed));
+}
+
+#[test]
+fn the_4_way_handshake_under_sae_uses_cmac_and_delivers_the_igtk() {
+    use crate::handshake::{Igtk, RSNE_SAE};
+    let pmk = [0x3a; 32];
+    let igtk = Igtk { index: 4, key: [0x91; 16] };
+    let mut ap = Authenticator::new(Akm::Sae, pmk, AA, SPA, [0xa1; 32], &RSNE_SAE, GTK).with_igtk(igtk);
+    let mut sta = Supplicant::new(Akm::Sae, pmk, SPA, AA, [0x5e; 32], &RSNE_SAE, &RSNE_SAE);
+    let m1 = ap.start();
+    assert_eq!(m1.bytes()[6] & 7, 0, "key descriptor version 0: defined by the AKM");
+    let m2 = sta.receive(m1.bytes()).unwrap();
+    let m3 = ap.receive(m2.bytes()).unwrap().unwrap();
+    let m4 = sta.receive(m3.bytes()).unwrap();
+    assert!(matches!(ap.receive(m4.bytes()), Ok(None)));
+    let keys = sta.keys().unwrap();
+    assert_eq!(Some(keys.tk), ap.tk());
+    assert_eq!(keys.igtk, Some(igtk));
+    assert_ne!(keys.tk, crate::handshake::ptk(&pmk, &AA, &SPA, &[0xa1; 32], &[0x5e; 32]).tk, "not WPA2's PTK");
+    // A WPA2 station's frames are refused under SAE, and message 3
+    // without an IGTK too.
+    let mut psk_sta = Supplicant::new(Akm::Psk, pmk, SPA, AA, [0x5e; 32], &RSNE_PSK_CCMP, &RSNE_SAE);
+    let mut ap = Authenticator::new(Akm::Sae, pmk, AA, SPA, [0xa1; 32], &RSNE_SAE, GTK);
+    assert_eq!(psk_sta.receive(ap.start().bytes()).err(), Some(Error::Malformed));
+    let mut sta = Supplicant::new(Akm::Sae, pmk, SPA, AA, [0x5e; 32], &RSNE_SAE, &RSNE_SAE);
+    let m2 = sta.receive(ap.start().bytes()).unwrap();
+    let m3 = ap.receive(m2.bytes()).unwrap().unwrap();
+    assert_eq!(sta.receive(m3.bytes()).err(), Some(Error::KeyData));
+}
+
+#[test]
+fn a_station_joins_wpa3_by_sae_and_carries_frames() {
+    let mut air = air::Air::offering(b"correct horse", false, true);
+    air.sta.join(b"superior", b"correct horse", [7; 32], 0);
+    air.run(500);
+    assert!(air.joined(), "{:?} / {:?}", air.sta.link(), air.ap.peer());
+    assert_eq!((air.sta.akm(), air.ap.akm()), (Akm::Sae, Akm::Sae));
+    let sent = (0..10).map(|k| exchange(&mut air, k)).sum::<usize>();
+    assert_eq!(air.sta_up.len() + air.ap_up.len(), sent);
+    assert_eq!(sent, 20);
+    // Rekeying works the same under SAE.
+    let now = air.now;
+    assert!(air.ap.rekey(now, &mut |f| air.to_sta.push(f.to_vec())));
+    air.run(50);
+    assert_eq!((air.sta.rekeys, air.ap.rekeys), (1, 1));
+}
+
+#[test]
+fn a_transition_mode_access_point_is_joined_by_sae() {
+    let mut air = air::Air::offering(b"correct horse", true, true);
+    air.sta.join(b"superior", b"correct horse", [7; 32], 0);
+    air.run(500);
+    assert!(air.joined());
+    assert_eq!(air.ap.akm(), Akm::Sae);
+}
+
+#[test]
+fn joining_by_sae_survives_losing_every_other_frame() {
+    let mut air = air::Air::offering(b"correct horse", false, true);
+    air.lossy = true;
+    air.sta.join(b"superior", b"correct horse", [7; 32], 0);
+    air.run(15_000);
+    assert!(air.joined(), "{:?} / {:?}", air.sta.link(), air.ap.peer());
+}
+
+#[test]
+fn a_wrong_password_fails_sae_s_confirm() {
+    use crate::station::Link;
+    let mut air = air::Air::offering(b"another horse", false, true);
+    air.sta.join(b"superior", b"correct horse", [7; 32], 0);
+    air.run(5000);
+    assert_ne!(air.sta.link(), Link::Up);
+    assert_ne!(air.sta.link(), Link::Associating, "never past authentication");
+    assert!(air.ap.refused > 0, "the station's confirm refused");
+}
+
+/// A deauthentication from the access point to the station, unprotected
+/// (as anyone in range can forge one).
+fn forged_deauth() -> std::vec::Vec<u8> {
+    let mut f = [0u8; 26];
+    let n = crate::frame::header(&mut f, crate::frame::DEAUTH, 0, &air::STA, &air::BSSID, &air::BSSID, 9);
+    f[n..n + 2].copy_from_slice(&[7, 0]);
+    f.to_vec()
+}
+
+#[test]
+fn under_wpa3_only_a_sealed_deauthentication_is_obeyed() {
+    use crate::station::Link;
+    let mut air = air::Air::offering(b"correct horse", false, true);
+    air.sta.join(b"superior", b"correct horse", [7; 32], 0);
+    air.run(500);
+    assert!(air.joined());
+    air.to_sta.push(forged_deauth());
+    air.run(10);
+    assert_eq!(air.sta.link(), Link::Up, "a forged deauthentication is ignored");
+    assert_eq!(air.sta.refused, 1);
+    air.ap.deauth(&mut |f| air.to_sta.push(f.to_vec()));
+    air.run(10);
+    assert_ne!(air.sta.link(), Link::Up, "the access point's own, sealed, is obeyed");
+    // Under WPA2 there is no protection: a forged one knocks it off.
+    let mut air = air::Air::new(b"correct horse");
+    air.sta.join(b"superior", b"correct horse", [7; 32], 0);
+    air.run(200);
+    assert!(air.joined());
+    air.to_sta.push(forged_deauth());
+    air.run(10);
+    assert_ne!(air.sta.link(), Link::Up);
 }

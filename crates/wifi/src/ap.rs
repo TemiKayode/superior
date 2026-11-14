@@ -2,9 +2,12 @@
 //! no I/O of its own: what the test harness plays at the far end of the
 //! simulated radio (and what a host test joins a [`Station`] to).
 //!
-//! It answers probe requests for its SSID, open system authentication and
-//! association (if the station offers WPA2-PSK with CCMP), runs the access
-//! point's side of the 4-way handshake ([`Authenticator`]), and then
+//! It answers probe requests for its SSID, authentication (open system
+//! for WPA2-PSK, SAE's exchange for WPA3; [`AccessPoint::offering`] says
+//! which it offers, WPA2 alone by default) and association (if the
+//! station offers the RSN element of the suite it authenticated with),
+//! runs the access point's side of the 4-way handshake
+//! ([`Authenticator`]), and then
 //! carries Ethernet frames both ways: the station's, opened under the
 //! temporal key, and its own, sealed with the temporal key to the station
 //! or the group key to a group. Once the station is keyed it can renew the
@@ -17,8 +20,14 @@
 
 use crate::ccmp;
 use crate::frame::{self, *};
-use crate::handshake::{Authenticator, Gtk, RSNE_PSK_CCMP};
+use crate::handshake::{Akm, Authenticator, Gtk, Igtk, RSNE_PSK_CCMP, RSNE_SAE};
+use crate::sae::{self, COMMIT_LEN, Sae};
 use crate::sha1::{prf, psk};
+
+/// The RSN element of transition mode: PSK and SAE both, management frame
+/// protection capable.
+pub const RSNE_PSK_SAE: [u8; 26] =
+    [0x30, 24, 1, 0, 0x00, 0x0f, 0xac, 4, 1, 0, 0x00, 0x0f, 0xac, 4, 2, 0, 0x00, 0x0f, 0xac, 2, 0x00, 0x0f, 0xac, 8, 0x80, 0];
 
 /// How long the access point waits for a handshake answer before sending
 /// message 1 again.
@@ -37,8 +46,22 @@ pub struct AccessPoint {
     bssid: [u8; 6],
     ssid: [u8; 32],
     ssid_len: usize,
+    /// The passphrase's PSK, and the passphrase (SAE's password).
     pmk: [u8; 32],
+    password: [u8; 63],
+    password_len: usize,
+    /// The suites offered.
+    psk_ok: bool,
+    sae_ok: bool,
+    /// The station's: how it authenticated, and its PMK.
+    authed: Option<Akm>,
+    station_pmk: [u8; 32],
+    akm: Akm,
+    /// SAE with the station, and the last commit it sent.
+    sae: Option<Sae>,
+    sae_commit: [u8; COMMIT_LEN],
     gtk: Gtk,
+    igtk: Igtk,
     seed: [u8; 32],
     nonces: u32,
     station: [u8; 6],
@@ -64,12 +87,27 @@ impl AccessPoint {
         let mut s = [0u8; 32];
         let n = ssid.len().min(32);
         s[..n].copy_from_slice(&ssid[..n]);
+        let mut password = [0u8; 63];
+        let password_len = passphrase.len().min(63);
+        password[..password_len].copy_from_slice(&passphrase[..password_len]);
+        let mut igtk = Igtk { index: 4, key: [0; 16] };
+        prf(&seed, b"IGTK", &[&bssid], &mut igtk.key);
         AccessPoint {
             bssid,
             ssid: s,
             ssid_len: n,
             pmk: psk(passphrase, &ssid[..n]),
+            password,
+            password_len,
+            psk_ok: true,
+            sae_ok: false,
+            authed: None,
+            station_pmk: [0; 32],
+            akm: Akm::Psk,
+            sae: None,
+            sae_commit: [0; COMMIT_LEN],
             gtk,
+            igtk,
             seed,
             nonces: 0,
             station: [0; 6],
@@ -88,8 +126,53 @@ impl AccessPoint {
         }
     }
 
+    /// Which suites it offers: WPA2-PSK, WPA3-SAE, or both (transition
+    /// mode).
+    pub fn offering(mut self, psk: bool, sae: bool) -> Self {
+        (self.psk_ok, self.sae_ok) = (psk, sae);
+        self
+    }
+
+    /// The RSN element it advertises.
+    fn rsne(&self) -> &'static [u8] {
+        match (self.psk_ok, self.sae_ok) {
+            (true, true) => &RSNE_PSK_SAE,
+            (false, true) => &RSNE_SAE,
+            _ => &RSNE_PSK_CCMP,
+        }
+    }
+
     pub fn peer(&self) -> Peer {
         self.peer
+    }
+
+    /// The suite the station joined with.
+    pub fn akm(&self) -> Akm {
+        self.akm
+    }
+
+    /// Tells the station to go (reason 3, leaving): sealed under the
+    /// temporal key when management frames are protected (SAE), so the
+    /// station believes it.
+    pub fn deauth(&mut self, radio: &mut dyn FnMut(&[u8])) {
+        if self.peer == Peer::None {
+            return;
+        }
+        let mut f = [0u8; 64];
+        let seq = self.next_seq();
+        let n = header(&mut f, DEAUTH, 0, &self.station, &self.bssid, &self.bssid, seq);
+        if self.peer == Peer::Up && self.akm == Akm::Sae {
+            let mut out = [0u8; 64];
+            self.pn += 1;
+            if let Some(m) = ccmp::seal(&self.tk, self.pn, 0, &f[..n], &[3, 0], &mut out) {
+                radio(&out[..m]);
+            }
+        } else {
+            f[n..n + 2].copy_from_slice(&[3, 0]);
+            radio(&f[..n + 2]);
+        }
+        self.peer = Peer::None;
+        self.auth = None;
     }
 
     pub fn station(&self) -> [u8; 6] {
@@ -113,8 +196,9 @@ impl AccessPoint {
         n = element(out, n, SSID, &self.ssid[..self.ssid_len]);
         n = element(out, n, RATES, &RATE_SET);
         n = element(out, n, DS_PARAMS, &[6]);
-        out[n..n + RSNE_PSK_CCMP.len()].copy_from_slice(&RSNE_PSK_CCMP);
-        n + RSNE_PSK_CCMP.len()
+        let rsne = self.rsne();
+        out[n..n + rsne.len()].copy_from_slice(rsne);
+        n + rsne.len()
     }
 
     /// A beacon, into `out` (200 bytes is room enough).
@@ -123,7 +207,7 @@ impl AccessPoint {
     }
 
     fn reply(&mut self, fc0: u8, body: &[u8], radio: &mut dyn FnMut(&[u8])) {
-        let mut f = [0u8; 64];
+        let mut f = [0u8; 160];
         let seq = self.next_seq();
         let n = header(&mut f, fc0, 0, &self.station, &self.bssid, &self.bssid, seq);
         f[n..n + body.len()].copy_from_slice(body);
@@ -221,27 +305,36 @@ impl AccessPoint {
                     radio(&out[..n]);
                 }
             }
-            AUTH if ours && body.len() >= 6 && body[..4] == [0, 0, 1, 0] => {
+            AUTH if ours && self.psk_ok && body.len() >= 6 && body[..4] == [0, 0, 1, 0] => {
                 self.station = sa;
                 self.peer = Peer::Authenticated;
                 self.auth = None;
+                (self.authed, self.station_pmk) = (Some(Akm::Psk), self.pmk);
                 self.reply(AUTH, &[0, 0, 2, 0, 0, 0], radio);
             }
+            AUTH if ours && self.sae_ok && body.len() >= 6 && body[..2] == [3, 0] => self.sae_auth(sa, body, radio),
             ASSOC_REQ if ours && sa == self.station && self.peer != Peer::None => {
                 let offered = body.get(4..).and_then(|e| find_element(e, RSN));
-                if offered != Some(&RSNE_PSK_CCMP[..]) {
-                    // Status 43: invalid AKMP (not WPA2-PSK with CCMP).
-                    let cap = CAPABILITY.to_le_bytes();
-                    self.reply(ASSOC_RESP, &[cap[0], cap[1], 43, 0, 0, 0], radio);
-                    return;
-                }
+                let akm = match (offered, self.authed) {
+                    (Some(o), Some(Akm::Psk)) if o == RSNE_PSK_CCMP => Akm::Psk,
+                    (Some(o), Some(Akm::Sae)) if o == RSNE_SAE => Akm::Sae,
+                    _ => {
+                        // Status 43: invalid AKMP (not the suite it
+                        // authenticated with, or not one offered).
+                        let cap = CAPABILITY.to_le_bytes();
+                        self.reply(ASSOC_RESP, &[cap[0], cap[1], 43, 0, 0, 0], radio);
+                        return;
+                    }
+                };
+                self.akm = akm;
                 let cap = CAPABILITY.to_le_bytes();
                 // Status 0, association ID 1 (top two bits set).
                 let mut resp = [cap[0], cap[1], 0, 0, 1, 0xc0, RATES, 8, 0, 0, 0, 0, 0, 0, 0, 0];
                 resp[8..].copy_from_slice(&RATE_SET);
                 self.reply(ASSOC_RESP, &resp, radio);
                 let anonce = self.nonce();
-                self.auth = Some(Authenticator::new(self.pmk, self.bssid, sa, anonce, &RSNE_PSK_CCMP, self.gtk));
+                let auth = Authenticator::new(akm, self.station_pmk, self.bssid, sa, anonce, self.rsne(), self.gtk);
+                self.auth = Some(auth.with_igtk(self.igtk));
                 self.peer = Peer::Keying;
                 self.rx_pn = None;
                 self.resend = now;
@@ -254,6 +347,66 @@ impl AccessPoint {
             DATA if ours && fc1 & (TO_DS | FROM_DS) == TO_DS && sa == self.station => self.data(f, fc1, sa, a3, now, radio, up),
             _ => {}
         }
+    }
+
+    /// SAE authentication from `sa`: its commit, answered with ours (the
+    /// same again if its commit comes again); its confirm, which checked
+    /// gives the PMK, answered with ours.
+    fn sae_auth(&mut self, sa: [u8; 6], body: &[u8], radio: &mut dyn FnMut(&[u8])) {
+        match (body[2..4] == [1, 0], body[2..4] == [2, 0]) {
+            (true, _) => {
+                let Some(commit) = body.get(6..6 + COMMIT_LEN) else { return };
+                if sa == self.station && commit == self.sae_commit && self.sae.is_some() {
+                    let ours = self.sae.as_ref().map(|s| s.commit()).unwrap();
+                    self.auth_reply(1, &ours, radio);
+                    return;
+                }
+                (self.station, self.peer, self.authed, self.auth) = (sa, Peer::None, None, None);
+                let mut fresh = None;
+                for _ in 0..4 {
+                    let mut r = [0u8; 64];
+                    r[..32].copy_from_slice(&self.nonce());
+                    r[32..].copy_from_slice(&self.nonce());
+                    fresh = Sae::new(&self.password[..self.password_len], &self.bssid, &sa, &r);
+                    if fresh.is_some() {
+                        break;
+                    }
+                }
+                let Some(mut s) = fresh else { return };
+                match s.receive_commit(commit) {
+                    Ok(_) => {
+                        self.sae_commit.copy_from_slice(commit);
+                        let ours = s.commit();
+                        self.sae = Some(s);
+                        self.auth_reply(1, &ours, radio);
+                    }
+                    // Status 77: the group is not supported (with ours).
+                    Err(sae::Error::Group) => self.reply(AUTH, &[3, 0, 1, 0, 77, 0, 19, 0], radio),
+                    Err(_) => self.refused += 1,
+                }
+            }
+            (_, true) if sa == self.station => {
+                let Some(s) = self.sae.as_mut() else { return };
+                match s.receive_confirm(&body[6..]).map(|_| s.pmk()) {
+                    Ok(Some(pmk)) => {
+                        let ours = s.confirm().unwrap_or([0; sae::CONFIRM_LEN]);
+                        (self.peer, self.authed, self.station_pmk) = (Peer::Authenticated, Some(Akm::Sae), pmk);
+                        self.auth_reply(2, &ours, radio);
+                    }
+                    _ => self.refused += 1,
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// An SAE authentication frame to the station: transaction `seq`,
+    /// status 0, then `body`.
+    fn auth_reply(&mut self, seq: u8, body: &[u8], radio: &mut dyn FnMut(&[u8])) {
+        let mut b = [0u8; 6 + COMMIT_LEN];
+        b[..6].copy_from_slice(&[3, 0, seq, 0, 0, 0]);
+        b[6..6 + body.len()].copy_from_slice(body);
+        self.reply(AUTH, &b[..6 + body.len()], radio);
     }
 
     #[allow(clippy::too_many_arguments)]
