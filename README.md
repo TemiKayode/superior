@@ -1057,6 +1057,25 @@ holds the rest):
   bottom-right corner staying put); seven screenshots (the outlines, the
   greeter at each size and place it took, and its field scrolled and not) must
   have every pixel right.
+- Richer toolkit widgets, and the List app (`user/list/`) to show them. In a
+  column, widgets may share a line (`begin_row`/`end_row`): a field or list on
+  one, or a label made to (`stretch`), takes the width the others leave and
+  follows the window's width. A list shows as many of its items as fit, one
+  chosen at most: a press chooses one and gives it the keyboard (the arrows,
+  Page Up and Down, Home and End choose another, scrolling to show it), the
+  wheel scrolls it (the compositor's `WHEEL` events), and its scroll bar pages
+  it or follows its thumb dragged. Text in a field is selected by dragging, by
+  Shift with the arrows, Home, End or a press, or all of it with Control-A;
+  typing replaces the selection, and Control-C, -X and -V copy, cut and paste
+  within the app. The List app keeps a list (ten fruits at first): "Add" (or
+  Enter) adds the field's text and chooses it, "Remove" takes the chosen item
+  out, a status label tells which is chosen. `cargo xtask widgets-test` boots
+  `boot/widgets.manifest` on both ISAs: the host chooses a row, moves down past
+  the rows shown, turns the wheel, drags the thumb back up, types into the
+  field, selects all of it with Shift and Home and types over it, selects two
+  characters, cuts and pastes them, adds the text, removes it and closes the
+  window; seven screenshots must have every pixel as the toolkit draws the
+  window on the host after the same events.
 - The mixer (`user/mixer/`), the sound server. It is the sound driver's one
   client and serves the same `audio` interface to every component that plays
   sound: it adds their streams together, sample by sample and saturating, into a
@@ -1171,7 +1190,7 @@ holds the rest):
   notifications, a 256-slot CNode pool) so filling them stays quick; normal kernels have
   32 of each, 32 address spaces and a 4096-slot pool.
 
-Not yet: in the compositor resizing by the left and top borders and maximising; in the desktop shell a launcher menu, a clock, minimising, and app icons; in the toolkit layouts other than a column, scrolling lists, and text selection; a hardware cursor plane,
+Not yet: in the compositor maximising; in the desktop shell a launcher menu, a clock, minimising, and app icons; in the toolkit a clipboard shared between apps, and multi-line text; a hardware cursor plane,
 pointer events when a window moves or appears under a still pointer, keyboard
 layouts and key repeat (keys are USB usages), and surviving a client
 that dies at the very moment its window is read (the compositor then faults and
@@ -1241,8 +1260,9 @@ https://claude.ai/artifact/QKJS8qH5Dfbjzn58RStq1j
 | `user/lde-bochs/` | Linux's bochs DRM display driver, likewise |
 | `user/lde-es1370/` | Linux's ES1370 sound driver, likewise |
 | `user/compositor/` | The display server: windows from every client over the desktop |
-| `crates/toolkit/` | The UI toolkit: a bitmap font, drawing, labels, buttons and text fields in a column |
+| `crates/toolkit/` | The UI toolkit: a bitmap font, drawing, labels, buttons, text fields (with selection) and scrolling lists, in a column of lines or a row |
 | `user/greeter/` | The first toolkit app: asks for a name and greets it |
+| `user/list/` | A toolkit app that keeps a list: lines, a scrolling list and text selection |
 | `user/panel/` | The desktop shell's panel: launchers and a button for each window |
 | `user/mixer/` | The sound server: every client's stream mixed through the sound driver |
 | `user/pcibus/` | The PCI bus server |
@@ -1257,7 +1277,7 @@ https://claude.ai/artifact/QKJS8qH5Dfbjzn58RStq1j
 | `user/xhci/` | The xHCI (USB) host controller driver |
 | `user/hid/` | The USB HID keyboard, mouse and tablet driver |
 | `user/echo/`, `user/counter/`, `user/testclient/` | Test components for the Component Manager, supervision and drivers |
-| `boot/` | Component manifests: `shell.manifest` (normal boot), `test.manifest` (`cm-test`), `supervise.manifest` (`supervise-test`) , `drivers.manifest` (`drivers-test`) , `memory.manifest` (`memory-test`), `reboot.manifest` (`reboot-test`), `fs.manifest` and `fs-verify.manifest` (`fs-test`), `net.manifest` (`net-test`), `tcp.manifest` (`tcp-test`), `keyboard.manifest` (`keyboard-test`), `display.manifest` (`display-test`), `desktop.manifest` (`desktop-test`), `input.manifest` (`input-test`), `windows.manifest` (`windows-test`), `toolkit.manifest` (`toolkit-test`), `panel.manifest` (`panel-test`), `resize.manifest` (`resize-test`), `audio.manifest` (`audio-test`), `suspend.manifest` (`suspend-test`) |
+| `boot/` | Component manifests: `shell.manifest` (normal boot), `test.manifest` (`cm-test`), `supervise.manifest` (`supervise-test`) , `drivers.manifest` (`drivers-test`) , `memory.manifest` (`memory-test`), `reboot.manifest` (`reboot-test`), `fs.manifest` and `fs-verify.manifest` (`fs-test`), `net.manifest` (`net-test`), `tcp.manifest` (`tcp-test`), `keyboard.manifest` (`keyboard-test`), `display.manifest` (`display-test`), `desktop.manifest` (`desktop-test`), `input.manifest` (`input-test`), `windows.manifest` (`windows-test`), `toolkit.manifest` (`toolkit-test`), `panel.manifest` (`panel-test`), `resize.manifest` (`resize-test`), `widgets.manifest` (`widgets-test`), `audio.manifest` (`audio-test`), `suspend.manifest` (`suspend-test`) |
 | `sel4/` | Docker build of seL4 and rust-sel4's kernel loader, for running the shell on seL4 |
 | `xtask/` | Build driver: user program, kernel, disk image, QEMU boot |
 
@@ -1281,7 +1301,8 @@ cargo xtask lde-e100-test  # the same over Linux's e100 driver
 cargo xtask display-test   # Linux's bochs display driver: two pictures, checked pixel by pixel from QEMU screenshots
 cargo xtask desktop-test   # the compositor: two clients' windows through restarts, five screenshots checked pixel by pixel
 cargo xtask panel-test     # the desktop shell's panel: two apps launched, one activated, closed and launched again, five screenshots checked
-cargo xtask resize-test    # a resizable window: its frame dragged out and in past its least size, a long name scrolled in its field, five screenshots checked
+cargo xtask resize-test    # a resizable window: its frame dragged out and in past its least size, a long name scrolled in its field, its top-left corner dragged out, seven screenshots checked
+cargo xtask widgets-test   # the List app: a list chosen in, scrolled by keys, wheel and scroll bar, text selected, cut and pasted, seven screenshots checked
 cargo xtask toolkit-test   # the greeter on the toolkit: a field typed in and edited at its cursor, a button clicked, closed, five screenshots checked against the toolkit drawn on the host
 cargo xtask windows-test   # translucent and decorated windows: a blend, a drag by the title bar, a close box, three screenshots checked
 cargo xtask input-test     # the compositor's pointer, focus, keys and wheel from a USB mouse, tablet and keyboard, seven screenshots checked

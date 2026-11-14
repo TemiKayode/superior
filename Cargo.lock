@@ -745,6 +745,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "superior-list"
+version = "0.1.0"
+dependencies = [
+ "superior-objects",
+ "superior-sys",
+ "superior-toolkit",
+]
+
+[[package]]
 name = "superior-memserver"
 version = "0.1.0"
 dependencies = [

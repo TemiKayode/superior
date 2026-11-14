@@ -188,6 +188,7 @@ fn main() -> ExitCode {
                         .and_then(|_| toolkit_test(a))
                         .and_then(|_| panel_test(a))
                         .and_then(|_| resize_test(a))
+                        .and_then(|_| widgets_test(a))
                         .and_then(|_| input_test(a))
                         .and_then(|_| audio_test(a))
                         .and_then(|_| tcp_test(a))
@@ -230,6 +231,7 @@ fn main() -> ExitCode {
         Some("toolkit-test") => toolkit_test(arch),
         Some("panel-test") => panel_test(arch),
         Some("resize-test") => resize_test(arch),
+        Some("widgets-test") => widgets_test(arch),
         Some("input-test") => input_test(arch),
         Some("audio-test") => audio_test(arch),
         Some("tcp-test") => tcp_test(arch),
@@ -389,7 +391,7 @@ const LINUX_SOURCES: [(&str, &str, &str); 5] = [
 /// a network test's, the display tests', or the audio test's.
 fn linux_driver(manifest: &str) -> Option<&'static str> {
     match manifest {
-        "display" | "desktop" | "input" | "windows" | "toolkit" | "panel" | "resize" => Some("bochs"),
+        "display" | "desktop" | "input" | "windows" | "toolkit" | "panel" | "resize" | "widgets" => Some("bochs"),
         "audio" => Some("es1370"),
         _ => linux_nic(manifest).map(|l| l.0),
     }
@@ -593,6 +595,7 @@ fn bundle(arch: Arch, manifest: &str, driver: &str) -> Result<PathBuf, String> {
         ("testclient", "superior-testclient"),
         ("compositor", "superior-compositor"),
         ("greeter", "superior-greeter"),
+        ("list", "superior-list"),
         ("panel", "superior-panel"),
         ("mixer", "superior-mixer"),
         // Need Linux's source and the build container: only where used.
@@ -846,10 +849,10 @@ fn image_sealed(
         net: matches!(manifest, "net" | "tcp") || linux_nic(manifest).is_some(),
         linux_nic: linux_nic(manifest).map(|l| l.1),
         radio: manifest == "wifi",
-        keyboard: matches!(manifest, "keyboard" | "input" | "windows" | "toolkit" | "panel" | "resize"),
-        mouse: matches!(manifest, "input" | "windows" | "toolkit" | "panel" | "resize"),
+        keyboard: matches!(manifest, "keyboard" | "input" | "windows" | "toolkit" | "panel" | "resize" | "widgets"),
+        mouse: matches!(manifest, "input" | "windows" | "toolkit" | "panel" | "resize" | "widgets"),
         hotplug: manifest == "hotplug",
-        display: matches!(manifest, "display" | "desktop" | "input" | "windows" | "toolkit" | "panel" | "resize"),
+        display: matches!(manifest, "display" | "desktop" | "input" | "windows" | "toolkit" | "panel" | "resize" | "widgets"),
         audio: (manifest == "audio").then(|| audio_wav(arch)),
         uefi: false,
         smp: None,
@@ -2754,7 +2757,9 @@ enum Act {
     Button(bool),
     /// Types these letters on the keyboard.
     Type(&'static str),
-    /// Presses and lets go of the key with this QEMU name ("left", "end").
+    /// Presses and lets go of the key with this QEMU name ("left", "end"),
+    /// or of keys joined by '+' ("shift+home"), held down in order and let
+    /// go in reverse.
     Key(&'static str),
     /// Puts the tablet where it puts the pointer at this pixel.
     Tablet(usize, usize),
@@ -2855,8 +2860,10 @@ fn input_act(act: &Act, arch: Arch) -> Result<Option<String>, String> {
                 ))])?;
             }
         }
-        Act::Key(k) => {
-            for down in [true, false] {
+        Act::Key(keys) => {
+            let keys: Vec<&str> = keys.split('+').collect();
+            let order = keys.iter().map(|k| (true, k)).chain(keys.iter().rev().map(|k| (false, k)));
+            for (down, k) in order {
                 qmp(&[send(format!(
                     "{{\"type\":\"key\",\"data\":{{\"down\":{down},\"key\":{{\"type\":\"qcode\",\"data\":\"{k}\"}}}}}}"
                 ))])?;
@@ -3736,6 +3743,282 @@ fn resize_test(arch: Arch) -> Result<(), String> {
         return Err(format!("resize test: {shots} screenshots taken, want {}", resize_pictures().len()));
     }
     println!("== resize test passed ({})", arch.name());
+    Ok(())
+}
+
+/// The List app's window: its size and place, and its widgets as
+/// `user/list` lays them out (`layout` there): the field, "Add", the
+/// list, "Remove" and the status label.
+const LIST_SIZE: (usize, usize) = (320, 206);
+const LIST_AT: (usize, usize) = (240, 140);
+
+struct ListUi {
+    ui: superior_toolkit::Ui,
+    field: usize,
+    list: usize,
+    status: usize,
+}
+
+fn list_ui() -> ListUi {
+    let mut ui = superior_toolkit::Ui::new(LIST_SIZE.0 as u32, LIST_SIZE.1 as u32);
+    ui.begin_row();
+    ui.label("Item:");
+    let field = ui.field();
+    ui.button("Add");
+    ui.end_row();
+    let list = ui.list(6);
+    for f in ["apple", "banana", "cherry", "date", "elderberry", "fig", "grape", "kiwi", "lemon", "mango"] {
+        ui.push_item(list, f);
+    }
+    ui.begin_row();
+    ui.button("Remove");
+    let status = ui.label("");
+    ui.stretch(status);
+    ui.end_row();
+    let mut l = ListUi { ui, field, list, status };
+    l.status();
+    l
+}
+
+impl ListUi {
+    /// The status label as the app sets it: the item chosen, or how many.
+    fn status(&mut self) {
+        let text = match self.ui.chosen(self.list) {
+            Some(k) => format!("Chosen: {}", self.ui.item(self.list, k)),
+            None => format!("{} items", self.ui.items(self.list)),
+        };
+        self.ui.set_text(self.status, &text);
+    }
+
+    fn event(&mut self, e: superior_toolkit::Event) -> superior_toolkit::Response {
+        let r = self.ui.event(e);
+        self.status();
+        r
+    }
+
+    /// The pointer moved to `at` on the screen, holding the button or not.
+    fn pointer(&mut self, at: (usize, usize), held: bool) -> superior_toolkit::Response {
+        let (x, y) = ((at.0 - LIST_AT.0) as i32, (at.1 - LIST_AT.1) as i32);
+        self.event(superior_toolkit::Event::Pointer { x, y, buttons: held as u64 })
+    }
+
+    fn click(&mut self, at: (usize, usize)) -> superior_toolkit::Response {
+        self.pointer(at, false);
+        self.pointer(at, true);
+        self.pointer(at, false)
+    }
+
+    fn key(&mut self, usage: u64, modifiers: u8) -> superior_toolkit::Response {
+        use superior_toolkit::Event;
+        let r = self.event(Event::Key { usage, down: true, modifiers });
+        self.event(Event::Key { usage, down: false, modifiers });
+        r
+    }
+
+    fn layer(&self) -> Layer {
+        let size = LIST_SIZE;
+        let mut pixels = vec![0u32; size.0 * size.1];
+        self.ui.draw(&mut superior_toolkit::Surface { px: &mut pixels, w: size.0 as u32, h: size.1 as u32 });
+        let at = LIST_AT;
+        Layer {
+            at,
+            size,
+            frame: Some(StyledWindow { id: 0, at, size, alpha: false, decorated: true, focused: true, title: b"List" }),
+            pixels,
+        }
+    }
+}
+
+/// Where the widgets test's pointer goes: the list's third row; its
+/// scroll bar's thumb (once scrolled to the end), dragged up past the
+/// top; the field; "Remove"; the close box.
+const WIDGETS_ROW: (usize, usize) = (300, 233);
+const WIDGETS_THUMB: (usize, usize) = (545, 260);
+const WIDGETS_THUMB_UP: (usize, usize) = (545, 160);
+const WIDGETS_FIELD: (usize, usize) = (340, 160);
+const WIDGETS_REMOVE: (usize, usize) = (290, 325);
+const WIDGETS_CLOSE: (usize, usize) = (550, 130);
+
+/// What each of the widgets test's screenshots must show: the List app's
+/// window after the same events, and the pointer.
+fn widgets_pictures() -> Vec<(Layer, Option<(usize, usize)>)> {
+    use superior_toolkit::Event;
+    let mut l = list_ui();
+    let mut shots = Vec::new();
+    l.event(Event::Focus(true));
+    shots.push((l.layer(), None));
+    // The third row chosen, then Down five times: the eighth, scrolled to
+    // show it.
+    let r = l.click(WIDGETS_ROW);
+    assert_eq!(l.ui.chosen(l.list), Some(2), "{r:?}");
+    for _ in 0..5 {
+        l.key(81, 0);
+    }
+    assert_eq!((l.ui.chosen(l.list), l.ui.widget(l.list).scroll), (Some(7), 2));
+    shots.push((l.layer(), Some(WIDGETS_ROW)));
+    // The wheel down two steps: scrolled to the end.
+    let (x, y) = ((WIDGETS_ROW.0 - LIST_AT.0) as i32, (WIDGETS_ROW.1 - LIST_AT.1) as i32);
+    for _ in 0..2 {
+        l.event(Event::Wheel { x, y, up: -1 });
+    }
+    assert_eq!(l.ui.widget(l.list).scroll, 4);
+    shots.push((l.layer(), Some(WIDGETS_ROW)));
+    // The thumb taken and dragged up past the top: scrolled back.
+    l.pointer(WIDGETS_THUMB, false);
+    l.pointer(WIDGETS_THUMB, true);
+    l.pointer(WIDGETS_THUMB_UP, true);
+    l.pointer(WIDGETS_THUMB_UP, false);
+    assert_eq!((l.ui.widget(l.list).scroll, l.ui.chosen(l.list)), (0, Some(7)));
+    shots.push((l.layer(), Some(WIDGETS_THUMB_UP)));
+    // The field pressed, "milk" typed, all of it selected with Shift and
+    // Home and replaced by "plum", the last two selected with Shift and
+    // Left.
+    l.click(WIDGETS_FIELD);
+    let letters = |w: &str| w.bytes().map(|c| 4 + (c - b'a') as u64).collect::<Vec<_>>();
+    for u in letters("milk") {
+        l.key(u, 0);
+    }
+    l.key(74, 0x02);
+    for u in letters("plum") {
+        l.key(u, 0);
+    }
+    l.key(80, 0x02);
+    l.key(80, 0x02);
+    assert_eq!((l.ui.text(l.field), l.ui.selection(l.field)), ("plum", Some((2, 4))));
+    shots.push((l.layer(), Some(WIDGETS_FIELD)));
+    // Cut, pasted back, Enter: "plum" added to the list and chosen.
+    l.key(27, 0x01);
+    l.key(25, 0x01);
+    assert_eq!(l.key(40, 0).entered, Some(l.field));
+    l.ui.push_item(l.list, "plum");
+    l.ui.choose(l.list, Some(10));
+    l.ui.set_text(l.field, "");
+    l.status();
+    assert_eq!(l.ui.widget(l.list).scroll, 5);
+    shots.push((l.layer(), Some(WIDGETS_FIELD)));
+    // "Remove": it goes, the item before it chosen.
+    let r = l.click(WIDGETS_REMOVE);
+    assert!(r.clicked.is_some());
+    l.ui.remove_item(l.list, 10);
+    l.status();
+    assert_eq!((l.ui.chosen(l.list), l.ui.widget(l.list).scroll), (Some(9), 4));
+    shots.push((l.layer(), Some(WIDGETS_REMOVE)));
+    shots
+}
+
+fn widgets_act(act: &Act, arch: Arch) -> Result<Option<String>, String> {
+    let Act::Shot(k) = act else { return input_act(act, arch) };
+    let path = root().join("target").join(format!("widgets-{}-{k}.ppm", arch.name()));
+    let _ = std::fs::remove_file(&path);
+    screendump(&path)?;
+    let (layer, pointer) = &widgets_pictures()[*k - 1];
+    check_layers(&path, *k, std::slice::from_ref(layer), None, *pointer)
+        .map(|()| Some(format!("screenshot {k}: all {} pixels right: the List window, the pointer at {pointer:?}", SCREEN.0 * SCREEN.1)))
+}
+
+/// Boots `boot/widgets.manifest`: the List app, on the toolkit's lines,
+/// list and text selection. Through QEMU's monitor the host chooses a
+/// row, moves down past the rows shown (the list scrolls), turns the wheel
+/// (to the end), drags the scroll bar's thumb back up, types into the
+/// field, selects all of it with Shift and Home and types over it,
+/// selects two characters with Shift and Left, cuts and pastes them, adds
+/// the text with Enter, removes it with "Remove" and closes the window.
+/// Seven screenshots must have every pixel as the toolkit draws the window
+/// after the same events.
+fn widgets_test(arch: Arch) -> Result<(), String> {
+    use Act::*;
+    let img = image_with(false, arch, "widgets")?;
+    println!("== widgets test on {}", img.path.display());
+    let to = |from: (usize, usize), to: (usize, usize)| Move(to.0 as i64 - from.0 as i64, to.1 as i64 - from.1 as i64);
+    let script = vec![
+        (
+            vec![
+                "relative X and Y",
+                "absolute X and Y",
+                "compositor: input subscribed",
+                "list: ready",
+                "widgets: the List window is on the screen",
+            ],
+            vec![
+                Shot(1),
+                to((400, 300), WIDGETS_ROW),
+                Button(true),
+                Button(false),
+                Key("down"),
+                Key("down"),
+                Key("down"),
+                Key("down"),
+                Key("down"),
+            ],
+        ),
+        (vec!["list: 10 items, \"kiwi\" chosen (item 7), items 2 to 7 shown"], vec![Shot(2), Wheel(-1), Wheel(-1)]),
+        (
+            vec!["list: 10 items, \"kiwi\" chosen (item 7), items 4 to 9 shown"],
+            vec![Shot(3), to(WIDGETS_ROW, WIDGETS_THUMB), Button(true), to(WIDGETS_THUMB, WIDGETS_THUMB_UP), Button(false)],
+        ),
+        (
+            vec!["list: 10 items, \"kiwi\" chosen (item 7), items 0 to 5 shown"],
+            vec![
+                Shot(4),
+                to(WIDGETS_THUMB_UP, WIDGETS_FIELD),
+                Button(true),
+                Button(false),
+                Type("milk"),
+                Key("shift+home"),
+                Type("plum"),
+                Key("shift+left"),
+                Key("shift+left"),
+            ],
+        ),
+        (
+            vec!["list: the field holds \"plum\", the cursor at 2, \"um\" selected"],
+            vec![Shot(5), Key("ctrl+x"), Key("ctrl+v"), Key("ret")],
+        ),
+        (
+            vec!["list: 11 items, \"plum\" chosen (item 10), items 5 to 10 shown"],
+            vec![Shot(6), to(WIDGETS_FIELD, WIDGETS_REMOVE), Button(true), Button(false)],
+        ),
+        (
+            vec!["list: 10 items, \"mango\" chosen (item 9), items 4 to 9 shown"],
+            vec![Shot(7), to(WIDGETS_REMOVE, WIDGETS_CLOSE), Button(true), Button(false)],
+        ),
+        (vec!["widgets: the List window is gone"], vec![]),
+    ];
+    let (out, shots) = run_script(&img, arch, "widgets test", script, widgets_act)?;
+    let log = [
+        "list: ready: window 0, decorated, titled \"List\"",
+        "list: 10 items, none chosen, items 0 to 5 shown",
+        "list: 10 items, \"cherry\" chosen (item 2), items 0 to 5 shown",
+        "list: 10 items, \"date\" chosen (item 3), items 0 to 5 shown",
+        "list: 10 items, \"elderberry\" chosen (item 4), items 0 to 5 shown",
+        "list: 10 items, \"fig\" chosen (item 5), items 0 to 5 shown",
+        "list: 10 items, \"grape\" chosen (item 6), items 1 to 6 shown",
+        "list: 10 items, \"kiwi\" chosen (item 7), items 2 to 7 shown",
+        "list: 10 items, \"kiwi\" chosen (item 7), items 3 to 8 shown",
+        "list: 10 items, \"kiwi\" chosen (item 7), items 4 to 9 shown",
+        "list: 10 items, \"kiwi\" chosen (item 7), items 0 to 5 shown",
+        "list: the field holds \"milk\", the cursor at 4",
+        "list: the field holds \"milk\", the cursor at 0, \"milk\" selected",
+        "list: the field holds \"p\", the cursor at 1",
+        "list: the field holds \"plum\", the cursor at 4",
+        "list: the field holds \"plum\", the cursor at 3, \"m\" selected",
+        "list: the field holds \"plum\", the cursor at 2, \"um\" selected",
+        "list: the field holds \"pl\", the cursor at 2",
+        "list: the field holds \"plum\", the cursor at 4",
+        "list: added \"plum\"",
+        "list: 11 items, \"plum\" chosen (item 10), items 5 to 10 shown",
+        "list: removed \"plum\"",
+        "list: 10 items, \"mango\" chosen (item 9), items 4 to 9 shown",
+        "compositor: window 0: its close box was pressed",
+        "list: closed",
+        "widgets: the List window is gone",
+        "[cm] watcher asked to shut down (pass)",
+    ];
+    check_log("widgets test", &out, &log)?;
+    if shots != widgets_pictures().len() {
+        return Err(format!("widgets test: {shots} screenshots taken, want {}", widgets_pictures().len()));
+    }
+    println!("== widgets test passed ({})", arch.name());
     Ok(())
 }
 

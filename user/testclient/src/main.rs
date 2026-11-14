@@ -5183,23 +5183,24 @@ fn styled_second() -> ! {
     }
 }
 
-/// The toolkit test's watcher (`arg 39`, boot/toolkit.manifest): once the
-/// greeter's window has been shown and is gone again, shuts the system
-/// down (after the host's last screenshot).
-fn toolkit_watcher() -> ! {
+/// The toolkit and widgets tests' watcher (`arg 39`, boot/toolkit.manifest,
+/// and `arg 42`, boot/widgets.manifest): once the app's window (`what`)
+/// has been shown and is gone again, shuts the system down (after the
+/// host's last screenshot).
+fn window_watcher(test: &str, what: &str) -> ! {
     let mut seen = false;
     loop {
         let shown = window_info()[3];
         if shown == 1 && !seen {
             seen = true;
-            say!("toolkit: the greeter's window is on the screen");
+            say!("{test}: {what} is on the screen");
         }
         if shown == 0 && seen {
             break;
         }
         superior_sys::sleep(5);
     }
-    say!("toolkit: the greeter's window is gone");
+    say!("{test}: {what} is gone");
     superior_sys::sleep(SCREENSHOT_TICKS);
     syscall(Syscall::Call, DESKTOP_CONTROL, [OP_SHUTDOWN, 0, 0, 0]);
     superior_sys::park()
@@ -5843,9 +5844,10 @@ pub extern "C" fn _start(role: u64) -> ! {
         36 => app_client(),
         37 => styled_first(),
         38 => styled_second(),
-        39 => toolkit_watcher(),
+        39 => window_watcher("toolkit", "the greeter's window"),
         40 => panel_watcher(),
         41 => wifi_client(),
+        42 => window_watcher("widgets", "the List window"),
         _ => probe(),
     }
 }
