@@ -3566,34 +3566,35 @@ fn greeter_sized(size: (usize, usize)) -> Layer {
     greeter_drawn(&ui)
 }
 
-/// The greeter's window as `ui` draws it, focused.
+/// The greeter's window as `ui` draws it, focused, at its place.
 fn greeter_drawn(ui: &superior_toolkit::Ui) -> Layer {
+    greeter_drawn_at(ui, GREETER_AT)
+}
+
+/// The greeter's window as `ui` draws it, focused, at `at`.
+fn greeter_drawn_at(ui: &superior_toolkit::Ui, at: (usize, usize)) -> Layer {
     let size = (ui.w as usize, ui.h as usize);
     let mut pixels = vec![0u32; size.0 * size.1];
     ui.draw(&mut superior_toolkit::Surface { px: &mut pixels, w: size.0 as u32, h: size.1 as u32 });
     Layer {
-        at: GREETER_AT,
+        at,
         size,
-        frame: Some(StyledWindow {
-            id: 0,
-            at: GREETER_AT,
-            size,
-            alpha: false,
-            decorated: true,
-            focused: true,
-            title: b"Greeter",
-        }),
+        frame: Some(StyledWindow { id: 0, at, size, alpha: false, decorated: true, focused: true, title: b"Greeter" }),
         pixels,
     }
 }
 
 /// Where the resize test's pointer goes: the greeter's frame's
-/// bottom-right corner, dragged out, then in, then its close box once it
-/// is the least it takes.
+/// bottom-right corner, dragged out, then in; once it is the least it
+/// takes, its top-left corner, dragged out (its bottom-right corner
+/// staying put, so it moves to `RESIZE_MOVED`); then its close box.
 const RESIZE_CORNER: (usize, usize) = (541, 305);
 const RESIZE_OUT: (usize, usize) = (641, 365);
 const RESIZE_IN: (usize, usize) = (391, 245);
-const RESIZE_CLOSE: (usize, usize) = (450, 170);
+const RESIZE_TOP_LEFT: (usize, usize) = (258, 160);
+const RESIZE_LEFT_OUT: (usize, usize) = (208, 110);
+const RESIZE_MOVED: (usize, usize) = (210, 130);
+const RESIZE_CLOSE: (usize, usize) = (450, 120);
 
 /// A rectangle on the screen: x, y, width, height.
 type Area = (usize, usize, usize, usize);
@@ -3601,16 +3602,21 @@ type Area = (usize, usize, usize, usize);
 /// What each of the resize test's screenshots must show: the greeter's
 /// window, the outline being dragged (if any), and the pointer.
 fn resize_pictures() -> Vec<(Layer, Option<Area>, (usize, usize))> {
-    // The frame of a 380x184 window at the greeter's place.
+    // The frames of a 380x184 window at the greeter's place, and of a
+    // 250x174 one where its top-left corner was dragged to.
     let (b, t) = (2, 18);
-    let out = (GREETER_AT.0 - b, GREETER_AT.1 - t - b, 380 + 2 * b, 184 + t + 2 * b);
+    let frame = |at: (usize, usize), size: (usize, usize)| (at.0 - b, at.1 - t - b, size.0 + 2 * b, size.1 + t + 2 * b);
+    let mut grown = greeter_typed_ui(true);
+    grown.resize(250, 174);
     vec![
-        (greeter_sized(GREETER_SIZE), Some(out), RESIZE_OUT),
+        (greeter_sized(GREETER_SIZE), Some(frame(GREETER_AT, (380, 184))), RESIZE_OUT),
         (greeter_sized((380, 184)), None, RESIZE_OUT),
         // Asked for 130x64, it takes the least it can: 200x124.
         (greeter_sized((200, 124)), None, RESIZE_IN),
         (greeter_typed(false), None, TOOLKIT_FIELD),
         (greeter_typed(true), None, TOOLKIT_FIELD),
+        (greeter_typed(true), Some(frame(RESIZE_MOVED, (250, 174))), RESIZE_LEFT_OUT),
+        (greeter_drawn_at(&grown, RESIZE_MOVED), None, RESIZE_LEFT_OUT),
     ]
 }
 
@@ -3621,6 +3627,11 @@ const LONG_NAME: &str = "abcdefghijklmnopq";
 /// The greeter at its least size, its field pressed and `LONG_NAME` typed
 /// (scrolled to show its end), then with Home pressed (`home`).
 fn greeter_typed(home: bool) -> Layer {
+    greeter_drawn(&greeter_typed_ui(home))
+}
+
+/// The greeter's toolkit state as `greeter_typed` draws it.
+fn greeter_typed_ui(home: bool) -> superior_toolkit::Ui {
     use superior_toolkit::Event;
     let (mut ui, field, ..) = greeter_ui();
     ui.resize(200, 124);
@@ -3636,7 +3647,7 @@ fn greeter_typed(home: bool) -> Layer {
     }
     assert_eq!(ui.text(field), LONG_NAME);
     assert_eq!(ui.widget(field).scroll, if home { 0 } else { 3 });
-    greeter_drawn(&ui)
+    ui
 }
 
 fn resize_act(act: &Act, arch: Arch) -> Result<Option<String>, String> {
@@ -3661,8 +3672,9 @@ fn resize_act(act: &Act, arch: Arch) -> Result<Option<String>, String> {
 /// out (an outline shows the size asked for; let go, the greeter draws
 /// itself at that size and sets it), then in past the least it takes (it
 /// takes that), types a name wider than its field there (it scrolls to
-/// show the cursor, and back with Home), then closes it. Five screenshots
-/// must have every pixel right.
+/// show the cursor, and back with Home), drags its top-left corner out
+/// (it grows up and to the left, its bottom-right corner staying where it
+/// was), then closes it. Seven screenshots must have every pixel right.
 fn resize_test(arch: Arch) -> Result<(), String> {
     use Act::*;
     let img = image_with(false, arch, "resize")?;
@@ -3691,7 +3703,12 @@ fn resize_test(arch: Arch) -> Result<(), String> {
         (vec!["greeter: the field holds \"abcdefghijklmnopq\", the cursor at 17"], vec![Shot(4), Key("home")]),
         (
             vec!["greeter: the field holds \"abcdefghijklmnopq\", the cursor at 0"],
-            vec![Shot(5), to(TOOLKIT_FIELD, RESIZE_CLOSE), Button(true), Button(false)],
+            vec![Shot(5), to(TOOLKIT_FIELD, RESIZE_TOP_LEFT), Button(true), to(RESIZE_TOP_LEFT, RESIZE_LEFT_OUT)],
+        ),
+        (vec!["compositor: window 0: asking for 250x174"], vec![Shot(6), Button(false)]),
+        (
+            vec!["greeter: resized to 250x174 (status 0)"],
+            vec![Shot(7), to(RESIZE_LEFT_OUT, RESIZE_CLOSE), Button(true), Button(false)],
         ),
         (vec!["toolkit: the greeter's window is gone"], vec![]),
     ];
@@ -3706,6 +3723,10 @@ fn resize_test(arch: Arch) -> Result<(), String> {
         "greeter: resized to 200x124 (status 0)",
         "greeter: the field holds \"abcdefghijklmnopq\", the cursor at 17",
         "greeter: the field holds \"abcdefghijklmnopq\", the cursor at 0",
+        "compositor: window 0: asking for 250x174",
+        "compositor: window 0 resized to 250x174",
+        "compositor: window 0 moved to (210, 130) to keep its right and bottom edges",
+        "greeter: resized to 250x174 (status 0)",
         "compositor: window 0: its close box was pressed",
         "greeter: closed",
         "[cm] watcher asked to shut down (pass)",

@@ -1041,18 +1041,22 @@ holds the rest):
   from its task button, closes it and launches it again; five screenshots must
   have every pixel right, the panel laid out by the toolkit on the host.
 - Resizing windows by their frame (`window` version 7). A window styled
-  `RESIZABLE` is resized by dragging its frame's right or bottom border (or the
-  corner between them): the compositor draws an outline of the size asked for
+  `RESIZABLE` is resized by dragging any border of its frame (the top one is the
+  strip above the title bar) or a corner: the compositor draws an outline of the size asked for
   over every window, at least `MIN_WIDTH` by `MIN_HEIGHT`, on the screen and
   within the pages attached (a client may attach up to `WINDOW_PAGES` to leave
   room to grow). Let go, the client is told (`RESIZE`), draws itself at the size
-  it accepts and sets it (`SET_SIZE`). The toolkit's column follows the window's
+  it accepts and sets it (`SET_SIZE`). Dragged by its left or top border, it
+  grows or shrinks from there: the size it sets keeps its right and bottom edges
+  where they were, and it is told where it moved (`MOVED`). The toolkit's column follows the window's
   width, and the greeter takes sizes from 200x124 to 600x400.
   `cargo xtask resize-test` boots `boot/resize.manifest` on both ISAs: the host
   drags the greeter's corner out and then in past its least size, then types a
   name wider than its narrowed field (it scrolls to the cursor, and back with
-  Home); five screenshots (the outline, the greeter at each size it took, and
-  its field scrolled and not) must have every pixel right.
+  Home), then drags its top-left corner out (it grows up and to the left, its
+  bottom-right corner staying put); seven screenshots (the outlines, the
+  greeter at each size and place it took, and its field scrolled and not) must
+  have every pixel right.
 - The mixer (`user/mixer/`), the sound server. It is the sound driver's one
   client and serves the same `audio` interface to every component that plays
   sound: it adds their streams together, sample by sample and saturating, into a

@@ -174,10 +174,9 @@ enum Part {
     Title,
     Close,
     Border,
-    /// The right border (or the bottom one, or the corner between them),
-    /// which resizes a resizable window: whether it moves the right edge
-    /// and the bottom one.
-    Edge(bool, bool),
+    /// A border (or a corner between two), which resizes a resizable
+    /// window: which of its sides move.
+    Edge(Sides),
 }
 
 /// A window's events not yet read.
@@ -249,11 +248,19 @@ impl Rect {
 
 const NONE: Rect = Rect { x: 0, y: 0, w: 0, h: 0 };
 
+/// The sides of a window a drag of its frame moves.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+struct Sides {
+    left: bool,
+    top: bool,
+    right: bool,
+    bottom: bool,
+}
+
 #[derive(Clone, Copy)]
 struct Resize {
     window: usize,
-    right: bool,
-    bottom: bool,
+    sides: Sides,
     from: (u32, u32),
     size: (u32, u32),
 }
@@ -272,6 +279,18 @@ struct Window {
     /// Its title, and how long it is.
     title: [u8; window::TITLE_BYTES as usize],
     title_len: usize,
+    /// After a drag of its left or top border, until its client sets the
+    /// size it takes: that its right (and bottom) edge stays where it is.
+    anchored: Sides,
+}
+
+/// A window at `at` resized to `size`: its left (or top) edge moved if
+/// that side is in `sides`, so its right (or bottom) edge stays, else its
+/// top left staying.
+fn anchored(at: Rect, size: (u32, u32), sides: Sides) -> Rect {
+    let x = if sides.left { (at.x + at.w).saturating_sub(size.0) } else { at.x };
+    let y = if sides.top { (at.y + at.h).saturating_sub(size.1) } else { at.y };
+    Rect { x, y, w: size.0, h: size.1 }
 }
 
 /// The frame of a window at `at` with `style`: itself, or with its
@@ -312,9 +331,15 @@ impl Window {
         let (t, m, c) = (window::TITLE as u32, window::CLOSE_MARGIN as u32, window::CLOSE_BOX as u32);
         let top = self.at.y - t;
         if !within(Rect { x: self.at.x, y: top, w: self.at.w, h: t }) {
-            let (right, bottom) = (x >= self.at.x + self.at.w, y >= self.at.y + self.at.h);
-            if (right || bottom) && self.style & window::RESIZABLE != 0 {
-                return Some(Part::Edge(right, bottom));
+            // The top border is the strip above the title bar.
+            let sides = Sides {
+                left: x < self.at.x,
+                top: y < top,
+                right: x >= self.at.x + self.at.w,
+                bottom: y >= self.at.y + self.at.h,
+            };
+            if sides != Sides::default() && self.style & window::RESIZABLE != 0 {
+                return Some(Part::Edge(sides));
             }
             return Some(Part::Border);
         }
@@ -576,7 +601,7 @@ impl Compositor {
     fn outline(&self) -> Rect {
         let Some(z) = self.resize else { return NONE };
         let Some(w) = self.windows[z.window] else { return NONE };
-        let at = Rect { w: z.size.0, h: z.size.1, ..w.at };
+        let at = anchored(w.at, z.size, z.sides);
         frame_of(at, w.style).unwrap_or(at).intersect(self.whole())
     }
 
@@ -818,14 +843,8 @@ impl Compositor {
                                 say!("window {i}: its close box was pressed");
                                 self.post(i, window::CLOSE, 0, 0);
                             }
-                            (Part::Edge(right, bottom), Some(w)) => {
-                                self.resize = Some(Resize {
-                                    window: i,
-                                    right,
-                                    bottom,
-                                    from: self.pointer,
-                                    size: (w.at.w, w.at.h),
-                                });
+                            (Part::Edge(sides), Some(w)) => {
+                                self.resize = Some(Resize { window: i, sides, from: self.pointer, size: (w.at.w, w.at.h) });
                             }
                             _ => {}
                         }
@@ -890,13 +909,32 @@ impl Compositor {
         let Some(mut z) = self.resize else { return NONE };
         let Some(w) = self.windows[z.window] else { return NONE };
         let grow = |from: u32, to: u32, size: u32| (size as i64 + to as i64 - from as i64).max(0) as u32;
-        let b = if w.decorated() { window::BORDER as u32 } else { 0 };
+        let (b, t) = if w.decorated() { (window::BORDER as u32, window::TITLE as u32) } else { (0, 0) };
+        let s = z.sides;
         let mut size = (
-            if z.right { grow(z.from.0, self.pointer.0, w.at.w) } else { w.at.w },
-            if z.bottom { grow(z.from.1, self.pointer.1, w.at.h) } else { w.at.h },
+            if s.right {
+                grow(z.from.0, self.pointer.0, w.at.w)
+            } else if s.left {
+                grow(self.pointer.0, z.from.0, w.at.w)
+            } else {
+                w.at.w
+            },
+            if s.bottom {
+                grow(z.from.1, self.pointer.1, w.at.h)
+            } else if s.top {
+                grow(self.pointer.1, z.from.1, w.at.h)
+            } else {
+                w.at.h
+            },
         );
-        size.0 = size.0.clamp(window::MIN_WIDTH as u32, self.width.saturating_sub(w.at.x + b).max(window::MIN_WIDTH as u32));
-        size.1 = size.1.clamp(window::MIN_HEIGHT as u32, self.height.saturating_sub(w.at.y + b).max(window::MIN_HEIGHT as u32));
+        // Its frame on the screen: a side dragged left or up stops at the
+        // screen's edge, the opposite side staying where it is.
+        let room = (
+            if s.left { (w.at.x + w.at.w).saturating_sub(b) } else { self.width.saturating_sub(w.at.x + b) },
+            if s.top { (w.at.y + w.at.h).saturating_sub(t + b) } else { self.height.saturating_sub(w.at.y + b) },
+        );
+        size.0 = size.0.clamp(window::MIN_WIDTH as u32, room.0.max(window::MIN_WIDTH as u32));
+        size.1 = size.1.clamp(window::MIN_HEIGHT as u32, room.1.max(window::MIN_HEIGHT as u32));
         // As many rows as the pages attached hold at that width.
         let rows = (w.pages * 1024 / size.0 as u64) as u32;
         size.1 = size.1.min(rows.max(1));
@@ -916,7 +954,11 @@ impl Compositor {
         let Some(z) = self.resize else { return NONE };
         let gone = self.outline();
         self.resize = None;
-        if self.windows[z.window].is_some_and(|w| (w.at.w, w.at.h) != z.size) {
+        if let Some(mut w) = self.windows[z.window].filter(|w| (w.at.w, w.at.h) != z.size) {
+            // The size it sets is taken from its right (or bottom) edge if
+            // its left (or top) border was dragged.
+            w.anchored = Sides { left: z.sides.left, top: z.sides.top, ..Sides::default() };
+            self.windows[z.window] = Some(w);
             self.post(z.window, window::RESIZE, z.size.0 as u64 | (z.size.1 as u64) << 16, 0);
         }
         gone
@@ -1086,6 +1128,7 @@ impl Compositor {
             style: 0,
             title: [0; window::TITLE_BYTES as usize],
             title_len: 0,
+            anchored: Sides::default(),
         };
         if w.needed() > window::WINDOW_PAGES {
             return [Status::Invalid as u64, 0, 0, 0];
@@ -1183,18 +1226,30 @@ impl Compositor {
 
     fn set_size(&mut self, i: usize, size: u64) -> Status {
         let Some(mut w) = self.windows[i] else { return Status::NotFound };
-        let to = Rect { w: size as u32 & 0xffff, h: (size >> 16) as u32 & 0xffff, ..w.at };
+        let (tw, th) = (size as u32 & 0xffff, (size >> 16) as u32 & 0xffff);
+        // After a drag of its left or top border, its right or bottom edge
+        // stays (if the window can grow that way).
+        let to = Some(anchored(w.at, (tw, th), w.anchored))
+            .filter(|&a| w.anchored != Sides::default() && self.fits_styled(a, w.style))
+            .unwrap_or(Rect { w: tw, h: th, ..w.at });
         let needed = (to.w as u64 * to.h as u64 * 4).div_ceil(4096);
         if size >> 32 != 0 || to.empty() || needed > w.pages || !self.fits_styled(to, w.style) {
             return Status::Invalid;
         }
+        w.anchored = Sides::default();
         if to == w.at {
+            self.windows[i] = Some(w);
             return Status::Ok;
         }
         let from = w.frame();
+        let moved = (to.x, to.y) != (w.at.x, w.at.y);
         w.at = to;
         self.windows[i] = Some(w);
         say!("window {i} resized to {}x{}", to.w, to.h);
+        if moved {
+            say!("window {i} moved to ({}, {}) to keep its right and bottom edges", to.x, to.y);
+            self.post(i, window::MOVED, to.x as u64 | (to.y as u64) << 16, 0);
+        }
         if w.shown {
             self.show(from.union(w.frame()));
         }

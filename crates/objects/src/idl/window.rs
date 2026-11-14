@@ -41,11 +41,14 @@
 /// is `Denied`.
 ///
 /// Resizing: a resizable window's client may lend more pages than its size
-/// needs (up to `WINDOW_PAGES`). A button pressed on its right or bottom
-/// border, or the corner between them, drags an outline of the size asked
-/// for; let go, the client is told (`RESIZE`), draws at the size it
-/// accepts and sets it (`SET_SIZE`), so it is never shown at a width its
-/// pixels were not drawn for.
+/// needs (up to `WINDOW_PAGES`). A button pressed on any of its borders
+/// (the top one is the strip above the title bar), or a corner between
+/// two, drags an outline of the size asked for; let go, the client is told
+/// (`RESIZE`), draws at the size it accepts and sets it (`SET_SIZE`), so
+/// it is never shown at a width its pixels were not drawn for. If its left
+/// or top border was dragged, the size it sets is taken from its right or
+/// bottom edge, which stay where they were: the window moves, and is told
+/// where to (`MOVED`).
 pub mod window {
     use crate::interfaces::Status;
 
@@ -108,7 +111,7 @@ pub mod window {
     /// The compositor draws a border and a title bar around the window.
     pub const DECORATED: u64 = 2;
 
-    /// The window's right and bottom borders may be dragged to resize it.
+    /// The window's borders may be dragged to resize it.
     pub const RESIZABLE: u64 = 4;
 
     /// The smallest size a drag asks for.
