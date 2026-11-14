@@ -46,7 +46,7 @@
 # or top border was dragged, the size it sets is taken from its right or
 # bottom edge, which stay where they were: the window moves, and is told
 # where to (`MOVED`).
-interface window version 7
+interface window version 8
 
 # The most windows on the screen, all clients together.
 const MAX_WINDOWS = 8
@@ -144,7 +144,8 @@ const MIN_HEIGHT = 32
 # A decorated window's frame: the border's width all round, the title
 # bar's height between the top border and the window, and its close box,
 # a square at the title bar's right end that far from its top, bottom and
-# right.
+# right. Its minimise box is the same square, that far left of the close
+# box: pressed, the window is minimised (see `MINIMISE`).
 const BORDER = 2
 const TITLE = 18
 const CLOSE_BOX = 12
@@ -160,23 +161,30 @@ const TITLE_BYTES = 16
 
 # Sets the window's title: up to `TITLE_BYTES` of ASCII, `a` the first 8
 # (the first in its low byte) and `b` the next, a zero byte ending it
-# early. A decorated window shows as much of it as fits before its close
-# box.
+# early. A decorated window shows as much of it as fits before its
+# minimise box.
 op SET_TITLE = 11 (window, a, b)
 
-# A manager's: the windows shown (bit n for window n) and the one with
-# the keyboard focus (`MAX_WINDOWS` if none).
-op LIST = 12 () -> (shown, focus)
+# A manager's: the windows shown (bit n for window n), the one with the
+# keyboard focus (`MAX_WINDOWS` if none) and those of them minimised.
+op LIST = 12 () -> (shown, focus, minimised)
 
 # A manager's: window `window`'s title (as `SET_TITLE` takes it) and
-# whether it is a manager's own (bit 0 of `flags`).
+# whether it is a manager's own (bit 0 of `flags`) or minimised (bit 1).
 op DESCRIBE = 13 (window) -> (a, b, flags)
 
 # A manager's: puts window `window` in front of every other client's and
-# gives it the keyboard focus.
+# gives it the keyboard focus (if minimised, it is drawn again).
 op ACTIVATE = 14 (window)
 
 # Makes the window `size` (width | height << 16): its pixels' rows are
 # then the new width apart. `Invalid` if it would need more pages than
 # were attached, or would not lie wholly on the screen.
 op SET_SIZE = 15 (window, size)
+
+# Minimises window `window`: it stays shown (a manager lists it) but is
+# drawn nowhere, and the front window takes the keyboard focus if it had
+# it, until a manager activates it (or its own client raises it). A
+# manager's, for any other client's window, or the window's own client's;
+# `Denied` for another client's.
+op MINIMISE = 16 (window)

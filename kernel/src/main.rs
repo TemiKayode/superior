@@ -24,6 +24,7 @@ mod arch;
 mod arch;
 
 mod entropy;
+mod rtc;
 mod iommu;
 mod memory;
 mod smp;

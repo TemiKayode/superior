@@ -1046,6 +1046,7 @@ fn qemu_command(img: &Image) -> Command {
                     .args(["-m", "512M"]);
             }
             q.args(["-device", "isa-debug-exit,iobase=0xf4,iosize=0x04"]);
+            q.args(["-rtc", RTC_BASE]);
             if img.radio {
                 // A CPU with random instructions, for the entropy pool.
                 q.args(["-cpu", "qemu64,+rdrand,+rdseed"]);
@@ -1066,6 +1067,9 @@ fn qemu_command(img: &Image) -> Command {
             let cpu = if img.radio { "max" } else { "cortex-a72" };
             q.args(["-machine", machine, "-cpu", cpu, "-kernel"])
                 .arg(&img.path);
+            if !img.sel4 {
+                q.args(["-rtc", RTC_BASE]);
+            }
             if img.sel4 {
                 // The shell's exit is a semihosting call from user mode.
                 q.args([
@@ -3016,9 +3020,15 @@ impl StyledWindow {
             let cross = (3..c - 3).contains(&cx) && (cx == cy || cx + cy == c - 1);
             return Some(if cross { CLOSE_CROSS } else { CLOSE_COLOUR });
         }
+        // The minimise box, left of it: a bar along its bottom.
+        if (right - 2 * (m + c)..right - 2 * m - c).contains(&x) && (top + m..top + m + c).contains(&y) {
+            let (cx, cy) = (x + 2 * (m + c) - right, y - top - m);
+            let bar = (3..c - 3).contains(&cx) && (c - 5..c - 3).contains(&cy);
+            return Some(if bar { CLOSE_CROSS } else { CLOSE_COLOUR });
+        }
         let (tx, ty) = (ax + TITLE_LEFT, top + TITLE_TOP);
-        // The characters wholly before the close box, less the gap.
-        let room = w.saturating_sub(TITLE_LEFT + TITLE_GAP + m + c);
+        // The characters wholly before the minimise box, less the gap.
+        let room = w.saturating_sub(TITLE_LEFT + TITLE_GAP + 2 * (m + c));
         let fits = (room / TITLE_SCALE + 1) / superior_toolkit::font::ADVANCE as usize;
         let title = &self.title[..self.title.len().min(fits)];
         if x >= tx && y >= ty {
@@ -3392,20 +3402,62 @@ fn toolkit_test(arch: Arch) -> Result<(), String> {
     Ok(())
 }
 
-/// The panel (user/panel): its height, and its layout for these launchers
-/// and windows (title, focused), the same as the panel's `layout`.
+/// Where every boot's real-time clock starts (QEMU's `-rtc`), running
+/// with the machine: the desktop shell's clock shows 09:41 at first.
+const RTC_BASE: &str = "base=2026-11-14T09:41:00,clock=vm";
+
+/// The times the desktop shell's clock may show in the test's
+/// screenshots: from 09:41 for a few minutes.
+const PANEL_CLOCKS: [&str; 5] = ["09:41", "09:42", "09:43", "09:44", "09:45"];
+
+/// The panel (user/panel): its height, and its layout for these windows
+/// (title, focused, minimised), with the menu open or not and the clock
+/// showing `clock`, the same as the panel's `layout`.
 const PANEL_H: usize = 32;
 
-fn panel_ui(launchers: &[&str], tasks: &[(&str, bool)]) -> superior_toolkit::Ui {
+fn panel_ui(tasks: &[(&str, bool, bool)], menu_open: bool, clock: &str) -> superior_toolkit::Ui {
     let mut ui = superior_toolkit::Ui::row(SCREEN.0 as u32, PANEL_H as u32);
-    for l in launchers {
-        ui.button(&format!("+ {l}"));
-    }
-    for (title, focused) in tasks {
+    let apps = ui.button("Apps");
+    ui.select(apps, menu_open);
+    for (title, focused, _) in tasks {
         let id = ui.button(title);
         ui.select(id, *focused);
     }
+    let c = ui.label(clock);
+    ui.push_right(c);
     ui
+}
+
+/// The launcher menu (user/panel's `menu_layout`): a button for each of
+/// the apps boot/panel.manifest may launch, above the panel's left end.
+const MENU_W: usize = 160;
+const MENU_H: usize = 8 + 2 * 34;
+const MENU_AT: (usize, usize) = (0, SCREEN.1 - PANEL_H - MENU_H);
+
+fn menu_ui() -> superior_toolkit::Ui {
+    let mut ui = superior_toolkit::Ui::new(MENU_W as u32, MENU_H as u32);
+    for l in PANEL_LAUNCHERS {
+        ui.button(l);
+    }
+    ui
+}
+
+/// The middle of the menu's button `k`, on the screen.
+fn menu_spot(k: usize) -> (usize, usize) {
+    let r = menu_ui().widget(k).rect;
+    (MENU_AT.0 + (r.x + r.w / 2) as usize, MENU_AT.1 + (r.y + r.h / 2) as usize)
+}
+
+/// The menu, with the pointer at `pointer` (on the screen) over it or not.
+fn menu_layer(pointer: Option<(usize, usize)>) -> Layer {
+    use superior_toolkit::Event;
+    let mut ui = menu_ui();
+    if let Some((x, y)) = pointer.filter(|&(x, y)| x < MENU_W && (MENU_AT.1..MENU_AT.1 + MENU_H).contains(&y)) {
+        ui.event(Event::Pointer { x: (x - MENU_AT.0) as i32, y: (y - MENU_AT.1) as i32, buttons: 0 });
+    }
+    let mut pixels = vec![0u32; MENU_W * MENU_H];
+    ui.draw(&mut superior_toolkit::Surface { px: &mut pixels, w: MENU_W as u32, h: MENU_H as u32 });
+    Layer { at: MENU_AT, size: (MENU_W, MENU_H), frame: None, pixels }
 }
 
 /// The middle of widget `id` of the panel, on the screen.
@@ -3438,11 +3490,12 @@ fn greeter_layer(hello: bool, focused: bool) -> Layer {
     }
 }
 
-/// The panel, laid out for `tasks` with the pointer at `pointer` (on the
-/// screen) if it is on the panel.
-fn panel_layer(tasks: &[(&str, bool)], pointer: Option<(usize, usize)>) -> Layer {
+/// The panel, laid out for `tasks` (the menu open or not, the clock at
+/// `clock`) with the pointer at `pointer` (on the screen) if it is on the
+/// panel.
+fn panel_layer(tasks: &[(&str, bool, bool)], menu_open: bool, clock: &str, pointer: Option<(usize, usize)>) -> Layer {
     use superior_toolkit::Event;
-    let mut ui = panel_ui(PANEL_LAUNCHERS, tasks);
+    let mut ui = panel_ui(tasks, menu_open, clock);
     if let Some((x, y)) = pointer.filter(|&(_, y)| y >= SCREEN.1 - PANEL_H) {
         ui.event(Event::Pointer { x: x as i32, y: (y - (SCREEN.1 - PANEL_H)) as i32, buttons: 0 });
     }
@@ -3454,55 +3507,79 @@ fn panel_layer(tasks: &[(&str, bool)], pointer: Option<(usize, usize)>) -> Layer
 /// The apps boot/panel.manifest may launch, in manifest order.
 const PANEL_LAUNCHERS: &[&str] = &["greeter", "hello"];
 
-/// Where the desktop shell test's pointer goes: the two launchers, the
-/// greeter's task button (with both apps' windows on the panel) and the
-/// greeter's close box.
-fn panel_spots() -> [(usize, usize); 4] {
-    let ui = panel_ui(PANEL_LAUNCHERS, &[("Greeter", false), ("Hello", true)]);
-    [panel_spot(&ui, 0), panel_spot(&ui, 1), panel_spot(&ui, 2), TOOLKIT_CLOSE]
+/// Where the desktop shell test's pointer goes: "Apps", the menu's two
+/// launchers, the greeter's and Hello's task buttons (with both apps'
+/// windows on the panel), and the greeter's minimise and close boxes.
+struct PanelSpots {
+    apps: (usize, usize),
+    run: [(usize, usize); 2],
+    greeter_task: (usize, usize),
+    hello_task: (usize, usize),
+    minimise: (usize, usize),
+    close: (usize, usize),
 }
 
-/// What each of the desktop shell test's screenshots must show: the
-/// windows back to front, and where the pointer is.
-fn panel_pictures() -> Vec<(Vec<Layer>, Option<(usize, usize)>)> {
-    let [run_greeter, run_hello, greeter_task, close] = panel_spots();
-    let both = |front_greeter: bool| {
-        if front_greeter {
-            [("Greeter", true), ("Hello", false)]
-        } else {
-            [("Greeter", false), ("Hello", true)]
-        }
-    };
+fn panel_spots() -> PanelSpots {
+    let ui = panel_ui(&[("Greeter", false, false), ("Hello", true, false)], false, PANEL_CLOCKS[0]);
+    PanelSpots {
+        apps: panel_spot(&ui, 0),
+        run: [menu_spot(0), menu_spot(1)],
+        greeter_task: panel_spot(&ui, 1),
+        hello_task: panel_spot(&ui, 2),
+        // A box CLOSE_BOX square, CLOSE_MARGIN left of the close box.
+        minimise: (TOOLKIT_CLOSE.0 - 15, TOOLKIT_CLOSE.1),
+        close: TOOLKIT_CLOSE,
+    }
+}
+
+/// What each of the desktop shell test's screenshots must show, the
+/// clock at `clock`: the windows back to front, and where the pointer is.
+fn panel_pictures(clock: &str) -> Vec<(Vec<Layer>, Option<(usize, usize)>)> {
+    let s = panel_spots();
+    let panel = |tasks: &[(&str, bool, bool)], open: bool, pointer: (usize, usize)| panel_layer(tasks, open, clock, Some(pointer));
     vec![
-        (vec![panel_layer(&[], None)], None),
+        (vec![panel_layer(&[], false, clock, None)], None),
+        (vec![panel(&[], true, s.apps), menu_layer(Some(s.apps))], Some(s.apps)),
         (
-            vec![greeter_layer(false, false), greeter_layer(true, true), panel_layer(&both(false), Some(run_hello))],
-            Some(run_hello),
+            vec![
+                greeter_layer(false, false),
+                greeter_layer(true, true),
+                panel(&[("Greeter", false, false), ("Hello", true, false)], false, s.run[1]),
+            ],
+            Some(s.run[1]),
         ),
         (
-            vec![greeter_layer(true, false), greeter_layer(false, true), panel_layer(&both(true), Some(greeter_task))],
-            Some(greeter_task),
+            vec![greeter_layer(true, true), panel(&[("Greeter", false, true), ("Hello", true, false)], false, s.minimise)],
+            Some(s.minimise),
         ),
-        (vec![greeter_layer(true, true), panel_layer(&[("Hello", true)], Some(close))], Some(close)),
+        (vec![panel(&[("Greeter", false, true), ("Hello", false, true)], false, s.hello_task)], Some(s.hello_task)),
         (
-            vec![greeter_layer(true, false), greeter_layer(false, true), panel_layer(&both(true), Some(run_greeter))],
-            Some(run_greeter),
+            vec![greeter_layer(false, true), panel(&[("Greeter", true, false), ("Hello", false, true)], false, s.run[0])],
+            Some(s.run[0]),
         ),
     ]
 }
 
-/// Checks the desktop shell test's screenshot `k` (from 1) pixel by pixel.
+/// Checks the desktop shell test's screenshot `k` (from 1) pixel by pixel,
+/// with the clock at any of the times it may show.
 fn check_panel(path: &Path, k: usize) -> Result<String, String> {
-    let (layers, pointer) = &panel_pictures()[k - 1];
-    check_layers(path, k, layers, None, *pointer).map(|()| {
-        format!(
-            "screenshot {k}: all {} pixels right: the panel and {} app window{}{}",
-            SCREEN.0 * SCREEN.1,
-            layers.len() - 1,
-            if layers.len() == 2 { "" } else { "s" },
-            pointer.map_or(String::new(), |(x, y)| format!(", the pointer at ({x}, {y})"))
-        )
-    })
+    let mut last = Err(String::new());
+    for clock in PANEL_CLOCKS {
+        let (layers, pointer) = &panel_pictures(clock)[k - 1];
+        last = check_layers(path, k, layers, None, *pointer).map(|()| {
+            format!(
+                "screenshot {k}: all {} pixels right: the panel (its clock at {clock}) and {} other window{}{}",
+                SCREEN.0 * SCREEN.1,
+                layers.len() - 1,
+                if layers.len() == 2 { "" } else { "s" },
+                pointer.map_or(String::new(), |(x, y)| format!(", the pointer at ({x}, {y})"))
+            )
+        });
+        if last.is_ok() {
+            break;
+        }
+    }
+    last
 }
 
 /// The outline a resize drags (user/compositor): its colour and
@@ -4041,22 +4118,15 @@ fn panel_test(arch: Arch) -> Result<(), String> {
     use Act::*;
     let img = image_with(false, arch, "panel")?;
     println!("== desktop shell test on {}", img.path.display());
-    let [run_greeter, run_hello, greeter_task, close] = panel_spots();
-    let to = |from: (usize, usize), to: (usize, usize)| Move(to.0 as i64 - from.0 as i64, to.1 as i64 - from.1 as i64);
-    let click = |v: &mut Vec<Act>| {
-        v.push(Button(true));
-        v.push(Button(false));
+    let s = panel_spots();
+    let mut at = (400, 300);
+    // To `to` and a click there.
+    let mut click = |to: (usize, usize)| {
+        let v = vec![Move(to.0 as i64 - at.0 as i64, to.1 as i64 - at.1 as i64), Button(true), Button(false)];
+        at = to;
+        v
     };
-    let mut s1 = vec![Shot(1), to((400, 300), run_greeter)];
-    click(&mut s1);
-    let mut s2 = vec![to(run_greeter, run_hello)];
-    click(&mut s2);
-    let mut s3 = vec![Shot(2), to(run_hello, greeter_task)];
-    click(&mut s3);
-    let mut s4 = vec![Shot(3), to(greeter_task, close)];
-    click(&mut s4);
-    let mut s5 = vec![Shot(4), to(close, run_greeter)];
-    click(&mut s5);
+    let with = |shot: Option<usize>, acts: Vec<Act>| shot.map(Shot).into_iter().chain(acts).collect::<Vec<_>>();
     let script = vec![
         (
             vec![
@@ -4064,42 +4134,59 @@ fn panel_test(arch: Arch) -> Result<(), String> {
                 "absolute X and Y",
                 "compositor: input subscribed",
                 "panel: ready",
+                "panel: the clock shows 09:4",
                 "panel: windows: none",
             ],
-            s1,
+            with(Some(1), click(s.apps)),
         ),
-        (vec!["greeter: ready", "panel: windows: \"Greeter\" (focused)"], s2),
-        (vec!["hello: ready", "panel: windows: \"Greeter\", \"Hello\" (focused)"], s3),
-        (vec!["panel: windows: \"Greeter\" (focused), \"Hello\""], s4),
-        (vec!["greeter: closed", "panel: windows: \"Hello\" (focused)"], s5),
-        (vec!["2x greeter: ready", "2x panel: windows: \"Greeter\" (focused), \"Hello\""], vec![Shot(5)]),
+        (vec!["panel: menu open: greeter, hello"], with(Some(2), click(s.run[0]))),
+        (vec!["greeter: ready", "panel: windows: \"Greeter\" (focused)"], with(None, click(s.apps))),
+        (vec!["2x panel: menu open: greeter, hello"], with(None, click(s.run[1]))),
+        (vec!["hello: ready", "panel: windows: \"Greeter\", \"Hello\" (focused)"], with(Some(3), click(s.greeter_task))),
+        (vec!["panel: windows: \"Greeter\" (focused), \"Hello\""], with(None, click(s.minimise))),
+        (vec!["panel: windows: \"Greeter\" (minimised), \"Hello\" (focused)"], with(Some(4), click(s.hello_task))),
+        (vec!["panel: windows: \"Greeter\" (minimised), \"Hello\" (minimised)"], with(Some(5), click(s.greeter_task))),
+        (vec!["panel: windows: \"Greeter\" (focused), \"Hello\" (minimised)"], with(None, click(s.close))),
+        (vec!["greeter: closed", "panel: windows: \"Hello\" (minimised)"], with(None, click(s.apps))),
+        (vec!["3x panel: menu open: greeter, hello"], with(None, click(s.run[0]))),
+        (vec!["2x greeter: ready", "2x panel: windows: \"Greeter\" (focused), \"Hello\" (minimised)"], vec![Shot(6)]),
     ];
     let (out, shots) = run_script(&img, arch, "desktop shell test", script, panel_act)?;
     let log = [
         "compositor: ready: the desktop on a 800x600 screen",
         "panel: windows: none",
-        "panel: ready: 800x32 at the bottom, 2 launchers (greeter, hello)",
-        "[cm] started greeter (launched)",
+        "panel: ready: 800x32 at the bottom, 2 launchers in its menu",
+        "panel: the clock shows 09:4",
+        "panel: menu open: greeter, hello",
+        "panel: menu closed",
         "panel: launched greeter (status 0)",
-        // The panel's own lists race the apps' lines (it runs before
-        // them): the script waits for each.
+        "[cm] started greeter (launched)",
         "greeter: ready: window 1, decorated, titled \"Greeter\"",
+        "panel: launched hello (status 0)",
         "[cm] started hello (launched)",
         "hello: ready: window 2, decorated, titled \"Hello\"",
-        "compositor: window 1 activated by the desktop shell",
         "panel: activated \"Greeter\" (status 0)",
-        "panel: windows: \"Greeter\" (focused), \"Hello\"",
+        "compositor: window 1 activated by the desktop shell",
+        "compositor: window 1: its minimise box was pressed",
+        "compositor: window 1 minimised",
+        "panel: minimised \"Hello\" (status 0)",
+        "compositor: window 2 minimised",
+        "compositor: window 1 restored",
+        "compositor: window 1 activated by the desktop shell",
         "compositor: window 1: its close box was pressed",
         "greeter: closed",
         "[cm] greeter exited",
+        "panel: launched greeter (status 0)",
         "[cm] started greeter (launched)",
         "greeter: ready: window 1, decorated, titled \"Greeter\"",
-        "panel test: 3 windows on the screen (step 4)",
+        "panel test: both apps minimised (step 1)",
+        "panel test: the greeter gone, Hello minimised (step 2)",
+        "panel test: the greeter back with the focus, Hello minimised (step 3)",
         "[cm] watcher asked to shut down (pass)",
     ];
     check_log("desktop shell test", &out, &log)?;
-    if shots != panel_pictures().len() {
-        return Err(format!("desktop shell test: {shots} screenshots taken, want {}", panel_pictures().len()));
+    if shots != 6 {
+        return Err(format!("desktop shell test: {shots} screenshots taken, want 6"));
     }
     println!("== desktop shell test passed ({})", arch.name());
     Ok(())

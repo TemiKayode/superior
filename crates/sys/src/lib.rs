@@ -92,6 +92,14 @@ pub fn ticks() -> u64 {
     syscall(Syscall::Ticks, 0, [0; MSG_WORDS]).msg[0]
 }
 
+/// The time of day (`Time`): seconds since 1970-01-01 00:00 UTC; `None`
+/// where the machine has no real-time clock (or the kernel no `Time`, as
+/// on seL4).
+pub fn time() -> Option<u64> {
+    let r = syscall(Syscall::Time, 0, [0; MSG_WORDS]);
+    (r.status == 0).then_some(r.msg[0])
+}
+
 /// 32 random bytes from the kernel's entropy pool (`Random`), for keys
 /// and nonces; `None` where the kernel has none (seL4).
 pub fn random() -> Option<[u8; 32]> {

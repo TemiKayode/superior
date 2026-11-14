@@ -5206,18 +5206,44 @@ fn window_watcher(test: &str, what: &str) -> ! {
     superior_sys::park()
 }
 
-/// The desktop shell test's watcher (`arg 40`, boot/panel.manifest): the
-/// windows shown go from the panel alone to it and both apps, down to two
-/// as the greeter closes, and up to three as it is launched again; then it
-/// shuts the system down (after the host's last screenshot).
+/// The desktop shell test's watcher (`arg 40`, boot/panel.manifest), a
+/// window manager too, to see what the panel does: both apps minimised,
+/// then the greeter closed (Hello still minimised), then the greeter
+/// launched again with the focus; then it shuts the system down (after
+/// the host's last screenshot).
 fn panel_watcher() -> ! {
-    let steps = [1, 2, 3, 2, 3];
+    // The greeter's and Hello's windows: whether each is shown, minimised
+    // and has the focus, as the compositor lists them to a manager.
+    let apps = || {
+        let mut s = [(false, false, false); 2];
+        let Ok(l) = window_call(window::list(), None) else { return s };
+        for w in (0..window::MAX_WINDOWS).filter(|&w| l[0] == 0 && l[1] & 1 << w != 0) {
+            let Ok(d) = window_call(window::describe(w), None) else { continue };
+            let title = d[1].to_le_bytes();
+            let k = if title.starts_with(b"Greeter") {
+                0
+            } else if title.starts_with(b"Hello") {
+                1
+            } else {
+                continue;
+            };
+            if d[0] == 0 && d[3] & 1 == 0 {
+                s[k] = (true, l[3] & 1 << w != 0, l[2] == w);
+            }
+        }
+        s
+    };
+    let minimised = (true, true, false);
+    let steps = [
+        ("both apps minimised", [minimised, minimised]),
+        ("the greeter gone, Hello minimised", [(false, false, false), minimised]),
+        ("the greeter back with the focus, Hello minimised", [(true, false, true), minimised]),
+    ];
     let mut at = 0;
-    while at + 1 < steps.len() {
-        let shown = window_info()[3];
-        if shown == steps[at + 1] {
+    while at < steps.len() {
+        if apps() == steps[at].1 {
+            say!("panel test: {} (step {})", steps[at].0, at + 1);
             at += 1;
-            say!("panel test: {shown} windows on the screen (step {at})");
         }
         superior_sys::sleep(5);
     }

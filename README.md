@@ -1040,6 +1040,27 @@ holds the rest):
   the host launches both apps from the panel, brings the greeter back in front
   from its task button, closes it and launches it again; five screenshots must
   have every pixel right, the panel laid out by the toolkit on the host.
+- The rest of the desktop shell: a launcher menu, minimising and a clock
+  (`window` version 8). The panel's "Apps" button opens a menu, a window of the
+  panel's own above it, with a button for each `start launch` component;
+  pressing one starts it and closes the menu. A decorated window has a minimise
+  box left of its close box: pressed, the window stays shown (a manager lists it,
+  `LIST` giving the minimised ones too) but is drawn nowhere, and the front
+  window takes the focus. `MINIMISE` does the same for a manager (any app's
+  window) or a window's own client; `ACTIVATE` (or the client's `RAISE`) draws
+  it again. The panel's task button for the focused window minimises it, and for
+  any other window, minimised or not, puts it in front with the focus. At the
+  panel's right end a clock shows the time of day (UTC, hours and minutes) from
+  the new `Time` system call: seconds since 1970 from the machine's real-time
+  clock (the CMOS clock on x86-64, read between updates and converted from BCD
+  and 12-hour forms; a PL031 on AArch64, found in the device tree). Every QEMU
+  boot's clock starts at 2026-11-14 09:41 UTC (`-rtc base=...,clock=vm`), so
+  screenshots can be checked. `cargo xtask panel-test` now launches both apps
+  from the menu, brings the greeter in front from its task button, minimises it
+  by its box and Hello by its task button, restores the greeter, closes it and
+  launches it again; six screenshots must have every pixel right (the clock
+  showing a minute from 09:41), and the watcher, itself a window manager,
+  follows the apps' windows through it.
 - Resizing windows by their frame (`window` version 7). A window styled
   `RESIZABLE` is resized by dragging any border of its frame (the top one is the
   strip above the title bar) or a corner: the compositor draws an outline of the size asked for
@@ -1190,7 +1211,7 @@ holds the rest):
   notifications, a 256-slot CNode pool) so filling them stays quick; normal kernels have
   32 of each, 32 address spaces and a 4096-slot pool.
 
-Not yet: in the compositor maximising; in the desktop shell a launcher menu, a clock, minimising, and app icons; in the toolkit a clipboard shared between apps, and multi-line text; a hardware cursor plane,
+Not yet: in the compositor maximising; in the desktop shell app icons, time zones and a date; in the toolkit a clipboard shared between apps, and multi-line text; a hardware cursor plane,
 pointer events when a window moves or appears under a still pointer, keyboard
 layouts and key repeat (keys are USB usages), and surviving a client
 that dies at the very moment its window is read (the compositor then faults and
@@ -1300,7 +1321,7 @@ cargo xtask lde-test       # the network test over Linux's 8139cp driver (needs 
 cargo xtask lde-e100-test  # the same over Linux's e100 driver
 cargo xtask display-test   # Linux's bochs display driver: two pictures, checked pixel by pixel from QEMU screenshots
 cargo xtask desktop-test   # the compositor: two clients' windows through restarts, five screenshots checked pixel by pixel
-cargo xtask panel-test     # the desktop shell's panel: two apps launched, one activated, closed and launched again, five screenshots checked
+cargo xtask panel-test     # the desktop shell: apps launched from its menu, activated, minimised and restored, closed and launched again, its clock, six screenshots checked
 cargo xtask resize-test    # a resizable window: its frame dragged out and in past its least size, a long name scrolled in its field, its top-left corner dragged out, seven screenshots checked
 cargo xtask widgets-test   # the List app: a list chosen in, scrolled by keys, wheel and scroll bar, text selected, cut and pasted, seven screenshots checked
 cargo xtask toolkit-test   # the greeter on the toolkit: a field typed in and edited at its cursor, a button clicked, closed, five screenshots checked against the toolkit drawn on the host

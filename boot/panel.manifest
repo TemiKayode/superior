@@ -1,11 +1,14 @@
 # The desktop shell test (cargo xtask panel-test).
 #
 # The panel, the desktop shell's strip along the bottom of the screen,
-# manages the compositor and may launch the two `start launch` apps: the
-# greeter and its "Hello" variant. The host launches both from the panel,
-# brings the greeter back in front from its task button, closes it and
-# launches it again, through QEMU's monitor, and checks every pixel of
-# five screenshots. The watcher shuts the system down at the end.
+# manages the compositor and may launch the two `start launch` apps from
+# its menu: the greeter and its "Hello" variant. The host launches both,
+# brings the greeter back in front from its task button, minimises it by
+# its minimise box and Hello by its task button, restores the greeter,
+# closes it and launches it again, through QEMU's monitor, and checks
+# every pixel of six screenshots (the panel's clock included). The
+# watcher, a window manager too, follows the apps' windows and shuts the
+# system down at the end.
 
 component pcibus
   image pcibus
@@ -70,9 +73,10 @@ component panel
   control 1
   launch-control
   cspace 8
-  # Its window: up to 1024x32 at 32 bits is 32 pages, and a notification.
+  # Its window: up to 1024x32 at 32 bits is 32 pages; its menu's, up to
+  # 34; and a notification (512 KiB in all).
   memory 21
-  untyped 18 2
+  untyped 19 2
 
 component greeter
   image greeter
@@ -101,5 +105,5 @@ component watcher
   image testclient
   arg 40
   priority 8
-  uses window 0
+  manages window 0
   control 1

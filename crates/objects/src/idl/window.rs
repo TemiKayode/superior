@@ -52,7 +52,7 @@
 pub mod window {
     use crate::interfaces::Status;
 
-    pub const VERSION: u64 = 7;
+    pub const VERSION: u64 = 8;
 
     /// The most windows on the screen, all clients together.
     pub const MAX_WINDOWS: u64 = 8;
@@ -122,7 +122,8 @@ pub mod window {
     /// A decorated window's frame: the border's width all round, the title
     /// bar's height between the top border and the window, and its close box,
     /// a square at the title bar's right end that far from its top, bottom and
-    /// right.
+    /// right. Its minimise box is the same square, that far left of the close
+    /// box: pressed, the window is minimised (see `MINIMISE`).
     pub const BORDER: u64 = 2;
 
     pub const TITLE: u64 = 18;
@@ -284,16 +285,16 @@ pub mod window {
 
     /// Sets the window's title: up to `TITLE_BYTES` of ASCII, `a` the first 8
     /// (the first in its low byte) and `b` the next, a zero byte ending it
-    /// early. A decorated window shows as much of it as fits before its close
-    /// box.
+    /// early. A decorated window shows as much of it as fits before its
+    /// minimise box.
     pub const SET_TITLE: u64 = 11;
     /// The message of a `SET_TITLE` call.
     pub const fn set_title(window: u64, a: u64, b: u64) -> [u64; 4] {
         [SET_TITLE, window, a, b]
     }
 
-    /// A manager's: the windows shown (bit n for window n) and the one with
-    /// the keyboard focus (`MAX_WINDOWS` if none).
+    /// A manager's: the windows shown (bit n for window n), the one with the
+    /// keyboard focus (`MAX_WINDOWS` if none) and those of them minimised.
     pub const LIST: u64 = 12;
     /// The message of a `LIST` call.
     pub const fn list() -> [u64; 4] {
@@ -304,6 +305,7 @@ pub mod window {
     pub struct ListReply {
         pub shown: u64,
         pub focus: u64,
+        pub minimised: u64,
     }
     /// Reads a `LIST` reply: its results, or the status it failed with.
     pub fn list_reply(m: [u64; 4]) -> Result<ListReply, Status> {
@@ -311,13 +313,14 @@ pub mod window {
             Status::Ok => Ok(ListReply {
                 shown: m[1],
                 focus: m[2],
+                minimised: m[3],
             }),
             s => Err(s),
         }
     }
 
     /// A manager's: window `window`'s title (as `SET_TITLE` takes it) and
-    /// whether it is a manager's own (bit 0 of `flags`).
+    /// whether it is a manager's own (bit 0 of `flags`) or minimised (bit 1).
     pub const DESCRIBE: u64 = 13;
     /// The message of a `DESCRIBE` call.
     pub const fn describe(window: u64) -> [u64; 4] {
@@ -343,7 +346,7 @@ pub mod window {
     }
 
     /// A manager's: puts window `window` in front of every other client's and
-    /// gives it the keyboard focus.
+    /// gives it the keyboard focus (if minimised, it is drawn again).
     pub const ACTIVATE: u64 = 14;
     /// The message of a `ACTIVATE` call.
     pub const fn activate(window: u64) -> [u64; 4] {
@@ -357,5 +360,16 @@ pub mod window {
     /// The message of a `SET_SIZE` call.
     pub const fn set_size(window: u64, size: u64) -> [u64; 4] {
         [SET_SIZE, window, size, 0]
+    }
+
+    /// Minimises window `window`: it stays shown (a manager lists it) but is
+    /// drawn nowhere, and the front window takes the keyboard focus if it had
+    /// it, until a manager activates it (or its own client raises it). A
+    /// manager's, for any other client's window, or the window's own client's;
+    /// `Denied` for another client's.
+    pub const MINIMISE: u64 = 16;
+    /// The message of a `MINIMISE` call.
+    pub const fn minimise(window: u64) -> [u64; 4] {
+        [MINIMISE, window, 0, 0]
     }
 }

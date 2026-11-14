@@ -687,6 +687,13 @@ pub fn handle_syscall(frame: &mut UserFrame) -> Exit {
             k.ipc.set_msg_of(cur, [w(0), w(1), w(2), w(3)]);
             Ok(())
         }
+        Some(Syscall::Time) => match crate::rtc::now() {
+            Some(t) => {
+                k.ipc.set_msg_of(cur, [t, 0, 0, 0]);
+                Ok(())
+            }
+            None => Err(Error::IllegalOperation.code()),
+        },
         Some(Syscall::IrqMsiMessage) => irq_msi_message(k, cur, &a),
         Some(Syscall::FrameDmaAddress) => frame_dma_address(k, cur, a.a0),
         Some(Syscall::DeviceFrame) => device_frame(k, cur, &a),

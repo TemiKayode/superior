@@ -335,6 +335,19 @@ pub fn cycles() -> u64 {
     timer::counter()
 }
 
+/// The PL031 real-time clock's count: seconds since 1970 (UTC), if the
+/// device tree has one.
+pub fn rtc_seconds() -> Option<u64> {
+    let (base, _) = fdt::find_device(DTB.load(core::sync::atomic::Ordering::Relaxed), b"arm,pl031")?;
+    // Devices below 1 GiB are identity-mapped as device memory.
+    if base >= 0x4000_0000 {
+        return None;
+    }
+    // SAFETY: the PL031's data register (offset 0), read-only, at the
+    // address the device tree gives.
+    Some(unsafe { core::ptr::read_volatile(base as *const u32) } as u64)
+}
+
 /// RNDR, if the CPU has it (FEAT_RNG: ID_AA64ISAR0_EL1 bits 63:60).
 pub fn random_source() -> Option<&'static str> {
     let isar0: u64;

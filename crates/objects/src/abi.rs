@@ -267,6 +267,11 @@ pub enum Syscall {
     /// where it has one and the cycle counter's jitter, and fed interrupt
     /// timings. For keys and nonces; it needs no capability.
     Random = 50,
+    /// The time of day: seconds since 1970-01-01 00:00 UTC in message word
+    /// 0, from the machine's real-time clock (the CMOS clock on x86-64, a
+    /// PL031 on AArch64). `IllegalOperation` where there is none. It needs
+    /// no capability.
+    Time = 51,
     /// Maps the frame in slot `rdi` at page-aligned `rsi` in the address
     /// space in slot `r8` (Write right). `rdx` = [`MAP_WRITE`] and/or
     /// [`MAP_EXEC`], never both. Needs the frame's Map right, plus Write
@@ -342,6 +347,7 @@ impl Syscall {
             48 => Syscall::UntypedInfo,
             49 => Syscall::Suspend,
             50 => Syscall::Random,
+            51 => Syscall::Time,
             42 => Syscall::IoFaults,
             0x100 => Syscall::DebugPutStr,
             0x101 => Syscall::DebugSelftestDone,

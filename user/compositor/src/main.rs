@@ -173,6 +173,7 @@ enum Part {
     Inside,
     Title,
     Close,
+    Minimise,
     Border,
     /// A border (or a corner between two), which resizes a resizable
     /// window: which of its sides move.
@@ -282,6 +283,8 @@ struct Window {
     /// After a drag of its left or top border, until its client sets the
     /// size it takes: that its right (and bottom) edge stays where it is.
     anchored: Sides,
+    /// Minimised: shown, but drawn nowhere, until activated.
+    minimised: bool,
 }
 
 /// A window at `at` resized to `size`: its left (or top) edge moved if
@@ -344,17 +347,20 @@ impl Window {
             return Some(Part::Border);
         }
         let right = self.at.x + self.at.w;
-        if x + m < right && x + m + c >= right && y >= top + m && y < top + m + c {
+        let boxed = y >= top + m && y < top + m + c;
+        if boxed && x + m < right && x + m + c >= right {
             Some(Part::Close)
+        } else if boxed && x + 2 * m + c < right && x + 2 * (m + c) >= right {
+            Some(Part::Minimise)
         } else {
             Some(Part::Title)
         }
     }
 
-    /// As much of its title as fits before the close box.
+    /// As much of its title as fits before the minimise box.
     fn shown_title(&self) -> &[u8] {
         let (m, c) = (window::CLOSE_MARGIN as u32, window::CLOSE_BOX as u32);
-        let room = self.at.w.saturating_sub(TITLE_LEFT + TITLE_GAP + m + c);
+        let room = self.at.w.saturating_sub(TITLE_LEFT + TITLE_GAP + 2 * (m + c));
         let fits = (room / TITLE_SCALE + 1) / superior_toolkit::font::ADVANCE;
         &self.title[..self.title_len.min(fits as usize)]
     }
@@ -380,6 +386,12 @@ impl Window {
                 let (m, c) = (window::CLOSE_MARGIN as u32, window::CLOSE_BOX as u32);
                 let (cx, cy) = (x + m + c - (self.at.x + self.at.w), y - (self.at.y - window::TITLE as u32 + m));
                 if (3..c - 3).contains(&cx) && (cx == cy || cx + cy == c - 1) { CLOSE_CROSS } else { CLOSE_COLOUR }
+            }
+            Some(Part::Minimise) => {
+                // A bar along its bottom.
+                let (m, c) = (window::CLOSE_MARGIN as u32, window::CLOSE_BOX as u32);
+                let (cx, cy) = (x + 2 * (m + c) - (self.at.x + self.at.w), y - (self.at.y - window::TITLE as u32 + m));
+                if (3..c - 3).contains(&cx) && (c - 5..c - 3).contains(&cy) { CLOSE_CROSS } else { CLOSE_COLOUR }
             }
             _ => BORDER_COLOUR,
         }
@@ -843,6 +855,10 @@ impl Compositor {
                                 say!("window {i}: its close box was pressed");
                                 self.post(i, window::CLOSE, 0, 0);
                             }
+                            (Part::Minimise, _) => {
+                                say!("window {i}: its minimise box was pressed");
+                                damage = damage.union(self.minimise(i));
+                            }
                             (Part::Edge(sides), Some(w)) => {
                                 self.resize = Some(Resize { window: i, sides, from: self.pointer, size: (w.at.w, w.at.h) });
                             }
@@ -1095,6 +1111,35 @@ impl Compositor {
         self.order[..n].copy_from_slice(&stack[..n]);
     }
 
+    /// Minimises window `i`: drawn nowhere, and the front window takes the
+    /// focus if it had it, until it is activated. The part of the screen
+    /// to repaint.
+    fn minimise(&mut self, i: usize) -> Rect {
+        let Some(mut w) = self.windows[i].filter(|w| w.shown && !w.minimised) else { return NONE };
+        w.minimised = true;
+        self.windows[i] = Some(w);
+        self.unstack(i);
+        if self.hover == Some(i) {
+            self.hover = None;
+            self.post(i, window::LEAVE, 0, 0);
+        }
+        say!("window {i} minimised");
+        if self.focus == Some(i) {
+            self.set_focus(self.front());
+        }
+        self.changed();
+        w.frame()
+    }
+
+    /// Window `i` is no longer minimised (it goes in front).
+    fn restore(&mut self, i: usize) {
+        if let Some(mut w) = self.windows[i].filter(|w| w.minimised) {
+            w.minimised = false;
+            self.windows[i] = Some(w);
+            say!("window {i} restored");
+        }
+    }
+
     /// The caller's window `n`, if it has one by that number.
     fn own(&mut self, n: u64, badge: u64) -> Option<usize> {
         let i = usize::try_from(n).ok().filter(|&i| i < self.windows.len())?;
@@ -1129,6 +1174,7 @@ impl Compositor {
             title: [0; window::TITLE_BYTES as usize],
             title_len: 0,
             anchored: Sides::default(),
+            minimised: false,
         };
         if w.needed() > window::WINDOW_PAGES {
             return [Status::Invalid as u64, 0, 0, 0];
@@ -1281,14 +1327,30 @@ impl Compositor {
             }
             window::CREATE => self.create(m[1], m[2], badge),
             window::LIST | window::DESCRIBE | window::ACTIVATE if badge & MANAGER_BADGE == 0 => status(Status::Denied),
+            window::MINIMISE => {
+                // A manager's (any other client's window), or the window's
+                // own client's.
+                let i = usize::try_from(m[1]).ok().filter(|&i| i < self.windows.len());
+                let Some(i) = i.filter(|&i| self.windows[i].is_some_and(|w| w.shown) && self.alive(i)) else {
+                    return status(Status::NotFound);
+                };
+                let mine = self.windows[i].is_some_and(|w| w.owner == badge);
+                if self.manager(i) || (badge & MANAGER_BADGE == 0 && !mine) {
+                    return status(if mine { Status::Invalid } else { Status::Denied });
+                }
+                let r = self.minimise(i);
+                self.show(r);
+                status(Status::Ok)
+            }
             window::LIST => {
                 if self.reap() {
                     self.show(NONE);
                 }
-                let shown = (0..self.windows.len())
-                    .filter(|&i| self.windows[i].is_some_and(|w| w.shown))
-                    .fold(0, |m, i| m | 1 << i);
-                [Status::Ok as u64, shown, self.focus.map_or(window::MAX_WINDOWS, |f| f as u64), 0]
+                let bits = |f: fn(&Window) -> bool| {
+                    (0..self.windows.len()).filter(|&i| self.windows[i].as_ref().is_some_and(f)).fold(0, |m, i| m | 1 << i)
+                };
+                let (shown, minimised) = (bits(|w| w.shown), bits(|w| w.shown && w.minimised));
+                [Status::Ok as u64, shown, self.focus.map_or(window::MAX_WINDOWS, |f| f as u64), minimised]
             }
             window::DESCRIBE | window::ACTIVATE => {
                 let i = usize::try_from(m[1]).ok().filter(|&i| i < self.windows.len());
@@ -1298,11 +1360,12 @@ impl Compositor {
                 let Some(w) = self.windows[i] else { return status(Status::NotFound) };
                 if m[0] == window::DESCRIBE {
                     let word = |k: usize| u64::from_le_bytes(w.title[k * 8..k * 8 + 8].try_into().unwrap());
-                    return [Status::Ok as u64, word(0), word(1), self.manager(i) as u64];
+                    return [Status::Ok as u64, word(0), word(1), self.manager(i) as u64 | (w.minimised as u64) << 1];
                 }
                 if self.manager(i) {
                     return status(Status::Invalid);
                 }
+                self.restore(i);
                 say!("window {i} activated by the desktop shell");
                 self.to_front(i);
                 self.set_focus(Some(i));
@@ -1332,6 +1395,7 @@ impl Compositor {
                     window::SET_TITLE => status(self.set_title(i, m[2], m[3])),
                     window::SET_SIZE => status(self.set_size(i, m[2])),
                     window::RAISE => {
+                        self.restore(i);
                         if let Some(w) = self.windows[i].filter(|w| w.shown) {
                             self.to_front(i);
                             self.show(w.frame());

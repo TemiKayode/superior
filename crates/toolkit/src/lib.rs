@@ -541,6 +541,13 @@ impl Ui {
         }
     }
 
+    /// In a row, moves widget `id` to the window's right end (it must be
+    /// the last laid out, or it may cover others).
+    pub fn push_right(&mut self, id: Id) {
+        let r = &mut self.widgets[id].rect;
+        r.x = self.w.saturating_sub(PAD + r.w);
+    }
+
     /// Lays out across the window the line that starts with `start`: the
     /// widgets left to right, those that stretch sharing what the others
     /// leave.
@@ -1328,6 +1335,8 @@ mod tests {
         assert_eq!(ui.widget(a).rect, Rect { x: 8, y: 3, w: 130, h: 26 });
         assert_eq!(ui.widget(b).rect, Rect { x: 146, y: 3, w: 82, h: 26 });
         assert_eq!(ui.widget(l).rect, Rect { x: 236, y: 8, w: 22, h: 16 });
+        ui.push_right(l);
+        assert_eq!(ui.widget(l).rect.x, 800 - 8 - 22);
         assert_eq!(press(&mut ui, 150, 10).clicked, Some(b));
         ui.event(Event::Pointer { x: 150, y: 10, buttons: 0 });
         assert_eq!(ui.select(b, true), ui.widget(b).rect);

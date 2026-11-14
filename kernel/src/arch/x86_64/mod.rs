@@ -158,6 +158,50 @@ pub fn idle_wait() {
     x86_64::instructions::interrupts::disable();
 }
 
+/// The CMOS real-time clock's date and time: (year, month, day, hour,
+/// minute, second), read between updates; `None` if it reads as nonsense.
+pub fn rtc() -> Option<(u64, u64, u64, u64, u64, u64)> {
+    use x86_64::instructions::port::Port;
+    let read = |reg: u8| -> u8 {
+        let (mut index, mut data) = (Port::<u8>::new(0x70), Port::<u8>::new(0x71));
+        // SAFETY: the CMOS index and data ports; reading a clock register
+        // changes nothing.
+        unsafe {
+            index.write(reg);
+            data.read()
+        }
+    };
+    let regs = || {
+        // Not while it updates (register A, bit 7).
+        let mut spins = 0;
+        while read(0x0a) & 0x80 != 0 && spins < 1_000_000 {
+            spins += 1;
+            core::hint::spin_loop();
+        }
+        [read(0x00), read(0x02), read(0x04), read(0x07), read(0x08), read(0x09)]
+    };
+    // Read until two reads agree (an update may fall between registers).
+    let mut r = regs();
+    for _ in 0..8 {
+        let again = regs();
+        if again == r {
+            break;
+        }
+        r = again;
+    }
+    let b = read(0x0b);
+    let bcd = |v: u8| if b & 0x04 == 0 { (v & 0x0f) + (v >> 4) * 10 } else { v };
+    let pm = r[2] & 0x80 != 0;
+    let mut hour = bcd(r[2] & 0x7f);
+    if b & 0x02 == 0 {
+        // 12-hour: 12 is midnight or noon.
+        hour = hour % 12 + if pm { 12 } else { 0 };
+    }
+    let (s, m, d, mo, y) = (bcd(r[0]), bcd(r[1]), bcd(r[3]), bcd(r[4]), bcd(r[5]));
+    let ok = s < 60 && m < 60 && hour < 24 && (1..=31).contains(&d) && (1..=12).contains(&mo) && y < 100;
+    ok.then_some((2000 + y as u64, mo as u64, d as u64, hour as u64, m as u64, s as u64))
+}
+
 /// The time-stamp counter, for the entropy pool's timings.
 pub fn cycles() -> u64 {
     // SAFETY: rdtsc reads the counter, nothing else.
