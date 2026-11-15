@@ -37,7 +37,12 @@ holds the rest):
   to APIC ID, and device interrupts sent to the boot CPU's own APIC ID; DMAR for the
   VT-d unit, either the one covering every PCI function or the only one, covering
   just the functions its device scopes name (QEMU's way), and a function it does
-  not cover cannot be bound. Legacy interrupts go through the I/O APIC (from the
+  not cover cannot be bound. The DMAR's reserved memory regions (memory a device
+  keeps using whatever it is told: a USB controller's legacy keyboard emulation, a
+  GPU's stolen memory) are mapped where they are in a function's I/O space when it
+  is bound, except any pages firmware left usable RAM; the x86-64 virtio-blk test
+  adds a second DMAR reserving 0xf0000 to 0xfffff for its disk at 00:10.0, which
+  QEMU's own cannot say. Legacy interrupts go through the I/O APIC (from the
   MADT, every entry masked until its line is claimed), not the 8259 PIC: COM1 on
   the GSI the MADT's interrupt source overrides give ISA IRQ 4, and PCI's
   interrupt pins as the root bridge's `_PRT` says. A small AML reader walks the

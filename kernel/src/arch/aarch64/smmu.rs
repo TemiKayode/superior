@@ -201,6 +201,13 @@ pub fn fixed_pages() -> &'static [u64] {
     &PAGES
 }
 
+/// Pages a function keeps using whatever it is given: none known here
+/// (on Arm they would come from IORT's reserved memory ranges, or a
+/// device tree's `iommu-addresses`, neither of which QEMU's virt has).
+pub fn reserved_pages(_sid: u16) -> core::iter::Empty<u64> {
+    core::iter::empty()
+}
+
 /// Writes a new space's context descriptor into its header page: stage-1
 /// translation through the tables at `root`, 39-bit inputs, 40-bit
 /// outputs, ASID = `domain`.

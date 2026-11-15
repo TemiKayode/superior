@@ -15,7 +15,8 @@
 //!   on bus 0, or everything behind a bridge there). A function no unit
 //!   in use covers cannot be bound, so it never gets DMA unisolated.
 //!   And the requester ID each I/O APIC's interrupts carry, which
-//!   interrupt remapping checks.
+//!   interrupt remapping checks. And its reserved memory regions: memory
+//!   a function keeps using whatever it is told, which binding it maps.
 //! - The MADT's interrupt source overrides: which GSI each ISA IRQ arrives
 //!   on, and how it signals.
 //! - The DSDT (through the FADT): the PCI root bridge's `_PRT`, which says
@@ -23,7 +24,7 @@
 
 use super::aml;
 use super::vm::phys_ptr;
-use crate::kprintln;
+use crate::{kprint, kprintln};
 use crate::smp::MAX_CPUS;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
@@ -51,28 +52,38 @@ fn sums_to_zero(pa: u64, len: u64) -> bool {
     (0..len).fold(0u8, |s, i| s.wrapping_add(read::<1>(pa + i)[0])) == 0
 }
 
-/// The table with signature `sig`, from the RSDP at `rsdp`: its address
-/// and length, if it is there and whole.
-fn find(rsdp: u64, sig: &[u8; 4]) -> Option<(u64, u64)> {
-    if &read::<8>(rsdp) != b"RSD PTR " || !sums_to_zero(rsdp, 20) {
-        return None;
-    }
-    // ACPI 2.0 and later: the XSDT, with 64-bit entries; else the RSDT.
-    let (root, entry) = if read::<1>(rsdp + 15)[0] >= 2 && u64_at(rsdp + 24) != 0 {
-        (u64_at(rsdp + 24), 8)
-    } else {
-        (u32_at(rsdp + 16) as u64, 4)
-    };
-    let len = u32_at(root + 4) as u64;
-    if len < 36 || len > 1 << 16 || !sums_to_zero(root, len) {
-        return None;
-    }
-    (0..(len - 36) / entry).find_map(|i| {
+/// Every table with signature `sig`, from the RSDP at `rsdp`, in the
+/// order the root table lists them: each one's address and length, if it
+/// is whole.
+fn tables(rsdp: u64, sig: &[u8; 4]) -> impl Iterator<Item = (u64, u64)> {
+    let root = (&read::<8>(rsdp) == b"RSD PTR " && sums_to_zero(rsdp, 20))
+        .then(|| {
+            // ACPI 2.0 and later: the XSDT, with 64-bit entries; else the
+            // RSDT.
+            if read::<1>(rsdp + 15)[0] >= 2 && u64_at(rsdp + 24) != 0 {
+                (u64_at(rsdp + 24), 8)
+            } else {
+                (u32_at(rsdp + 16) as u64, 4)
+            }
+        })
+        .and_then(|(root, entry)| {
+            let len = u32_at(root + 4) as u64;
+            ((36..=1 << 16).contains(&len) && sums_to_zero(root, len)).then_some((root, entry, (len - 36) / entry))
+        });
+    let (root, entry, count) = root.unwrap_or((0, 4, 0));
+    let sig = *sig;
+    (0..count).filter_map(move |i| {
         let at = root + 36 + i * entry;
         let table = if entry == 8 { u64_at(at) } else { u32_at(at) as u64 };
         let tlen = u32_at(table + 4) as u64;
-        (&read::<4>(table) == sig && (36..1 << 20).contains(&tlen) && sums_to_zero(table, tlen)).then_some((table, tlen))
+        (read::<4>(table) == sig && (36..1 << 20).contains(&tlen) && sums_to_zero(table, tlen)).then_some((table, tlen))
     })
+}
+
+/// The (first) table with signature `sig`: its address and length, if it
+/// is there and whole.
+fn find(rsdp: u64, sig: &[u8; 4]) -> Option<(u64, u64)> {
+    tables(rsdp, sig).next()
 }
 
 /// The enabled CPUs' local APIC IDs, in the MADT's order (up to
@@ -97,6 +108,12 @@ static IOAPIC_ID: [AtomicU32; 4] = [const { AtomicU32::new(0) }; 4];
 /// The DMAR's I/O APIC device scopes (up to 4): bit 31 set, APIC ID <<
 /// 16, requester ID.
 static IOAPIC_SID: [AtomicU32; 4] = [const { AtomicU32::new(0) }; 4];
+/// The DMAR's reserved memory regions (up to 8): each one's first byte
+/// and end (exclusive; 0 for no region), and the requester IDs of up to 4
+/// functions it names (bit 31 set).
+const MAX_RESERVED: usize = 8;
+static RESERVED: [[AtomicU64; 2]; MAX_RESERVED] = [const { [const { AtomicU64::new(0) }; 2] }; MAX_RESERVED];
+static RESERVED_SID: [[AtomicU32; 4]; MAX_RESERVED] = [const { [const { AtomicU32::new(0) }; 4] }; MAX_RESERVED];
 /// ISA IRQ overrides: bit 31 set, the MPS flags << 24, the GSI.
 static ISA: [AtomicU32; 16] = [const { AtomicU32::new(0) }; 16];
 /// The root bus's interrupt routes, from `_PRT`.
@@ -229,7 +246,7 @@ fn dmar(rsdp: u64) {
         kprintln!("[ok] ACPI: no DMAR (no VT-d)");
         return;
     };
-    let (mut units, mut reserved, mut all, mut scoped) = (0, 0, 0, None);
+    let (mut units, mut all, mut scoped) = (0, 0, None);
     // 12 bytes after the header: address width, flags, reserved.
     for (e, kind, n) in structures(t, len, 12, true) {
         match (kind, n) {
@@ -258,12 +275,10 @@ fn dmar(rsdp: u64) {
                     scoped = Some((e, n));
                 }
             }
-            // A memory range a device keeps using (a USB controller's
-            // legacy emulation, a GPU's stolen memory).
-            (1, _) => reserved += 1,
             _ => {}
         }
     }
+    let (reserved, kept) = reserved_regions(rsdp);
     let mut named = 0;
     if all != 0 {
         VTD.store(all, Ordering::Relaxed);
@@ -309,6 +324,75 @@ fn dmar(rsdp: u64) {
             if VTD_BRIDGES.load(Ordering::Relaxed) { " and what is behind its bridges" } else { "" }
         );
     }
+    for i in 0..kept {
+        let [start, end] = [0, 1].map(|j| RESERVED[i][j].load(Ordering::Relaxed));
+        kprint!("[ok] ACPI: reserved memory {start:#x} to {:#x}, for", end - 1);
+        let mut any = false;
+        for sid in RESERVED_SID[i].iter().map(|s| s.load(Ordering::Relaxed)).filter(|s| s >> 31 == 1) {
+            kprint!(" {:02x}:{:02x}.{}", sid >> 8 & 0xff, sid >> 3 & 31, sid & 7);
+            any = true;
+        }
+        kprintln!("{}", if any { "" } else { " no function the kernel can name" });
+        // Firmware should mark it reserved; if it left any of it usable,
+        // the kernel may have given those pages to anyone, so the function
+        // does not get them.
+        let usable = (start..end).step_by(4096).filter(|&pa| crate::memory::is_ram(pa)).count();
+        if usable > 0 {
+            kprintln!("[warn] ACPI: {usable} of its pages are usable RAM too: they are not mapped for it");
+        }
+    }
+}
+
+/// Reads the reserved memory regions of every DMAR the firmware lists
+/// (it lists one; QEMU's tests add a second, with the regions QEMU's own
+/// lacks): ranges a device keeps using whatever it is told, such as a USB
+/// controller's legacy keyboard emulation or a GPU's stolen memory. Each
+/// function a region names must find it mapped where it is in its I/O
+/// space. Returns how many there are, and how many were kept (segment 0,
+/// whole pages, up to `MAX_RESERVED`).
+fn reserved_regions(rsdp: u64) -> (usize, usize) {
+    let (mut found, mut kept) = (0, 0);
+    for (t, len) in tables(rsdp, b"DMAR") {
+        for (e, kind, n) in structures(t, len, 12, true) {
+            // Type 1, a reserved region: reserved, segment, base, limit
+            // (its last byte), then device scopes.
+            if kind != 1 || n < 24 {
+                continue;
+            }
+            found += 1;
+            let [_, _, s0, s1] = read::<4>(e + 4);
+            let (base, limit) = (u64_at(e + 8), u64_at(e + 16));
+            if u16::from_le_bytes([s0, s1]) != 0 || base & 0xfff != 0 || limit & 0xfff != 0xfff || limit < base || kept == MAX_RESERVED {
+                continue;
+            }
+            let mut sids = 0;
+            for (kind, _, bus, path, plen) in scopes(e, n, 24) {
+                // An endpoint on its start bus (a path of one), as the
+                // functions firmware reserves memory for are: integrated
+                // USB controllers and graphics, on bus 0.
+                if kind == 1 && plen == 2 && sids < 4 {
+                    let [dev, func] = read::<2>(path);
+                    let sid = (bus as u32) << 8 | (dev as u32 & 31) << 3 | func as u32 & 7;
+                    RESERVED_SID[kept][sids].store(1 << 31 | sid, Ordering::Relaxed);
+                    sids += 1;
+                }
+            }
+            RESERVED[kept][0].store(base, Ordering::Relaxed);
+            RESERVED[kept][1].store(limit + 1, Ordering::Relaxed);
+            kept += 1;
+        }
+    }
+    (found, kept)
+}
+
+/// The reserved memory regions the DMAR names requester `sid` in: each
+/// one's first byte and end (exclusive).
+pub fn reserved_for(sid: u16) -> impl Iterator<Item = (u64, u64)> {
+    (0..MAX_RESERVED).filter_map(move |i| {
+        let end = RESERVED[i][1].load(Ordering::Relaxed);
+        let named = RESERVED_SID[i].iter().any(|s| s.load(Ordering::Relaxed) == 1 << 31 | sid as u32);
+        (end != 0 && named).then(|| (RESERVED[i][0].load(Ordering::Relaxed), end))
+    })
 }
 
 /// Whether the VT-d unit in use covers requester ID `sid` (bus, device,

@@ -332,6 +332,16 @@ pub fn fixed_pages() -> &'static [u64] {
     &[]
 }
 
+/// The pages requester `sid` keeps using whatever it is given (the DMAR's
+/// reserved memory regions for it), to be mapped where they are before
+/// its DMA is translated. Any the firmware left usable RAM are left out:
+/// the kernel may have given them to anyone.
+pub fn reserved_pages(sid: u16) -> impl Iterator<Item = u64> {
+    super::acpi::reserved_for(sid)
+        .flat_map(|(start, end)| (start..end).step_by(4096))
+        .filter(|&pa| !crate::memory::is_ram(pa))
+}
+
 /// Prepares a new space's header page (unused on VT-d).
 pub fn init_space(_header: u64, _root: u64, _domain: u16) {}
 

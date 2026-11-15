@@ -1015,6 +1015,40 @@ fn uefi_image(manifest: &str) -> Result<Image, String> {
     Ok(img)
 }
 
+/// The x86-64 virtio-blk disk's device on bus 0, and the memory its test
+/// DMAR reserves for it: the BIOS area, which no firmware calls usable.
+const RESERVED_FOR: u8 = 0x10;
+const RESERVED_RANGE: (u64, u64) = (0xf_0000, 0xf_ffff);
+
+/// A DMAR holding only a reserved memory region (RMRR) for 00:10.0, for
+/// QEMU's `-acpitable`.
+fn reserved_dmar() -> Vec<u8> {
+    // A device scope: an endpoint, on bus 0, path device 0x10 function 0.
+    let scope = [1, 8, 0, 0, 0, 0, RESERVED_FOR, 0];
+    let mut rmrr = Vec::new();
+    rmrr.extend(1u16.to_le_bytes()); // type: reserved memory region
+    rmrr.extend((24 + scope.len() as u16).to_le_bytes());
+    rmrr.extend([0, 0, 0, 0]); // reserved, segment 0
+    rmrr.extend(RESERVED_RANGE.0.to_le_bytes());
+    rmrr.extend(RESERVED_RANGE.1.to_le_bytes());
+    rmrr.extend(scope);
+    let mut t = Vec::new();
+    t.extend(b"DMAR");
+    t.extend((36 + 12 + rmrr.len() as u32).to_le_bytes());
+    t.extend([1, 0]); // revision, checksum (below)
+    t.extend(b"SUPERI");
+    t.extend(b"TESTDMAR");
+    t.extend(1u32.to_le_bytes());
+    t.extend(b"SUPR");
+    t.extend(1u32.to_le_bytes());
+    // Host address width (39 bits, less one), flags, 10 reserved bytes.
+    t.extend([38, 0]);
+    t.extend([0; 10]);
+    t.extend(rmrr);
+    t[9] = 0u8.wrapping_sub(t.iter().fold(0u8, |s, &b| s.wrapping_add(b)));
+    t
+}
+
 fn qemu_command(img: &Image) -> Command {
     let mut q = Command::new(qemu(img.arch));
     match img.arch {
@@ -1167,10 +1201,24 @@ fn qemu_command(img: &Image) -> Command {
                 if img.writable { "off" } else { "on" },
                 disk.display()
             ))
-            .args([
-                "-device",
-                "virtio-blk-pci,drive=blk0,disable-legacy=on,iommu_platform=on",
-            ]);
+            .arg("-device")
+            .arg(format!(
+                "virtio-blk-pci,drive=blk0,disable-legacy=on,iommu_platform=on{}",
+                if img.arch == Arch::X86_64 { format!(",addr={RESERVED_FOR:#x}") } else { String::new() }
+            ));
+        if img.arch == Arch::X86_64 {
+            // At a known address, with memory the firmware reserves for
+            // it, which QEMU's DMAR cannot say: a second DMAR, with just
+            // that region, which the kernel must map for it.
+            let path = Path::new("target").join("test-dmar.bin");
+            match std::fs::write(root().join(&path), reserved_dmar()) {
+                Ok(()) => {
+                    // The path must be relative: QEMU splits it at colons.
+                    q.current_dir(root()).arg("-acpitable").arg(format!("file={}", path.display()));
+                }
+                Err(e) => eprintln!("writing {}: {e}", path.display()),
+            }
+        }
     }
     if img.net {
         // User-mode networking, on a network other than QEMU's default
@@ -1558,7 +1606,22 @@ fn drivers_test(img: &Image) -> Result<(), String> {
             return Err(format!("driver framework test: missing {line:?}"));
         }
     }
-    for bad in ["[fail]", "could not", "panic"] {
+    // x86-64's virtio-blk disk has memory reserved for it in a second
+    // DMAR: the kernel reads it, and maps it each time the function is
+    // bound to a domain (first, and on the restarted driver's fresh one),
+    // with the reads still right.
+    if img.arch == Arch::X86_64 && d == "virtio-blk" {
+        let (start, end) = RESERVED_RANGE;
+        let region = format!("[ok] ACPI: reserved memory {start:#x} to {end:#x}, for 00:{RESERVED_FOR:02x}.0");
+        let bound = format!(
+            "[ok] IOMMU: 00:{RESERVED_FOR:02x}.0 bound, with its {} pages of reserved memory mapped where they are",
+            (end + 1 - start) / 4096
+        );
+        if let Err(step) = find_in_order(&out, &[&region, &bound, &bound]) {
+            return Err(format!("driver framework test: missing (in order) {step:?}"));
+        }
+    }
+    for bad in ["[fail]", "could not", "panic", "[warn] ACPI"] {
         if out.contains(bad) {
             return Err(format!("driver framework test: log contains {bad:?}"));
         }

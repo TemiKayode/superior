@@ -1711,10 +1711,45 @@ fn io_space_bind(k: &mut Kernel, cur: Tid, f: &Args) -> Result<(), u64> {
         .ok()
         .filter(|&s| iommu::valid_sid(s))
         .ok_or(Error::InvalidArgument.code())?;
-    let d = k.io_spaces[id].ok_or(Error::InvalidCapability.code())?;
+    let mut d = k.io_spaces[id].ok_or(Error::InvalidCapability.code())?;
     // One function per space, one space per function.
     if d.sid.is_some() || k.io_spaces.iter().flatten().any(|o| o.sid == Some(sid)) {
         return Err(Error::IllegalOperation.code());
+    }
+    // Memory the firmware says the function keeps using whatever it is
+    // told (a USB controller's legacy keyboard emulation, a GPU's stolen
+    // memory): mapped where it is before its DMA is translated, or it
+    // would fault from the start. It is not RAM, so no frame the driver
+    // maps can land on it.
+    let (root, mut pages) = (d.root(), 0u64);
+    for pa in iommu::reserved_pages(sid) {
+        match crate::iommu::map(root, pa, pa, true, &mut d.pool) {
+            Ok(()) => pages += 1,
+            // Two regions overlap.
+            Err(crate::iommu::IoMapError::InUse) => {}
+            Err(e) => {
+                for pa in iommu::reserved_pages(sid) {
+                    crate::iommu::unmap(root, pa);
+                }
+                // The tables made so far stay in the space's tree, so its
+                // pool must not hand them out again.
+                k.io_spaces[id] = Some(d);
+                return Err(match e {
+                    crate::iommu::IoMapError::OutOfMemory => Error::NotEnoughMemory,
+                    _ => Error::InvalidArgument,
+                }
+                .code());
+            }
+        }
+    }
+    if pages > 0 {
+        kprintln!(
+            "[ok] IOMMU: {:02x}:{:02x}.{} bound, with its {pages} page{} of reserved memory mapped where they are",
+            sid >> 8,
+            sid >> 3 & 31,
+            sid & 7,
+            if pages == 1 { "" } else { "s" }
+        );
     }
     iommu::attach(sid, id as u16 + 1, d.base, d.root());
     k.io_spaces[id] = Some(IoDomain {
