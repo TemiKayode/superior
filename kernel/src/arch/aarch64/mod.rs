@@ -408,6 +408,13 @@ pub fn intx_lines() -> &'static [u8] {
     &INTX_LINES
 }
 
+/// Which of [`intx_lines`] pin `pin` (1 to 4) of root-bus device `device`
+/// reaches: on QEMU `virt`, wire `(device + pin - 1) % 4`, as its device
+/// tree's `interrupt-map` says.
+pub fn intx_line(device: u8, pin: u8) -> Option<usize> {
+    (device < 32 && (1..=4).contains(&pin)).then(|| (device as usize + pin as usize - 1) % 4)
+}
+
 /// The message a device writes to raise MSI line `line`, if it is one:
 /// an event ID written to the ITS, which the ITS maps to the line for
 /// device `source` alone (or for no device).

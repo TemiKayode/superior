@@ -272,6 +272,16 @@ pub enum Syscall {
     /// PL031 on AArch64). `IllegalOperation` where there is none. It needs
     /// no capability.
     Time = 51,
+    /// Which legacy PCI interrupt line pin `rsi` (1 to 4, INTA# to INTD#)
+    /// of device `rdi` on the root bus reaches, as the firmware routes it
+    /// (ACPI's `_PRT` on x86-64, the device tree on AArch64): its index
+    /// among the [`root::INTX`] lines, in message word 0. A function
+    /// behind bridges asks for the root-bus device and pin its pin comes
+    /// out on. `IllegalOperation` if the pin reaches none the kernel routes;
+    /// `InvalidArgument` for a device past 31 or a pin outside 1 to 4. It
+    /// needs no capability: the wiring is no secret, and the lines
+    /// themselves are capabilities.
+    IntxLine = 52,
     /// Maps the frame in slot `rdi` at page-aligned `rsi` in the address
     /// space in slot `r8` (Write right). `rdx` = [`MAP_WRITE`] and/or
     /// [`MAP_EXEC`], never both. Needs the frame's Map right, plus Write
@@ -348,6 +358,7 @@ impl Syscall {
             49 => Syscall::Suspend,
             50 => Syscall::Random,
             51 => Syscall::Time,
+            52 => Syscall::IntxLine,
             42 => Syscall::IoFaults,
             0x100 => Syscall::DebugPutStr,
             0x101 => Syscall::DebugSelftestDone,
@@ -607,13 +618,14 @@ pub mod root {
     /// across a fast reboot ([`Syscall::Reboot`]), zeroed at power-on.
     pub const STATE_STORE: u64 = IOMMU + 1;
     pub const STATE_PAGES: u64 = 16;
-    /// The legacy PCI interrupt lines (IRQ capabilities), [`INTX_COUNT`]
-    /// of them in consecutive slots, for functions with no MSI: the one a
-    /// function's pin reaches is slot `(device + pin - 1) % 4` for a
-    /// function on bus 0. Empty where the kernel does not know the
-    /// machine's routing.
+    /// The legacy PCI interrupt lines (IRQ capabilities), up to
+    /// [`INTX_COUNT`] of them in consecutive slots from the first, for
+    /// functions with no MSI: one for each interrupt input the firmware
+    /// routes PCI's pins to. [`Syscall::IntxLine`] says which a pin
+    /// reaches. Empty where the kernel does not know the machine's
+    /// routing.
     pub const INTX: u64 = STATE_STORE + STATE_PAGES;
-    pub const INTX_COUNT: u64 = 4;
+    pub const INTX_COUNT: u64 = 8;
     /// I/O ports for PCI BARs: a range of ports on x86-64, on AArch64 the
     /// window of device memory that stands for them.
     pub const PCI_IO: u64 = INTX + INTX_COUNT;

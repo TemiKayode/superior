@@ -104,7 +104,8 @@ const TOMB_STACK: u64 = TOMB_TCB + MAX_SERVICES as u64;
 /// Pages components share with servers (`shared`): made once, handed out
 /// from here in manifest order, outliving every instance on both sides.
 const SHARED_PAGES: u64 = TOMB_STACK + 2 * MAX_SERVICES as u64;
-const SHARED_SLOTS: u64 = 128;
+/// (The busiest manifest shares 29 pages.)
+const SHARED_SLOTS: u64 = 120;
 const _: () = assert!(SHARED_PAGES + SHARED_SLOTS <= BLOCKS);
 /// Each component's block of slots: its untyped memory, then the objects
 /// of its current instance.

@@ -13,7 +13,7 @@ component pcibus
   provides pci 0
   device pci-config 1
   device pci-mmio 2
-  device pci-io 84
+  device pci-io 88
   device msi 3
   device iommu 11
   untyped 18 12

@@ -694,6 +694,7 @@ pub fn handle_syscall(frame: &mut UserFrame) -> Exit {
             }
             None => Err(Error::IllegalOperation.code()),
         },
+        Some(Syscall::IntxLine) => intx_line(k, cur, &a),
         Some(Syscall::IrqMsiMessage) => irq_msi_message(k, cur, &a),
         Some(Syscall::FrameDmaAddress) => frame_dma_address(k, cur, a.a0),
         Some(Syscall::DeviceFrame) => device_frame(k, cur, &a),
@@ -1680,6 +1681,21 @@ fn unmap_parts(
             iommu::flush();
         }
     }
+}
+
+/// `IntxLine`: rdi = root-bus device, rsi = pin (1 to 4).
+fn intx_line(k: &mut Kernel, cur: Tid, f: &Args) -> Result<(), u64> {
+    let (Ok(device), Ok(pin)) = (u8::try_from(f.a0), u8::try_from(f.a1)) else {
+        return Err(Error::InvalidArgument.code());
+    };
+    if device >= 32 || !(1..=4).contains(&pin) {
+        return Err(Error::InvalidArgument.code());
+    }
+    let w = arch::intx_line(device, pin)
+        .filter(|&w| w < arch::intx_lines().len())
+        .ok_or(Error::IllegalOperation.code())?;
+    k.ipc.set_msg_of(cur, [w as u64, 0, 0, 0]);
+    Ok(())
 }
 
 /// The I/O address space a capability in the caller's slot names, with

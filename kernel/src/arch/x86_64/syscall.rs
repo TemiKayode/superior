@@ -639,7 +639,7 @@ macro_rules! intx_entries {
         )*
 
         /// The entry for each PCI interrupt line, in order.
-        pub const INTX_ENTRIES: [unsafe extern "C" fn(); 4] = [$($entry),*];
+        pub const INTX_ENTRIES: [unsafe extern "C" fn(); 8] = [$($entry),*];
     };
 }
 
@@ -648,6 +648,10 @@ intx_entries!(
     intx1_entry intx1_handler 1,
     intx2_entry intx2_handler 2,
     intx3_entry intx3_handler 3,
+    intx4_entry intx4_handler 4,
+    intx5_entry intx5_handler 5,
+    intx6_entry intx6_handler 6,
+    intx7_entry intx7_handler 7,
 );
 
 /// Entries for the MSI vectors, one per vector: each saves the user

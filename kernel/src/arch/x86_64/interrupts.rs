@@ -6,8 +6,8 @@
 
 use super::aml::Route;
 use super::{acpi, apic, gdt, ioapic, syscall};
-use crate::kprintln;
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use crate::{kprint, kprintln};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, AtomicUsize, Ordering};
 use spin::Lazy;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame};
 use x86_64::VirtAddr;
@@ -82,17 +82,22 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
 pub const PIC_BASE: u8 = 0x20;
 /// COM1's interrupt line (its ISA IRQ), handed to the serial driver.
 pub const COM1_IRQ: u8 = 4;
-/// The lines of the four PCI interrupt wires, on vectors
-/// `INTX_VECTOR_BASE ..`.
-pub const INTX_LINES: [u8; 4] = [16, 17, 18, 19];
+/// The lines PCI's interrupt pins can reach, one for each GSI the root
+/// bridge's `_PRT` routes pins to (up to 8), on vectors
+/// `INTX_VECTOR_BASE ..` (up to MSI's).
+pub const INTX_LINES: [u8; 8] = [16, 17, 18, 19, 20, 21, 22, 23];
 const INTX_VECTOR_BASE: u8 = 0x38;
-static INTX_ROUTED: AtomicBool = AtomicBool::new(false);
+/// How many of `INTX_LINES` are routed (0 where the routing is unknown).
+static INTX_USED: AtomicUsize = AtomicUsize::new(0);
+/// For each root-bus device's four pins, the line it reaches: its index
+/// in `INTX_LINES`, plus 1 (0: none).
+static PIN_LINE: [[AtomicU8; 4]; 32] = [const { [const { AtomicU8::new(0) }; 4] }; 32];
 /// Whether the I/O APIC carries the legacy lines (else the 8259 PIC
 /// carries COM1, and PCI's pins have none).
 static IOAPIC_ON: AtomicBool = AtomicBool::new(false);
-/// Where COM1 and the four wires arrive at the I/O APIC: bit 31 set,
-/// bit 30 level-triggered, bit 29 active low, the GSI.
-static ROUTE: [AtomicU32; 5] = [const { AtomicU32::new(0) }; 5];
+/// Where COM1 and the PCI lines arrive at the I/O APIC: bit 31 set, bit
+/// 30 level-triggered, bit 29 active low, the GSI.
+static ROUTE: [AtomicU32; 1 + INTX_LINES.len()] = [const { AtomicU32::new(0) }; 1 + INTX_LINES.len()];
 
 /// A legacy line's place in `ROUTE`.
 fn slot(line: u8) -> Option<usize> {
@@ -122,23 +127,28 @@ fn set_route(line: u8, r: Route) {
     }
 }
 
-/// The legacy PCI interrupt lines, if this machine's routing is known:
-/// line `INTX_LINES[(device + pin - 1) % 4]` for a function on bus 0.
+/// The legacy PCI interrupt lines this machine's routing reaches (none
+/// where it is unknown).
 pub fn intx_lines() -> &'static [u8] {
-    if INTX_ROUTED.load(Ordering::Relaxed) {
-        &INTX_LINES
-    } else {
-        &[]
-    }
+    &INTX_LINES[..INTX_USED.load(Ordering::Relaxed)]
+}
+
+/// The line pin `pin` (1 to 4, INTA# to INTD#) of root-bus device
+/// `device` reaches, as `_PRT` says: its index among [`intx_lines`].
+pub fn intx_line(device: u8, pin: u8) -> Option<usize> {
+    let p = PIN_LINE.get(device as usize)?.get((pin as usize).checked_sub(1)?)?;
+    (p.load(Ordering::Relaxed) as usize).checked_sub(1)
 }
 
 /// Routes the legacy lines through the I/O APIC, once ACPI's tables are
-/// read: COM1 to the GSI the MADT says ISA IRQ 4 arrives on, and the four
-/// PCI wires to the GSIs the root bridge's `_PRT` gives slot 0's pins.
-/// The PCI bus server finds a function's wire as `(device + pin - 1) % 4`
-/// (slots 25 to 31 are the chipset's own), so the kernel offers the wires
-/// only if `_PRT` routes every slot below 25 that way, as on QEMU's q35.
-/// Without an I/O APIC, the PIC carries COM1 alone.
+/// read: COM1 to the GSI the MADT says ISA IRQ 4 arrives on, and PCI's
+/// pins as the root bridge's `_PRT` routes each device's: a line for each
+/// GSI it names (in the order first named, up to 8), which every pin
+/// routed there reaches. The PCI bus server asks which line a function's
+/// pin reaches (`IntxLine`), so any wiring works: QEMU's q35 rotates four
+/// wires and gives the chipset's slots four more, laptops route each
+/// integrated device its own way. Without an I/O APIC, the PIC carries
+/// COM1 alone.
 pub fn init_routing() {
     if !ioapic::init() {
         kprintln!("[ok] legacy interrupts: no I/O APIC, the 8259 PIC carries COM1; PCI's pins unrouted");
@@ -169,30 +179,46 @@ pub fn init_routing() {
         kprintln!("[ok] PCI interrupt pins: routing unknown (no _PRT), only MSI");
         return;
     };
-    let [Some(a), Some(b), Some(c), Some(d)] = routes[0] else {
-        kprintln!("[ok] PCI interrupt pins: _PRT gives slot 0 no route for every pin, only MSI");
-        return;
-    };
-    let wires = [a, b, c, d];
-    let rotated = (0..25).all(|dev| {
-        (0..4).all(|pin| routes[dev][pin].is_none_or(|r| r == wires[(dev + pin) % 4]))
-    });
-    if !rotated || wires.iter().any(|r| !ioapic::has(r.gsi)) {
-        kprintln!("[ok] PCI interrupt pins: _PRT's routing is not four rotated wires on this I/O APIC; only MSI");
+    let (mut used, mut pins, mut left) = (0, 0, 0);
+    for (dev, slot) in routes.iter().enumerate() {
+        for (pin, r) in slot.iter().enumerate() {
+            let Some(r) = *r else { continue };
+            // The line for its GSI, or a new one; none if the GSI is on no
+            // I/O APIC, or every line is taken.
+            let w = (0..used).find(|&w| route_of(INTX_LINES[w]).is_some_and(|l| l.gsi == r.gsi));
+            let w = match w {
+                Some(w) => w,
+                None if used < INTX_LINES.len() && ioapic::has(r.gsi) => {
+                    set_route(INTX_LINES[used], r);
+                    used += 1;
+                    used - 1
+                }
+                None => {
+                    left += 1;
+                    continue;
+                }
+            };
+            PIN_LINE[dev][pin].store(w as u8 + 1, Ordering::Relaxed);
+            pins += 1;
+        }
+    }
+    INTX_USED.store(used, Ordering::Relaxed);
+    if used == 0 {
+        kprintln!("[ok] PCI interrupt pins: _PRT routes none to this I/O APIC; only MSI");
         return;
     }
-    for (&line, &r) in INTX_LINES.iter().zip(&wires) {
-        set_route(line, r);
+    kprint!("[ok] PCI interrupt pins through the I/O APIC, as _PRT says: {pins} pins on {used} lines, at GSIs");
+    for (i, &line) in INTX_LINES[..used].iter().enumerate() {
+        if let Some(r) = route_of(line) {
+            kprint!("{} {}", if i == 0 { "" } else { "," }, r.gsi);
+        }
     }
-    INTX_ROUTED.store(true, Ordering::Relaxed);
-    kprintln!(
-        "[ok] PCI interrupt pins through the I/O APIC, as _PRT says: four wires at GSIs {}, {}, {}, {} ({})",
-        wires[0].gsi,
-        wires[1].gsi,
-        wires[2].gsi,
-        wires[3].gsi,
-        edge(wires[0])
-    );
+    let first = route_of(INTX_LINES[0]).map_or("", edge);
+    if left > 0 {
+        kprintln!(" ({first}); {left} pins left without (past 8 GSIs, or on no I/O APIC)");
+    } else {
+        kprintln!(" ({first})");
+    }
 }
 
 /// MSI vectors: interrupt lines `MSI_LINE_BASE ..` arrive on vectors

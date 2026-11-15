@@ -1015,6 +1015,9 @@ fn uefi_image(manifest: &str) -> Result<Image, String> {
     Ok(img)
 }
 
+/// The q35 chipset slot the x86-64 LDE test's RTL-8139 sits in.
+const LDE_SLOT: u8 = 0x1b;
+
 /// The x86-64 virtio-blk disk's device on bus 0, and the memory its test
 /// DMAR reserves for it: the BIOS area, which no firmware calls usable.
 const RESERVED_FOR: u8 = 0x10;
@@ -1253,9 +1256,15 @@ fn qemu_command(img: &Image) -> Command {
             "user,id=n0,net=10.0.3.0/24,dhcpstart=10.0.3.30,ipv6-net=fd00:3::/64,hostfwd=tcp:127.0.0.1:47004-:8080",
             "-device",
             // The cards Linux's drivers are for have no MSI: their
-            // interrupt is a legacy line.
-            img.linux_nic
-                .unwrap_or("virtio-net-pci,netdev=n0,disable-legacy=on,iommu_platform=on"),
+            // interrupt is a legacy line. On x86-64 the RTL-8139 sits in
+            // slot 27, one of the q35 chipset's, whose pins _PRT routes its
+            // own way rather than as the other slots' rotated wires: the
+            // bus server must ask the kernel which line its pin reaches.
+            &match img.linux_nic {
+                Some(nic) if img.arch == Arch::X86_64 && nic.starts_with("rtl8139") => format!("{nic},addr={LDE_SLOT:#x}"),
+                Some(nic) => nic.to_string(),
+                None => "virtio-net-pci,netdev=n0,disable-legacy=on,iommu_platform=on".to_string(),
+            },
         ]);
     }
     if img.radio {
@@ -2378,6 +2387,23 @@ fn net_test(arch: Arch, manifest: &str) -> Result<(), String> {
         None => &[],
     };
     check_log("Linux Driver Environment test", &out, linux)?;
+    // On x86-64 the RTL-8139 is in q35's chipset slot 27, whose INTA# _PRT
+    // routes to GSI 16, the fifth GSI it names: not where four rotated
+    // wires would put it (the fourth line, GSI 23). The kernel routes
+    // every slot's pins, and the bus server asks it which line the card's
+    // pin reaches.
+    if img.arch == Arch::X86_64 && lde == Some("8139cp") {
+        let slot = format!("lde 8139cp: 10ec:8139 at 00:{LDE_SLOT:02x}.0 opened");
+        check_log(
+            "Linux Driver Environment test",
+            &out,
+            &[
+                "[ok] PCI interrupt pins through the I/O APIC, as _PRT says: 128 pins on 8 lines, at GSIs 20, 21, 22, 23, 16, 17, 18, 19",
+                &slot,
+                "lde 8139cp: the device's legacy interrupt line (wire 4) is the driver's",
+            ],
+        )?;
+    }
     let ready = lde.map(|d| format!("lde {d}: Linux's {d} driver runs"));
     let steps = [
         ready.as_deref().unwrap_or("virtio-net: ready:"),

@@ -358,11 +358,13 @@ holds the rest):
     compiler (malformed descriptions are refused with their line) and checks the
     generated numbers against the hand-written interface the bus server answers.
   - Legacy PCI interrupts, for devices with no MSI: the kernel hands the root task
-    an IRQ capability for each of the bus's four interrupt wires (on x86-64 the
-    I/O APIC GSIs `_PRT` gives slot 0's pins, 20 to 23 on QEMU's q35, offered only
-    if `_PRT` routes every slot as those four wires rotated; on `virt` they are
-    shared interrupts 35 to 38), the bus server
-    works out which wire a function's pin drives (rotating through bridges) and
+    an IRQ capability for each interrupt input the firmware routes PCI's pins to,
+    up to eight (on x86-64 each I/O APIC GSI the root bridge's `_PRT` names, in
+    the order first named: GSIs 20 to 23 for QEMU q35's slots and 16 to 19 for
+    its chipset's, while a laptop routes each integrated device its own way; on
+    `virt` the four shared interrupts 35 to 38). The bus server follows a
+    function's pin up through its bridges (rotating it by device number), asks
+    the kernel which line that root-bus device and pin reaches (`IntxLine`), and
     gives that line to its driver (`pci::INTX`), one function a line. The kernel
     masks a level-triggered line as it signals; the driver unmasks it (`IrqAck`)
     once its device has let go.

@@ -44,7 +44,7 @@
 //! behind it keeps that window shut.
 //!
 //! I/O BARs get ports from a range the manifest may give (`device pci-io
-//! 84`). A driver does not get the ports themselves: it reads and writes
+//! 88`). A driver does not get the ports themselves: it reads and writes
 //! its BAR through this server (`pci::IO_READ`, `pci::IO_WRITE`), which
 //! keeps each access inside the BAR. `pci::CLOSE` gives a function back.
 //!
@@ -60,15 +60,17 @@
 //! bridge plugged in is not configured.
 //!
 //! Legacy interrupts: a function with no MSI gets the interrupt line
-//! its pin is wired to (`pci::INTX`), one function a line: the wire of a
-//! function on bus 0 is `(device + pin - 1) % 4`, and a bridge passes
-//! the pins of what is behind it on rotated by their device numbers.
+//! its pin is wired to (`pci::INTX`), one function a line. A bridge passes
+//! the pins of what is behind it on rotated by their device numbers; the
+//! root-bus device and pin that comes out on reach the line the kernel
+//! says (`IntxLine`), as the firmware routes them: any wiring, not just
+//! four rotated wires.
 //!
 //! Slots: 0 the `pci` endpoint (receive), 1 configuration space (I/O ports
 //! on x86-64, ECAM device memory on AArch64), 2 the BAR window (device
 //! memory), 3.. the MSI vectors, then the IOMMU-control capability (empty
 //! without an IOMMU) and untyped memory for the domains; from 80, if the
-//! manifest gives them (`device intx 80`), the four legacy PCI interrupt
+//! manifest gives them (`device intx 80`), the (up to 8) legacy PCI interrupt
 //! lines. Its CSpace has 2^7 slots.
 
 #![no_std]
@@ -105,13 +107,13 @@ const DOMAIN_BITS: u64 = 16;
 const NOTIFY: u64 = 78;
 /// Ticks between looks at the hot-plug slots (200 ms).
 const SLOT_POLL: u64 = 20;
-/// The legacy interrupt lines, one per wire.
+/// The legacy interrupt lines (up to 8).
 const INTX: u64 = 80;
 /// The I/O port range (ports on x86-64, a window of device memory on
 /// AArch64), and on AArch64 a slot for each page of it.
-const IO_PORTS: u64 = 84;
+const IO_PORTS: u64 = 88;
 #[cfg(target_arch = "aarch64")]
-const IO_PAGE_SLOTS: u64 = 85;
+const IO_PAGE_SLOTS: u64 = 89;
 #[cfg(target_arch = "aarch64")]
 const IO_PAGES: u64 = 16;
 const _: () = assert!(DOMAINS + MAX_OPEN as u64 <= INTX);
@@ -1209,7 +1211,9 @@ impl Bus {
     }
 
     /// Serves one call. Returns the reply and a capability to grant.
-    /// The interrupt wire function `i`'s pin drives.
+    /// The interrupt line function `i`'s pin reaches: its index among the
+    /// lines, as the kernel says the firmware routes the root-bus device
+    /// and pin it comes out on.
     fn wire(&self, i: usize) -> Option<usize> {
         let f = self.funcs[i].unwrap();
         let pin = self.read8(i, 0x3d) as usize;
@@ -1228,12 +1232,8 @@ impl Bus {
             let g = self.funcs[up].unwrap();
             (bus, dev) = (g.bus, g.dev as usize);
         }
-        // On QEMU's q35 the slots from 25 up are the chipset's, wired
-        // their own way.
-        if cfg!(target_arch = "x86_64") && dev >= 25 {
-            return None;
-        }
-        Some((pin + dev) % 4)
+        let r = syscall(Syscall::IntxLine, dev as u64, [pin as u64 + 1, 0, 0, 0]);
+        (r.status == 0 && r.msg[0] < INTX_COUNT as u64).then_some(r.msg[0] as usize)
     }
 
     /// Gives function `i` its legacy interrupt line: the slot of the

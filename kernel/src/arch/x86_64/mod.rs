@@ -318,6 +318,12 @@ pub fn intx_lines() -> &'static [u8] {
     interrupts::intx_lines()
 }
 
+/// Which of [`intx_lines`] pin `pin` (1 to 4) of root-bus device `device`
+/// reaches, as ACPI's `_PRT` says.
+pub fn intx_line(device: u8, pin: u8) -> Option<usize> {
+    interrupts::intx_line(device, pin)
+}
+
 /// Reads an I/O port the caller's capability grants.
 pub fn io_in(port: u16, width: u64) -> u64 {
     use x86_64::instructions::port::Port;
