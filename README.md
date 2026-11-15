@@ -1061,6 +1061,27 @@ holds the rest):
   launches it again; six screenshots must have every pixel right (the clock
   showing a minute from 09:41), and the watcher, itself a window manager,
   follows the apps' windows through it.
+- Maximising, app icons, a date and time zones (`window` version 9). A
+  resizable window has a maximise box between its close and minimise boxes:
+  pressed, its client is asked (`RESIZE`) for the size that fills the screen
+  above the panel, and the size it sets is taken at the screen's top left (it
+  is told, `MOVED`); pressed again, it is asked back to its old size and goes
+  back where it was. `DESCRIBE` says whether a window is maximised. A client
+  says what its window is with `SET_ICON` (the toolkit's icons, 8 by 8
+  pictures: app, person, wave, list, clock), and a manager asks with `ICON`;
+  a manifest's `icon NAME` gives a launcher its icon, which the Component
+  Manager tells the panel (`launch::OP_ICON`). The toolkit's `icon_button`
+  draws one before a button's text: the panel's launcher menu and task
+  buttons show them (the greeter a person, Hello a wave, the List app a
+  list). The panel's clock is now a button showing the date and time
+  ("Sat 14 Nov 09:41"), from the new `superior_objects::time` (civil dates,
+  weekdays, and zones with the EU's and the US's daylight-saving rules,
+  tested on the host against the real changeovers); pressed, it opens a menu
+  of time zones (UTC, London, Lagos, Berlin, New York, Tokyo) above it, and
+  the chosen zone's time is shown. `cargo xtask resize-test` now maximises the
+  greeter (600x400 at the top left, as big as it takes) and puts it back;
+  `cargo xtask panel-test` picks Lagos first (the clock then shows 10:41), and
+  its eight screenshots show the icons and the date.
 - Resizing windows by their frame (`window` version 7). A window styled
   `RESIZABLE` is resized by dragging any border of its frame (the top one is the
   strip above the title bar) or a corner: the compositor draws an outline of the size asked for
@@ -1211,7 +1232,7 @@ holds the rest):
   notifications, a 256-slot CNode pool) so filling them stays quick; normal kernels have
   32 of each, 32 address spaces and a 4096-slot pool.
 
-Not yet: in the compositor maximising; in the desktop shell app icons, time zones and a date; in the toolkit a clipboard shared between apps, and multi-line text; a hardware cursor plane,
+Not yet: in the desktop shell icons as image files and more time zones than its table; in the toolkit a clipboard shared between apps, and multi-line text; a hardware cursor plane,
 pointer events when a window moves or appears under a still pointer, keyboard
 layouts and key repeat (keys are USB usages), and surviving a client
 that dies at the very moment its window is read (the compositor then faults and

@@ -26,4 +26,5 @@ pub mod pages;
 pub mod model;
 #[cfg(test)]
 pub mod sim;
+pub mod time;
 pub mod untyped;

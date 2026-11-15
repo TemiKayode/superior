@@ -185,6 +185,7 @@ impl App {
             let made = (0..pages()).all(|p| ok(call(window::attach(n, p), Some(PAGE_SLOTS + p))))
                 && ok(call(window::style(n, window::DECORATED | window::RESIZABLE), None))
                 && ok(call(window::set_title(n, u64::from_le_bytes(*b"List\0\0\0\0"), 0), None))
+                && ok(call(window::set_icon(n, superior_toolkit::icon_by_name(b"list") as u64), None))
                 && ok(call(window::listen(n), Some(NTFN)));
             let all = Rect { x: 0, y: 0, w: self.ui.w, h: self.ui.h };
             if made && ok(call(window::commit(n, rect_word(all)), None)) {

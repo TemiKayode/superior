@@ -182,6 +182,8 @@ pub struct Component<'a> {
     pub install_control: bool,
     /// May start `start launch` components.
     pub launch_control: bool,
+    /// The icon a launcher shows for it (the toolkit's names), if any.
+    pub icon: &'a str,
     pub caps: [Option<CapSpec<'a>>; MAX_CAPS],
 }
 
@@ -205,6 +207,7 @@ impl<'a> Component<'a> {
             update_control: false,
             install_control: false,
             launch_control: false,
+            icon: "",
             caps: [None; MAX_CAPS],
         }
     }
@@ -449,6 +452,10 @@ impl<'a> Manifest<'a> {
                 }
                 "launch-control" => {
                     c.launch_control = true;
+                    None
+                }
+                "icon" => {
+                    c.icon = arg("icon needs a name")?;
                     None
                 }
                 "quota" => {
@@ -722,11 +729,12 @@ component memserver
         let m = Manifest::parse(
             "component compositor\n image compositor\n provides window 1\n\
              component panel\n image panel\n manages window 0\n control 1\n launch-control\n\
-             component app\n image app\n start launch\n uses window 0\n",
+             component app\n image app\n start launch\n icon wave\n uses window 0\n",
         )
         .unwrap();
         let (_, panel) = m.iter().nth(1).unwrap();
         assert!(panel.launch_control);
+        assert_eq!((panel.icon, m.iter().nth(2).unwrap().1.icon), ("", "wave"));
         assert_eq!(panel.caps().next().unwrap().kind, CapKind::Manages("window"));
         assert_eq!(m.iter().nth(2).unwrap().1.start, Start::Launch);
         assert_eq!(

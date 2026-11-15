@@ -2,11 +2,12 @@
 #
 # The panel, the desktop shell's strip along the bottom of the screen,
 # manages the compositor and may launch the two `start launch` apps from
-# its menu: the greeter and its "Hello" variant. The host launches both,
-# brings the greeter back in front from its task button, minimises it by
-# its minimise box and Hello by its task button, restores the greeter,
-# closes it and launches it again, through QEMU's monitor, and checks
-# every pixel of six screenshots (the panel's clock included). The
+# its menu: the greeter and its "Hello" variant (each with the icon named
+# here). The host picks Lagos from the clock's time zones, launches both
+# apps, brings the greeter back in front from its task button, minimises
+# it by its minimise box and Hello by its task button, restores the
+# greeter, closes it and launches it again, through QEMU's monitor, and
+# checks every pixel of eight screenshots (the panel's clock included). The
 # watcher, a window manager too, follows the apps' windows and shuts the
 # system down at the end.
 
@@ -80,6 +81,7 @@ component panel
 
 component greeter
   image greeter
+  icon person
   start launch
   restart never
   priority 8
@@ -91,6 +93,7 @@ component greeter
 
 component hello
   image greeter
+  icon wave
   arg 1
   start launch
   restart never

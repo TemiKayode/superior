@@ -781,6 +781,10 @@ pub mod launch {
     /// `[status]`: `InUse` if it is running, `NotFound` if there is no
     /// such component, `Denied` if it is not `start launch`.
     pub const OP_LAUNCH: u64 = 17;
+    /// `[OP_ICON, k]`: the icon (its name, as words) the manifest gives the
+    /// `k`th component with `start launch` (`icon`), none if it gives
+    /// none. Reply `[status, name words...]`, `NotFound` past the last.
+    pub const OP_ICON: u64 = 18;
 
     /// A name as three words.
     pub fn words(name: &[u8]) -> [u64; 3] {

@@ -46,7 +46,18 @@
 # or top border was dragged, the size it sets is taken from its right or
 # bottom edge, which stay where they were: the window moves, and is told
 # where to (`MOVED`).
-interface window version 8
+#
+# Maximising: a resizable decorated window has a maximise box between its
+# close and minimise boxes. Pressed, its client is asked (`RESIZE`) for
+# the size that fills the screen above any manager's windows along the
+# screen's bottom (the panel), the frame within that; the size it sets
+# is taken with the window moved to that space's top left (it is told,
+# `MOVED`). Pressed again, the client is asked for the size it had, and
+# the window goes back where it was.
+#
+# Icons: a client may say what its window is (`SET_ICON`), a number the
+# desktop shell draws a picture for, and a manager may ask (`ICON`).
+interface window version 9
 
 # The most windows on the screen, all clients together.
 const MAX_WINDOWS = 8
@@ -108,8 +119,8 @@ const WHEEL = 5
 # A button was pressed on the window's close box: its client should
 # close it.
 const CLOSE = 6
-# The window was dragged by its title bar: `a` is where it is now (x |
-# y << 16 on the screen).
+# The window was dragged by its title bar, or moved by a resize or a
+# maximise: `a` is where it is now (x | y << 16 on the screen).
 const MOVED = 7
 # To a manager's windows: the windows shown, their titles or the focus
 # changed.
@@ -144,8 +155,10 @@ const MIN_HEIGHT = 32
 # A decorated window's frame: the border's width all round, the title
 # bar's height between the top border and the window, and its close box,
 # a square at the title bar's right end that far from its top, bottom and
-# right. Its minimise box is the same square, that far left of the close
-# box: pressed, the window is minimised (see `MINIMISE`).
+# right. A resizable window's maximise box is the same square, that far
+# left of the close box; its minimise box (any window's) is the same
+# square again, that far left of the box before it: pressed, the window
+# is minimised (see `MINIMISE`).
 const BORDER = 2
 const TITLE = 18
 const CLOSE_BOX = 12
@@ -162,7 +175,7 @@ const TITLE_BYTES = 16
 # Sets the window's title: up to `TITLE_BYTES` of ASCII, `a` the first 8
 # (the first in its low byte) and `b` the next, a zero byte ending it
 # early. A decorated window shows as much of it as fits before its
-# minimise box.
+# boxes.
 op SET_TITLE = 11 (window, a, b)
 
 # A manager's: the windows shown (bit n for window n), the one with the
@@ -170,7 +183,8 @@ op SET_TITLE = 11 (window, a, b)
 op LIST = 12 () -> (shown, focus, minimised)
 
 # A manager's: window `window`'s title (as `SET_TITLE` takes it) and
-# whether it is a manager's own (bit 0 of `flags`) or minimised (bit 1).
+# whether it is a manager's own (bit 0 of `flags`), minimised (bit 1) or
+# maximised (bit 2).
 op DESCRIBE = 13 (window) -> (a, b, flags)
 
 # A manager's: puts window `window` in front of every other client's and
@@ -188,3 +202,10 @@ op SET_SIZE = 15 (window, size)
 # manager's, for any other client's window, or the window's own client's;
 # `Denied` for another client's.
 op MINIMISE = 16 (window)
+
+# Says what the window is: `icon`, a number the desktop shell knows
+# (the toolkit's icons; 0 none).
+op SET_ICON = 17 (window, icon)
+
+# A manager's: what window `window`'s client says it is (`SET_ICON`).
+op ICON = 18 (window) -> (icon)

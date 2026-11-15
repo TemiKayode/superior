@@ -49,10 +49,21 @@
 /// or top border was dragged, the size it sets is taken from its right or
 /// bottom edge, which stay where they were: the window moves, and is told
 /// where to (`MOVED`).
+///
+/// Maximising: a resizable decorated window has a maximise box between its
+/// close and minimise boxes. Pressed, its client is asked (`RESIZE`) for
+/// the size that fills the screen above any manager's windows along the
+/// screen's bottom (the panel), the frame within that; the size it sets
+/// is taken with the window moved to that space's top left (it is told,
+/// `MOVED`). Pressed again, the client is asked for the size it had, and
+/// the window goes back where it was.
+///
+/// Icons: a client may say what its window is (`SET_ICON`), a number the
+/// desktop shell draws a picture for, and a manager may ask (`ICON`).
 pub mod window {
     use crate::interfaces::Status;
 
-    pub const VERSION: u64 = 8;
+    pub const VERSION: u64 = 9;
 
     /// The most windows on the screen, all clients together.
     pub const MAX_WINDOWS: u64 = 8;
@@ -89,8 +100,8 @@ pub mod window {
     /// close it.
     pub const CLOSE: u64 = 6;
 
-    /// The window was dragged by its title bar: `a` is where it is now (x |
-    /// y << 16 on the screen).
+    /// The window was dragged by its title bar, or moved by a resize or a
+    /// maximise: `a` is where it is now (x | y << 16 on the screen).
     pub const MOVED: u64 = 7;
 
     /// To a manager's windows: the windows shown, their titles or the focus
@@ -122,8 +133,10 @@ pub mod window {
     /// A decorated window's frame: the border's width all round, the title
     /// bar's height between the top border and the window, and its close box,
     /// a square at the title bar's right end that far from its top, bottom and
-    /// right. Its minimise box is the same square, that far left of the close
-    /// box: pressed, the window is minimised (see `MINIMISE`).
+    /// right. A resizable window's maximise box is the same square, that far
+    /// left of the close box; its minimise box (any window's) is the same
+    /// square again, that far left of the box before it: pressed, the window
+    /// is minimised (see `MINIMISE`).
     pub const BORDER: u64 = 2;
 
     pub const TITLE: u64 = 18;
@@ -286,7 +299,7 @@ pub mod window {
     /// Sets the window's title: up to `TITLE_BYTES` of ASCII, `a` the first 8
     /// (the first in its low byte) and `b` the next, a zero byte ending it
     /// early. A decorated window shows as much of it as fits before its
-    /// minimise box.
+    /// boxes.
     pub const SET_TITLE: u64 = 11;
     /// The message of a `SET_TITLE` call.
     pub const fn set_title(window: u64, a: u64, b: u64) -> [u64; 4] {
@@ -320,7 +333,8 @@ pub mod window {
     }
 
     /// A manager's: window `window`'s title (as `SET_TITLE` takes it) and
-    /// whether it is a manager's own (bit 0 of `flags`) or minimised (bit 1).
+    /// whether it is a manager's own (bit 0 of `flags`), minimised (bit 1) or
+    /// maximised (bit 2).
     pub const DESCRIBE: u64 = 13;
     /// The message of a `DESCRIBE` call.
     pub const fn describe(window: u64) -> [u64; 4] {
@@ -371,5 +385,34 @@ pub mod window {
     /// The message of a `MINIMISE` call.
     pub const fn minimise(window: u64) -> [u64; 4] {
         [MINIMISE, window, 0, 0]
+    }
+
+    /// Says what the window is: `icon`, a number the desktop shell knows
+    /// (the toolkit's icons; 0 none).
+    pub const SET_ICON: u64 = 17;
+    /// The message of a `SET_ICON` call.
+    pub const fn set_icon(window: u64, icon: u64) -> [u64; 4] {
+        [SET_ICON, window, icon, 0]
+    }
+
+    /// A manager's: what window `window`'s client says it is (`SET_ICON`).
+    pub const ICON: u64 = 18;
+    /// The message of a `ICON` call.
+    pub const fn icon(window: u64) -> [u64; 4] {
+        [ICON, window, 0, 0]
+    }
+    /// What a `ICON` call answers.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct IconReply {
+        pub icon: u64,
+    }
+    /// Reads a `ICON` reply: its results, or the status it failed with.
+    pub fn icon_reply(m: [u64; 4]) -> Result<IconReply, Status> {
+        match Status::from_u64(m[0]) {
+            Status::Ok => Ok(IconReply {
+                icon: m[1],
+            }),
+            s => Err(s),
+        }
     }
 }

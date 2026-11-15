@@ -2967,6 +2967,8 @@ struct StyledWindow {
     /// Translucent: its pixel at (x, y) is as opaque as `translucence`.
     alpha: bool,
     decorated: bool,
+    /// Resizable: a maximise box between its close and minimise boxes.
+    resizable: bool,
     focused: bool,
     /// Its title, written in its title bar.
     title: &'static [u8],
@@ -3020,15 +3022,26 @@ impl StyledWindow {
             let cross = (3..c - 3).contains(&cx) && (cx == cy || cx + cy == c - 1);
             return Some(if cross { CLOSE_CROSS } else { CLOSE_COLOUR });
         }
-        // The minimise box, left of it: a bar along its bottom.
-        if (right - 2 * (m + c)..right - 2 * m - c).contains(&x) && (top + m..top + m + c).contains(&y) {
-            let (cx, cy) = (x + 2 * (m + c) - right, y - top - m);
+        // Box k from the right: [right - (k + 1)(m + c), that + c).
+        let boxes = if self.resizable { 3 } else { 2 };
+        let in_box = |k: usize| {
+            ((right - (k + 1) * (m + c)..right - (k + 1) * (m + c) + c).contains(&x) && (top + m..top + m + c).contains(&y))
+                .then(|| (x + (k + 1) * (m + c) - right, y - top - m))
+        };
+        // The maximise box, left of it: a square outline, its top thicker.
+        if let Some((cx, cy)) = in_box(1).filter(|_| self.resizable) {
+            let inside = (3..c - 3).contains(&cx) && (3..c - 3).contains(&cy);
+            let lit = inside && (cx == 3 || cx == c - 4 || cy <= 4 || cy == c - 4);
+            return Some(if lit { CLOSE_CROSS } else { CLOSE_COLOUR });
+        }
+        // The minimise box, left of the rest: a bar along its bottom.
+        if let Some((cx, cy)) = in_box(boxes - 1) {
             let bar = (3..c - 3).contains(&cx) && (c - 5..c - 3).contains(&cy);
             return Some(if bar { CLOSE_CROSS } else { CLOSE_COLOUR });
         }
         let (tx, ty) = (ax + TITLE_LEFT, top + TITLE_TOP);
-        // The characters wholly before the minimise box, less the gap.
-        let room = w.saturating_sub(TITLE_LEFT + TITLE_GAP + 2 * (m + c));
+        // The characters wholly before the boxes, less the gap.
+        let room = w.saturating_sub(TITLE_LEFT + TITLE_GAP + boxes * (m + c));
         let fits = (room / TITLE_SCALE + 1) / superior_toolkit::font::ADVANCE as usize;
         let title = &self.title[..self.title.len().min(fits)];
         if x >= tx && y >= ty {
@@ -3051,10 +3064,20 @@ fn windows_pictures() -> Vec<(Vec<StyledWindow>, Option<(usize, usize)>)> {
         size: (300, 200),
         alpha: false,
         decorated: true,
+        resizable: false,
         focused: false,
         title: b"",
     };
-    let b = StyledWindow { id: 1, at: (300, 220), size: (320, 240), alpha: true, decorated: true, focused: true, title: b"" };
+    let b = StyledWindow {
+        id: 1,
+        at: (300, 220),
+        size: (320, 240),
+        alpha: true,
+        decorated: true,
+        resizable: false,
+        focused: true,
+        title: b"",
+    };
     let dragged = StyledWindow { at: (300, 270), focused: true, ..a };
     vec![
         (vec![a, b], None),
@@ -3268,6 +3291,7 @@ fn check_toolkit(path: &Path, k: usize) -> Result<String, String> {
         size: GREETER_SIZE,
         alpha: false,
         decorated: true,
+        resizable: true,
         focused: true,
         title: b"Greeter",
     };
@@ -3406,58 +3430,113 @@ fn toolkit_test(arch: Arch) -> Result<(), String> {
 /// with the machine: the desktop shell's clock shows 09:41 at first.
 const RTC_BASE: &str = "base=2026-11-14T09:41:00,clock=vm";
 
-/// The times the desktop shell's clock may show in the test's
-/// screenshots: from 09:41 for a few minutes.
-const PANEL_CLOCKS: [&str; 5] = ["09:41", "09:42", "09:43", "09:44", "09:45"];
+/// Where every boot's clock starts, in seconds since 1970: 2026-11-14
+/// 09:41 UTC (`RTC_BASE`).
+const RTC_SECONDS: u64 = 1_794_649_260;
+
+/// How many minutes past 09:41 the desktop shell's clock may show in the
+/// test's screenshots.
+const PANEL_MINUTES: u64 = 5;
+
+/// The clock's text `minute` minutes past `RTC_SECONDS` in time zone
+/// `zone` (of `ZONES`), as the panel shows it.
+fn panel_clock(minute: u64, zone: usize) -> String {
+    use superior_objects::time::{ZONES, clock};
+    String::from_utf8(clock(&ZONES[zone], (RTC_SECONDS + minute * 60) as i64).to_vec()).unwrap()
+}
 
 /// The panel (user/panel): its height, and its layout for these windows
-/// (title, focused, minimised), with the menu open or not and the clock
+/// (title, focused, minimised), with a menu open or none and the clock
 /// showing `clock`, the same as the panel's `layout`.
 const PANEL_H: usize = 32;
 
-fn panel_ui(tasks: &[(&str, bool, bool)], menu_open: bool, clock: &str) -> superior_toolkit::Ui {
+/// Which of the panel's menus is open.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ShellMenu {
+    Closed,
+    Apps,
+    Zones,
+}
+
+/// The icon each test app's window has (its client's `SET_ICON`).
+fn task_icon(title: &str) -> u8 {
+    superior_toolkit::icon_by_name(match title {
+        "Greeter" => b"person",
+        "Hello" => b"wave",
+        _ => b"",
+    })
+}
+
+fn panel_ui(tasks: &[(&str, bool, bool)], menu: ShellMenu, clock: &str) -> superior_toolkit::Ui {
     let mut ui = superior_toolkit::Ui::row(SCREEN.0 as u32, PANEL_H as u32);
     let apps = ui.button("Apps");
-    ui.select(apps, menu_open);
+    ui.select(apps, menu == ShellMenu::Apps);
     for (title, focused, _) in tasks {
-        let id = ui.button(title);
+        let id = ui.icon_button(task_icon(title), title);
         ui.select(id, *focused);
     }
-    let c = ui.label(clock);
+    let c = ui.icon_button(superior_toolkit::icon_by_name(b"clock"), clock);
+    ui.select(c, menu == ShellMenu::Zones);
     ui.push_right(c);
     ui
 }
 
 /// The launcher menu (user/panel's `menu_layout`): a button for each of
-/// the apps boot/panel.manifest may launch, above the panel's left end.
+/// the apps boot/panel.manifest may launch (with the icon it names), above
+/// the panel's left end.
 const MENU_W: usize = 160;
 const MENU_H: usize = 8 + 2 * 34;
 const MENU_AT: (usize, usize) = (0, SCREEN.1 - PANEL_H - MENU_H);
 
 fn menu_ui() -> superior_toolkit::Ui {
     let mut ui = superior_toolkit::Ui::new(MENU_W as u32, MENU_H as u32);
-    for l in PANEL_LAUNCHERS {
-        ui.button(l);
+    for (l, icon) in PANEL_LAUNCHERS {
+        ui.icon_button(superior_toolkit::icon_by_name(icon.as_bytes()), l);
     }
     ui
 }
 
-/// The middle of the menu's button `k`, on the screen.
-fn menu_spot(k: usize) -> (usize, usize) {
-    let r = menu_ui().widget(k).rect;
-    (MENU_AT.0 + (r.x + r.w / 2) as usize, MENU_AT.1 + (r.y + r.h / 2) as usize)
+/// The time zones' menu (user/panel's `zone_layout`): a button for each
+/// zone, UTC chosen, above the panel's right end.
+const ZONES_H: usize = 8 + superior_objects::time::ZONES.len() * 34;
+const ZONES_AT: (usize, usize) = (SCREEN.0 - MENU_W, SCREEN.1 - PANEL_H - ZONES_H);
+
+fn zones_ui() -> superior_toolkit::Ui {
+    let mut ui = superior_toolkit::Ui::new(MENU_W as u32, ZONES_H as u32);
+    for (k, z) in superior_objects::time::ZONES.iter().enumerate() {
+        let id = ui.button(z.name);
+        ui.select(id, k == 0);
+    }
+    ui
 }
 
-/// The menu, with the pointer at `pointer` (on the screen) over it or not.
-fn menu_layer(pointer: Option<(usize, usize)>) -> Layer {
+/// The middle of button `k` of a menu laid out as `ui` at `at`, on the
+/// screen.
+fn menu_spot_of(ui: &superior_toolkit::Ui, at: (usize, usize), k: usize) -> (usize, usize) {
+    let r = ui.widget(k).rect;
+    (at.0 + (r.x + r.w / 2) as usize, at.1 + (r.y + r.h / 2) as usize)
+}
+
+fn menu_spot(k: usize) -> (usize, usize) {
+    menu_spot_of(&menu_ui(), MENU_AT, k)
+}
+
+/// A menu laid out as `ui` at `at`, with the pointer at `pointer` (on the
+/// screen) over it or not.
+fn menu_layer_of(mut ui: superior_toolkit::Ui, at: (usize, usize), pointer: Option<(usize, usize)>) -> Layer {
     use superior_toolkit::Event;
-    let mut ui = menu_ui();
-    if let Some((x, y)) = pointer.filter(|&(x, y)| x < MENU_W && (MENU_AT.1..MENU_AT.1 + MENU_H).contains(&y)) {
-        ui.event(Event::Pointer { x: (x - MENU_AT.0) as i32, y: (y - MENU_AT.1) as i32, buttons: 0 });
+    let size = (ui.w as usize, ui.h as usize);
+    let over = |&(x, y): &(usize, usize)| (at.0..at.0 + size.0).contains(&x) && (at.1..at.1 + size.1).contains(&y);
+    if let Some((x, y)) = pointer.filter(over) {
+        ui.event(Event::Pointer { x: (x - at.0) as i32, y: (y - at.1) as i32, buttons: 0 });
     }
-    let mut pixels = vec![0u32; MENU_W * MENU_H];
-    ui.draw(&mut superior_toolkit::Surface { px: &mut pixels, w: MENU_W as u32, h: MENU_H as u32 });
-    Layer { at: MENU_AT, size: (MENU_W, MENU_H), frame: None, pixels }
+    let mut pixels = vec![0u32; size.0 * size.1];
+    ui.draw(&mut superior_toolkit::Surface { px: &mut pixels, w: size.0 as u32, h: size.1 as u32 });
+    Layer { at, size, frame: None, pixels }
+}
+
+fn menu_layer(pointer: Option<(usize, usize)>) -> Layer {
+    menu_layer_of(menu_ui(), MENU_AT, pointer)
 }
 
 /// The middle of widget `id` of the panel, on the screen.
@@ -3485,7 +3564,7 @@ fn greeter_layer(hello: bool, focused: bool) -> Layer {
     Layer {
         at,
         size: GREETER_SIZE,
-        frame: Some(StyledWindow { id: 0, at, size: GREETER_SIZE, alpha: false, decorated: true, focused, title }),
+        frame: Some(StyledWindow { id: 0, at, size: GREETER_SIZE, alpha: false, decorated: true, resizable: true, focused, title }),
         pixels,
     }
 }
@@ -3493,9 +3572,9 @@ fn greeter_layer(hello: bool, focused: bool) -> Layer {
 /// The panel, laid out for `tasks` (the menu open or not, the clock at
 /// `clock`) with the pointer at `pointer` (on the screen) if it is on the
 /// panel.
-fn panel_layer(tasks: &[(&str, bool, bool)], menu_open: bool, clock: &str, pointer: Option<(usize, usize)>) -> Layer {
+fn panel_layer(tasks: &[(&str, bool, bool)], menu: ShellMenu, clock: &str, pointer: Option<(usize, usize)>) -> Layer {
     use superior_toolkit::Event;
-    let mut ui = panel_ui(tasks, menu_open, clock);
+    let mut ui = panel_ui(tasks, menu, clock);
     if let Some((x, y)) = pointer.filter(|&(_, y)| y >= SCREEN.1 - PANEL_H) {
         ui.event(Event::Pointer { x: x as i32, y: (y - (SCREEN.1 - PANEL_H)) as i32, buttons: 0 });
     }
@@ -3504,14 +3583,18 @@ fn panel_layer(tasks: &[(&str, bool, bool)], menu_open: bool, clock: &str, point
     Layer { at: (0, SCREEN.1 - PANEL_H), size: (SCREEN.0, PANEL_H), frame: None, pixels }
 }
 
-/// The apps boot/panel.manifest may launch, in manifest order.
-const PANEL_LAUNCHERS: &[&str] = &["greeter", "hello"];
+/// The apps boot/panel.manifest may launch, in manifest order, and their
+/// icons.
+const PANEL_LAUNCHERS: &[(&str, &str)] = &[("greeter", "person"), ("hello", "wave")];
 
 /// Where the desktop shell test's pointer goes: "Apps", the menu's two
 /// launchers, the greeter's and Hello's task buttons (with both apps'
-/// windows on the panel), and the greeter's minimise and close boxes.
+/// windows on the panel), the greeter's minimise and close boxes, the
+/// clock and the time zones' menu's Lagos.
 struct PanelSpots {
     apps: (usize, usize),
+    clock: (usize, usize),
+    lagos: (usize, usize),
     run: [(usize, usize); 2],
     greeter_task: (usize, usize),
     hello_task: (usize, usize),
@@ -3520,56 +3603,71 @@ struct PanelSpots {
 }
 
 fn panel_spots() -> PanelSpots {
-    let ui = panel_ui(&[("Greeter", false, false), ("Hello", true, false)], false, PANEL_CLOCKS[0]);
+    let ui = panel_ui(&[("Greeter", false, false), ("Hello", true, false)], ShellMenu::Closed, &panel_clock(0, 0));
     PanelSpots {
         apps: panel_spot(&ui, 0),
+        clock: panel_spot(&ui, 3),
+        lagos: menu_spot_of(&zones_ui(), ZONES_AT, 2),
         run: [menu_spot(0), menu_spot(1)],
         greeter_task: panel_spot(&ui, 1),
         hello_task: panel_spot(&ui, 2),
-        // A box CLOSE_BOX square, CLOSE_MARGIN left of the close box.
-        minimise: (TOOLKIT_CLOSE.0 - 15, TOOLKIT_CLOSE.1),
+        // A box CLOSE_BOX square, CLOSE_MARGIN left of the maximise box
+        // (the greeter is resizable), itself that far left of the close
+        // box.
+        minimise: (TOOLKIT_CLOSE.0 - 30, TOOLKIT_CLOSE.1),
         close: TOOLKIT_CLOSE,
     }
 }
 
 /// What each of the desktop shell test's screenshots must show, the
-/// clock at `clock`: the windows back to front, and where the pointer is.
-fn panel_pictures(clock: &str) -> Vec<(Vec<Layer>, Option<(usize, usize)>)> {
+/// clock `minute` minutes past 09:41 UTC (shown in UTC, then in Lagos):
+/// the windows back to front, and where the pointer is.
+fn panel_pictures(minute: u64) -> Vec<(Vec<Layer>, Option<(usize, usize)>)> {
+    use ShellMenu::*;
     let s = panel_spots();
-    let panel = |tasks: &[(&str, bool, bool)], open: bool, pointer: (usize, usize)| panel_layer(tasks, open, clock, Some(pointer));
+    let (utc, lagos) = (panel_clock(minute, 0), panel_clock(minute, 2));
+    let panel = |tasks: &[(&str, bool, bool)], menu: ShellMenu, pointer: (usize, usize)| {
+        panel_layer(tasks, menu, &lagos, Some(pointer))
+    };
     vec![
-        (vec![panel_layer(&[], false, clock, None)], None),
-        (vec![panel(&[], true, s.apps), menu_layer(Some(s.apps))], Some(s.apps)),
+        (vec![panel_layer(&[], Closed, &utc, None)], None),
+        (
+            vec![panel_layer(&[], Zones, &utc, Some(s.clock)), menu_layer_of(zones_ui(), ZONES_AT, Some(s.clock))],
+            Some(s.clock),
+        ),
+        (vec![panel_layer(&[], Closed, &lagos, Some(s.lagos))], Some(s.lagos)),
+        (vec![panel(&[], Apps, s.apps), menu_layer(Some(s.apps))], Some(s.apps)),
         (
             vec![
                 greeter_layer(false, false),
                 greeter_layer(true, true),
-                panel(&[("Greeter", false, false), ("Hello", true, false)], false, s.run[1]),
+                panel(&[("Greeter", false, false), ("Hello", true, false)], Closed, s.run[1]),
             ],
             Some(s.run[1]),
         ),
         (
-            vec![greeter_layer(true, true), panel(&[("Greeter", false, true), ("Hello", true, false)], false, s.minimise)],
+            vec![greeter_layer(true, true), panel(&[("Greeter", false, true), ("Hello", true, false)], Closed, s.minimise)],
             Some(s.minimise),
         ),
-        (vec![panel(&[("Greeter", false, true), ("Hello", false, true)], false, s.hello_task)], Some(s.hello_task)),
+        (vec![panel(&[("Greeter", false, true), ("Hello", false, true)], Closed, s.hello_task)], Some(s.hello_task)),
         (
-            vec![greeter_layer(false, true), panel(&[("Greeter", true, false), ("Hello", false, true)], false, s.run[0])],
+            vec![greeter_layer(false, true), panel(&[("Greeter", true, false), ("Hello", false, true)], Closed, s.run[0])],
             Some(s.run[0]),
         ),
     ]
 }
 
 /// Checks the desktop shell test's screenshot `k` (from 1) pixel by pixel,
-/// with the clock at any of the times it may show.
+/// with the clock at any of the minutes it may show.
 fn check_panel(path: &Path, k: usize) -> Result<String, String> {
     let mut last = Err(String::new());
-    for clock in PANEL_CLOCKS {
-        let (layers, pointer) = &panel_pictures(clock)[k - 1];
+    for minute in 0..PANEL_MINUTES {
+        let (layers, pointer) = &panel_pictures(minute)[k - 1];
         last = check_layers(path, k, layers, None, *pointer).map(|()| {
             format!(
-                "screenshot {k}: all {} pixels right: the panel (its clock at {clock}) and {} other window{}{}",
+                "screenshot {k}: all {} pixels right: the panel (its clock at 09:{} UTC, in the zone chosen) and {} other window{}{}",
                 SCREEN.0 * SCREEN.1,
+                41 + minute,
                 layers.len() - 1,
                 if layers.len() == 2 { "" } else { "s" },
                 pointer.map_or(String::new(), |(x, y)| format!(", the pointer at ({x}, {y})"))
@@ -3663,7 +3761,7 @@ fn greeter_drawn_at(ui: &superior_toolkit::Ui, at: (usize, usize)) -> Layer {
     Layer {
         at,
         size,
-        frame: Some(StyledWindow { id: 0, at, size, alpha: false, decorated: true, focused: true, title: b"Greeter" }),
+        frame: Some(StyledWindow { id: 0, at, size, alpha: false, decorated: true, resizable: true, focused: true, title: b"Greeter" }),
         pixels,
     }
 }
@@ -3671,7 +3769,9 @@ fn greeter_drawn_at(ui: &superior_toolkit::Ui, at: (usize, usize)) -> Layer {
 /// Where the resize test's pointer goes: the greeter's frame's
 /// bottom-right corner, dragged out, then in; once it is the least it
 /// takes, its top-left corner, dragged out (its bottom-right corner
-/// staying put, so it moves to `RESIZE_MOVED`); then its close box.
+/// staying put, so it moves to `RESIZE_MOVED`); its maximise box (it
+/// goes to `MAXIMISED_AT` as big as it takes), that box there (it comes
+/// back); then its close box.
 const RESIZE_CORNER: (usize, usize) = (541, 305);
 const RESIZE_OUT: (usize, usize) = (641, 365);
 const RESIZE_IN: (usize, usize) = (391, 245);
@@ -3679,6 +3779,9 @@ const RESIZE_TOP_LEFT: (usize, usize) = (258, 160);
 const RESIZE_LEFT_OUT: (usize, usize) = (208, 110);
 const RESIZE_MOVED: (usize, usize) = (210, 130);
 const RESIZE_CLOSE: (usize, usize) = (450, 120);
+const RESIZE_MAXIMISE: (usize, usize) = (436, 121);
+const MAXIMISED_AT: (usize, usize) = (2, 20);
+const MAXIMISED_BOX: (usize, usize) = (578, 11);
 
 /// A rectangle on the screen: x, y, width, height.
 type Area = (usize, usize, usize, usize);
@@ -3692,6 +3795,9 @@ fn resize_pictures() -> Vec<(Layer, Option<Area>, (usize, usize))> {
     let frame = |at: (usize, usize), size: (usize, usize)| (at.0 - b, at.1 - t - b, size.0 + 2 * b, size.1 + t + 2 * b);
     let mut grown = greeter_typed_ui(true);
     grown.resize(250, 174);
+    // Maximised: as big as it takes (600x400) at the screen's top left.
+    let mut big = greeter_typed_ui(true);
+    big.resize(600, 400);
     vec![
         (greeter_sized(GREETER_SIZE), Some(frame(GREETER_AT, (380, 184))), RESIZE_OUT),
         (greeter_sized((380, 184)), None, RESIZE_OUT),
@@ -3701,6 +3807,8 @@ fn resize_pictures() -> Vec<(Layer, Option<Area>, (usize, usize))> {
         (greeter_typed(true), None, TOOLKIT_FIELD),
         (greeter_typed(true), Some(frame(RESIZE_MOVED, (250, 174))), RESIZE_LEFT_OUT),
         (greeter_drawn_at(&grown, RESIZE_MOVED), None, RESIZE_LEFT_OUT),
+        (greeter_drawn_at(&big, MAXIMISED_AT), None, RESIZE_MAXIMISE),
+        (greeter_drawn_at(&grown, RESIZE_MOVED), None, MAXIMISED_BOX),
     ]
 }
 
@@ -3758,7 +3866,9 @@ fn resize_act(act: &Act, arch: Arch) -> Result<Option<String>, String> {
 /// takes that), types a name wider than its field there (it scrolls to
 /// show the cursor, and back with Home), drags its top-left corner out
 /// (it grows up and to the left, its bottom-right corner staying where it
-/// was), then closes it. Seven screenshots must have every pixel right.
+/// was), maximises it by its maximise box (it is as big as it takes at
+/// the screen's top left) and puts it back by that box, then closes it.
+/// Nine screenshots must have every pixel right.
 fn resize_test(arch: Arch) -> Result<(), String> {
     use Act::*;
     let img = image_with(false, arch, "resize")?;
@@ -3792,7 +3902,15 @@ fn resize_test(arch: Arch) -> Result<(), String> {
         (vec!["compositor: window 0: asking for 250x174"], vec![Shot(6), Button(false)]),
         (
             vec!["greeter: resized to 250x174 (status 0)"],
-            vec![Shot(7), to(RESIZE_LEFT_OUT, RESIZE_CLOSE), Button(true), Button(false)],
+            vec![Shot(7), to(RESIZE_LEFT_OUT, RESIZE_MAXIMISE), Button(true), Button(false)],
+        ),
+        (
+            vec!["greeter: resized to 600x400 (status 0)"],
+            vec![Shot(8), to(RESIZE_MAXIMISE, MAXIMISED_BOX), Button(true), Button(false)],
+        ),
+        (
+            vec!["2x greeter: resized to 250x174 (status 0)"],
+            vec![Shot(9), to(MAXIMISED_BOX, RESIZE_CLOSE), Button(true), Button(false)],
         ),
         (vec!["toolkit: the greeter's window is gone"], vec![]),
     ];
@@ -3810,6 +3928,16 @@ fn resize_test(arch: Arch) -> Result<(), String> {
         "compositor: window 0: asking for 250x174",
         "compositor: window 0 resized to 250x174",
         "compositor: window 0 moved to (210, 130) to keep its right and bottom edges",
+        "greeter: resized to 250x174 (status 0)",
+        "compositor: window 0: its maximise box was pressed",
+        "compositor: window 0 maximised: asked to be 796x578",
+        "compositor: window 0 resized to 600x400",
+        "compositor: window 0 moved to (2, 20)",
+        "greeter: resized to 600x400 (status 0)",
+        "compositor: window 0: its maximise box was pressed",
+        "compositor: window 0 asked back to 250x174 at (210, 130)",
+        "compositor: window 0 resized to 250x174",
+        "compositor: window 0 moved to (210, 130)",
         "greeter: resized to 250x174 (status 0)",
         "compositor: window 0: its close box was pressed",
         "greeter: closed",
@@ -3900,7 +4028,7 @@ impl ListUi {
         Layer {
             at,
             size,
-            frame: Some(StyledWindow { id: 0, at, size, alpha: false, decorated: true, focused: true, title: b"List" }),
+            frame: Some(StyledWindow { id: 0, at, size, alpha: false, decorated: true, resizable: true, focused: true, title: b"List" }),
             pixels,
         }
     }
@@ -4134,29 +4262,35 @@ fn panel_test(arch: Arch) -> Result<(), String> {
                 "absolute X and Y",
                 "compositor: input subscribed",
                 "panel: ready",
-                "panel: the clock shows 09:4",
+                "panel: the clock shows Sat 14 Nov 09:4",
                 "panel: windows: none",
             ],
-            with(Some(1), click(s.apps)),
+            with(Some(1), click(s.clock)),
         ),
-        (vec!["panel: menu open: greeter, hello"], with(Some(2), click(s.run[0]))),
+        (vec!["panel: time zones open: UTC chosen"], with(Some(2), click(s.lagos))),
+        (vec!["panel: the clock shows Sat 14 Nov 10:4"], with(Some(3), click(s.apps))),
+        (vec!["panel: menu open: greeter, hello"], with(Some(4), click(s.run[0]))),
         (vec!["greeter: ready", "panel: windows: \"Greeter\" (focused)"], with(None, click(s.apps))),
         (vec!["2x panel: menu open: greeter, hello"], with(None, click(s.run[1]))),
-        (vec!["hello: ready", "panel: windows: \"Greeter\", \"Hello\" (focused)"], with(Some(3), click(s.greeter_task))),
+        (vec!["hello: ready", "panel: windows: \"Greeter\", \"Hello\" (focused)"], with(Some(5), click(s.greeter_task))),
         (vec!["panel: windows: \"Greeter\" (focused), \"Hello\""], with(None, click(s.minimise))),
-        (vec!["panel: windows: \"Greeter\" (minimised), \"Hello\" (focused)"], with(Some(4), click(s.hello_task))),
-        (vec!["panel: windows: \"Greeter\" (minimised), \"Hello\" (minimised)"], with(Some(5), click(s.greeter_task))),
+        (vec!["panel: windows: \"Greeter\" (minimised), \"Hello\" (focused)"], with(Some(6), click(s.hello_task))),
+        (vec!["panel: windows: \"Greeter\" (minimised), \"Hello\" (minimised)"], with(Some(7), click(s.greeter_task))),
         (vec!["panel: windows: \"Greeter\" (focused), \"Hello\" (minimised)"], with(None, click(s.close))),
         (vec!["greeter: closed", "panel: windows: \"Hello\" (minimised)"], with(None, click(s.apps))),
         (vec!["3x panel: menu open: greeter, hello"], with(None, click(s.run[0]))),
-        (vec!["2x greeter: ready", "2x panel: windows: \"Greeter\" (focused), \"Hello\" (minimised)"], vec![Shot(6)]),
+        (vec!["2x greeter: ready", "2x panel: windows: \"Greeter\" (focused), \"Hello\" (minimised)"], vec![Shot(8)]),
     ];
     let (out, shots) = run_script(&img, arch, "desktop shell test", script, panel_act)?;
     let log = [
         "compositor: ready: the desktop on a 800x600 screen",
         "panel: windows: none",
         "panel: ready: 800x32 at the bottom, 2 launchers in its menu",
-        "panel: the clock shows 09:4",
+        "panel: the clock shows Sat 14 Nov 09:4",
+        "panel: time zones open: UTC chosen",
+        "panel: time zones closed",
+        "panel: time zone Lagos",
+        "panel: the clock shows Sat 14 Nov 10:4",
         "panel: menu open: greeter, hello",
         "panel: menu closed",
         "panel: launched greeter (status 0)",
@@ -4185,8 +4319,8 @@ fn panel_test(arch: Arch) -> Result<(), String> {
         "[cm] watcher asked to shut down (pass)",
     ];
     check_log("desktop shell test", &out, &log)?;
-    if shots != 6 {
-        return Err(format!("desktop shell test: {shots} screenshots taken, want 6"));
+    if shots != 8 {
+        return Err(format!("desktop shell test: {shots} screenshots taken, want 8"));
     }
     println!("== desktop shell test passed ({})", arch.name());
     Ok(())

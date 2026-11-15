@@ -1,13 +1,16 @@
 //! The desktop shell's panel: a strip along the bottom of the screen,
 //! drawn with the toolkit. At its left an "Apps" button opens the launcher
 //! menu, a window above it with a button for each `start launch`
-//! component in the manifest: pressing one asks the Component Manager to
-//! start it and closes the menu (as does "Apps" again). Then a button for
-//! each other client's window (its title), the one with the keyboard focus
-//! selected: pressing one puts that window in front with the focus
-//! (drawing it again if it was minimised), or minimises it if it already
-//! had the focus. At its right a clock: the time of day (UTC, hours and
-//! minutes) from the kernel's real-time clock (`Time`).
+//! component in the manifest (with the icon its manifest names): pressing
+//! one asks the Component Manager to start it and closes the menu (as does
+//! "Apps" again). Then a button for each other client's window (its icon
+//! and title), the one with the keyboard focus selected: pressing one puts
+//! that window in front with the focus (drawing it again if it was
+//! minimised), or minimises it if it already had the focus. At its right
+//! a clock: the date and time of day ("Sat 14 Nov 09:41") in a time zone,
+//! from the kernel's real-time clock (`Time`). Pressing it opens a menu of
+//! time zones above it (UTC at first); pressing one shows the clock in
+//! that zone, its daylight saving and all.
 //!
 //! It manages the compositor (`manages window`): it may list, describe,
 //! activate and minimise every window, the compositor tells its window
@@ -28,8 +31,9 @@
 use superior_objects::abi::{CapTransfer, ObjectType, Syscall};
 use superior_objects::idl::window;
 use superior_objects::interfaces::launch;
+use superior_objects::time::{self, ZONES};
 use superior_sys::{USER_BASE, print_line, syscall, syscall_x};
-use superior_toolkit::{BOX_H, Event, Id, PAD, Rect, Surface, Ui};
+use superior_toolkit::{BOX_H, Event, Id, PAD, Rect, Surface, Ui, icon_by_name};
 
 const WINDOWS: u64 = 0;
 const MANAGER: u64 = 1;
@@ -43,10 +47,11 @@ const HEIGHT: u32 = 32;
 const MAX_PAGES: u64 = (1024 * HEIGHT as u64 * 4).div_ceil(4096);
 const MAX_LAUNCHERS: usize = 6;
 const MAX_TASKS: usize = window::MAX_WINDOWS as usize;
-/// The launcher menu: its width, the most pages it takes (a button for
-/// every launcher), and where they go.
+/// The menu (the launchers or the time zones): its width, the most pages
+/// it takes (a button for every launcher or zone), and where they go.
 const MENU_W: u32 = 160;
-const MENU_PAGES: u64 = (MENU_W as u64 * menu_height(MAX_LAUNCHERS) as u64 * 4).div_ceil(4096);
+const MENU_ROWS: usize = if MAX_LAUNCHERS > ZONES.len() { MAX_LAUNCHERS } else { ZONES.len() };
+const MENU_PAGES: u64 = (MENU_W as u64 * menu_height(MENU_ROWS) as u64 * 4).div_ceil(4096);
 const MENU_SLOTS: u64 = PAGE_SLOTS + MAX_PAGES;
 const MENU_VA: u64 = VA + 0x10_0000;
 
@@ -73,11 +78,15 @@ fn rect_word(r: Rect) -> u64 {
     r.x as u64 | (r.y as u64) << 16 | (r.w as u64) << 32 | (r.h as u64) << 48
 }
 
-/// The clock's text for `seconds` since 1970 (UTC): hours and minutes.
-fn clock_text(seconds: Option<u64>) -> [u8; 5] {
-    let Some(s) = seconds else { return *b"--:--" };
-    let (h, m) = (s / 3600 % 24, s / 60 % 60);
-    [b'0' + (h / 10) as u8, b'0' + (h % 10) as u8, b':', b'0' + (m / 10) as u8, b'0' + (m % 10) as u8]
+/// The clock's text for `seconds` since 1970 (UTC) in time zone `zone`
+/// (of `ZONES`): the date and the time of day.
+fn clock_text(seconds: Option<u64>, zone: usize) -> [u8; 16] {
+    let Some(s) = seconds else { return *b"--- -- --- --:--" };
+    time::clock(&ZONES[zone], s as i64)
+}
+
+fn text(t: &[u8]) -> &str {
+    core::str::from_utf8(t).unwrap_or("?")
 }
 
 /// A short name or title, held inline.
@@ -103,32 +112,51 @@ struct Task {
     title: Name,
     focused: bool,
     minimised: bool,
+    icon: u8,
 }
 
-const NO_TASK: Task = Task { window: 0, title: Name::EMPTY, focused: false, minimised: false };
+const NO_TASK: Task = Task { window: 0, title: Name::EMPTY, focused: false, minimised: false, icon: 0 };
 
-/// Lays the panel out: "Apps" (selected while the menu is open), a button
-/// for each of `tasks` (the focused one selected), then the clock at the
-/// right end. "Apps" is button 0, the tasks' buttons follow in order, and
-/// the clock is last.
-fn layout(ui: &mut Ui, tasks: &[Task], menu_open: bool, clock: &[u8; 5]) {
+/// Which menu is open.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Menu {
+    Launchers,
+    Zones,
+}
+
+/// Lays the panel out: "Apps" (selected while the launcher menu is open),
+/// a button for each of `tasks` (the focused one selected), then the clock
+/// at the right end (selected while the time zones' menu is open). "Apps"
+/// is button 0, the tasks' buttons follow in order, and the clock is last.
+fn layout(ui: &mut Ui, tasks: &[Task], menu: Option<Menu>, clock: &[u8; 16]) {
     ui.clear();
     let apps = ui.button("Apps");
-    ui.select(apps, menu_open);
+    ui.select(apps, menu == Some(Menu::Launchers));
     for t in tasks {
-        let id = ui.button(if t.title.len == 0 { "untitled" } else { t.title.as_str() });
+        let id = ui.icon_button(t.icon, if t.title.len == 0 { "untitled" } else { t.title.as_str() });
         ui.select(id, t.focused);
     }
-    let c = ui.label(core::str::from_utf8(clock).unwrap_or("--:--"));
+    let c = ui.icon_button(icon_by_name(b"clock"), text(clock));
+    ui.select(c, menu == Some(Menu::Zones));
     ui.push_right(c);
 }
 
-/// Lays the launcher menu out: a button for each of `launchers`, in a
-/// column.
-fn menu_layout(ui: &mut Ui, launchers: &[Name]) {
+/// Lays the launcher menu out: a button for each of `launchers` (with its
+/// icon of `icons`), in a column.
+fn menu_layout(ui: &mut Ui, launchers: &[Name], icons: &[u8]) {
     ui.clear();
-    for l in launchers {
-        ui.button(l.as_str());
+    for (l, &icon) in launchers.iter().zip(icons) {
+        ui.icon_button(icon, l.as_str());
+    }
+}
+
+/// Lays the time zones' menu out: a button for each of `ZONES`, in a
+/// column, `zone`'s selected.
+fn zone_layout(ui: &mut Ui, zone: usize) {
+    ui.clear();
+    for (k, z) in ZONES.iter().enumerate() {
+        let id = ui.button(z.name);
+        ui.select(id, k == zone);
     }
 }
 
@@ -202,12 +230,18 @@ impl Own {
 struct Panel {
     bar: Own,
     menu: Own,
+    /// Which menu is open, if one is.
+    open: Option<Menu>,
     launchers: [Name; MAX_LAUNCHERS],
+    icons: [u8; MAX_LAUNCHERS],
     nlaunchers: usize,
     tasks: [Task; MAX_TASKS],
     ntasks: usize,
     at: (u64, u64),
-    clock: [u8; 5],
+    width: u32,
+    clock: [u8; 16],
+    /// The clock's time zone, of `ZONES`.
+    zone: usize,
     /// Where the pointer last was on the panel (it is laid out anew under
     /// it), none once it left.
     pointer: Option<(i32, i32)>,
@@ -225,23 +259,39 @@ impl Panel {
         false
     }
 
-    fn menu_open(&self) -> bool {
-        self.menu.window.is_some()
+    /// The panel's button that opens `menu`.
+    fn opener(&self, menu: Menu) -> Id {
+        if menu == Menu::Launchers { 0 } else { self.bar.ui.len() - 1 }
     }
 
-    /// Opens the launcher menu above "Apps", or closes it if it is open.
-    fn toggle_menu(&mut self) {
-        if self.menu_open() {
-            self.close_menu();
+    /// Opens `menu` (the launchers above "Apps", the time zones above the
+    /// clock), or closes it if it is open; another menu open closes.
+    fn toggle_menu(&mut self, menu: Menu) {
+        let was = self.open;
+        self.close_menu();
+        if was == Some(menu) {
             return;
         }
+        let rows = if menu == Menu::Launchers { self.nlaunchers.max(1) } else { ZONES.len() };
+        self.menu.ui = Ui::new(MENU_W, menu_height(rows));
+        let x = match menu {
+            Menu::Launchers => {
+                menu_layout(&mut self.menu.ui, &self.launchers[..self.nlaunchers], &self.icons);
+                0
+            }
+            Menu::Zones => {
+                zone_layout(&mut self.menu.ui, self.zone);
+                self.width.saturating_sub(MENU_W) as u64
+            }
+        };
         let h = self.menu.ui.h;
-        if self.menu.create((0, self.at.1.saturating_sub(h as u64)), MENU_SLOTS) {
+        if self.menu.create((x, self.at.1.saturating_sub(h as u64)), MENU_SLOTS) {
+            self.open = Some(menu);
             self.menu.show_all();
-            let d = self.bar.ui.select(0, true);
+            let d = self.bar.ui.select(self.opener(menu), true);
             self.bar.show(d);
-            struct Launchers<'a>(&'a [Name]);
-            impl core::fmt::Display for Launchers<'_> {
+            struct Names<'a>(&'a [Name]);
+            impl core::fmt::Display for Names<'_> {
                 fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
                     for (k, l) in self.0.iter().enumerate() {
                         write!(f, "{}{}", if k > 0 { ", " } else { "" }, l.as_str())?;
@@ -249,18 +299,22 @@ impl Panel {
                     Ok(())
                 }
             }
-            say!("menu open: {}", Launchers(&self.launchers[..self.nlaunchers]));
+            if menu == Menu::Launchers {
+                say!("menu open: {}", Names(&self.launchers[..self.nlaunchers]));
+            } else {
+                say!("time zones open: {} chosen", ZONES[self.zone].name);
+            }
         }
     }
 
     fn close_menu(&mut self) {
-        let Some(n) = self.menu.window.take() else { return };
-        let _ = call(window::destroy(n), None);
-        // Its buttons' state goes with it.
-        menu_layout(&mut self.menu.ui, &self.launchers[..self.nlaunchers]);
-        let d = self.bar.ui.select(0, false);
+        let Some(menu) = self.open.take() else { return };
+        if let Some(n) = self.menu.window.take() {
+            let _ = call(window::destroy(n), None);
+        }
+        let d = self.bar.ui.select(self.opener(menu), false);
         self.bar.show(d);
-        say!("menu closed");
+        say!("{} closed", if menu == Menu::Launchers { "menu" } else { "time zones" });
     }
 
     /// Asks the compositor which windows there are; if they changed (or
@@ -282,7 +336,8 @@ impl Panel {
             title.bytes = bytes;
             title.len = len.min(window::TITLE_BYTES as usize);
             let minimised = list[3] & 1 << w != 0;
-            tasks[n] = Task { window: w, title, focused: list[2] == w, minimised };
+            let icon = call(window::icon(w), None).filter(|m| m[0] == 0).map_or(0, |m| m[1] as u8);
+            tasks[n] = Task { window: w, title, focused: list[2] == w, minimised, icon };
             n += 1;
         }
         if !all && tasks[..n] == self.tasks[..self.ntasks] {
@@ -296,25 +351,24 @@ impl Panel {
 
     /// Lays the panel out anew (under the pointer) and shows all of it.
     fn lay_out(&mut self) {
-        let open = self.menu_open();
-        layout(&mut self.bar.ui, &self.tasks[..self.ntasks], open, &self.clock);
+        layout(&mut self.bar.ui, &self.tasks[..self.ntasks], self.open, &self.clock);
         if let Some((x, y)) = self.pointer {
             self.bar.ui.event(Event::Pointer { x, y, buttons: 0 });
         }
         self.bar.show_all();
     }
 
-    /// The clock shows the time now, if the minute changed.
+    /// The clock shows the time now, if the minute (or the zone) changed.
     fn tick(&mut self) {
-        let now = clock_text(superior_sys::time());
+        let now = clock_text(superior_sys::time(), self.zone);
         if now == self.clock {
             return;
         }
         self.clock = now;
         let id = self.bar.ui.len() - 1;
-        let d = self.bar.ui.set_text(id, core::str::from_utf8(&now).unwrap_or("--:--"));
+        let d = self.bar.ui.set_text(id, text(&now));
         self.bar.show(d);
-        say!("the clock shows {}", core::str::from_utf8(&now).unwrap_or("?"));
+        say!("the clock shows {} ({})", text(&now), ZONES[self.zone].name);
     }
 
     fn say_tasks(&self) {
@@ -346,7 +400,11 @@ impl Panel {
     /// has the focus.
     fn clicked(&mut self, id: Id) {
         if id == 0 {
-            self.toggle_menu();
+            self.toggle_menu(Menu::Launchers);
+            return;
+        }
+        if id == self.bar.ui.len() - 1 {
+            self.toggle_menu(Menu::Zones);
             return;
         }
         let Some(&t) = self.tasks[..self.ntasks].get(id - 1) else { return };
@@ -391,14 +449,28 @@ impl Panel {
         }
     }
 
+    /// Zone `k` in the time zones' menu was clicked: the menu closes and
+    /// the clock shows that zone's time.
+    fn choose_zone(&mut self, k: usize) {
+        if k >= ZONES.len() {
+            return;
+        }
+        self.close_menu();
+        self.zone = k;
+        say!("time zone {}", ZONES[k].name);
+        self.tick();
+    }
+
     fn menu_event(&mut self, kind: u64, a: u64, b: u64) {
         let clicked = match kind {
             window::POINTER => self.menu.pointer(Some((a, b))),
             window::LEAVE => self.menu.pointer(None),
             _ => None,
         };
-        if let Some(k) = clicked {
-            self.launch(k);
+        match (clicked, self.open) {
+            (Some(k), Some(Menu::Launchers)) => self.launch(k),
+            (Some(k), Some(Menu::Zones)) => self.choose_zone(k),
+            _ => {}
         }
     }
 }
@@ -431,6 +503,7 @@ pub extern "C" fn _start(_: u64) -> ! {
         superior_sys::park()
     }
     let mut launchers = [Name::EMPTY; MAX_LAUNCHERS];
+    let mut icons = [0; MAX_LAUNCHERS];
     let mut nlaunchers = 0;
     while nlaunchers < MAX_LAUNCHERS {
         let r = syscall(Syscall::Call, MANAGER, [launch::OP_LAUNCHERS, nlaunchers as u64, 0, 0]);
@@ -439,19 +512,26 @@ pub extern "C" fn _start(_: u64) -> ! {
         }
         let (bytes, len) = launch::name([r.msg[1], r.msg[2], r.msg[3]]);
         launchers[nlaunchers] = Name { bytes, len };
+        let r = syscall(Syscall::Call, MANAGER, [launch::OP_ICON, nlaunchers as u64, 0, 0]);
+        if r.status == 0 && r.msg[0] == 0 {
+            let (bytes, len) = launch::name([r.msg[1], r.msg[2], r.msg[3]]);
+            icons[nlaunchers] = icon_by_name(&bytes[..len]);
+        }
         nlaunchers += 1;
     }
-    let mut menu = Ui::new(MENU_W, menu_height(nlaunchers.max(1)));
-    menu_layout(&mut menu, &launchers[..nlaunchers]);
     let mut p = Panel {
         bar: Own { ui: Ui::row(width, HEIGHT), window: None, va: VA },
-        menu: Own { ui: menu, window: None, va: MENU_VA },
+        menu: Own { ui: Ui::new(MENU_W, menu_height(1)), window: None, va: MENU_VA },
+        open: None,
         launchers,
+        icons,
         nlaunchers,
         tasks: [NO_TASK; MAX_TASKS],
         ntasks: 0,
         at: (0, (height - HEIGHT) as u64),
-        clock: clock_text(superior_sys::time()),
+        width,
+        clock: clock_text(superior_sys::time(), 0),
+        zone: 0,
         pointer: None,
     };
     if !p.open() {
@@ -459,7 +539,7 @@ pub extern "C" fn _start(_: u64) -> ! {
         superior_sys::park()
     }
     say!("ready: {}x{} at the bottom, {} launchers in its menu", width, HEIGHT, p.nlaunchers);
-    say!("the clock shows {}", core::str::from_utf8(&p.clock).unwrap_or("?"));
+    say!("the clock shows {} ({})", text(&p.clock), ZONES[p.zone].name);
     loop {
         syscall(Syscall::TimerSignal, NTFN, [20, 0, 0, 0]);
         syscall(Syscall::Wait, NTFN, [0; 4]);
@@ -484,6 +564,7 @@ pub extern "C" fn _start(_: u64) -> ! {
         if restarted {
             say!("the compositor restarted; making the panel again");
             p.menu.window = None;
+            p.open = None;
             p.open();
         }
         p.tick();

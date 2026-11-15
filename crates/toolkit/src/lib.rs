@@ -70,6 +70,33 @@ pub const SELECTION: u32 = 0x00b4_d0f0;
 pub const SELECTION_IDLE: u32 = 0x00d8_dce2;
 /// A scroll bar's thumb.
 pub const THUMB: u32 = 0x00a0_a8b2;
+/// An icon's colour.
+pub const ICON_INK: u32 = 0x0035_6a9e;
+
+/// Icons: 8 by 8 pictures (a byte a row, its top bit the left pixel),
+/// drawn `SCALE` times as big on a button before its text. 0 is none; a
+/// window's client says which is its (`window` `SET_ICON`), and a
+/// component's manifest names one (`icon`).
+pub const ICON_SIZE: u32 = 8 * SCALE;
+/// The gap between an icon and its button's text.
+pub const ICON_GAP: u32 = 4;
+pub const ICONS: [(&str, [u8; 8]); 5] = [
+    // A window.
+    ("app", [0xff, 0xff, 0x81, 0x81, 0x81, 0x81, 0x81, 0xff]),
+    // Head and shoulders.
+    ("person", [0x3c, 0x3c, 0x3c, 0x18, 0x7e, 0xff, 0xff, 0xff]),
+    // Two waves.
+    ("wave", [0x00, 0x66, 0x99, 0x00, 0x00, 0x66, 0x99, 0x00]),
+    // Lines of a list, each with a bullet.
+    ("list", [0x00, 0xdf, 0x00, 0xdf, 0x00, 0xdf, 0x00, 0xdf]),
+    // A clock face.
+    ("clock", [0x3c, 0x52, 0x91, 0x9d, 0x81, 0x81, 0x42, 0x3c]),
+];
+
+/// The icon called `name` (its number, from 1), or 0 if none is.
+pub fn icon_by_name(name: &[u8]) -> u8 {
+    ICONS.iter().position(|(n, _)| n.as_bytes() == name).map_or(0, |k| k as u8 + 1)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct Rect {
@@ -258,6 +285,8 @@ pub struct Widget {
     /// others on its line leave.
     line: Id,
     stretch: bool,
+    /// A button's icon (see [`ICONS`]), 0 if none.
+    pub icon: u8,
 }
 
 impl Widget {
@@ -472,6 +501,7 @@ impl Ui {
             count: 0,
             line: 0,
             stretch: false,
+            icon: 0,
         };
         Ui {
             w,
@@ -597,6 +627,7 @@ impl Ui {
             count: 0,
             line,
             stretch,
+            icon: 0,
         };
         self.len += 1;
         if !self.row {
@@ -655,6 +686,18 @@ impl Ui {
     pub fn button(&mut self, text: &str) -> Id {
         let w = font::width(text.as_bytes(), SCALE) + 2 * BUTTON_SIDE;
         self.add(Kind::Button, w, BOX_H, text.as_bytes())
+    }
+
+    /// A button with icon `icon` (see [`ICONS`]; 0 for none, a plain
+    /// button) before its text.
+    pub fn icon_button(&mut self, icon: u8, text: &str) -> Id {
+        if !(1..=ICONS.len() as u8).contains(&icon) {
+            return self.button(text);
+        }
+        let w = font::width(text.as_bytes(), SCALE) + 2 * BUTTON_SIDE + ICON_SIZE + ICON_GAP;
+        let id = self.add(Kind::Button, w, BOX_H, text.as_bytes());
+        self.widgets[id].icon = icon;
+        id
     }
 
     /// An empty text field, the window's width (on a line, what the others
@@ -822,7 +865,18 @@ impl Ui {
                 s.fill(r, face);
                 s.outline(r, EDGE);
                 let tw = font::width(t, SCALE);
-                s.text(r.x + (r.w - tw.min(r.w)) / 2, r.y + (r.h - th) / 2, t, SCALE, INK);
+                if let Some((_, rows)) = ICONS.get((w.icon as usize).wrapping_sub(1)) {
+                    let (ix, iy) = (r.x + BUTTON_SIDE, r.y + (r.h - ICON_SIZE) / 2);
+                    for (y, row) in rows.iter().enumerate() {
+                        for x in (0..8).filter(|x| row & 0x80 >> x != 0) {
+                            let at = Rect { x: ix + x * SCALE, y: iy + y as u32 * SCALE, w: SCALE, h: SCALE };
+                            s.fill(at, ICON_INK);
+                        }
+                    }
+                    s.text(ix + ICON_SIZE + ICON_GAP, r.y + (r.h - th) / 2, t, SCALE, INK);
+                } else {
+                    s.text(r.x + (r.w - tw.min(r.w)) / 2, r.y + (r.h - th) / 2, t, SCALE, INK);
+                }
             }
             Kind::Field => {
                 s.fill(r, FIELD);
@@ -1603,5 +1657,22 @@ mod tests {
         let ty = 32 + (26 - 14) / 2;
         assert_eq!(s.px[((ty - 1) * 280 + 14 + 2 * 12 + 4) as usize], SELECTION);
         assert_eq!(s.px[((ty - 1) * 280 + 14 + 1 * 12 + 4) as usize], FIELD);
+    }
+
+    #[test]
+    fn an_icon_button_draws_its_icon_before_its_text() {
+        assert_eq!(icon_by_name(b"wave"), 3);
+        assert_eq!(icon_by_name(b"nothing"), 0);
+        let mut ui = Ui::row(800, 32);
+        let a = ui.icon_button(icon_by_name(b"wave"), "Hello");
+        let b = ui.icon_button(0, "Hello");
+        assert_eq!(ui.widget(a).rect, Rect { x: 8, y: 3, w: 82 + ICON_SIZE + ICON_GAP, h: 26 });
+        assert_eq!(ui.widget(b).rect.w, 82);
+        let mut px = [0u32; 800 * 32];
+        let mut s = Surface { px: &mut px, w: 800, h: 32 };
+        ui.draw(&mut s);
+        // The wave's second row, 0x66: its second pixel lit, its first not.
+        assert_eq!(s.px[(10 * 800 + 22) as usize], ICON_INK);
+        assert_eq!(s.px[(10 * 800 + 20) as usize], FACE);
     }
 }

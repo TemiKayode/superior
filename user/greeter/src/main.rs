@@ -41,11 +41,13 @@ struct Variant {
     name: &'static str,
     title: &'static [u8],
     at: (u64, u64),
+    /// Its window's icon (the toolkit's name).
+    icon: &'static [u8],
 }
 
 const VARIANTS: [Variant; 2] = [
-    Variant { name: "greeter", title: b"Greeter", at: (260, 180) },
-    Variant { name: "hello", title: b"Hello", at: (330, 250) },
+    Variant { name: "greeter", title: b"Greeter", at: (260, 180), icon: b"person" },
+    Variant { name: "hello", title: b"Hello", at: (330, 250), icon: b"wave" },
 ];
 
 static VARIANT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
@@ -146,6 +148,7 @@ impl App {
             let made = (0..pages()).all(|p| ok(call(window::attach(n, p), Some(PAGE_SLOTS + p))))
                 && ok(call(window::style(n, window::DECORATED | window::RESIZABLE), None))
                 && ok(call(window::set_title(n, a, b), None))
+                && ok(call(window::set_icon(n, superior_toolkit::icon_by_name(variant().icon) as u64), None))
                 && ok(call(window::listen(n), Some(NTFN)));
             let all = Rect { x: 0, y: 0, w: self.ui.w, h: self.ui.h };
             if made && ok(call(window::commit(n, rect_word(all)), None)) {

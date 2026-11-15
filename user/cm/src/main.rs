@@ -1628,12 +1628,14 @@ pub extern "C" fn _start(arg: u64) -> ! {
             BADGE_REPORT
                 if i < MAX_COMPONENTS
                     && m.component(i).launch_control
-                    && (launch::OP_LAUNCHERS..=launch::OP_LAUNCH).contains(&msg.msg[0]) =>
+                    && (launch::OP_LAUNCHERS..=launch::OP_ICON).contains(&msg.msg[0]) =>
             {
-                Some(if msg.msg[0] == launch::OP_LAUNCHERS {
+                Some(if msg.msg[0] != launch::OP_LAUNCH {
                     match m.launcher(msg.msg[1] as usize) {
                         Some(t) => {
-                            let w = launch::words(m.component(t).name.as_bytes());
+                            let c = m.component(t);
+                            let what = if msg.msg[0] == launch::OP_ICON { c.icon } else { c.name };
+                            let w = launch::words(what.as_bytes());
                             [Reply::Ok as u64, w[0], w[1], w[2]]
                         }
                         None => [Reply::NotFound as u64, 0, 0, 0],
