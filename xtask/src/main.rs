@@ -1019,12 +1019,26 @@ fn uefi_image(manifest: &str) -> Result<Image, String> {
 /// DMAR reserves for it: the BIOS area, which no firmware calls usable.
 const RESERVED_FOR: u8 = 0x10;
 const RESERVED_RANGE: (u64, u64) = (0xf_0000, 0xf_ffff);
+/// The device on bus 0 the test DMAR puts under a second VT-d unit, and
+/// where that unit's registers would be (nothing is there: QEMU emulates
+/// one unit).
+const SECOND_UNIT_FOR: u8 = 0x11;
+const SECOND_UNIT: u64 = 0xfed9_a000;
 
-/// A DMAR holding only a reserved memory region (RMRR) for 00:10.0, for
-/// QEMU's `-acpitable`.
-fn reserved_dmar() -> Vec<u8> {
-    // A device scope: an endpoint, on bus 0, path device 0x10 function 0.
-    let scope = [1, 8, 0, 0, 0, 0, RESERVED_FOR, 0];
+/// A second DMAR, for QEMU's `-acpitable`, with what QEMU's own cannot
+/// say: a second VT-d unit (DRHD) naming 00:11.0, as a laptop's graphics
+/// have one of their own, and a reserved memory region (RMRR) for
+/// 00:10.0.
+fn test_dmar() -> Vec<u8> {
+    // A device scope: an endpoint on bus 0, its path one device/function.
+    let endpoint = |dev: u8| [1, 8, 0, 0, 0, 0, dev, 0];
+    let mut drhd = Vec::new();
+    drhd.extend(0u16.to_le_bytes()); // type: remapping unit
+    drhd.extend(24u16.to_le_bytes());
+    drhd.extend([0, 0, 0, 0]); // flags (just the functions named), size, segment 0
+    drhd.extend(SECOND_UNIT.to_le_bytes());
+    drhd.extend(endpoint(SECOND_UNIT_FOR));
+    let scope = endpoint(RESERVED_FOR);
     let mut rmrr = Vec::new();
     rmrr.extend(1u16.to_le_bytes()); // type: reserved memory region
     rmrr.extend((24 + scope.len() as u16).to_le_bytes());
@@ -1034,7 +1048,7 @@ fn reserved_dmar() -> Vec<u8> {
     rmrr.extend(scope);
     let mut t = Vec::new();
     t.extend(b"DMAR");
-    t.extend((36 + 12 + rmrr.len() as u32).to_le_bytes());
+    t.extend((36 + 12 + drhd.len() as u32 + rmrr.len() as u32).to_le_bytes());
     t.extend([1, 0]); // revision, checksum (below)
     t.extend(b"SUPERI");
     t.extend(b"TESTDMAR");
@@ -1044,6 +1058,8 @@ fn reserved_dmar() -> Vec<u8> {
     // Host address width (39 bits, less one), flags, 10 reserved bytes.
     t.extend([38, 0]);
     t.extend([0; 10]);
+    // Units come before reserved regions.
+    t.extend(drhd);
     t.extend(rmrr);
     t[9] = 0u8.wrapping_sub(t.iter().fold(0u8, |s, &b| s.wrapping_add(b)));
     t
@@ -1208,10 +1224,13 @@ fn qemu_command(img: &Image) -> Command {
             ));
         if img.arch == Arch::X86_64 {
             // At a known address, with memory the firmware reserves for
-            // it, which QEMU's DMAR cannot say: a second DMAR, with just
-            // that region, which the kernel must map for it.
+            // it, which the kernel must map for it; and a virtio entropy
+            // source under a VT-d unit of its own that is not there, which
+            // the kernel must not bind. QEMU's DMAR can say neither: a
+            // second DMAR says both.
+            q.arg("-device").arg(format!("virtio-rng-pci,disable-legacy=on,iommu_platform=on,addr={SECOND_UNIT_FOR:#x}"));
             let path = Path::new("target").join("test-dmar.bin");
-            match std::fs::write(root().join(&path), reserved_dmar()) {
+            match std::fs::write(root().join(&path), test_dmar()) {
                 Ok(()) => {
                     // The path must be relative: QEMU splits it at colons.
                     q.current_dir(root()).arg("-acpitable").arg(format!("file={}", path.display()));
@@ -1618,6 +1637,25 @@ fn drivers_test(img: &Image) -> Result<(), String> {
             (end + 1 - start) / 4096
         );
         if let Err(step) = find_in_order(&out, &[&region, &bound, &bound]) {
+            return Err(format!("driver framework test: missing (in order) {step:?}"));
+        }
+        // Its second unit, which names 00:11.0 (taking it from QEMU's,
+        // which names every function), is not there: the kernel cannot
+        // drive it, so will not bind the function, and the bus server
+        // opens it with no domain and no bus mastering.
+        let second = [
+            "[ok] ACPI: 2 VT-d units; 1 reserved memory region".to_string(),
+            format!("[ok] ACPI: VT-d unit at {SECOND_UNIT:#x}: 1 function it names on bus 0"),
+            format!("[warn] IOMMU: the VT-d unit at {SECOND_UNIT:#x} cannot be driven"),
+            "IOMMU: Intel VT-d, interrupt remapping".to_string(),
+            format!("pci: 00:{SECOND_UNIT_FOR:02x}.0 given to client"),
+            "under no IOMMU unit the kernel drives, so no bus mastering".to_string(),
+            format!(
+                "[pass] block: the device under a VT-d unit the kernel cannot drive (00:{SECOND_UNIT_FOR:02x}.0) opens with no IOMMU domain and may not master the bus; its registers answer"
+            ),
+        ];
+        let second: Vec<&str> = second.iter().map(String::as_str).collect();
+        if let Err(step) = find_in_order(&out, &second) {
             return Err(format!("driver framework test: missing (in order) {step:?}"));
         }
     }

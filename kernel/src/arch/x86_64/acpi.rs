@@ -9,11 +9,11 @@
 //!   at 0xe000_0000; QEMU's `pc` machine has none.
 //! - MADT: the CPUs, by local APIC ID (which need not run 0, 1, 2, ...:
 //!   hybrid and multi-socket machines leave gaps), and the I/O APICs.
-//! - DMAR: the VT-d remapping unit to use and the PCI functions it covers:
-//!   the one flagged as covering every function, or else (QEMU's way) the
-//!   only unit, covering just the functions its device scopes name (one
-//!   on bus 0, or everything behind a bridge there). A function no unit
-//!   in use covers cannot be bound, so it never gets DMA unisolated.
+//! - DMAR: the VT-d remapping units and the PCI functions each covers:
+//!   those its device scopes name (one on bus 0, or everything behind a
+//!   bridge there), or, for the one so flagged, every function no other
+//!   unit names. A function no unit the kernel drives covers cannot be
+//!   bound, so it never gets DMA unisolated.
 //!   And the requester ID each I/O APIC's interrupts carry, which
 //!   interrupt remapping checks. And its reserved memory regions: memory
 //!   a function keeps using whatever it is told, which binding it maps.
@@ -92,21 +92,23 @@ static CPU_APIC: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(0) }; MAX_CPUS]
 static CPUS_KEPT: AtomicUsize = AtomicUsize::new(0);
 static CPUS_LISTED: AtomicUsize = AtomicUsize::new(0);
 
-/// The base of the VT-d unit in use (0 if none), whether it covers every
-/// PCI function, and if not, which functions on bus 0 it covers (a bit
-/// per device and function) and whether it covers everything behind a
-/// bridge.
-static VTD: AtomicU64 = AtomicU64::new(0);
-static VTD_ALL: AtomicBool = AtomicBool::new(false);
-static VTD_BUS0: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
-static VTD_BRIDGES: AtomicBool = AtomicBool::new(false);
+/// The VT-d units of PCI segment 0 (up to 4), in the DMAR's order: each
+/// one's register base (0: none), whether it covers every function no
+/// other unit names, which functions on bus 0 it names (a bit per device
+/// and function), and whether it names a bridge there (and so covers the
+/// buses behind it).
+pub const MAX_UNITS: usize = 4;
+static UNIT_BASE: [AtomicU64; MAX_UNITS] = [const { AtomicU64::new(0) }; MAX_UNITS];
+static UNIT_ALL: [AtomicBool; MAX_UNITS] = [const { AtomicBool::new(false) }; MAX_UNITS];
+static UNIT_BUS0: [[AtomicU64; 4]; MAX_UNITS] = [const { [const { AtomicU64::new(0) }; 4] }; MAX_UNITS];
+static UNIT_BRIDGES: [AtomicBool; MAX_UNITS] = [const { AtomicBool::new(false) }; MAX_UNITS];
 
 /// The I/O APICs (up to 4): register base | first GSI << 32 (0: none),
 /// and their APIC IDs.
 static IOAPIC: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 static IOAPIC_ID: [AtomicU32; 4] = [const { AtomicU32::new(0) }; 4];
-/// The DMAR's I/O APIC device scopes (up to 4): bit 31 set, APIC ID <<
-/// 16, requester ID.
+/// The DMAR's I/O APIC device scopes (up to 4): bit 31 set, the unit
+/// that names it << 24, APIC ID << 16, requester ID.
 static IOAPIC_SID: [AtomicU32; 4] = [const { AtomicU32::new(0) }; 4];
 /// The DMAR's reserved memory regions (up to 8): each one's first byte
 /// and end (exclusive; 0 for no region), and the requester IDs of up to 4
@@ -242,86 +244,96 @@ fn scopes(e: u64, n: u64, skip: u64) -> impl Iterator<Item = (u8, u8, u8, u64, u
 }
 
 fn dmar(rsdp: u64) {
-    let Some((t, len)) = find(rsdp, b"DMAR") else {
+    if find(rsdp, b"DMAR").is_none() {
         kprintln!("[ok] ACPI: no DMAR (no VT-d)");
         return;
-    };
-    let (mut units, mut all, mut scoped) = (0, 0, None);
-    // 12 bytes after the header: address width, flags, reserved.
-    for (e, kind, n) in structures(t, len, 12, true) {
-        match (kind, n) {
-            // A remapping unit: flags (bit 0: every PCI function not under
-            // another unit), segment, register base, then device scopes.
-            (0, 16..) => {
-                units += 1;
-                // I/O APICs (scope type 3): the requester ID their
-                // interrupts carry, from a path of one.
-                for (kind, id, bus, path, plen) in scopes(e, n, 16) {
-                    if kind == 3 && plen == 2 {
-                        let [dev, func] = read::<2>(path);
-                        let sid = (bus as u32) << 8 | (dev as u32 & 31) << 3 | func as u32 & 7;
-                        if let Some(slot) = IOAPIC_SID.iter().find(|s| s.load(Ordering::Relaxed) == 0) {
-                            slot.store(1 << 31 | (id as u32) << 16 | sid, Ordering::Relaxed);
-                        }
-                    }
-                }
-                let [flags, _, s0, s1] = read::<4>(e + 4);
-                if u16::from_le_bytes([s0, s1]) != 0 {
+    }
+    // Firmware lists one DMAR; QEMU's tests add a second, with what
+    // QEMU's own cannot say (a second unit, reserved memory). Every one is
+    // read, a unit listed twice merging into one.
+    let (mut units, mut other_segments) = (0, 0);
+    for (t, len) in tables(rsdp, b"DMAR") {
+        // 12 bytes after the header: address width, flags, reserved.
+        for (e, kind, n) in structures(t, len, 12, true) {
+            // A remapping unit: flags (bit 0: every PCI function no other
+            // unit names), reserved, segment, register base, then device
+            // scopes.
+            if kind != 0 || n < 16 {
+                continue;
+            }
+            let [flags, _, s0, s1] = read::<4>(e + 4);
+            let base = u64_at(e + 8);
+            if u16::from_le_bytes([s0, s1]) != 0 {
+                other_segments += 1;
+                continue;
+            }
+            // Its slot: the one it already has, or the first free one.
+            let u = match (0..MAX_UNITS).find(|&u| [0, base].contains(&UNIT_BASE[u].load(Ordering::Relaxed))) {
+                Some(u) => u,
+                None => {
+                    units += 1;
                     continue;
                 }
-                if flags & 1 != 0 {
-                    all = u64_at(e + 8);
-                } else if scoped.is_none() {
-                    scoped = Some((e, n));
-                }
+            };
+            if UNIT_BASE[u].swap(base, Ordering::Relaxed) == 0 {
+                units += 1;
             }
-            _ => {}
-        }
-    }
-    let (reserved, kept) = reserved_regions(rsdp);
-    let mut named = 0;
-    if all != 0 {
-        VTD.store(all, Ordering::Relaxed);
-        VTD_ALL.store(true, Ordering::Relaxed);
-    } else if let (1, Some((e, n))) = (units, scoped) {
-        VTD.store(u64_at(e + 8), Ordering::Relaxed);
-        for (kind, _, bus, path, plen) in scopes(e, n, 16) {
-            let [dev, func] = read::<2>(path);
-            // A function on bus 0 itself (path of one), or a bridge there.
-            if bus == 0 && plen == 2 && dev < 32 && func < 8 {
-                let devfn = (dev as usize) << 3 | func as usize;
+            if flags & 1 != 0 {
+                UNIT_ALL[u].store(true, Ordering::Relaxed);
+            }
+            for (kind, id, bus, path, plen) in scopes(e, n, 16) {
+                if plen != 2 {
+                    continue;
+                }
+                let [dev, func] = read::<2>(path);
+                let sid = (bus as u32) << 8 | (dev as u32 & 31) << 3 | func as u32 & 7;
+                let devfn = (sid & 0xff) as usize;
                 match kind {
-                    1 => {
-                        VTD_BUS0[devfn / 64].fetch_or(1 << (devfn % 64), Ordering::Relaxed);
-                        named += 1;
+                    // A function on bus 0 itself (a path of one), or a
+                    // bridge there. Named twice (firmware never does; a
+                    // test's second DMAR moves one), it is the last unit's.
+                    1 | 2 if bus == 0 => {
+                        for v in 0..MAX_UNITS {
+                            UNIT_BUS0[v][devfn / 64].fetch_and(!(1 << (devfn % 64)), Ordering::Relaxed);
+                        }
+                        UNIT_BUS0[u][devfn / 64].fetch_or(1 << (devfn % 64), Ordering::Relaxed);
+                        if kind == 2 {
+                            UNIT_BRIDGES[u].store(true, Ordering::Relaxed);
+                        }
                     }
-                    2 => {
-                        VTD_BUS0[devfn / 64].fetch_or(1 << (devfn % 64), Ordering::Relaxed);
-                        VTD_BRIDGES.store(true, Ordering::Relaxed);
-                        named += 1;
+                    // An I/O APIC: the requester ID its interrupts carry,
+                    // and the unit they go through.
+                    3 => {
+                        if let Some(slot) = IOAPIC_SID.iter().find(|s| s.load(Ordering::Relaxed) == 0) {
+                            slot.store(1 << 31 | (u as u32) << 24 | (id as u32) << 16 | sid, Ordering::Relaxed);
+                        }
                     }
                     _ => {}
                 }
             }
         }
     }
-    let vtd = VTD.load(Ordering::Relaxed);
+    let (reserved, kept) = reserved_regions(rsdp);
     kprintln!(
-        "[ok] ACPI: {units} VT-d unit{}; {}{}; {reserved} reserved memory region{}",
+        "[ok] ACPI: {units} VT-d unit{}{}; {reserved} reserved memory region{}",
         if units == 1 { "" } else { "s" },
-        match (vtd, VTD_ALL.load(Ordering::Relaxed)) {
-            (0, _) => "none used",
-            (_, true) => "one for every PCI function",
-            _ => "one for the PCI functions it names",
+        match (units > MAX_UNITS, other_segments) {
+            (true, _) => " (only the first 4 are used)",
+            (_, 0) => "",
+            _ => " (and some on other PCI segments, not used)",
         },
-        At(vtd),
         if reserved == 1 { "" } else { "s" },
     );
-    if named > 0 {
+    for (u, base) in vtd_units() {
+        if UNIT_ALL[u].load(Ordering::Relaxed) {
+            kprintln!("[ok] ACPI: VT-d unit at {base:#x}: every PCI function no other unit names");
+            continue;
+        }
+        let named: u32 = UNIT_BUS0[u].iter().map(|w| w.load(Ordering::Relaxed).count_ones()).sum();
         kprintln!(
-            "[ok] ACPI: VT-d covers {named} function{} named on bus 0{}",
+            "[ok] ACPI: VT-d unit at {base:#x}: {named} function{} it names on bus 0{}",
             if named == 1 { "" } else { "s" },
-            if VTD_BRIDGES.load(Ordering::Relaxed) { " and what is behind its bridges" } else { "" }
+            if UNIT_BRIDGES[u].load(Ordering::Relaxed) { " and what is behind its bridges" } else { "" }
         );
     }
     for i in 0..kept {
@@ -395,18 +407,30 @@ pub fn reserved_for(sid: u16) -> impl Iterator<Item = (u64, u64)> {
     })
 }
 
-/// Whether the VT-d unit in use covers requester ID `sid` (bus, device,
-/// function).
-pub fn vtd_covers(sid: u16) -> bool {
-    if VTD_ALL.load(Ordering::Relaxed) {
-        return true;
-    }
+/// The VT-d unit requester ID `sid` (bus, device, function) goes through:
+/// one that names it (on bus 0), or names a bridge (for the buses behind
+/// one), else the one for every function no other unit names. `None` if
+/// no unit covers it.
+pub fn vtd_unit(sid: u16) -> Option<usize> {
     let (bus, devfn) = (sid >> 8, (sid & 0xff) as usize);
-    if bus == 0 {
-        VTD_BUS0[devfn / 64].load(Ordering::Relaxed) & 1 << (devfn % 64) != 0
-    } else {
-        VTD_BRIDGES.load(Ordering::Relaxed)
-    }
+    let present = |u: &usize| UNIT_BASE[*u].load(Ordering::Relaxed) != 0;
+    let all = |u: usize| UNIT_ALL[u].load(Ordering::Relaxed);
+    let names = |u: usize| {
+        if bus == 0 {
+            UNIT_BUS0[u][devfn / 64].load(Ordering::Relaxed) & 1 << (devfn % 64) != 0
+        } else {
+            UNIT_BRIDGES[u].load(Ordering::Relaxed)
+        }
+    };
+    (0..MAX_UNITS)
+        .filter(present)
+        .find(|&u| !all(u) && names(u))
+        .or_else(|| (0..MAX_UNITS).filter(present).find(|&u| all(u)))
+}
+
+/// The VT-d units: each one's index and register base.
+pub fn vtd_units() -> impl Iterator<Item = (usize, u64)> {
+    (0..MAX_UNITS).filter_map(|u| Some((u, UNIT_BASE[u].load(Ordering::Relaxed))).filter(|&(_, b)| b != 0))
 }
 
 /// The enabled CPUs' local APIC IDs from the MADT (up to `MAX_CPUS`), or
@@ -414,12 +438,6 @@ pub fn vtd_covers(sid: u16) -> bool {
 pub fn cpus() -> Option<impl Iterator<Item = u32>> {
     (CPUS_LISTED.load(Ordering::Relaxed) > 0)
         .then(|| (0..CPUS_KEPT.load(Ordering::Relaxed)).map(|i| CPU_APIC[i].load(Ordering::Relaxed)))
-}
-
-/// The register base of the VT-d unit in use, if the DMAR describes one
-/// the kernel can use.
-pub fn vtd() -> Option<u64> {
-    Some(VTD.load(Ordering::Relaxed)).filter(|&b| b != 0)
 }
 
 /// The I/O APICs: APIC ID, register base and first GSI.
@@ -430,10 +448,11 @@ pub fn ioapics() -> impl Iterator<Item = (u32, u64, u32)> {
     })
 }
 
-/// The requester ID of I/O APIC `id`'s interrupts, from the DMAR.
-pub fn ioapic_sid(id: u32) -> Option<u16> {
+/// The requester ID of I/O APIC `id`'s interrupts, and the VT-d unit they
+/// go through, from the DMAR.
+pub fn ioapic_sid(id: u32) -> Option<(u16, usize)> {
     IOAPIC_SID.iter().map(|s| s.load(Ordering::Relaxed)).find_map(|v| {
-        (v >> 31 == 1 && (v >> 16) & 0xff == id).then_some(v as u16)
+        (v >> 31 == 1 && (v >> 16) & 0xff == id).then_some((v as u16, (v >> 24 & 0x7f) as usize))
     })
 }
 

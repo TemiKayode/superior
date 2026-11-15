@@ -35,9 +35,15 @@ holds the rest):
   (OVMF puts it at 0xe0000000, SeaBIOS at 0xb0000000); MADT for the CPUs, started
   by the APIC IDs it lists enabled (which can have gaps) with a table from CPU number
   to APIC ID, and device interrupts sent to the boot CPU's own APIC ID; DMAR for the
-  VT-d unit, either the one covering every PCI function or the only one, covering
-  just the functions its device scopes name (QEMU's way), and a function it does
-  not cover cannot be bound. The DMAR's reserved memory regions (memory a device
+  VT-d units (up to four): each covers the functions its device scopes name, or
+  (flagged so) every function no other unit names, as a laptop has one for its
+  graphics and one for the rest. Each unit the kernel can drive gets its own root,
+  context and interrupt remapping tables and invalidation queue, a function's
+  context entry and MSI entries go in its own unit's, and the faults of all are
+  drained. A function under no unit, or one the kernel cannot drive, cannot be
+  bound: the bus server opens it with no domain and no bus mastering. QEMU emulates
+  one unit, so the x86-64 virtio-blk test's second DMAR names a second unit where
+  nothing answers, with a virtio entropy source at 00:11.0 under it. The DMAR's reserved memory regions (memory a device
   keeps using whatever it is told: a USB controller's legacy keyboard emulation, a
   GPU's stolen memory) are mapped where they are in a function's I/O space when it
   is bound, except any pages firmware left usable RAM; the x86-64 virtio-blk test

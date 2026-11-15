@@ -764,6 +764,46 @@ fn block_client(open: [u64; 4]) -> ! {
             ),
         );
     }
+    // The x86-64 virtio-blk test's DMAR puts a virtio entropy source
+    // (00:11.0) under a second VT-d unit that is not there, as a laptop's
+    // graphics are under a unit of their own: the kernel cannot drive that
+    // unit, so it will not bind the function, and the bus server opens it
+    // with no IOMMU domain and refuses it bus mastering, as for a device
+    // behind a conventional bridge. Its registers still answer.
+    if cfg!(target_arch = "x86_64") && open[0] == pci::OPEN && open[2] == 0x1af4 << 16 | 0x1042 {
+        let x = CapTransfer {
+            grant: None,
+            accept: Some(BRIDGED_DOMAIN as u16),
+        };
+        let r = syscall_x(Syscall::Call, BLOCK_PCI, [pci::OPEN, pci::VERSION, 0x1af4 << 16 | 0x1044, 0], x);
+        let master = syscall(Syscall::Call, BLOCK_PCI, [pci::BUS_MASTER, 1, 0, 0]);
+        let answers = r.status == 0 && r.msg[0] == Status::Ok as u64 && bridged_bar(4) && {
+            // SAFETY: the BAR's first page is mapped; virtio's common
+            // configuration is there, and its second feature word has
+            // VERSION_1 (bit 0).
+            unsafe {
+                (BRIDGED_BAR_VA as *mut u32).write_volatile(1);
+                ((BRIDGED_BAR_VA + 4) as *const u32).read_volatile() & 1 == 1
+            }
+        };
+        syscall(Syscall::CapDelete, BRIDGED_BAR, [0; 4]);
+        syscall(Syscall::Call, BLOCK_PCI, [pci::CLOSE, 0, 0, 0]);
+        t.check(
+            r.status == 0
+                && r.msg[0] == Status::Ok as u64
+                && r.msg[1] == 0x11 << 3
+                && r.cap.is_none()
+                && master.status == 0
+                && master.msg[0] == Status::Denied as u64
+                && answers,
+            format_args!(
+                "the device under a VT-d unit the kernel cannot drive ({:02x}:{:02x}.{}) opens with no IOMMU domain and may not master the bus; its registers answer",
+                r.msg[1] >> 8,
+                r.msg[1] >> 3 & 0x1f,
+                r.msg[1] & 7
+            ),
+        );
+    }
     // The device can reach only what its driver maps into its IOMMU
     // domain: aimed at another page of the driver's, the DMA must not land,
     // and the IOMMU must report the blocked write to the driver.

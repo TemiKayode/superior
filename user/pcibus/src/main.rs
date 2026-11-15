@@ -212,6 +212,9 @@ struct Func {
     /// Its requester ID is its own (it is on bus 0, or only PCI Express
     /// bridges lie between), so a domain can isolate it.
     isolated: bool,
+    /// The kernel would not bind it to a domain: the DMAR puts it under
+    /// no IOMMU unit the kernel drives, so nothing can hold its DMA.
+    uncovered: bool,
     /// For a bridge: the bus behind it and the last bus behind that (0:
     /// it was given none), whether it is a PCI Express port, and its
     /// memory, prefetchable and I/O windows (first and last address).
@@ -455,6 +458,7 @@ impl Bus {
                     dma: false,
                     bridge: false,
                     isolated,
+                    uncovered: false,
                     secondary: 0,
                     subordinate: 0,
                     express: false,
@@ -990,7 +994,19 @@ impl Bus {
         }
         let f = self.funcs[i].unwrap();
         let rid = (f.bus as u64) << 8 | (f.dev as u64) << 3 | f.func as u64;
-        if syscall(Syscall::IoSpaceBind, slot, [IOMMU, rid, 0, 0]).status != 0 {
+        let bound = syscall(Syscall::IoSpaceBind, slot, [IOMMU, rid, 0, 0]).status;
+        if bound == Error::InvalidArgument.code() {
+            // No IOMMU unit the kernel drives covers the function (the
+            // DMAR puts it under one the kernel cannot use): no domain can
+            // hold its DMA, so it gets none, and no bus mastering.
+            syscall(Syscall::CapRevoke, DOMAIN_MEMORY + d as u64, [0; 4]);
+            self.domain_owner[d] = None;
+            let f = self.funcs[i].as_mut().unwrap();
+            f.domain = None;
+            f.uncovered = true;
+            return Ok(None);
+        }
+        if bound != 0 {
             return Err(Status::DeviceError);
         }
         Ok(Some(slot))
@@ -1052,6 +1068,8 @@ impl Bus {
                 "new, empty IOMMU domain"
             } else if !f.isolated {
                 "behind a conventional bridge, so no bus mastering"
+            } else if f.uncovered {
+                "under no IOMMU unit the kernel drives, so no bus mastering"
             } else {
                 "no IOMMU, so no bus mastering"
             }
