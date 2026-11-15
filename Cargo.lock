@@ -848,6 +848,10 @@ name = "superior-toolkit"
 version = "0.1.0"
 
 [[package]]
+name = "superior-uefi-loader"
+version = "0.1.0"
+
+[[package]]
 name = "superior-virtio-blk"
 version = "0.1.0"
 dependencies = [
@@ -1093,7 +1097,9 @@ version = "0.1.0"
 dependencies = [
  "bootloader",
  "ed25519-dalek",
+ "fatfs",
  "getrandom 0.2.17",
+ "gpt",
  "superior-idl",
  "superior-objects",
  "superior-toolkit",

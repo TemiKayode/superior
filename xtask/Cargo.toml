@@ -18,3 +18,7 @@ superior-objects = { path = "../crates/objects" }
 superior-toolkit = { path = "../crates/toolkit" }
 # Plays the access point at the far end of the Wi-Fi test's simulated radio.
 superior-wifi = { path = "../crates/wifi" }
+# The AArch64 UEFI disk: a GPT disk whose EFI system partition holds the
+# loader (the same versions the bootloader crate uses for x86-64's).
+fatfs = { version = "0.3.4", default-features = false, features = ["std", "alloc"] }
+gpt = "3.0.0"

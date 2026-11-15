@@ -202,14 +202,15 @@ fn main() -> ExitCode {
                         .and_then(|img| shell_session(&img))
                 })
             })
-            .and_then(|_| uefi_test())
+            .and_then(|_| uefi_test(Arch::X86_64))
+            .and_then(|_| uefi_test(Arch::Aarch64))
             .and_then(|_| console_test())
             .and_then(|_| sel4_image())
             .and_then(|img| shell_session(&img)),
         Some("sel4-test") => sel4_image().and_then(|img| shell_session(&img)),
         Some("boot-test") => image(true, arch).and_then(|img| boot(&img, true)),
         Some("shell-test") => image(false, arch).and_then(|img| shell_session(&img)),
-        Some("uefi-test") => uefi_test(),
+        Some("uefi-test") => uefi_test(arch),
         Some("console-test") => console_test(),
         Some("cm-test") => image_with(false, arch, "test").and_then(|img| cm_test(&img)),
         Some("drivers-test") => {
@@ -1002,7 +1003,10 @@ fn ovmf() -> PathBuf {
 /// The x86-64 image for `boot/<manifest>.manifest` as a UEFI disk: a GPT
 /// disk with an EFI system partition holding the bootloader's UEFI
 /// application and the kernel, and no BIOS boot code.
-fn uefi_image(manifest: &str) -> Result<Image, String> {
+fn uefi_image(arch: Arch, manifest: &str) -> Result<Image, String> {
+    if arch == Arch::Aarch64 {
+        return uefi_image_aarch64(manifest);
+    }
     let mut img = image_with(false, Arch::X86_64, manifest)?;
     let kernel = root().join("target").join(Arch::X86_64.target()).join("release").join("superior-kernel");
     let name = if manifest == "shell" { "superior-uefi.img".to_string() } else { format!("superior-uefi-{manifest}.img") };
@@ -1068,6 +1072,109 @@ fn test_dmar() -> Vec<u8> {
     t
 }
 
+/// The AArch64 image for `boot/<manifest>.manifest` as a UEFI disk: a GPT
+/// disk whose EFI system partition holds `EFI/BOOT/BOOTAA64.EFI`, the
+/// loader (`loader/`) with the kernel inside it.
+fn uefi_image_aarch64(manifest: &str) -> Result<Image, String> {
+    let mut img = image_with(false, Arch::Aarch64, manifest)?;
+    println!("== building the UEFI loader (aarch64)");
+    let kernel = std::fs::canonicalize(&img.path).map_err(|e| format!("{}: {e}", img.path.display()))?;
+    run(cargo()
+        .env("SUPERIOR_KERNEL_ELF", &kernel)
+        .args(["build", "--quiet", "-p", "superior-uefi-loader", "--release", "--target", "aarch64-unknown-uefi"]))?;
+    let efi = root().join("target").join("aarch64-unknown-uefi").join("release").join("superior-uefi-loader.efi");
+    let name = if manifest == "shell" { "superior-uefi-aarch64.img".to_string() } else { format!("superior-uefi-aarch64-{manifest}.img") };
+    let path = root().join("target").join(name);
+    esp_disk(&[("EFI/BOOT/BOOTAA64.EFI", &efi)], &path)?;
+    img.path = path;
+    img.uefi = true;
+    Ok(img)
+}
+
+/// Writes a GPT disk at `out` with one partition, an EFI system partition
+/// (FAT) holding `files` (each a path on it, and the file to copy there).
+fn esp_disk(files: &[(&str, &Path)], out: &Path) -> Result<(), String> {
+    use std::io::{Seek, SeekFrom, Write};
+    const MB: u64 = 1 << 20;
+    let mut data = Vec::new();
+    for (name, src) in files {
+        data.push((*name, std::fs::read(src).map_err(|e| format!("reading {}: {e}", src.display()))?));
+    }
+    let bytes: u64 = data.iter().map(|d| d.1.len() as u64).sum();
+    // Room for FAT's own tables, rounded to whole MiB; at least 34 MiB so
+    // FAT32 is chosen (UEFI reads FAT12, 16 and 32, but firmware differs).
+    let fat_size = ((bytes + 2 * MB).div_ceil(MB) * MB).max(34 * MB);
+    let mut fat = std::io::Cursor::new(vec![0u8; fat_size as usize]);
+    fatfs::format_volume(&mut fat, fatfs::FormatVolumeOptions::new().volume_label(*b"SUPERIOR   "))
+        .map_err(|e| format!("formatting the EFI system partition: {e}"))?;
+    {
+        let fs = fatfs::FileSystem::new(&mut fat, fatfs::FsOptions::new()).map_err(|e| format!("opening the EFI system partition: {e}"))?;
+        let root_dir = fs.root_dir();
+        for (name, bytes) in &data {
+            // Each parent directory first.
+            let parts: Vec<&str> = name.split('/').collect();
+            for i in 1..parts.len() {
+                let dir = parts[..i].join("/");
+                if root_dir.open_dir(&dir).is_err() {
+                    root_dir.create_dir(&dir).map_err(|e| format!("making {dir} on the EFI system partition: {e}"))?;
+                }
+            }
+            let mut f = root_dir.create_file(name).map_err(|e| format!("making {name}: {e}"))?;
+            f.truncate().map_err(|e| format!("{name}: {e}"))?;
+            f.write_all(bytes).map_err(|e| format!("writing {name}: {e}"))?;
+        }
+    }
+    let fat = fat.into_inner();
+    let mut disk = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .read(true)
+        .write(true)
+        .open(out)
+        .map_err(|e| format!("creating {}: {e}", out.display()))?;
+    // The partition, and room before and after it for GPT's two copies.
+    let disk_size = fat_size + 2 * MB;
+    disk.set_len(disk_size).map_err(|e| format!("{}: {e}", out.display()))?;
+    gpt::mbr::ProtectiveMBR::with_lb_size(u32::try_from(disk_size / 512 - 1).unwrap_or(u32::MAX))
+        .overwrite_lba0(&mut disk)
+        .map_err(|e| format!("writing the protective MBR: {e}"))?;
+    let block = gpt::disk::LogicalBlockSize::Lb512;
+    let mut table = gpt::GptConfig::new()
+        .writable(true)
+        .initialized(false)
+        .logical_block_size(block)
+        .create_from_device(Box::new(&mut disk), None)
+        .map_err(|e| format!("making the GPT: {e}"))?;
+    table.update_partitions(Default::default()).map_err(|e| format!("making the GPT: {e}"))?;
+    let id = table
+        .add_partition("EFI system partition", fat_size, gpt::partition_types::EFI, 0, None)
+        .map_err(|e| format!("adding the EFI system partition: {e}"))?;
+    let start = table
+        .partitions()
+        .get(&id)
+        .and_then(|p| p.bytes_start(block).ok())
+        .ok_or("finding the EFI system partition")?;
+    table.write().map_err(|e| format!("writing the GPT: {e}"))?;
+    disk.seek(SeekFrom::Start(start)).map_err(|e| format!("{}: {e}", out.display()))?;
+    disk.write_all(&fat).map_err(|e| format!("writing the EFI system partition: {e}"))?;
+    Ok(())
+}
+
+/// QEMU's AArch64 UEFI firmware (edk2's ArmVirtQemu), beside QEMU's
+/// executable in `share`, or $AAVMF.
+fn aavmf() -> PathBuf {
+    if let Ok(p) = env::var("AAVMF") {
+        return p.into();
+    }
+    let exe = qemu(Arch::Aarch64);
+    [exe.parent().map(|d| d.join("share")), Some(PathBuf::from("/usr/share/qemu"))]
+        .into_iter()
+        .flatten()
+        .map(|d| d.join("edk2-aarch64-code.fd"))
+        .find(|p| p.exists())
+        .unwrap_or_else(|| "edk2-aarch64-code.fd".into())
+}
+
 fn qemu_command(img: &Image) -> Command {
     let mut q = Command::new(qemu(img.arch));
     match img.arch {
@@ -1118,8 +1225,22 @@ fn qemu_command(img: &Image) -> Command {
             };
             // The radio's test wants RNDR (FEAT_RNG), which "max" has.
             let cpu = if img.radio { "max" } else { "cortex-a72" };
-            q.args(["-machine", machine, "-cpu", cpu, "-kernel"])
-                .arg(&img.path);
+            if img.uefi {
+                // UEFI firmware (edk2) in flash, booting the disk's EFI
+                // system partition. acpi=off: the firmware then hands over
+                // QEMU's device tree, not ACPI tables.
+                q.args(["-machine", &format!("{machine},acpi=off"), "-cpu", cpu])
+                    .arg("-drive")
+                    .arg(format!("if=pflash,format=raw,readonly=on,file={}", aavmf().display()))
+                    .arg("-drive")
+                    .arg(format!("if=none,id=boot,format=raw,file={}", img.path.display()))
+                    // On NVMe, so a virtio disk image's driver finds only
+                    // its test disk.
+                    .args(["-device", "nvme,serial=superior-boot,drive=boot,bootindex=0"]);
+            } else {
+                q.args(["-machine", machine, "-cpu", cpu, "-kernel"])
+                    .arg(&img.path);
+            }
             if !img.sel4 {
                 q.args(["-rtc", RTC_BASE]);
             }
@@ -5397,6 +5518,9 @@ fn run_to_exit_watching(
     watch: impl FnMut(&str) + Send + 'static,
 ) -> Result<String, String> {
     let (code, out) = run_capture(img, limit, watch)?;
+    // AArch64 edk2 says this when the host has no TRNG to offer: the
+    // firmware's notice, which the suites' "could not" check is not about.
+    let out = out.replace("ArmTrngLib could not be correctly initialized.", "");
     match code {
         Some(QEMU_PASS) => Ok(out),
         code => Err(format!(
@@ -5482,8 +5606,48 @@ fn shell_session(img: &Image) -> Result<(), String> {
 /// whose APIC IDs have a gap (found from ACPI's MADT), then the driver
 /// framework test on q35 (PCI Express, the VT-d IOMMU from ACPI's DMAR
 /// table, MSI).
-fn uefi_test() -> Result<(), String> {
-    let mut img = uefi_image("shell")?;
+/// AArch64 booted by UEFI firmware (QEMU's edk2) from a GPT disk: the
+/// firmware starts the loader on the EFI system partition, which places
+/// the kernel, hands it the firmware's device tree and leaves boot
+/// services; then the shell session, which must show all of that.
+fn uefi_test_aarch64() -> Result<(), String> {
+    let img = uefi_image(Arch::Aarch64, "shell")?;
+    println!("== UEFI shell session on {}", img.path.display());
+    let out = drive_shell(&img, &[], SHELL_SCRIPT)?;
+    // The firmware's boot manager starts the disk. What the firmware says
+    // before that is its own (QEMU gives it no TRNG, say, which it
+    // reports): the log is held to the usual words from the loader on.
+    if !out.contains("BdsDxe: starting Boot0001 \"UEFI QEMU NVMe Ctrl superior-boot") {
+        return Err("UEFI test (aarch64): the firmware's boot manager did not start the disk".into());
+    }
+    let banner = "Superior UEFI loader (AArch64)";
+    let out = out.find(banner).map_or("", |at| &out[at..]);
+    check_log(
+        "UEFI test (aarch64)",
+        out,
+        &[
+            banner,
+            "loader: kernel at 0x40200000 to ",
+            "; device tree (",
+            "loader: leaving boot services",
+            "Superior microkernel",
+            "[ok] MMU on; exception vectors installed",
+            "superior> ",
+        ],
+    )?;
+    println!("== UEFI shell session passed (aarch64)");
+    // The driver framework test from the same kind of disk: the SMMU, the
+    // ITS and PCI as the kernel finds them after the firmware.
+    drivers_test(&uefi_image(Arch::Aarch64, "drivers")?)?;
+    println!("== UEFI test passed (aarch64)");
+    Ok(())
+}
+
+fn uefi_test(arch: Arch) -> Result<(), String> {
+    if arch == Arch::Aarch64 {
+        return uefi_test_aarch64();
+    }
+    let mut img = uefi_image(Arch::X86_64, "shell")?;
     // Four CPUs of six possible, over two sockets of three cores: APIC IDs
     // 0, 1, 2 and 4, with a gap at 3 as on real machines. The kernel must
     // start the four ACPI's MADT lists enabled, not stop at the gap.
@@ -5504,7 +5668,7 @@ fn uefi_test() -> Result<(), String> {
         ],
     )?;
     println!("== UEFI shell session passed");
-    drivers_test(&uefi_image("drivers")?)?;
+    drivers_test(&uefi_image(Arch::X86_64, "drivers")?)?;
     println!("== UEFI test passed (x86_64)");
     Ok(())
 }
@@ -5603,7 +5767,7 @@ fn console_test() -> Result<(), String> {
         ]
     };
     let qmp = format!("tcp:127.0.0.1:{QMP_PORT},server=on,wait=off");
-    for (img, firmware) in [(image(false, Arch::X86_64)?, "BIOS"), (uefi_image("shell")?, "UEFI")] {
+    for (img, firmware) in [(image(false, Arch::X86_64)?, "BIOS"), (uefi_image(Arch::X86_64, "shell")?, "UEFI")] {
         println!("== console test ({firmware}) on {}", img.path.display());
         let path = root().join("target").join(format!("console-{}.ppm", firmware.to_lowercase()));
         let checked = std::cell::RefCell::new(String::new());

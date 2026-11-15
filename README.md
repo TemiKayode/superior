@@ -26,6 +26,19 @@ holds the rest):
   on both, so fault handlers are portable. The shell drives the PL011 through a device
   frame it maps, and `shutdown` uses the same exit-port capability, emulated.
 
+- AArch64 also boots from UEFI firmware, as Arm laptops and servers do: `loader/` is a
+  small UEFI application (no crates, `aarch64-unknown-uefi`) with the kernel ELF built
+  into it, on an EFI system partition of a GPT disk. It checks it was started at EL1,
+  takes the firmware's device tree (UEFI's DTB configuration table; with ACPI only, it
+  refuses and says so), loads the kernel's segments at their link address and copies
+  the device tree below 4 GiB, leaves boot services, cleans the caches to the point of
+  coherency, turns the MMU and caches off and enters the kernel as QEMU's `-kernel`
+  does (x0 the device tree), so the kernel needs no second entry. `cargo xtask
+  uefi-test aarch64` boots it from an NVMe disk under QEMU's edk2 for `virt`
+  (`acpi=off`): the firmware's boot manager, the loader and the shell session must
+  show, then the driver framework test with the SMMUv3 from the same kind of disk.
+  Booting from ACPI tables, at EL2, and keeping clear of what the firmware's memory
+  map reserves for its runtime are still to do.
 - x86-64 boots from a BIOS or, as on current laptops, from UEFI firmware: the same
   kernel on a GPT disk with an EFI system partition and no BIOS boot code. The
   Component Manager's 8 MiB arena is carved before spare RAM is handed out, since
@@ -1373,6 +1386,7 @@ cargo xtask run            # boot the shell in QEMU (x86-64), its console on thi
 cargo xtask run aarch64    # the same on QEMU's AArch64 virt machine
 cargo xtask console-test   # the kernel's log on the boot framebuffer, from a BIOS and from UEFI, checked by screenshot
 cargo xtask uefi-test      # x86-64 booted by UEFI firmware (OVMF): the shell session and the driver test
+cargo xtask uefi-test aarch64  # AArch64 booted by UEFI firmware (edk2) through loader/: the shell session and the driver test
 cargo xtask idl    # generate Rust from the interface descriptions in interfaces/
 cargo xtask image  # just build target/superior.img
 cargo xtask bench  # IPC timing under WHPX or KVM, checked against seL4's figures
