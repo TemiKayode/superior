@@ -1,18 +1,23 @@
 //! Superior's AArch64 UEFI loader: a UEFI application (`BOOTAA64.EFI` on
 //! the EFI system partition) that carries the kernel and starts it the way
-//! QEMU's `-kernel` does, so the kernel needs nothing new.
+//! QEMU's `-kernel` does: at EL1, MMU off, a device tree's address in x0.
 //!
 //! - The kernel's ELF segments go where they are linked (its physical
 //!   address, 0x4020_0000 on QEMU's `virt`), in pages asked of the
 //!   firmware at exactly that address.
-//! - The device tree is the one the firmware publishes in its
-//!   configuration table, copied to pages of the loader's own (the
-//!   firmware's copy is in memory the kernel will reuse). Firmware that
-//!   offers only ACPI (QEMU's `virt` unless `acpi=off`) is refused, for
-//!   now: the kernel reads its devices from a device tree.
+//! - The machine is described by the firmware: by its device tree, copied
+//!   to pages of the loader's own (the firmware's copy is in memory the
+//!   kernel will reuse), or, if it offers only ACPI (QEMU's `virt` unless
+//!   `acpi=off`), by its ACPI tables, which stay where they are.
+//! - The kernel is handed a small device tree of the loader's making: its
+//!   RAM, as the firmware's final memory map gives it (only what is free
+//!   once boot services end: none of the firmware's runtime code and data,
+//!   ACPI tables or reserved memory), and under `/chosen` where the
+//!   firmware's description is: `superior,device-tree` or
+//!   `superior,acpi-rsdp`, a 64-bit address.
 //! - Then boot services end, interrupts are masked, what the loader wrote
 //!   is cleaned from the caches to memory, the MMU and caches go off, and
-//!   the kernel is entered at EL1 with the device tree's address in x0.
+//!   the kernel is entered.
 //!
 //! Firmware that runs at EL2 is refused, for now: the kernel runs at EL1
 //! and expects to be entered there.
@@ -102,6 +107,154 @@ static KERNEL: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/kernel.elf"));
 /// The memory map ExitBootServices needs the key of.
 const MAP_SIZE: usize = 64 * 1024;
 static mut MAP: [u8; MAP_SIZE] = [0; MAP_SIZE];
+
+/// RAM ranges the kernel's device tree can list (the kernel reads as many).
+const MAX_RANGES: usize = 32;
+/// The kernel's device tree: one page.
+const BOOT_DTB_SIZE: usize = 4096;
+
+/// UEFI memory types free once boot services end: the loader's code and
+/// data, boot services' code and data, and conventional memory.
+fn usable(kind: u32) -> bool {
+    matches!(kind, 1 | 2 | 3 | 4 | 7)
+}
+
+/// The usable RAM in the memory map `map` (descriptors `desc_size` apart),
+/// sorted and with touching ranges joined: (base, size) pairs, and how
+/// many (at most [`MAX_RANGES`]; the smallest beyond that are dropped).
+fn usable_ram(map: &[u8], desc_size: usize) -> ([(u64, u64); MAX_RANGES], usize) {
+    let mut out = [(0u64, 0u64); MAX_RANGES];
+    let mut n = 0;
+    if desc_size < 40 {
+        return (out, 0);
+    }
+    for d in map.chunks_exact(desc_size) {
+        if !usable(u32_at(d, 0) as u32) {
+            continue;
+        }
+        let (mut base, mut end) = (u64_at(d, 8), u64_at(d, 8) + u64_at(d, 24) * 4096);
+        // Join every range it touches, which then goes.
+        let mut i = 0;
+        while i < n {
+            let (b, s) = out[i];
+            if b <= end && base <= b + s {
+                base = base.min(b);
+                end = end.max(b + s);
+                out[i] = out[n - 1];
+                n -= 1;
+            } else {
+                i += 1;
+            }
+        }
+        if n == MAX_RANGES {
+            // Full: this one replaces the smallest, if it is bigger.
+            let (i, s) = (0..n).map(|i| (i, out[i].1)).min_by_key(|r| r.1).unwrap();
+            if end - base <= s {
+                continue;
+            }
+            out[i] = out[n - 1];
+            n -= 1;
+        }
+        out[n] = (base, end - base);
+        n += 1;
+    }
+    out[..n].sort_unstable();
+    (out, n)
+}
+
+/// A device tree being written: the structure block's words go at `at`.
+struct Fdt<'a> {
+    buf: &'a mut [u8; BOOT_DTB_SIZE],
+    at: usize,
+}
+
+impl Fdt<'_> {
+    fn word(&mut self, v: u32) {
+        self.buf[self.at..self.at + 4].copy_from_slice(&v.to_be_bytes());
+        self.at += 4;
+    }
+
+    fn node(&mut self, name: &str) {
+        self.word(1); // FDT_BEGIN_NODE
+        self.buf[self.at..self.at + name.len()].copy_from_slice(name.as_bytes());
+        self.at = (self.at + name.len() + 1 + 3) & !3;
+    }
+
+    fn end_node(&mut self) {
+        self.word(2); // FDT_END_NODE
+    }
+
+    /// A property: its name's offset in the strings block, and its value.
+    fn prop(&mut self, name: u32, value: &[u8]) {
+        self.word(3); // FDT_PROP
+        self.word(value.len() as u32);
+        self.word(name);
+        self.buf[self.at..self.at + value.len()].copy_from_slice(value);
+        self.at = (self.at + value.len() + 3) & !3;
+    }
+
+    fn prop_u64s(&mut self, name: u32, values: impl Iterator<Item = u64> + Clone) {
+        let len = 8 * values.clone().count();
+        self.word(3);
+        self.word(len as u32);
+        self.word(name);
+        for v in values {
+            self.buf[self.at..self.at + 8].copy_from_slice(&v.to_be_bytes());
+            self.at += 8;
+        }
+    }
+}
+
+/// Writes the kernel's device tree into `buf`: `/memory` with `ram`, and
+/// `/chosen` with `name` (`superior,device-tree` or `superior,acpi-rsdp`)
+/// set to `at`. Two address and two size cells.
+fn boot_dtb(buf: &mut [u8; BOOT_DTB_SIZE], ram: &[(u64, u64)], name: &str, at: u64) {
+    // The strings block: each property name once.
+    let names = ["#address-cells", "#size-cells", "device_type", "reg", name];
+    let mut strings = [0u8; 96];
+    let mut offsets = [0u32; 5];
+    let mut sl = 0;
+    for (i, n) in names.iter().enumerate() {
+        offsets[i] = sl as u32;
+        strings[sl..sl + n.len()].copy_from_slice(n.as_bytes());
+        sl += n.len() + 1;
+    }
+    buf.fill(0);
+    // The structure block, after the 40-byte header and an empty
+    // reservation map.
+    const START: usize = 56;
+    let mut f = Fdt { buf, at: START };
+    f.node("");
+    f.prop(offsets[0], &2u32.to_be_bytes());
+    f.prop(offsets[1], &2u32.to_be_bytes());
+    f.node("memory");
+    f.prop(offsets[2], b"memory\0");
+    f.prop_u64s(offsets[3], ram.iter().flat_map(|&(b, s)| [b, s]));
+    f.end_node();
+    f.node("chosen");
+    f.prop_u64s(offsets[4], [at].into_iter());
+    f.end_node();
+    f.end_node();
+    f.word(9); // FDT_END
+    let strings_at = f.at;
+    let buf = f.buf;
+    buf[strings_at..strings_at + sl].copy_from_slice(&strings[..sl]);
+    let header = [
+        0xd00d_feed,
+        (strings_at + sl) as u32,
+        START as u32,
+        strings_at as u32,
+        40, // the (empty) memory reservation map
+        17,
+        16,
+        0,
+        sl as u32,
+        (strings_at - START) as u32,
+    ];
+    for (i, v) in header.iter().enumerate() {
+        buf[4 * i..4 * i + 4].copy_from_slice(&v.to_be_bytes());
+    }
+}
 
 struct Console(*mut TextOutput);
 
@@ -207,22 +360,33 @@ extern "efiapi" fn efi_main(image: Handle, st: *const SystemTable) -> Status {
     // SAFETY: the firmware's configuration table, `number_of_table_entries`
     // long.
     let tables = unsafe { core::slice::from_raw_parts(st.configuration_table, st.number_of_table_entries) };
-    let acpi = tables.iter().any(|t| t.guid == ACPI_GUID);
-    let Some(dtb) = tables.iter().find(|t| t.guid == DTB_GUID).map(|t| t.table as u64) else {
-        con.say(if acpi {
-            "loader: the firmware offers ACPI and no device tree (QEMU: -machine virt,acpi=off); the kernel needs a device tree for now\n"
-        } else {
-            "loader: the firmware offers no device tree\n"
-        });
-        return LOAD_ERROR;
+    let dtb = tables.iter().find(|t| t.guid == DTB_GUID).map(|t| t.table as u64);
+    let rsdp = tables.iter().find(|t| t.guid == ACPI_GUID).map(|t| t.table as u64);
+    let dtb_size = match (dtb, rsdp) {
+        (Some(dtb), _) => {
+            // SAFETY: the firmware's device tree: its header first.
+            let header = unsafe { core::slice::from_raw_parts(dtb as *const u8, 8) };
+            let size = u32::from_be_bytes(header[4..8].try_into().unwrap()) as u64;
+            if header[..4] != [0xd0, 0x0d, 0xfe, 0xed] || size < 40 {
+                con.say("loader: the firmware's device tree is not one\n");
+                return LOAD_ERROR;
+            }
+            size
+        }
+        (None, Some(rsdp)) => {
+            // SAFETY: the firmware's ACPI 2.0 RSDP: 36 bytes.
+            let r = unsafe { core::slice::from_raw_parts(rsdp as *const u8, 36) };
+            if r[..8] != *b"RSD PTR " || r[15] < 2 || r.iter().fold(0u8, |a, &b| a.wrapping_add(b)) != 0 {
+                con.say("loader: the firmware's ACPI RSDP is not an ACPI 2.0 one\n");
+                return LOAD_ERROR;
+            }
+            0
+        }
+        (None, None) => {
+            con.say("loader: the firmware describes the machine neither by a device tree nor by ACPI\n");
+            return LOAD_ERROR;
+        }
     };
-    // SAFETY: the firmware's device tree: its header first.
-    let header = unsafe { core::slice::from_raw_parts(dtb as *const u8, 8) };
-    let dtb_size = u32::from_be_bytes(header[4..8].try_into().unwrap()) as u64;
-    if header[..4] != [0xd0, 0x0d, 0xfe, 0xed] || dtb_size < 40 {
-        con.say("loader: the firmware's device tree is not one\n");
-        return LOAD_ERROR;
-    }
 
     // The kernel: one block of pages from its lowest segment to its
     // highest end, at exactly that address.
@@ -248,29 +412,44 @@ extern "efiapi" fn efi_main(image: Handle, st: *const SystemTable) -> Status {
     }
     let entry = u64_at(KERNEL, 24);
 
-    // The device tree, copied below where the kernel maps RAM to.
+    // The firmware's device tree, copied below where the kernel maps RAM
+    // to, and the kernel's own after it.
     let mut copy = KERNEL_RAM_END - 1;
-    let pages = dtb_size.div_ceil(4096) as usize;
+    let pages = (dtb_size.div_ceil(4096) + BOOT_DTB_SIZE as u64 / 4096) as usize;
     if (bs.allocate_pages)(ALLOCATE_MAX_ADDRESS, LOADER_DATA, pages, &mut copy) != SUCCESS {
         con.say("loader: no memory for the device tree\n");
         return LOAD_ERROR;
     }
-    // SAFETY: the firmware's device tree, `dtb_size` bytes, into pages of
-    // the loader's own that big.
-    unsafe { core::ptr::copy_nonoverlapping(dtb as *const u8, copy as *mut u8, dtb_size as usize) };
-
+    let boot_at = copy + dtb_size.div_ceil(4096) * 4096;
+    // SAFETY: the last page of those just allocated.
+    let boot = unsafe { &mut *(boot_at as *mut [u8; BOOT_DTB_SIZE]) };
     con.say("loader: kernel at ");
     con.hex(lo);
     con.say(" to ");
     con.hex(hi);
     con.say(", entry ");
     con.hex(entry);
-    con.say("; device tree (");
-    con.hex(dtb_size);
-    con.say(" bytes) at ");
-    con.hex(copy);
-    con.say(if acpi { "; ACPI tables offered too, unused\n" } else { "\n" });
-    con.say("loader: leaving boot services\n");
+    let (name, described) = match (dtb, rsdp) {
+        (Some(dtb), _) => {
+            // SAFETY: the firmware's device tree, `dtb_size` bytes, into
+            // pages of the loader's own that big.
+            unsafe { core::ptr::copy_nonoverlapping(dtb as *const u8, copy as *mut u8, dtb_size as usize) };
+            con.say("; device tree (");
+            con.hex(dtb_size);
+            con.say(" bytes) at ");
+            con.hex(copy);
+            con.say(if rsdp.is_some() { "; ACPI tables offered too, unused\n" } else { "\n" });
+            ("superior,device-tree", copy)
+        }
+        (None, rsdp) => {
+            let rsdp = rsdp.unwrap_or(0);
+            con.say("; ACPI tables, RSDP at ");
+            con.hex(rsdp);
+            con.say("\n");
+            ("superior,acpi-rsdp", rsdp)
+        }
+    };
+    con.say("loader: leaving boot services; the kernel's RAM is what the final memory map leaves free\n");
 
     // Boot services end with the key of the memory map as it is: a map
     // that changed meanwhile (the call itself can change it) is read again.
@@ -279,8 +458,16 @@ extern "efiapi" fn efi_main(image: Handle, st: *const SystemTable) -> Status {
         let (mut size, mut key, mut desc_size, mut version) = (MAP_SIZE, 0, 0, 0);
         // SAFETY: the loader's map buffer, `size` bytes.
         let got = (bs.get_memory_map)(&mut size, core::ptr::addr_of_mut!(MAP) as *mut u8, &mut key, &mut desc_size, &mut version);
-        if got == SUCCESS && (bs.exit_boot_services)(image, key) == SUCCESS {
-            break;
+        if got == SUCCESS {
+            // The kernel's device tree, from this map: written into pages
+            // already allocated, so the map stays as it is.
+            // SAFETY: the map the firmware just wrote, `size` bytes.
+            let map = unsafe { core::slice::from_raw_parts(core::ptr::addr_of!(MAP) as *const u8, size.min(MAP_SIZE)) };
+            let (ram, n) = usable_ram(map, desc_size);
+            boot_dtb(boot, &ram[..n], name, described);
+            if (bs.exit_boot_services)(image, key) == SUCCESS {
+                break;
+            }
         }
         tries += 1;
         if tries == 3 {
@@ -294,7 +481,7 @@ extern "efiapi" fn efi_main(image: Handle, st: *const SystemTable) -> Status {
     // SAFETY: interrupts masked; the firmware's handlers are gone.
     unsafe { core::arch::asm!("msr daifset, #0xf") };
     clean(lo, hi);
-    clean(copy, copy + dtb_size);
+    clean(copy, boot_at + BOOT_DTB_SIZE as u64);
     // SAFETY: the kernel is in place and in memory: the MMU and caches go
     // off (the firmware's identity map means this code goes on where it
     // is), the instruction cache and TLBs are emptied, and the kernel is
@@ -316,7 +503,7 @@ extern "efiapi" fn efi_main(image: Handle, st: *const SystemTable) -> Status {
             "mov x3, xzr",
             "br x4",
             in("x4") entry,
-            in("x0") copy,
+            in("x0") boot_at,
             options(noreturn),
         )
     }

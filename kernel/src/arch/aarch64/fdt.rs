@@ -1,16 +1,19 @@
-//! Just enough of a flattened device tree reader to find RAM: the `reg`
-//! ranges of the root's `memory` nodes. Every read is bounds-checked
-//! against the tree's stated size.
+//! Just enough of a flattened device tree reader to find RAM (the `reg`
+//! ranges of the root's `memory` nodes), a device by its `compatible`
+//! string, and a 64-bit property of `/chosen`. Every read is
+//! bounds-checked against the tree's stated size.
 
-pub const MAX_RANGES: usize = 4;
+/// RAM ranges read: as many as the UEFI loader writes.
+pub const MAX_RANGES: usize = 32;
 const MAGIC: u32 = 0xd00d_feed;
 const BEGIN_NODE: u32 = 1;
 const END_NODE: u32 = 2;
 const PROP: u32 = 3;
 const NOP: u32 = 4;
 const END: u32 = 9;
-/// Refuse absurd sizes before trusting the header.
-const MAX_SIZE: u64 = 1 << 20;
+/// Refuse absurd sizes before trusting the header (QEMU's `virt` pads its
+/// tree to just over 1 MiB).
+const MAX_SIZE: u64 = 4 << 20;
 
 fn be32(addr: u64) -> u32 {
     // SAFETY: callers bounds-check against the tree, which lies in RAM
@@ -218,6 +221,72 @@ pub fn find_device(dtb: u64, want: &[u8]) -> Option<(u64, Option<u32>)> {
                     // SPIs are numbered from ID 32, PPIs from 16.
                     let base = if be32(value) == 0 { 32 } else { 16 };
                     irq = Some(base + be32(value + 4));
+                }
+                p = (value + len + 3) & !3;
+            }
+            NOP => {}
+            END => break,
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// The 64-bit value of the property `want` of `/chosen` (two cells, as
+/// the UEFI loader writes them), if it has one.
+pub fn chosen_u64(dtb: u64, want: &[u8]) -> Option<u64> {
+    if !valid(dtb) {
+        return None;
+    }
+    let end = dtb + size(dtb);
+    let structs = dtb + be32(dtb + 8) as u64;
+    let strings = dtb + be32(dtb + 12) as u64;
+    let name_is = |off: u32| -> bool {
+        let at = strings + off as u64;
+        at + (want.len() as u64) < end
+            && want
+                .iter()
+                .enumerate()
+                .all(|(i, &c)| byte(at + i as u64) == c)
+            && byte(at + want.len() as u64) == 0
+    };
+    let mut depth = 0u32;
+    let mut in_chosen = false;
+    let mut p = structs;
+    while p + 4 <= end {
+        let token = be32(p);
+        p += 4;
+        match token {
+            BEGIN_NODE => {
+                depth += 1;
+                let start = p;
+                while p < end && byte(p) != 0 {
+                    p += 1;
+                }
+                in_chosen = depth == 2
+                    && p - start == 6
+                    && b"chosen"
+                        .iter()
+                        .enumerate()
+                        .all(|(i, &c)| byte(start + i as u64) == c);
+                p = (p + 1 + 3) & !3;
+            }
+            END_NODE => {
+                depth = depth.saturating_sub(1);
+                in_chosen = false;
+            }
+            PROP => {
+                if p + 8 > end {
+                    return None;
+                }
+                let len = be32(p) as u64;
+                let name = be32(p + 4);
+                let value = p + 8;
+                if value + len > end {
+                    return None;
+                }
+                if in_chosen && len == 8 && name_is(name) {
+                    return Some(cells(value, 2));
                 }
                 p = (value + len + 3) & !3;
             }

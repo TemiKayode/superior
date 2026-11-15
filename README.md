@@ -29,16 +29,25 @@ holds the rest):
 - AArch64 also boots from UEFI firmware, as Arm laptops and servers do: `loader/` is a
   small UEFI application (no crates, `aarch64-unknown-uefi`) with the kernel ELF built
   into it, on an EFI system partition of a GPT disk. It checks it was started at EL1,
-  takes the firmware's device tree (UEFI's DTB configuration table; with ACPI only, it
-  refuses and says so), loads the kernel's segments at their link address and copies
-  the device tree below 4 GiB, leaves boot services, cleans the caches to the point of
-  coherency, turns the MMU and caches off and enters the kernel as QEMU's `-kernel`
-  does (x0 the device tree), so the kernel needs no second entry. `cargo xtask
-  uefi-test aarch64` boots it from an NVMe disk under QEMU's edk2 for `virt`
-  (`acpi=off`): the firmware's boot manager, the loader and the shell session must
-  show, then the driver framework test with the SMMUv3 from the same kind of disk.
-  Booting from ACPI tables, at EL2, and keeping clear of what the firmware's memory
-  map reserves for its runtime are still to do.
+  loads the kernel's segments at their link address and hands the kernel a small
+  device tree of its own, as QEMU's `-kernel` hands it QEMU's: the RAM the firmware's
+  final memory map leaves free once boot services end (none of the firmware's runtime
+  code and data, ACPI tables or reserved memory), and under `/chosen` where the
+  firmware describes the machine, by its device tree (`superior,device-tree`, copied
+  below 4 GiB) or by ACPI (`superior,acpi-rsdp`). Then it leaves boot services, cleans
+  the caches to the point of coherency, turns the MMU and caches off and enters the
+  kernel with x0 the device tree. Given ACPI, the kernel reads the MADT (the CPUs by
+  MPIDR, the GICv3's distributor, redistributors and ITS), GTDT (the timer's
+  interrupt), SPCR (the console), MCFG (ECAM), IORT (the SMMUv3 and its interrupt, and
+  that stream IDs are requester IDs) and FADT (PSCI by `hvc`), before any RAM is
+  handed out; it starts the CPUs the MADT lists and drives the SMMU the IORT names,
+  and refuses to go on if the GIC, timer, console or ECAM are not where it drives them
+  (QEMU `virt`'s layout, still fixed). `cargo xtask uefi-test aarch64` boots it from an
+  NVMe disk under QEMU's edk2 for `virt` twice, with the firmware's device tree
+  (`acpi=off`) and with its ACPI tables alone: each time the firmware's boot manager,
+  the loader and the shell session must show, then the driver framework test with
+  the SMMUv3. Entry at EL2, and the GIC, console and ECAM wherever the firmware puts
+  them, are still to do.
 - x86-64 boots from a BIOS or, as on current laptops, from UEFI firmware: the same
   kernel on a GPT disk with an EFI system partition and no BIOS boot code. The
   Component Manager's 8 MiB arena is carved before spare RAM is handed out, since
@@ -1386,7 +1395,7 @@ cargo xtask run            # boot the shell in QEMU (x86-64), its console on thi
 cargo xtask run aarch64    # the same on QEMU's AArch64 virt machine
 cargo xtask console-test   # the kernel's log on the boot framebuffer, from a BIOS and from UEFI, checked by screenshot
 cargo xtask uefi-test      # x86-64 booted by UEFI firmware (OVMF): the shell session and the driver test
-cargo xtask uefi-test aarch64  # AArch64 booted by UEFI firmware (edk2) through loader/: the shell session and the driver test
+cargo xtask uefi-test aarch64  # AArch64 booted by UEFI firmware (edk2) through loader/, from its device tree and from ACPI: the shell session and the driver test
 cargo xtask idl    # generate Rust from the interface descriptions in interfaces/
 cargo xtask image  # just build target/superior.img
 cargo xtask bench  # IPC timing under WHPX or KVM, checked against seL4's figures

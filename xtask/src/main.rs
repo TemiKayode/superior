@@ -131,9 +131,12 @@ struct Image {
     /// QEMU's ENSONIQ AudioPCI, recording what it plays to this WAV file
     /// (the audio test).
     audio: Option<PathBuf>,
-    /// An x86-64 image booted by UEFI firmware (QEMU's OVMF) rather than
-    /// a BIOS.
+    /// Booted by UEFI firmware (QEMU's OVMF, or edk2 for `virt`) rather
+    /// than a BIOS or QEMU's `-kernel`.
     uefi: bool,
+    /// AArch64 UEFI: the firmware describes the machine by ACPI tables,
+    /// not a device tree.
+    acpi: bool,
     /// QEMU's `-smp` in place of the usual CPU count (a CPU topology).
     smp: Option<&'static str>,
 }
@@ -856,6 +859,7 @@ fn image_sealed(
         display: matches!(manifest, "display" | "desktop" | "input" | "windows" | "toolkit" | "panel" | "resize" | "widgets"),
         audio: (manifest == "audio").then(|| audio_wav(arch)),
         uefi: false,
+        acpi: false,
         smp: None,
     })
 }
@@ -957,6 +961,7 @@ fn sel4_image() -> Result<Image, String> {
         display: false,
         audio: None,
         uefi: false,
+        acpi: false,
         smp: None,
     })
 }
@@ -1229,7 +1234,8 @@ fn qemu_command(img: &Image) -> Command {
                 // UEFI firmware (edk2) in flash, booting the disk's EFI
                 // system partition. acpi=off: the firmware then hands over
                 // QEMU's device tree, not ACPI tables.
-                q.args(["-machine", &format!("{machine},acpi=off"), "-cpu", cpu])
+                let acpi = if img.acpi { "on" } else { "off" };
+                q.args(["-machine", &format!("{machine},acpi={acpi}"), "-cpu", cpu])
                     .arg("-drive")
                     .arg(format!("if=pflash,format=raw,readonly=on,file={}", aavmf().display()))
                     .arg("-drive")
@@ -1628,6 +1634,11 @@ fn test_disk() -> Result<PathBuf, String> {
 /// - a crashed driver is restarted, its device reset and reopened, and
 ///   reads work again.
 fn drivers_test(img: &Image) -> Result<(), String> {
+    drivers_test_log(img).map(|_| ())
+}
+
+/// As [`drivers_test`], returning the log.
+fn drivers_test_log(img: &Image) -> Result<String, String> {
     println!("== driver framework test on {}", img.path.display());
     let out = run_to_exit(img, Duration::from_secs(60))?;
     let (d, device, _) = disk_driver(img.driver);
@@ -1795,7 +1806,7 @@ fn drivers_test(img: &Image) -> Result<(), String> {
         }
     }
     println!("== driver framework test passed ({}, {d})", img.arch.name());
-    Ok(())
+    Ok(out)
 }
 
 /// The filesystem tests' disk (4 MiB), shared by both boots.
@@ -5600,49 +5611,75 @@ fn shell_session(img: &Image) -> Result<(), String> {
     Ok(())
 }
 
+/// AArch64 booted by UEFI firmware (QEMU's edk2) from a GPT disk: the
+/// firmware starts the loader on the EFI system partition, which places
+/// the kernel, hands it a device tree of its own (the RAM the firmware's
+/// memory map leaves free, and where the firmware's description is) and
+/// leaves boot services. Twice: with the firmware's device tree
+/// (`acpi=off`), then with its ACPI tables alone. Each time the shell
+/// session, which must show all of that, then the driver framework test
+/// (the SMMU, the ITS and PCI as the kernel finds them after the firmware).
+fn uefi_test_aarch64() -> Result<(), String> {
+    for acpi in [false, true] {
+        let how = if acpi { "ACPI" } else { "device tree" };
+        let mut img = uefi_image(Arch::Aarch64, "shell")?;
+        img.acpi = acpi;
+        println!("== UEFI shell session ({how}) on {}", img.path.display());
+        let out = drive_shell(&img, &[], SHELL_SCRIPT)?;
+        // The firmware's boot manager starts the disk. What the firmware
+        // says before that is its own: the log is held to the usual words
+        // from the loader on.
+        if !out.contains("BdsDxe: starting Boot0001 \"UEFI QEMU NVMe Ctrl superior-boot") {
+            return Err(format!("UEFI test (aarch64, {how}): the firmware's boot manager did not start the disk"));
+        }
+        let banner = "Superior UEFI loader (AArch64)";
+        let out = out.find(banner).map_or("", |at| &out[at..]);
+        let described: &[&str] = if acpi {
+            &[
+                "; ACPI tables, RSDP at ",
+                "loader: leaving boot services; the kernel's RAM is what the final memory map leaves free",
+                "Superior microkernel",
+                "[ok] MMU on; exception vectors installed",
+                "[ok] ACPI (RSDP at ",
+                "2 CPUs (MADT), PSCI by hvc (FADT); GICv3 at 0x8000000, ITS; timer interrupt 27 (GTDT); PL011 at 0x9000000 (SPCR); ECAM at 0x3f000000, buses 0-15 (MCFG)",
+                "[ok] ACPI: no SMMU (IORT)",
+                "[ok] 2 CPUs online",
+                "superior> ",
+            ]
+        } else {
+            &[
+                "; device tree (",
+                "loader: leaving boot services; the kernel's RAM is what the final memory map leaves free",
+                "Superior microkernel",
+                "[ok] MMU on; exception vectors installed",
+                "[ok] 2 CPUs online",
+                "superior> ",
+            ]
+        };
+        let mut steps = vec![banner, "loader: kernel at 0x40200000 to "];
+        steps.extend_from_slice(described);
+        check_log(&format!("UEFI test (aarch64, {how})"), out, &steps)?;
+        if !acpi && out.contains("[ok] ACPI") {
+            return Err("UEFI test (aarch64, device tree): the kernel read ACPI tables".into());
+        }
+        println!("== UEFI shell session passed (aarch64, {how})");
+        let mut img = uefi_image(Arch::Aarch64, "drivers")?;
+        img.acpi = acpi;
+        let out = drivers_test_log(&img)?;
+        if acpi && !out.contains("[ok] ACPI: SMMUv3 at 0x9050000, event interrupt 106; stream IDs are requester IDs (IORT)") {
+            return Err("UEFI test (aarch64, ACPI): the SMMU was not found from the IORT".into());
+        }
+    }
+    println!("== UEFI test passed (aarch64)");
+    Ok(())
+}
+
 /// x86-64 booted by UEFI firmware (QEMU's OVMF) from a GPT disk with no
 /// BIOS boot code: the shell session, which must show the firmware's boot
 /// manager starting the disk and the bootloader's UEFI stage, on four CPUs
 /// whose APIC IDs have a gap (found from ACPI's MADT), then the driver
 /// framework test on q35 (PCI Express, the VT-d IOMMU from ACPI's DMAR
 /// table, MSI).
-/// AArch64 booted by UEFI firmware (QEMU's edk2) from a GPT disk: the
-/// firmware starts the loader on the EFI system partition, which places
-/// the kernel, hands it the firmware's device tree and leaves boot
-/// services; then the shell session, which must show all of that.
-fn uefi_test_aarch64() -> Result<(), String> {
-    let img = uefi_image(Arch::Aarch64, "shell")?;
-    println!("== UEFI shell session on {}", img.path.display());
-    let out = drive_shell(&img, &[], SHELL_SCRIPT)?;
-    // The firmware's boot manager starts the disk. What the firmware says
-    // before that is its own (QEMU gives it no TRNG, say, which it
-    // reports): the log is held to the usual words from the loader on.
-    if !out.contains("BdsDxe: starting Boot0001 \"UEFI QEMU NVMe Ctrl superior-boot") {
-        return Err("UEFI test (aarch64): the firmware's boot manager did not start the disk".into());
-    }
-    let banner = "Superior UEFI loader (AArch64)";
-    let out = out.find(banner).map_or("", |at| &out[at..]);
-    check_log(
-        "UEFI test (aarch64)",
-        out,
-        &[
-            banner,
-            "loader: kernel at 0x40200000 to ",
-            "; device tree (",
-            "loader: leaving boot services",
-            "Superior microkernel",
-            "[ok] MMU on; exception vectors installed",
-            "superior> ",
-        ],
-    )?;
-    println!("== UEFI shell session passed (aarch64)");
-    // The driver framework test from the same kind of disk: the SMMU, the
-    // ITS and PCI as the kernel finds them after the firmware.
-    drivers_test(&uefi_image(Arch::Aarch64, "drivers")?)?;
-    println!("== UEFI test passed (aarch64)");
-    Ok(())
-}
-
 fn uefi_test(arch: Arch) -> Result<(), String> {
     if arch == Arch::Aarch64 {
         return uefi_test_aarch64();

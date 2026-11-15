@@ -11,7 +11,7 @@
 //! wired SPI the device tree names first) has the kernel drain it at once
 //! ([`take_faults`]); the timer tick drains it too, in case one is missed.
 
-use super::{fdt, gic, vm};
+use super::{gic, vm};
 use crate::iommu::IoFault;
 use crate::{kprintln, memory};
 use superior_objects::abi::PCI_BUSES;
@@ -124,8 +124,9 @@ fn sync() {
 }
 
 /// Finds and turns on the SMMU, with no stream able to reach anything.
-pub fn init(dtb: u64) -> Option<&'static str> {
-    let (base, irq) = fdt::find_device(dtb, b"arm,smmu-v3")?;
+/// `base` is its register page, `irq` its event queue's interrupt ID (from
+/// the device tree or ACPI's IORT).
+pub fn init(base: u64, irq: Option<u32>) -> Option<&'static str> {
     REGS.store(base, Ordering::Relaxed);
     let idr0 = r32(IDR0);
     // Stage 1, AArch64 tables.

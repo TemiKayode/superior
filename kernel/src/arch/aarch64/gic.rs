@@ -18,11 +18,11 @@ use superior_objects::abi::PCI_BUSES;
 use core::sync::atomic::{AtomicU64, Ordering};
 use spin::Mutex;
 
-const GICD: u64 = 0x0800_0000;
-const GITS: u64 = 0x0808_0000;
+pub(super) const GICD: u64 = 0x0800_0000;
+pub(super) const GITS: u64 = 0x0808_0000;
 /// CPU 0's redistributor: its control frame, then its SGI/PPI frame. The
 /// next CPU's follows ([`REDIST_STRIDE`] on).
-const GICR: u64 = 0x080a_0000;
+pub(super) const GICR: u64 = 0x080a_0000;
 const REDIST_STRIDE: u64 = 0x2_0000;
 /// The SGIs CPUs send each other: a kick, and a shootdown request.
 pub const KICK_SGI: u32 = 1;
