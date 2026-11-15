@@ -1,12 +1,14 @@
-//! AArch64 on QEMU's `virt` machine: entered at EL1 with the MMU off, at
-//! the link address, with a device tree's address in x0: QEMU's own at the
+//! AArch64 on QEMU's `virt` machine: entered at EL1 or EL2 with the MMU
+//! off, at the link address, with a device tree's address in x0 (entered
+//! at EL2, each CPU sets EL1 up and steps down to it first): QEMU's own at the
 //! start of RAM (`-kernel`), or the UEFI loader's, which lists the RAM the
 //! firmware's memory map leaves free and points under `/chosen` to the
 //! firmware's device tree or to its ACPI tables ([`acpi`]). The kernel
 //! runs at EL1 and user threads at EL0. Devices: a PL011 UART, a GICv3
 //! interrupt controller with an ITS, and the architected generic timer.
-//! The other CPUs are started through PSCI (`CPU_ON`, by `hvc`, which QEMU
-//! answers itself) at [`ap_start`], each with its own stack, redistributor
+//! The other CPUs are started through PSCI (`CPU_ON`, by `hvc`, or by `smc`
+//! where EL2 is there to catch `hvc`, as the device tree or ACPI's FADT
+//! says; QEMU answers either itself) at [`ap_start`], each with its own stack, redistributor
 //! and timer; CPU `n` is the one whose MPIDR affinity 0 is `n`.
 //!
 //! One translation table base (`TTBR0_EL1`) serves both: every address
@@ -52,6 +54,8 @@ static DTB: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0
 static ACPI: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 static ACPI_SMMU: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static ACPI_SMMU_IRQ: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// PSCI is called by `smc`, not `hvc`.
+static PSCI_SMC: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 /// CPUs to bring up at most: ACPI's MADT says how many there are.
 static CPU_LIMIT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(MAX_CPUS);
 /// QEMU `virt`'s ECAM with `highmem=off`: the kernel hands it out as it is.
@@ -119,23 +123,7 @@ pub fn send_ipi(cpu: usize, ipi: Ipi) {
 pub fn start_secondaries() -> usize {
     let limit = CPU_LIMIT.load(core::sync::atomic::Ordering::Relaxed).min(MAX_CPUS);
     for cpu in 1..limit {
-        let r: i64;
-        // SAFETY: a PSCI call; the new CPU starts at `ap_start` with the
-        // MMU off and builds nothing this CPU uses.
-        unsafe {
-            core::arch::asm!(
-                "hvc #0",
-                inout("x0") PSCI_CPU_ON => r,
-                inout("x1") cpu as u64 => _,
-                inout("x2") ap_start as *const () as u64 => _,
-                inout("x3") cpu as u64 => _,
-                out("x4") _, out("x5") _, out("x6") _, out("x7") _,
-                out("x8") _, out("x9") _, out("x10") _, out("x11") _,
-                out("x12") _, out("x13") _, out("x14") _, out("x15") _,
-                out("x16") _, out("x17") _,
-                options(nostack)
-            )
-        };
+        let r = psci(PSCI_CPU_ON, cpu as u64, ap_start as *const () as u64, cpu as u64);
         if r != 0 {
             break;
         }
@@ -149,6 +137,46 @@ pub fn start_secondaries() -> usize {
         }
     }
     smp::online()
+}
+
+/// A PSCI call, by the conduit the firmware's description names.
+fn psci(function: u64, a1: u64, a2: u64, a3: u64) -> i64 {
+    let r: i64;
+    if PSCI_SMC.load(core::sync::atomic::Ordering::Relaxed) {
+        // SAFETY: a PSCI call, which the caller makes for its own ends;
+        // the firmware may clobber x0 to x17.
+        unsafe {
+            core::arch::asm!(
+                "smc #0",
+                inout("x0") function => r,
+                inout("x1") a1 => _,
+                inout("x2") a2 => _,
+                inout("x3") a3 => _,
+                out("x4") _, out("x5") _, out("x6") _, out("x7") _,
+                out("x8") _, out("x9") _, out("x10") _, out("x11") _,
+                out("x12") _, out("x13") _, out("x14") _, out("x15") _,
+                out("x16") _, out("x17") _,
+                options(nostack)
+            )
+        };
+    } else {
+        // SAFETY: as above.
+        unsafe {
+            core::arch::asm!(
+                "hvc #0",
+                inout("x0") function => r,
+                inout("x1") a1 => _,
+                inout("x2") a2 => _,
+                inout("x3") a3 => _,
+                out("x4") _, out("x5") _, out("x6") _, out("x7") _,
+                out("x8") _, out("x9") _, out("x10") _, out("x11") _,
+                out("x12") _, out("x13") _, out("x14") _, out("x15") _,
+                out("x16") _, out("x17") _,
+                options(nostack)
+            )
+        };
+    }
+    r
 }
 
 extern "C" {
@@ -185,6 +213,8 @@ core::arch::global_asm!(
     ".section .text.boot, \"ax\"",
     ".global _start",
     "_start:",
+    "    bl el2_to_el1",
+    "    mov x20, x9",
     "    mrs x1, mpidr_el1",
     "    and x1, x1, #0xff",
     "    cbz x1, 2f",
@@ -227,6 +257,7 @@ core::arch::global_asm!(
     "    msr sctlr_el1, x3",
     "    isb",
     "    mov x0, x19",
+    "    mov x1, x20",
     "    bl {main}",
     "    b 1b",
     // A CPU started by PSCI, with its number in x0: its own stack (below
@@ -234,6 +265,9 @@ core::arch::global_asm!(
     // tables (already built), the MMU on.
     ".global ap_start",
     "ap_start:",
+    "    mov x19, x0",
+    "    bl el2_to_el1",
+    "    mov x0, x19",
     "    adrp x1, {stack}",
     "    add x1, x1, :lo12:{stack}",
     "    mov x2, #{stack_size}",
@@ -257,6 +291,57 @@ core::arch::global_asm!(
     "    isb",
     "    bl {ap_main}",
     "    b 1b",
+    // Entered at EL2: EL1 gets the machine as if there were no EL2 (EL1
+    // in AArch64, nothing trapped, the counter and timers, the GIC's
+    // system registers, FP and SIMD, the PMU's counters, its own MIDR
+    // and MPIDR, no stage 2), and this returns there, at EL1 with the
+    // MMU off and interrupts masked. Entered at EL1, it just returns.
+    // x9 is then 1 if it stepped down, 0 if not; x0 to x8 are kept.
+    "el2_to_el1:",
+    "    mrs x9, CurrentEL",
+    "    cmp x9, #8",
+    "    b.eq 7f",
+    "    mov x9, #0",
+    "    ret",
+    "7:  mov x9, #0x80000000", // HCR_EL2.RW: EL1 is AArch64
+    "    msr hcr_el2, x9",
+    "    isb",
+    "    mov x9, #3", // CNTHCTL_EL2: EL1PCTEN, EL1PCEN
+    "    msr cnthctl_el2, x9",
+    "    msr cntvoff_el2, xzr",
+    "    mrs x9, id_aa64pfr0_el1",
+    "    ubfx x9, x9, #24, #4", // GIC system register interface
+    "    cbz x9, 8f",
+    "    mrs x9, icc_sre_el2",
+    "    orr x9, x9, #0xf", // SRE, DFB, DIB, and EL1 may use SRE
+    "    msr icc_sre_el2, x9",
+    "    isb",
+    "    msr ich_hcr_el2, xzr",
+    "8:  mov x9, #0x33ff", // CPTR_EL2: its RES1 bits; FP not trapped
+    "    msr cptr_el2, x9",
+    "    msr hstr_el2, xzr",
+    "    msr vttbr_el2, xzr",
+    "    mrs x9, id_aa64dfr0_el1",
+    "    ubfx x9, x9, #8, #4", // PMUVer
+    "    mov x10, #0",
+    "    cbz x9, 9f",
+    "    cmp x9, #0xf",
+    "    b.eq 9f",
+    "    mrs x10, pmcr_el0",
+    "    ubfx x10, x10, #11, #5", // PMCR_EL0.N: every counter to EL1
+    "9:  msr mdcr_el2, x10",
+    "    mrs x9, midr_el1",
+    "    msr vpidr_el2, x9",
+    "    mrs x9, mpidr_el1",
+    "    msr vmpidr_el2, x9",
+    "    ldr x9, =0x30d00800", // SCTLR_EL1: its RES1 bits; MMU, caches off
+    "    msr sctlr_el1, x9",
+    "    mov x9, #0x3c5", // SPSR_EL2: EL1h, D, A, I and F masked
+    "    msr spsr_el2, x9",
+    "    msr elr_el2, x30",
+    "    mov x9, #1",
+    "    isb",
+    "    eret",
     stack = sym BOOT_STACKS,
     stack_size = const BOOT_STACK_SIZE,
     l0 = sym vm::KERNEL_L0,
@@ -271,10 +356,13 @@ core::arch::global_asm!(
 );
 
 #[no_mangle]
-extern "C" fn kernel_main(dtb: u64) -> ! {
+extern "C" fn kernel_main(dtb: u64, from_el2: u64) -> ! {
     serial::init();
     crate::banner();
     exceptions::init();
+    if from_el2 != 0 {
+        kprintln!("[ok] entered at EL2: set EL1 up, with nothing trapped, and stepped down to it");
+    }
     kprintln!("[ok] MMU on; exception vectors installed");
 
     let boot = if fdt::valid(dtb) { dtb } else { DTB_DEFAULT };
@@ -287,6 +375,11 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
         None => boot,
     };
     DTB.store(devices, core::sync::atomic::Ordering::Relaxed);
+    // The device tree's PSCI node says how PSCI is called (ACPI's FADT
+    // does, below).
+    if fdt::device_prop_is(devices, b"arm,psci-0.2", b"method", b"smc") {
+        PSCI_SMC.store(true, core::sync::atomic::Ordering::Relaxed);
+    }
     let mut ram = [(0u64, 0u64); fdt::MAX_RANGES];
     let n = fdt::memory(boot, &mut ram).expect("no usable device tree");
     let kernel_end = core::ptr::addr_of!(__kernel_end) as u64;
@@ -378,13 +471,17 @@ fn use_acpi(m: &acpi::Machine) {
         ACPI_SMMU.store(base, Relaxed);
         ACPI_SMMU_IRQ.store(irq.unwrap_or(0), Relaxed);
     }
-    let cpus = if m.psci_hvc { m.cpus } else { 1 };
-    CPU_LIMIT.store(cpus, Relaxed);
+    PSCI_SMC.store(m.psci == Some(false), Relaxed);
+    CPU_LIMIT.store(if m.psci.is_some() { m.cpus } else { 1 }, Relaxed);
     kprintln!(
         "[ok] ACPI (RSDP at {:#x}): {} CPUs (MADT){}; GICv3 at {:#x}{}; timer interrupt {} (GTDT); PL011 at {:#x} (SPCR); ECAM at {:#x}, buses {}-{} (MCFG)",
         m.rsdp,
         m.cpus,
-        if m.psci_hvc { ", PSCI by hvc (FADT)" } else { ", no PSCI by hvc (FADT): only this one started" },
+        match m.psci {
+            Some(true) => ", PSCI by hvc (FADT)",
+            Some(false) => ", PSCI by smc (FADT)",
+            None => ", no PSCI (FADT): only this one started",
+        },
         m.gicd,
         if m.its.is_some() { ", ITS" } else { ", no ITS" },
         timer::INTID,

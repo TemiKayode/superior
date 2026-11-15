@@ -1,6 +1,8 @@
 //! Superior's AArch64 UEFI loader: a UEFI application (`BOOTAA64.EFI` on
 //! the EFI system partition) that carries the kernel and starts it the way
-//! QEMU's `-kernel` does: at EL1, MMU off, a device tree's address in x0.
+//! QEMU's `-kernel` does: at the firmware's exception level (EL1, or EL2,
+//! from which the kernel steps down itself), MMU off, a device tree's
+//! address in x0.
 //!
 //! - The kernel's ELF segments go where they are linked (its physical
 //!   address, 0x4020_0000 on QEMU's `virt`), in pages asked of the
@@ -18,9 +20,6 @@
 //! - Then boot services end, interrupts are masked, what the loader wrote
 //!   is cleaned from the caches to memory, the MMU and caches go off, and
 //!   the kernel is entered.
-//!
-//! Firmware that runs at EL2 is refused, for now: the kernel runs at EL1
-//! and expects to be entered there.
 //!
 //! No crates: the few UEFI calls it makes are declared here.
 
@@ -352,9 +351,13 @@ extern "efiapi" fn efi_main(image: Handle, st: *const SystemTable) -> Status {
     let el: u64;
     // SAFETY: reads the current exception level.
     unsafe { core::arch::asm!("mrs {}, CurrentEL", out(reg) el) };
-    if (el >> 2) & 3 != 1 {
-        con.say("loader: the firmware runs at EL2; the kernel must be entered at EL1, which this loader cannot do yet\n");
-        return LOAD_ERROR;
+    match (el >> 2) & 3 {
+        1 => {}
+        2 => con.say("loader: the firmware runs at EL2; the kernel steps down to EL1 itself\n"),
+        _ => {
+            con.say("loader: started at an exception level neither EL1 nor EL2\n");
+            return LOAD_ERROR;
+        }
     }
 
     // SAFETY: the firmware's configuration table, `number_of_table_entries`
@@ -488,6 +491,9 @@ extern "efiapi" fn efi_main(image: Handle, st: *const SystemTable) -> Status {
     // entered as QEMU enters it.
     unsafe {
         core::arch::asm!(
+            "mrs x2, CurrentEL",
+            "cmp x2, #8",
+            "b.eq 1f",
             "mrs x2, sctlr_el1",
             "bic x2, x2, #1",       // M: the MMU
             "bic x2, x2, #4",       // C: data caches
@@ -496,7 +502,17 @@ extern "efiapi" fn efi_main(image: Handle, st: *const SystemTable) -> Status {
             "isb",
             "ic iallu",
             "tlbi vmalle1",
-            "dsb sy",
+            "b 2f",
+            // At EL2: its own translation regime, the same bits.
+            "1: mrs x2, sctlr_el2",
+            "bic x2, x2, #1",
+            "bic x2, x2, #4",
+            "bic x2, x2, #0x1000",
+            "msr sctlr_el2, x2",
+            "isb",
+            "ic iallu",
+            "tlbi alle2",
+            "2: dsb sy",
             "isb",
             "mov x1, xzr",
             "mov x2, xzr",

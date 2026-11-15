@@ -297,3 +297,83 @@ pub fn chosen_u64(dtb: u64, want: &[u8]) -> Option<u64> {
     }
     None
 }
+
+/// Whether the first top-level node whose `compatible` list includes
+/// `compat` has the string property `prop` equal to `value`.
+pub fn device_prop_is(dtb: u64, compat: &[u8], prop: &[u8], value: &[u8]) -> bool {
+    if !valid(dtb) {
+        return false;
+    }
+    let end = dtb + size(dtb);
+    let structs = dtb + be32(dtb + 8) as u64;
+    let strings = dtb + be32(dtb + 12) as u64;
+    let bytes_are = |at: u64, want: &[u8]| -> bool {
+        at + (want.len() as u64) < end
+            && want
+                .iter()
+                .enumerate()
+                .all(|(i, &c)| byte(at + i as u64) == c)
+            && byte(at + want.len() as u64) == 0
+    };
+    // Whether the NUL-separated string list at [value, value + len)
+    // contains `compat`.
+    let list_has = |value: u64, len: u64| -> bool {
+        let mut s = value;
+        while s < value + len {
+            if bytes_are(s, compat) {
+                return true;
+            }
+            while s < value + len && byte(s) != 0 {
+                s += 1;
+            }
+            s += 1;
+        }
+        false
+    };
+    let mut depth = 0u32;
+    let (mut matched, mut has) = (false, false);
+    let mut p = structs;
+    while p + 4 <= end {
+        let token = be32(p);
+        p += 4;
+        match token {
+            BEGIN_NODE => {
+                depth += 1;
+                while p < end && byte(p) != 0 {
+                    p += 1;
+                }
+                p = (p + 1 + 3) & !3;
+                if depth == 2 {
+                    (matched, has) = (false, false);
+                }
+            }
+            END_NODE => {
+                if depth == 2 && matched {
+                    return has;
+                }
+                depth = depth.saturating_sub(1);
+            }
+            PROP => {
+                if p + 8 > end {
+                    return false;
+                }
+                let len = be32(p) as u64;
+                let name = be32(p + 4);
+                let v = p + 8;
+                if v + len > end {
+                    return false;
+                }
+                if depth == 2 && bytes_are(strings + name as u64, b"compatible") {
+                    matched |= list_has(v, len);
+                } else if depth == 2 && bytes_are(strings + name as u64, prop) {
+                    has = len == value.len() as u64 + 1 && bytes_are(v, value);
+                }
+                p = (v + len + 3) & !3;
+            }
+            NOP => {}
+            END => break,
+            _ => return false,
+        }
+    }
+    false
+}

@@ -16,7 +16,10 @@ Component Manager. Working today, under QEMU on x86-64 and AArch64 (one kernel:
 capabilities, threads, IPC, scheduling and the system calls are shared; `kernel/src/arch`
 holds the rest):
 
-- AArch64 on QEMU's `virt` machine: entered at EL1 from the kernel ELF, MMU and caches on
+- AArch64 on QEMU's `virt` machine: entered at EL1 or EL2 from the kernel ELF (each CPU
+  entered at EL2, as firmware and PSCI start them where the CPU has it, sets EL1 up with
+  nothing trapped and steps down to it, and PSCI is then called by `smc`, as the device
+  tree or ACPI's FADT says), MMU and caches on
   before any Rust runs, an identity map of devices and RAM for EL1 only, 4-level page
   tables for user address spaces at the same user window as x86-64, the device tree read
   for RAM, a GICv3 with an ITS, the generic timer at 100 Hz, EL0/EL1 exception vectors (`svc`, aborts,
@@ -28,8 +31,8 @@ holds the rest):
 
 - AArch64 also boots from UEFI firmware, as Arm laptops and servers do: `loader/` is a
   small UEFI application (no crates, `aarch64-unknown-uefi`) with the kernel ELF built
-  into it, on an EFI system partition of a GPT disk. It checks it was started at EL1,
-  loads the kernel's segments at their link address and hands the kernel a small
+  into it, on an EFI system partition of a GPT disk. It runs at EL1 or EL2 (turning
+  off that level's MMU before it jumps), loads the kernel's segments at their link address and hands the kernel a small
   device tree of its own, as QEMU's `-kernel` hands it QEMU's: the RAM the firmware's
   final memory map leaves free once boot services end (none of the firmware's runtime
   code and data, ACPI tables or reserved memory), and under `/chosen` where the
@@ -46,8 +49,10 @@ holds the rest):
   NVMe disk under QEMU's edk2 for `virt` twice, with the firmware's device tree
   (`acpi=off`) and with its ACPI tables alone: each time the firmware's boot manager,
   the loader and the shell session must show, then the driver framework test with
-  the SMMUv3. Entry at EL2, and the GIC, console and ECAM wherever the firmware puts
-  them, are still to do.
+  the SMMUv3. `cargo xtask el2-test` boots with EL2 (`virtualization=on`): from
+  `-kernel` the shell session and the driver test, and from edk2 running at EL2 the
+  shell session with its device tree and with its ACPI tables. The GIC, console and
+  ECAM wherever the firmware puts them are still to do.
 - x86-64 boots from a BIOS or, as on current laptops, from UEFI firmware: the same
   kernel on a GPT disk with an EFI system partition and no BIOS boot code. The
   Component Manager's 8 MiB arena is carved before spare RAM is handed out, since
@@ -1396,6 +1401,7 @@ cargo xtask run aarch64    # the same on QEMU's AArch64 virt machine
 cargo xtask console-test   # the kernel's log on the boot framebuffer, from a BIOS and from UEFI, checked by screenshot
 cargo xtask uefi-test      # x86-64 booted by UEFI firmware (OVMF): the shell session and the driver test
 cargo xtask uefi-test aarch64  # AArch64 booted by UEFI firmware (edk2) through loader/, from its device tree and from ACPI: the shell session and the driver test
+cargo xtask el2-test       # AArch64 entered at EL2, from -kernel and from UEFI firmware: the shell session (and the driver test)
 cargo xtask idl    # generate Rust from the interface descriptions in interfaces/
 cargo xtask image  # just build target/superior.img
 cargo xtask bench  # IPC timing under WHPX or KVM, checked against seL4's figures

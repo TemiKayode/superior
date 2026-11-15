@@ -23,8 +23,8 @@ pub struct Machine {
     pub rsdp: u64,
     /// Enabled CPUs, numbered by their MPIDR affinity 0 (0 to `cpus` - 1).
     pub cpus: usize,
-    /// PSCI is there and called by `hvc` (the kernel's only conduit).
-    pub psci_hvc: bool,
+    /// PSCI, if there: called by `hvc` (true) or `smc` (false).
+    pub psci: Option<bool>,
     /// The GIC: its version (0 if unstated), distributor, first
     /// redistributor and ITS.
     pub gic_version: u8,
@@ -122,7 +122,7 @@ pub fn read(rsdp: u64) -> Result<Machine, &'static str> {
     let mut m = Machine {
         rsdp,
         cpus: 0,
-        psci_hvc: false,
+        psci: None,
         gic_version: 0,
         gicd: 0,
         gicr: None,
@@ -188,7 +188,8 @@ pub fn read(rsdp: u64) -> Result<Machine, &'static str> {
 
     // FADT: ARM boot architecture flags (PSCI compliant, by HVC).
     if let Some((fadt, len)) = tables.find(b"FACP")? {
-        m.psci_hvc = len >= 131 && u16_at(fadt + 129) & 3 == 3;
+        let flags = if len >= 131 { u16_at(fadt + 129) } else { 0 };
+        m.psci = (flags & 1 != 0).then_some(flags & 2 != 0);
     }
 
     // GTDT: the EL1 virtual timer's GSIV.

@@ -10,6 +10,7 @@
 //!                                  a scripted session with the shell
 //!   cargo xtask boot-test [arch]   just the boot self-tests
 //!   cargo xtask shell-test [arch]  just the shell session
+//!   cargo xtask el2-test           AArch64 entered at EL2 (-kernel and UEFI)
 //!   cargo xtask cm-test [arch]     the Component Manager's boot test: boot
 //!                                  `boot/test.manifest` and check the log
 //!   cargo xtask supervise-test [arch]  supervision: boot
@@ -137,6 +138,9 @@ struct Image {
     /// AArch64 UEFI: the firmware describes the machine by ACPI tables,
     /// not a device tree.
     acpi: bool,
+    /// AArch64: the CPUs have EL2 (`virtualization=on`), where QEMU's
+    /// `-kernel`, edk2 and PSCI start them.
+    el2: bool,
     /// QEMU's `-smp` in place of the usual CPU count (a CPU topology).
     smp: Option<&'static str>,
 }
@@ -207,12 +211,14 @@ fn main() -> ExitCode {
             })
             .and_then(|_| uefi_test(Arch::X86_64))
             .and_then(|_| uefi_test(Arch::Aarch64))
+            .and_then(|_| el2_test())
             .and_then(|_| console_test())
             .and_then(|_| sel4_image())
             .and_then(|img| shell_session(&img)),
         Some("sel4-test") => sel4_image().and_then(|img| shell_session(&img)),
         Some("boot-test") => image(true, arch).and_then(|img| boot(&img, true)),
         Some("shell-test") => image(false, arch).and_then(|img| shell_session(&img)),
+        Some("el2-test") => el2_test(),
         Some("uefi-test") => uefi_test(arch),
         Some("console-test") => console_test(),
         Some("cm-test") => image_with(false, arch, "test").and_then(|img| cm_test(&img)),
@@ -860,6 +866,7 @@ fn image_sealed(
         audio: (manifest == "audio").then(|| audio_wav(arch)),
         uefi: false,
         acpi: false,
+        el2: false,
         smp: None,
     })
 }
@@ -962,6 +969,7 @@ fn sel4_image() -> Result<Image, String> {
         audio: None,
         uefi: false,
         acpi: false,
+        el2: false,
         smp: None,
     })
 }
@@ -1228,6 +1236,12 @@ fn qemu_command(img: &Image) -> Command {
             } else {
                 "virt,highmem=off,gic-version=3"
             };
+            let machine = if img.el2 && !img.sel4 {
+                format!("{machine},virtualization=on")
+            } else {
+                machine.to_string()
+            };
+            let machine = machine.as_str();
             // The radio's test wants RNDR (FEAT_RNG), which "max" has.
             let cpu = if img.radio { "max" } else { "cortex-a72" };
             if img.uefi {
@@ -5680,6 +5694,57 @@ fn uefi_test_aarch64() -> Result<(), String> {
 /// whose APIC IDs have a gap (found from ACPI's MADT), then the driver
 /// framework test on q35 (PCI Express, the VT-d IOMMU from ACPI's DMAR
 /// table, MSI).
+/// AArch64 with EL2 (QEMU's `virtualization=on`), where firmware and PSCI
+/// start the CPUs: each steps down to EL1 itself, and PSCI is called by
+/// `smc`, as the device tree or ACPI's FADT then says. From QEMU's
+/// `-kernel` the shell session and the driver framework test (the SMMU
+/// and the ITS); from UEFI firmware at EL2 the shell session, with its
+/// device tree and with its ACPI tables.
+fn el2_test() -> Result<(), String> {
+    let entered = "[ok] entered at EL2: set EL1 up, with nothing trapped, and stepped down to it";
+    let mut img = image(false, Arch::Aarch64)?;
+    img.el2 = true;
+    println!("== shell session at EL2 on {}", img.path.display());
+    let out = drive_shell(&img, &[], SHELL_SCRIPT)?;
+    check_log(
+        "EL2 test (-kernel)",
+        &out,
+        &["Superior microkernel", entered, "[ok] MMU on; exception vectors installed", "[ok] 2 CPUs online", "superior> "],
+    )?;
+    let mut img = image_with(false, Arch::Aarch64, "drivers")?;
+    img.el2 = true;
+    let out = drivers_test_log(&img)?;
+    if !out.contains(entered) {
+        return Err("EL2 test: the driver test's kernel did not step down from EL2".into());
+    }
+    for acpi in [false, true] {
+        let how = if acpi { "ACPI" } else { "device tree" };
+        let mut img = uefi_image(Arch::Aarch64, "shell")?;
+        img.acpi = acpi;
+        img.el2 = true;
+        println!("== UEFI shell session at EL2 ({how}) on {}", img.path.display());
+        let out = drive_shell(&img, &[], SHELL_SCRIPT)?;
+        let banner = "Superior UEFI loader (AArch64)";
+        let out = out.find(banner).map_or("", |at| &out[at..]);
+        let mut steps = vec![
+            banner,
+            "loader: the firmware runs at EL2; the kernel steps down to EL1 itself",
+            "loader: kernel at 0x40200000 to ",
+            "loader: leaving boot services",
+            "Superior microkernel",
+            entered,
+        ];
+        if acpi {
+            steps.push(", PSCI by smc (FADT);");
+        }
+        steps.extend(["[ok] 2 CPUs online", "superior> "]);
+        check_log(&format!("EL2 test (UEFI, {how})"), out, &steps)?;
+        println!("== UEFI shell session at EL2 passed ({how})");
+    }
+    println!("== EL2 test passed (aarch64)");
+    Ok(())
+}
+
 fn uefi_test(arch: Arch) -> Result<(), String> {
     if arch == Arch::Aarch64 {
         return uefi_test_aarch64();
