@@ -283,8 +283,13 @@ mod air {
 
         /// With a WPA3-only access point that takes hash-to-element.
         pub fn h2e(ap_pass: &[u8]) -> Air {
+            Air::with(|ap| ap.hash_to_element(), ap_pass)
+        }
+
+        /// With a WPA3-only access point set up by `f`.
+        pub fn with(f: impl FnOnce(AccessPoint) -> AccessPoint, ap_pass: &[u8]) -> Air {
             let gtk = Gtk { index: 1, key: [0x47; 16] };
-            let ap = AccessPoint::new(BSSID, b"superior", ap_pass, gtk, [9; 32]).offering(false, true).hash_to_element();
+            let ap = f(AccessPoint::new(BSSID, b"superior", ap_pass, gtk, [9; 32]).offering(false, true));
             Air { ap, ..Air::offering(ap_pass, false, true) }
         }
 
@@ -850,6 +855,53 @@ fn a_station_joins_by_hash_to_element_when_the_network_offers_it() {
 }
 
 #[test]
+fn a_station_sends_back_the_anti_clogging_token_asked_for() {
+    for h2e in [false, true] {
+        let mut air = air::Air::with(|ap| if h2e { ap.hash_to_element() } else { ap }.anti_clogging(0), b"correct horse");
+        air.sta.join(b"superior", b"correct horse", [7; 32], 0);
+        air.run(500);
+        assert!(air.joined(), "H2E {h2e}: {:?} / {:?}", air.sta.link(), air.ap.peer());
+        assert_eq!(air.ap.tokens_asked, 1, "H2E {h2e}: one token asked for, then the commit taken");
+        assert_eq!(air.sta.hash_to_element(), h2e);
+    }
+}
+
+#[test]
+fn commits_without_the_token_cost_the_access_point_only_an_answer() {
+    use crate::frame::{AUTH, HEADER};
+    use crate::sae::Sae;
+    let mut air = air::Air::with(|ap| ap.anti_clogging(0), b"correct horse");
+    let commit = Sae::new(b"guess", &[2, 0, 0, 0, 0, 9], &air::BSSID, &[0x33; 64]).unwrap().commit();
+    let mut answers = std::vec::Vec::new();
+    for k in 0..50u8 {
+        // From 50 made-up addresses, then one with a wrong token.
+        let sa = [2, 0, 0, 0, 1, k];
+        let mut f = std::vec![0u8; HEADER];
+        f[0] = AUTH;
+        f[4..10].copy_from_slice(&air::BSSID);
+        f[10..16].copy_from_slice(&sa);
+        f[16..22].copy_from_slice(&air::BSSID);
+        f.extend([3, 0, 1, 0, 0, 0]);
+        f.extend(&commit[..2]);
+        if k == 49 {
+            f.extend([0x5a; 32]);
+        }
+        f.extend(&commit[2..]);
+        air.ap.receive(&f, 0, &mut |r| answers.push(r.to_vec()), &mut |_| {});
+    }
+    assert_eq!(air.ap.tokens_asked, 50);
+    assert_eq!(answers.len(), 50);
+    // Each to the address the commit came from.
+    assert!(answers.iter().enumerate().all(|(k, a)| a[4..10] == [2, 0, 0, 0, 1, k as u8]));
+    for (k, a) in answers.iter().enumerate() {
+        assert_eq!(a[HEADER..HEADER + 8], [3, 0, 1, 0, 76, 0, 19, 0], "answer {k}");
+        assert_eq!(a.len(), HEADER + 8 + 32);
+    }
+    // Each address its own token.
+    assert_ne!(answers[0][HEADER + 8..], answers[1][HEADER + 8..]);
+}
+
+#[test]
 fn stripping_the_h2e_advertisement_is_caught_as_a_downgrade() {
     use crate::station::Link;
     let mut air = air::Air::h2e(b"correct horse");
@@ -992,3 +1044,4 @@ fn under_wpa3_only_a_deauthentication_to_all_under_bip_is_obeyed() {
     assert_eq!(air.ap.ipn(), 1);
     let _ = igtk;
 }
+

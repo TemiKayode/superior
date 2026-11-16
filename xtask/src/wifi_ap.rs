@@ -110,6 +110,8 @@ pub struct Seen {
     pub wpa3_keyed: AtomicBool,
     /// Whether that SAE exchange was by hash-to-element.
     pub wpa3_h2e: AtomicBool,
+    /// Anti-clogging tokens it asked for before taking the commit.
+    pub wpa3_tokens: AtomicU64,
     pub wpa3_from_station: AtomicU64,
     pub forged_deauths: AtomicU64,
     pub wpa3_refused: AtomicU64,
@@ -133,7 +135,7 @@ pub fn start(stop: Arc<AtomicBool>, seen: Arc<Seen>) -> Result<JoinHandle<()>, S
     }
     Ok(std::thread::spawn(move || {
         let mut ap = AccessPoint::new(BSSID, SSID, PASSPHRASE, gtk, seed);
-        let mut ap3 = AccessPoint::new(WPA3_BSSID, WPA3_SSID, PASSPHRASE, gtk3, seed3).offering(false, true).hash_to_element();
+        let mut ap3 = AccessPoint::new(WPA3_BSSID, WPA3_SSID, PASSPHRASE, gtk3, seed3).offering(false, true).hash_to_element().anti_clogging(0);
         let (mut next_rekey, mut rekeyings, mut group_rekeys) = (REKEY_EVERY, 0usize, 0);
         let started = Instant::now();
         let radio = ("127.0.0.1", RADIO_PORT);
@@ -213,6 +215,7 @@ pub fn start(stop: Arc<AtomicBool>, seen: Arc<Seen>) -> Result<JoinHandle<()>, S
             seen.refused.store(ap.refused, Ordering::Relaxed);
             if ap3.peer() == Peer::Up && !seen.wpa3_keyed.swap(true, Ordering::Relaxed) {
                 seen.wpa3_h2e.store(ap3.station_used_h2e(), Ordering::Relaxed);
+                seen.wpa3_tokens.store(ap3.tokens_asked as u64, Ordering::Relaxed);
                 // Keyed by SAE: a deauthentication forged in its name,
                 // unprotected, which the station must not obey.
                 let mut f = [0u8; 26];

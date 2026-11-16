@@ -2588,10 +2588,11 @@ fn wifi_test(arch: Arch) -> Result<(), String> {
         seen.wpa3_refused.load(Ordering::Relaxed),
     );
     println!(
-        "== WPA3 access point: station keyed by SAE ({}), {wpa3_from} frames from it, {forged} forged deauthentications sent (one to the station, two to every station), {wpa3_refused} frames refused",
-        if seen.wpa3_h2e.load(Ordering::Relaxed) { "hash-to-element" } else { "hunting and pecking" }
+        "== WPA3 access point: station keyed by SAE ({}, after {} anti-clogging token asked for), {wpa3_from} frames from it, {forged} forged deauthentications sent (one to the station, two to every station), {wpa3_refused} frames refused",
+        if seen.wpa3_h2e.load(Ordering::Relaxed) { "hash-to-element" } else { "hunting and pecking" },
+        seen.wpa3_tokens.load(Ordering::Relaxed)
     );
-    if !seen.wpa3_keyed.load(Ordering::Relaxed) || !seen.wpa3_h2e.load(Ordering::Relaxed) || wpa3_from == 0 || forged == 0 || wpa3_refused != 0 {
+    if !seen.wpa3_keyed.load(Ordering::Relaxed) || !seen.wpa3_h2e.load(Ordering::Relaxed) || seen.wpa3_tokens.load(Ordering::Relaxed) == 0 || wpa3_from == 0 || forged == 0 || wpa3_refused != 0 {
         return Err("Wi-Fi test: the WPA3 access point did not see the station keyed by SAE and carrying frames".into());
     }
     println!("== Wi-Fi test passed ({})", arch.name());

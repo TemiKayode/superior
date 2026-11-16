@@ -949,7 +949,11 @@ holds the rest):
   PT times a scalar from the two addresses, commits marked with status 126.
   The station always says it takes H2E when associating, so an access point
   that offers it refuses one that came by hunting and pecking (its RSNXE was
-  stripped: a downgrade). Commit and confirm give both sides the
+  stripped: a downgrade). An access point can ask for an anti-clogging token
+  once enough exchanges are open (status 76): an HMAC of the station's
+  address, which the station sends back with its commit (after the group,
+  or in a token container element under H2E), so commits forged from many
+  addresses cost it an HMAC each rather than a scalar multiplication. Commit and confirm give both sides the
   PMK, which an eavesdropper cannot test passwords against offline. The 4-way
   handshake takes the suite: under SAE its PTK comes from the SHA-256 KDF, its
   MICs are AES-CMAC (key descriptor version 0) and message 3 also delivers
@@ -966,8 +970,9 @@ holds the rest):
   lossy channel, transition mode, by H2E (and a stripped RSNXE caught as a
   downgrade), forged versus sealed deauthentications, and BIP refusing a
   forged, wrong-key or replayed MMIE. In `wifi-test` a second, WPA3-only
-  access point, taking H2E, serves the same network: the client joins it by
-  hash-to-element after the WPA2 checks, the harness forges an unprotected
+  access point, taking H2E and always asking for a token, serves the same
+  network: the client joins it by hash-to-element, the token sent back,
+  after the WPA2 checks, the harness forges an unprotected
   deauthentication to it and two to every station (no MMIE, then an MMIE
   under a wrong key), and the station ignores all three and pings on.
 - Surveying the networks in range: the station's `survey` sends probe

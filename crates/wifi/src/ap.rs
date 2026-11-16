@@ -64,6 +64,12 @@ pub struct AccessPoint {
     /// H2E, and whether the exchange with the station used it.
     pt: Option<crate::p256::Affine>,
     sae_h2e: bool,
+    /// Anti-clogging: how many SAE exchanges may be open (begun, not
+    /// confirmed) before a commit must carry a token, and how many are.
+    clog_threshold: Option<u32>,
+    open_exchanges: u32,
+    /// Commits answered with a token to send back (status 76).
+    pub tokens_asked: u32,
     gtk: Gtk,
     igtk: Igtk,
     seed: [u8; 32],
@@ -114,6 +120,9 @@ impl AccessPoint {
             sae_commit: [0; COMMIT_LEN],
             pt: None,
             sae_h2e: false,
+            clog_threshold: None,
+            open_exchanges: 0,
+            tokens_asked: 0,
             gtk,
             igtk,
             seed,
@@ -147,6 +156,24 @@ impl AccessPoint {
     pub fn hash_to_element(mut self) -> Self {
         self.pt = sae::pt(&self.ssid[..self.ssid_len], &self.password[..self.password_len]);
         self
+    }
+
+    /// Asks for an anti-clogging token once `threshold` SAE exchanges are
+    /// open (0: always). A commit then must carry the token this access
+    /// point gave its address, which only a station that hears its
+    /// answers can send back: commits forged from many addresses cost
+    /// it an HMAC each, not a scalar multiplication.
+    pub fn anti_clogging(mut self, threshold: u32) -> Self {
+        self.clog_threshold = Some(threshold);
+        self
+    }
+
+    /// The token for station `sa`: an HMAC of its address under a key
+    /// from the seed, so nothing need be kept per station.
+    fn token(&self, sa: &[u8; 6]) -> [u8; 32] {
+        let mut key = [0u8; 32];
+        prf(&self.seed, b"Anti-clogging", &[&self.bssid], &mut key);
+        crate::sha256::hmac_sha256(&key, &[sa])
     }
 
     /// Whether the station's SAE exchange was by hash-to-element.
@@ -261,9 +288,15 @@ impl AccessPoint {
     }
 
     fn reply(&mut self, fc0: u8, body: &[u8], radio: &mut dyn FnMut(&[u8])) {
+        let to = self.station;
+        self.reply_to(&to, fc0, body, radio);
+    }
+
+    /// The same to `to`, which need not be the station.
+    fn reply_to(&mut self, to: &[u8; 6], fc0: u8, body: &[u8], radio: &mut dyn FnMut(&[u8])) {
         let mut f = [0u8; 160];
         let seq = self.next_seq();
-        let n = header(&mut f, fc0, 0, &self.station, &self.bssid, &self.bssid, seq);
+        let n = header(&mut f, fc0, 0, to, &self.bssid, &self.bssid, seq);
         f[n..n + body.len()].copy_from_slice(body);
         radio(&f[..n + body.len()]);
     }
@@ -420,7 +453,6 @@ impl AccessPoint {
     fn sae_auth(&mut self, sa: [u8; 6], body: &[u8], radio: &mut dyn FnMut(&[u8])) {
         match (body[2..4] == [1, 0], body[2..4] == [2, 0]) {
             (true, _) => {
-                let Some(commit) = body.get(6..6 + COMMIT_LEN) else { return };
                 // Status 0: hunting and pecking; 126: hash-to-element,
                 // if this network takes it.
                 let h2e = match body[4..6] {
@@ -432,6 +464,19 @@ impl AccessPoint {
                     }
                 };
                 let status = if h2e { 126 } else { 0 };
+                let Some((c, token)) = split_commit(&body[6..], h2e) else { return };
+                let commit = &c[..];
+                if self.clog_threshold.is_some_and(|t| self.open_exchanges >= t) && token != Some(&self.token(&sa)[..]) {
+                    // Status 76: send this token back with the commit.
+                    let mut b = [0u8; 8 + 32];
+                    b[..8].copy_from_slice(&[3, 0, 1, 0, 76, 0, 19, 0]);
+                    b[8..].copy_from_slice(&self.token(&sa));
+                    // To the sender, not the station: none is adopted
+                    // before its token comes back.
+                    self.reply_to(&sa, AUTH, &b, radio);
+                    self.tokens_asked += 1;
+                    return;
+                }
                 if sa == self.station && commit == self.sae_commit && self.sae.is_some() && h2e == self.sae_h2e {
                     let ours = self.sae.as_ref().map(|s| s.commit()).unwrap();
                     self.auth_reply(1, status, &ours, radio);
@@ -456,6 +501,7 @@ impl AccessPoint {
                     Ok(_) => {
                         self.sae_commit.copy_from_slice(commit);
                         self.sae_h2e = h2e;
+                        self.open_exchanges += 1;
                         let ours = s.commit();
                         self.sae = Some(s);
                         self.auth_reply(1, status, &ours, radio);
@@ -471,6 +517,7 @@ impl AccessPoint {
                     Ok(Some(pmk)) => {
                         let ours = s.confirm().unwrap_or([0; sae::CONFIRM_LEN]);
                         (self.peer, self.authed, self.station_pmk) = (Peer::Authenticated, Some(Akm::Sae), pmk);
+                        self.open_exchanges = self.open_exchanges.saturating_sub(1);
                         self.auth_reply(2, 0, &ours, radio);
                     }
                     _ => self.refused += 1,
@@ -587,5 +634,26 @@ impl AccessPoint {
             self.pn += 1;
             ccmp::seal(&self.tk, self.pn, 0, &h, &body[..n], out)
         }
+    }
+}
+
+/// A commit's body (after algorithm, transaction and status) as the
+/// commit itself and the anti-clogging token it carries, if any: between
+/// the group and the scalar under hunting and pecking; in a token
+/// container element (extension 93) after the element under H2E.
+fn split_commit(rest: &[u8], h2e: bool) -> Option<([u8; COMMIT_LEN], Option<&[u8]>)> {
+    let mut c = [0u8; COMMIT_LEN];
+    if h2e {
+        c.copy_from_slice(rest.get(..COMMIT_LEN)?);
+        let token = match rest.get(COMMIT_LEN..) {
+            Some([255, n, 93, t @ ..]) if *n as usize == t.len() + 1 => Some(t),
+            _ => None,
+        };
+        Some((c, token))
+    } else {
+        let extra = rest.len().checked_sub(COMMIT_LEN)?;
+        c[..2].copy_from_slice(&rest[..2]);
+        c[2..].copy_from_slice(&rest[2 + extra..COMMIT_LEN + extra]);
+        Some((c, (extra > 0).then(|| &rest[2..2 + extra])))
     }
 }

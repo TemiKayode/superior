@@ -162,6 +162,10 @@ pub struct Station {
     /// password element PT (computed once per network joined).
     h2e: bool,
     pt: Option<crate::p256::Affine>,
+    /// The anti-clogging token the access point asked to see with the
+    /// commit (status 76), if it did.
+    token: [u8; 32],
+    token_len: usize,
     /// The last packet number of a sealed management frame taken.
     mgmt_pn: Option<u64>,
     /// The last BIP packet number accepted from the access point.
@@ -218,6 +222,8 @@ impl Station {
             sae: None,
             h2e: false,
             pt: None,
+            token: [0; 32],
+            token_len: 0,
             mgmt_pn: None,
             bip_ipn: None,
             seed: [0; 32],
@@ -464,10 +470,32 @@ impl Station {
             // The access point's commit came: our confirm again.
             Some(c) => self.auth_frame(&[3, 0, 2, 0, 0, 0], &c, radio),
             None => {
-                // Status 126 marks a commit by hash-to-element.
+                // Status 126 marks a commit by hash-to-element. With the
+                // token asked for: after the group under hunting and
+                // pecking, in a container element after it all under H2E.
                 let c = sae.commit();
                 let status = if self.h2e { 126 } else { 0 };
-                self.auth_frame(&[3, 0, 1, 0, status, 0], &c, radio);
+                let (t, n) = (self.token, self.token_len);
+                let mut b = [0u8; sae::COMMIT_LEN + 3 + 32];
+                let len = match (n, self.h2e) {
+                    (0, _) => {
+                        b[..sae::COMMIT_LEN].copy_from_slice(&c);
+                        sae::COMMIT_LEN
+                    }
+                    (_, false) => {
+                        b[..2].copy_from_slice(&c[..2]);
+                        b[2..2 + n].copy_from_slice(&t[..n]);
+                        b[2 + n..sae::COMMIT_LEN + n].copy_from_slice(&c[2..]);
+                        sae::COMMIT_LEN + n
+                    }
+                    (_, true) => {
+                        b[..sae::COMMIT_LEN].copy_from_slice(&c);
+                        b[sae::COMMIT_LEN..sae::COMMIT_LEN + 3].copy_from_slice(&[255, n as u8 + 1, 93]);
+                        b[sae::COMMIT_LEN + 3..sae::COMMIT_LEN + 3 + n].copy_from_slice(&t[..n]);
+                        sae::COMMIT_LEN + 3 + n
+                    }
+                };
+                self.auth_frame(&[3, 0, 1, 0, status, 0], &b[..len], radio);
             }
         }
     }
@@ -475,7 +503,7 @@ impl Station {
     /// An authentication frame to the access point: algorithm, transaction
     /// and status (`head`), then `body`.
     fn auth_frame(&mut self, head: &[u8; 6], body: &[u8], radio: &mut dyn FnMut(&[u8])) {
-        let mut f = [0u8; 160];
+        let mut f = [0u8; 200];
         let seq = self.next_seq();
         let n = header(&mut f, AUTH, 0, &self.bssid, &self.mac, &self.bssid, seq);
         f[n..n + 6].copy_from_slice(head);
@@ -554,6 +582,7 @@ impl Station {
                 let rsne = rsne.unwrap();
                 self.akm = akm;
                 self.sae = None;
+                self.token_len = 0;
                 let h2e = akm == Akm::Sae && find_element(elems, RSNX).is_some_and(|e| e.first().is_some_and(|b| b & RSNX_H2E != 0));
                 if h2e != self.h2e {
                     self.pt = None;
@@ -582,6 +611,14 @@ impl Station {
                             }
                             Err(_) => self.refused += 1,
                         }
+                    }
+                    // Status 76: our commit again, with the token it holds.
+                    (Akm::Sae, [3, 0, 1, 0, 76, 0]) if body.len() > 8 && body[6..8] == [19, 0] && self.sae.is_some() => {
+                        let t = &body[8..body.len().min(8 + 32)];
+                        self.token[..t.len()].copy_from_slice(t);
+                        self.token_len = t.len();
+                        self.authenticate(radio);
+                        self.deadline = now + STEP_MS;
                     }
                     (Akm::Sae, [3, 0, 2, 0, 0, 0]) => {
                         let Some(s) = self.sae.as_mut() else { return };
