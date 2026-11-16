@@ -5,13 +5,17 @@
 //!
 //! Only until user space starts ([`hand_over`]): from then on the PCI bus
 //! server and a display driver own the display, and may move its memory
-//! (the framebuffer is a BAR), so the kernel must not write there. Light
+//! (the framebuffer is a BAR), so the kernel must not write there. The
+//! root task is given the framebuffer as device memory ([`screen`]), for
+//! a component that draws on it as it is (the shell's screen console).
+//! Light
 //! grey text on black, in the toolkit's 5x7 font at twice its size, from
 //! the top left; when the screen is full, everything moves up a line.
 
 use bootloader_api::info::{FrameBuffer, PixelFormat};
 use core::fmt;
 use spin::Mutex;
+use superior_objects::abi::framebuffer::{self, Geometry};
 use superior_toolkit::font;
 
 /// Text is drawn at twice the font's size, with this much space around.
@@ -37,6 +41,12 @@ struct Console {
 
 static CONSOLE: Mutex<Option<Console>> = Mutex::new(None);
 
+/// The framebuffer as user space may be given it, kept past
+/// [`hand_over`]: where the kernel sees it (until [`locate`]) or its
+/// physical address (after), and its geometry.
+static SCREEN: Mutex<Option<(u64, Geometry)>> = Mutex::new(None);
+static LOCATED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 /// Starts drawing the log on `fb`, cleared to black, if the format is one
 /// it knows (RGB or BGR, 3 or 4 bytes a pixel).
 pub fn init(fb: Option<&'static mut FrameBuffer>) {
@@ -47,6 +57,17 @@ pub fn init(fb: Option<&'static mut FrameBuffer>) {
     }
     let buf = fb.buffer_mut();
     buf.fill(0);
+    let geometry = Geometry {
+        width: info.width as u64,
+        height: info.height as u64,
+        stride: info.stride as u64,
+        bytes_per_pixel: info.bytes_per_pixel as u64,
+        format: match info.pixel_format {
+            PixelFormat::Bgr => framebuffer::BGR,
+            _ => framebuffer::RGB,
+        },
+    };
+    *SCREEN.lock() = Some((buf.as_ptr() as u64, geometry));
     *CONSOLE.lock() = Some(Console {
         buf,
         width: info.width,
@@ -67,6 +88,31 @@ pub fn size() -> Option<(usize, usize)> {
 /// Stops drawing: user space is about to start and may take the display.
 pub fn hand_over() {
     *CONSOLE.lock() = None;
+}
+
+/// Finds the framebuffer's physical address through the kernel's page
+/// tables, once they are known ([`super::vm::init`]). A framebuffer that
+/// does not start on a page, or that the tables do not map, is not handed
+/// out.
+pub fn locate() {
+    let mut screen = SCREEN.lock();
+    let Some((va, g)) = *screen else { return };
+    *screen = super::vm::translate(va)
+        .filter(|pa| pa.is_multiple_of(4096) && g.bytes() > 0)
+        .map(|pa| (pa, g));
+    LOCATED.store(true, core::sync::atomic::Ordering::Release);
+}
+
+/// The framebuffer's physical address, the power of two of bytes its
+/// device memory spans from there (at least the screen's rows), and its
+/// geometry; `None` without one, or before [`locate`].
+pub fn screen() -> Option<(u64, u8, Geometry)> {
+    if !LOCATED.load(core::sync::atomic::Ordering::Acquire) {
+        return None;
+    }
+    let (pa, g) = (*SCREEN.lock())?;
+    let bits = g.bytes().next_power_of_two().trailing_zeros().max(12) as u8;
+    Some((pa, bits, g))
 }
 
 impl Console {

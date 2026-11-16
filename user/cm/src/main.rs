@@ -367,9 +367,10 @@ impl<'a> Manager<'a> {
                     Some((src, count)) => {
                         let r = (0..count)
                             .try_for_each(|k| cnode_copy(cnode, slot + k, src + k, ALL, 0));
-                        // A machine without an IOMMU has none to give: the
-                        // slot stays empty, and the component copes.
-                        if d == "iommu" || d == "intx" { Ok(()) } else { r }
+                        // A machine without an IOMMU (or a PS/2 controller,
+                        // or a boot framebuffer) has none to give: the slot
+                        // stays empty, and the component copes.
+                        if matches!(d, "iommu" | "intx" | "ps2" | "framebuffer") { Ok(()) } else { r }
                     }
                     None => return Err(("unknown device", 0)),
                 },
@@ -1202,7 +1203,8 @@ fn ticks() -> u64 {
 /// `msi` is all the MSI vectors, in consecutive slots from the one named;
 /// `intx` the legacy PCI interrupt lines likewise (absent where the
 /// kernel does not know the machine's routing: those slots stay empty);
-/// the rest are one capability each (`iommu` may be absent). Returns
+/// `ps2` the controller's two ports; the rest are one capability each
+/// (`iommu`, `ps2` and `framebuffer` may be absent). Returns
 /// (first slot, count).
 fn device(name: &str) -> Option<(u64, u64)> {
     Some(match name {
@@ -1216,6 +1218,8 @@ fn device(name: &str) -> Option<(u64, u64)> {
         "iommu" => (root::IOMMU, 1),
         "intx" => (root::INTX, root::INTX_COUNT),
         "pci-io" => (root::PCI_IO, 1),
+        "ps2" => (root::PS2, root::PS2_COUNT),
+        "framebuffer" => (root::FRAMEBUFFER, 1),
         _ => return None,
     })
 }

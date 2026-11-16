@@ -70,6 +70,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         .expect("bootloader did not map physical memory");
     vm::init(offset);
     kprintln!("[ok] physical memory mapped at {offset:#x}");
+    fbcon::locate();
     acpi::init(boot_info.rsdp_addr.into_option());
     dbc_init();
     interrupts::init_routing();
@@ -169,6 +170,32 @@ pub fn console_caps() -> (Capability, Capability) {
             rw,
         ),
     )
+}
+
+/// The PS/2 controller (i8042): its data port (0x60) and its status and
+/// command port (0x64), one capability each, so a holder reaches neither
+/// the ports between them (0x61 gates the PC speaker and the PIT's
+/// channel 2) nor anything else. A driver reads the keyboard through them;
+/// where there is no controller, the ports read as all ones.
+pub fn ps2_caps() -> Option<[Capability; 2]> {
+    let rw = Rights::READ | Rights::WRITE;
+    let port = |base| Capability::new(Object::IoPort { base, count: 1 }, rw);
+    Some([port(0x60), port(0x64)])
+}
+
+/// The boot framebuffer as device memory, from its first byte over the
+/// power of two of bytes that covers its rows ([`fbcon::screen`]), if the
+/// bootloader or firmware set one up.
+pub fn framebuffer_cap() -> Option<Capability> {
+    let (base, size_bits, _) = fbcon::screen()?;
+    Some(Capability::new(Object::DeviceUntyped { base, size_bits }, Rights::ALL))
+}
+
+/// The framebuffer's geometry, packed for `UntypedInfo`, if `base` is the
+/// framebuffer's device memory.
+pub fn framebuffer_geometry(base: u64) -> Option<[u64; 2]> {
+    let (pa, _, g) = fbcon::screen()?;
+    (pa == base).then(|| g.pack())
 }
 
 #[cfg_attr(not(feature = "selftest"), allow(dead_code))]

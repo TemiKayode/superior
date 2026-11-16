@@ -4,6 +4,13 @@
 //!   cargo xtask image [arch]       build the kernel and a bootable image
 //!   cargo xtask run [arch]         boot it in QEMU, into the shell (serial on
 //!                                  this terminal)
+//!   cargo xtask console-image      an image whose shell is also a console on
+//!                                  the screen and the PS/2 keyboard
+//!                                  (boot/console.manifest), for PCs with no
+//!                                  serial port
+//!   cargo xtask console-run        boot that image in QEMU
+//!   cargo xtask console-shell-test type on QEMU's PS/2 keyboard and check the
+//!                                  screen, pixel by pixel
 //!   cargo xtask test               host unit tests, the exhaustive model check
 //!                                  and long simulation, then on each
 //!                                  architecture the boot self-tests in QEMU and
@@ -173,6 +180,13 @@ fn main() -> ExitCode {
     let result = arch.and_then(|arch| match args.first().map(String::as_str) {
         Some("idl") => idl(false),
         Some("image") => image(false, arch).map(|i| println!("image: {}", i.path.display())),
+        // The shell as a console on the machine's own screen and PS/2
+        // keyboard (boot/console.manifest), for PCs with no serial port.
+        Some("console-image") => {
+            image_with(false, arch, "console").map(|i| println!("image: {}", i.path.display()))
+        }
+        Some("console-run") => image_with(false, arch, "console").and_then(|img| boot(&img, false)),
+        Some("console-shell-test") => console_shell_test(),
         Some("run") => image(false, arch).and_then(|img| boot(&img, false)),
         Some("test") => host_tests()
             .and_then(|_| {
@@ -6113,6 +6127,88 @@ fn console_test() -> Result<(), String> {
         )?;
         println!("== console test passed ({firmware}): {}", checked.borrow());
     }
+    Ok(())
+}
+
+/// Types `text` on QEMU's keyboard through its monitor, one key press and
+/// release at a time (Shift held for capitals and `!`), as a person
+/// would. With no USB keyboard, QEMU's keyboard is the PS/2 one.
+fn qmp_type(text: &str) -> Result<(), String> {
+    let key = |qcode: &str, down: bool| {
+        format!(
+            "{{\"execute\":\"input-send-event\",\"arguments\":{{\"events\":[{{\"type\":\"key\",\"data\":{{\"down\":{down},\"key\":{{\"type\":\"qcode\",\"data\":\"{qcode}\"}}}}}}]}}}}"
+        )
+    };
+    let mut commands = Vec::new();
+    for c in text.chars() {
+        let lower = c.to_ascii_lowercase().to_string();
+        let (shift, qcode) = match c {
+            'a'..='z' | '0'..='9' => (false, lower.as_str()),
+            'A'..='Z' => (true, lower.as_str()),
+            ' ' => (false, "spc"),
+            '/' => (false, "slash"),
+            '!' => (true, "1"),
+            '\n' => (false, "ret"),
+            other => return Err(format!("qmp_type: no key for {other:?}")),
+        };
+        if shift {
+            commands.push(key("shift", true));
+        }
+        commands.push(key(qcode, true));
+        commands.push(key(qcode, false));
+        if shift {
+            commands.push(key("shift", false));
+        }
+    }
+    qmp(&commands)
+}
+
+/// The shell as a console on the screen and the PS/2 keyboard
+/// (boot/console.manifest): a command typed on QEMU's PS/2 keyboard must
+/// be answered, and the screen must show the session, every pixel as the
+/// kernel's log would draw those lines; the serial console must still
+/// work beside them.
+fn console_shell_test() -> Result<(), String> {
+    let img = image_with(false, Arch::X86_64, "console")?;
+    println!("== screen console test on {}", img.path.display());
+    let qmp_arg = format!("tcp:127.0.0.1:{QMP_PORT},server=on,wait=off");
+    let path = root().join("target").join("console-shell.ppm");
+    let checked = std::cell::RefCell::new(String::new());
+    let lines = |w: usize, h: usize| {
+        vec![
+            String::new(),
+            "Superior shell. Type 'help' for commands.".to_string(),
+            format!("Console on the screen ({w}x{h}), the PS/2 keyboard, and COM1."),
+            "superior> echo Hi PS/2!".to_string(),
+            "Hi PS/2!".to_string(),
+            "superior> ".to_string(),
+        ]
+    };
+    let script = [("help", "reboot          restart the machine")];
+    let out = drive_shell_at(&img, &["-qmp", &qmp_arg], &script, &|| {
+        qmp_type("echo Hi PS/2!\n")?;
+        // The shell reads the keyboard every tick: look until the screen
+        // shows the answer.
+        let deadline = Instant::now() + scaled(Duration::from_secs(30));
+        loop {
+            let _ = std::fs::remove_file(&path);
+            screendump(&path)?;
+            match check_console(&path, &lines) {
+                Ok(s) => {
+                    *checked.borrow_mut() = s;
+                    return Ok(());
+                }
+                Err(e) if Instant::now() > deadline => return Err(e),
+                Err(_) => std::thread::sleep(Duration::from_millis(500)),
+            }
+        }
+    })?;
+    check_log(
+        "screen console test",
+        &out,
+        &["Console on the screen", "the PS/2 keyboard", "echo Hi PS/2!", "\nHi PS/2!", "reboot"],
+    )?;
+    println!("== screen console test passed: {}", checked.borrow());
     Ok(())
 }
 
