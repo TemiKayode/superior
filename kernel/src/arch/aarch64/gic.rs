@@ -200,6 +200,11 @@ pub fn init() {
         write32(gicd() + GICD_ICENABLER + id as u64 / 8, !0);
         write32(gicd() + GICD_IGROUPR + id as u64 / 8, !0);
     }
+    // Level-triggered, all of them (PCI's pins, the console), until one
+    // is made edge-triggered (the SMMU's).
+    for id in (32..MAX_SPI).step_by(16) {
+        write32(gicd() + GICD_ICFGR + id as u64 / 4, 0);
+    }
     for id in 32..MAX_SPI {
         write8(gicd() + GICD_IPRIORITYR + id as u64, 0x80);
         write64(gicd() + GICD_IROUTER + 8 * id as u64, 0);

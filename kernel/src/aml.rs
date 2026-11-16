@@ -1,7 +1,8 @@
 //! Just enough of ACPI's AML to find how the PCI root bridge's interrupt
-//! pins reach the I/O APIC (its `_PRT`, PCI routing table, on x86-64) and
-//! the windows of addresses it decodes (its `_CRS`, on AArch64), read from
-//! the DSDT's bytecode without running any of it.
+//! pins reach the interrupt controller (its `_PRT`, PCI routing table: the
+//! I/O APIC on x86-64, the GIC on AArch64) and the windows of addresses it
+//! decodes (its `_CRS`, on AArch64), read from the DSDT's bytecode without
+//! running any of it.
 //!
 //! The DSDT is walked as a tree of definitions (scopes, devices, names,
 //! methods and the like); the root bridge is the device named PNP0A08 or
@@ -9,7 +10,8 @@
 //! most machines, a method that returns one of two packages: one for PIC
 //! mode, one for APIC mode, chosen by what the OS said through `_PIC`.
 //! Without running the method, the kernel reads every package it returns
-//! by name and keeps the one whose entries all reach the I/O APIC: an
+//! by name (a package, or a variable-size one as QEMU's Arm `_PRT` is)
+//! and keeps the one whose entries all reach the controller: an
 //! entry that names its GSI outright (source `Zero`), or names a link
 //! device whose `_CRS` is a fixed extended interrupt (QEMU's GSIA-GSIH).
 //! The PIC-mode package's links have `_CRS` methods and fail that.
@@ -363,15 +365,25 @@ impl Aml<'_> {
     /// Reads a routing package at `o` (defined in `scope`) into `routes`,
     /// if every entry reaches a GSI.
     fn table(&self, o: usize, scope: &Path) -> Option<(Routes, usize)> {
-        if self.byte(o)? != 0x12 {
-            return None;
-        }
-        let (body, end) = self.package(o + 1)?;
-        let count = self.byte(body)? as usize;
+        // A package (its count a byte) or a variable package (its count
+        // an integer, as QEMU's Arm tables write it).
+        let (count, first) = match self.byte(o)? {
+            0x12 => {
+                let (body, _) = self.package(o + 1)?;
+                (self.byte(body)? as usize, body + 1)
+            }
+            0x13 => {
+                let (body, _) = self.package(o + 1)?;
+                let (n, next) = self.integer(body)?;
+                (usize::try_from(n).ok()?, next)
+            }
+            _ => return None,
+        };
+        let (_, end) = self.package(o + 1)?;
         let mut routes: Routes = [[None; 4]; 32];
         // Links already looked up (each is named many times over).
         let mut links: [Option<([u8; 4], Option<Route>)>; 16] = [None; 16];
-        let mut e = body + 1;
+        let mut e = first;
         for _ in 0..count {
             if self.byte(e)? != 0x12 {
                 return None;
@@ -431,7 +443,7 @@ impl Aml<'_> {
                 // An EisaId, or the ID as a string (QEMU's Arm tables).
                 let eisa = self.integer(o).is_some_and(|(v, _)| ROOT_BRIDGE.contains(&v));
                 let string = self.byte(o) == Some(0x0d)
-                    && [&b"PNP0A08 "[..], b"PNP0A03 "].iter().any(|id| self.d.get(o + 1..o + 9) == Some(*id));
+                    && [&b"PNP0A08\0"[..], b"PNP0A03\0"].iter().any(|id| self.d.get(o + 1..o + 9) == Some(*id));
                 if eisa || string {
                     bridge = Some(p.parent());
                 }
@@ -523,7 +535,6 @@ pub fn root_windows(d: &[u8], out: &mut [Window]) -> Option<usize> {
 
 /// The root bridge's routes from the DSDT `d` (whole, header included),
 /// and how many entries its table has; `None` if the walk cannot tell.
-#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
 pub fn root_routes(d: &[u8]) -> Option<(Routes, usize)> {
     let aml = Aml { d };
     let bridge = aml.root_bridge()?;

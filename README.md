@@ -43,16 +43,18 @@ holds the rest):
   MPIDR, the GICv3's distributor, redistributors and ITS), GTDT (the timer's
   interrupt), SPCR (the console), MCFG (ECAM), IORT (the SMMUv3 and its interrupt, and
   that stream IDs are requester IDs), FADT (PSCI by `hvc` or `smc`) and the DSDT
-  (the PCI root bridge's `_CRS`: its memory and I/O port windows, read by the AML
-  reader x86-64 uses for `_PRT`), before any RAM is handed out. Either way the kernel
+  (the PCI root bridge's `_CRS`, its memory and I/O port windows, and its `_PRT`,
+  read by the same AML reader x86-64 uses), before any RAM is handed out. Either way the kernel
   drives the machine where the firmware says it is, not at QEMU `virt`'s addresses:
   the GICv3's distributor, redistributors (GICv3 or GICv4 frames) and ITS, the
   timer's interrupt, the PL011 console (found before anything is printed), the SMMU,
   and PCI's ECAM, 32-bit memory window and I/O port window, each device's GiB mapped
   into the kernel's identity map as it is found (anywhere in the first 512 GiB). What
   it needs and is not told, it reports on the console and stops. PCI's interrupt pins
-  still reach QEMU `virt`'s four wires (the device tree's `interrupt-map` and ACPI's
-  `_PRT` are not read on Arm yet). `cargo xtask uefi-test aarch64` boots it from an
+  reach the GIC's shared interrupts the PCI host's `interrupt-map` names (looked up
+  under its `interrupt-map-mask`), or the root bridge's `_PRT` (QEMU's a variable-size
+  package of link devices with extended-interrupt `_CRS`), each a level-triggered,
+  active-high line; with neither, PCI devices get MSI only. `cargo xtask uefi-test aarch64` boots it from an
   NVMe disk under QEMU's edk2 for `virt` twice, with the firmware's device tree
   (`acpi=off`) and with its ACPI tables alone: each time the firmware's boot manager,
   the loader and the shell session must show, then the driver framework test with
@@ -397,7 +399,8 @@ holds the rest):
     up to eight (on x86-64 each I/O APIC GSI the root bridge's `_PRT` names, in
     the order first named: GSIs 20 to 23 for QEMU q35's slots and 16 to 19 for
     its chipset's, while a laptop routes each integrated device its own way; on
-    `virt` the four shared interrupts 35 to 38). The bus server follows a
+    AArch64 each GIC shared interrupt the device tree's `interrupt-map` or
+    `_PRT` names: 35 to 38 on `virt`). The bus server follows a
     function's pin up through its bridges (rotating it by device number), asks
     the kernel which line that root-bus device and pin reaches (`IntxLine`), and
     gives that line to its driver (`pci::INTX`), one function a line. The kernel

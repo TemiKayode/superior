@@ -1411,7 +1411,7 @@ fn qemu_command(img: &Image) -> Command {
             // own way rather than as the other slots' rotated wires: the
             // bus server must ask the kernel which line its pin reaches.
             &match img.linux_nic {
-                Some(nic) if img.arch == Arch::X86_64 && nic.starts_with("rtl8139") => format!("{nic},addr={LDE_SLOT:#x}"),
+                Some(nic) if nic.starts_with("rtl8139") => format!("{nic},addr={LDE_SLOT:#x}"),
                 Some(nic) => nic.to_string(),
                 None => "virtio-net-pci,netdev=n0,disable-legacy=on,iommu_platform=on".to_string(),
             },
@@ -2409,12 +2409,17 @@ fn wifi_test(arch: Arch) -> Result<(), String> {
 }
 
 fn net_test(arch: Arch, manifest: &str) -> Result<(), String> {
+    net_test_on(image_with(false, arch, manifest)?, manifest)
+}
+
+/// As [`net_test`], on an image already built for `manifest` (a UEFI one,
+/// say).
+fn net_test_on(img: Image, manifest: &str) -> Result<(), String> {
     use std::collections::HashMap;
     use std::net::UdpSocket;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
     let lde = linux_nic(manifest).map(|l| l.0);
-    let img = image_with(false, arch, manifest)?;
     let stop = Arc::new(AtomicBool::new(false));
     let echoed = Arc::new(AtomicU64::new(0));
     // UDP echoes over IPv4 and IPv6 (QEMU sends the guest's datagrams to
@@ -2542,22 +2547,29 @@ fn net_test(arch: Arch, manifest: &str) -> Result<(), String> {
         None => &[],
     };
     check_log("Linux Driver Environment test", &out, linux)?;
-    // On x86-64 the RTL-8139 is in q35's chipset slot 27, whose INTA# _PRT
-    // routes to GSI 16, the fifth GSI it names: not where four rotated
-    // wires would put it (the fourth line, GSI 23). The kernel routes
-    // every slot's pins, and the bus server asks it which line the card's
-    // pin reaches.
-    if img.arch == Arch::X86_64 && lde == Some("8139cp") {
+    // The RTL-8139 is in slot 27. On x86-64 that is a q35 chipset slot,
+    // whose INTA# _PRT routes to GSI 16, the fifth GSI it names: not where
+    // four rotated wires would put it (the fourth line, GSI 23). On
+    // AArch64 the device tree's interrupt-map (under its mask) or ACPI's
+    // _PRT sends it to the fourth of virt's four, interrupt 38. The kernel
+    // routes every slot's pins, and the bus server asks it which line the
+    // card's pin reaches.
+    if lde == Some("8139cp") {
         let slot = format!("lde 8139cp: 10ec:8139 at 00:{LDE_SLOT:02x}.0 opened");
-        check_log(
-            "Linux Driver Environment test",
-            &out,
-            &[
-                "[ok] PCI interrupt pins through the I/O APIC, as _PRT says: 128 pins on 8 lines, at GSIs 20, 21, 22, 23, 16, 17, 18, 19",
-                &slot,
+        let (routes, wire) = match img.arch {
+            Arch::X86_64 => (
+                "[ok] PCI interrupt pins through the I/O APIC, as _PRT says: 128 pins on 8 lines, at GSIs 20, 21, 22, 23, 16, 17, 18, 19".to_string(),
                 "lde 8139cp: the device's legacy interrupt line (wire 4) is the driver's",
-            ],
-        )?;
+            ),
+            Arch::Aarch64 => (
+                format!(
+                    "[ok] PCI interrupt pins through the GIC, as {} says: 128 pins on 4 lines, at interrupts 35, 36, 37, 38 (level, active high)",
+                    if img.acpi { "_PRT" } else { "the device tree's interrupt-map" }
+                ),
+                "lde 8139cp: the device's legacy interrupt line (wire 3) is the driver's",
+            ),
+        };
+        check_log("Linux Driver Environment test", &out, &[&routes, &slot, wire])?;
     }
     let ready = lde.map(|d| format!("lde {d}: Linux's {d} driver runs"));
     let steps = [
@@ -2677,7 +2689,7 @@ fn net_test(arch: Arch, manifest: &str) -> Result<(), String> {
         tcp_echoed.load(Ordering::Relaxed),
         asked.values().sum::<u32>()
     );
-    println!("== network test passed ({})", arch.name());
+    println!("== network test passed ({})", img.arch.name());
     Ok(())
 }
 
@@ -5667,6 +5679,7 @@ fn uefi_test_aarch64() -> Result<(), String> {
                 "2 CPUs (MADT), PSCI by hvc (FADT)",
                 "[ok] machine (ACPI): GICv3 at 0x8000000, redistributors at 0x80a0000, ITS at 0x8080000; timer interrupt 27; PL011 at 0x9000000, interrupt 33; PCI: ECAM at 0x3f000000, memory at 0x10000000 (256 MiB), I/O ports at 0x3eff0000",
                 "[ok] machine (ACPI): no SMMU",
+                "[ok] PCI interrupt pins through the GIC, as _PRT says: 128 pins on 4 lines, at interrupts 35, 36, 37, 38 (level, active high)",
                 "[ok] 2 CPUs online",
                 "superior> ",
             ]
@@ -5691,6 +5704,13 @@ fn uefi_test_aarch64() -> Result<(), String> {
         let mut img = uefi_image(Arch::Aarch64, "drivers")?;
         img.acpi = acpi;
         let out = drivers_test_log(&img)?;
+        if acpi {
+            // A Linux driver on a legacy interrupt pin, routed by _PRT.
+            let mut img = uefi_image(Arch::Aarch64, "lde")?;
+            img.acpi = true;
+            println!("== Linux Driver Environment test (ACPI) on {}", img.path.display());
+            net_test_on(img, "lde")?;
+        }
         if acpi && !out.contains("[ok] machine (ACPI): SMMUv3 at 0x9050000, event interrupt 106") {
             return Err("UEFI test (aarch64, ACPI): the SMMU was not found from the IORT".into());
         }

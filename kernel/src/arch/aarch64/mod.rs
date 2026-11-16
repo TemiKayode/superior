@@ -32,7 +32,7 @@ pub use exceptions::{enter_user, Args, Exit, UserFrame};
 #[cfg_attr(not(feature = "selftest"), allow(unused_imports))]
 pub use timer::{alarm, alarm_fired, alarm_keep, tick_start, tick_stop, TICK_HZ};
 
-use crate::kprintln;
+use crate::{kprint, kprintln};
 use crate::memory::{add_region, Summary};
 use crate::smp::{self, MAX_CPUS};
 use superior_objects::cap::{Capability, Object, Rights};
@@ -398,6 +398,7 @@ extern "C" fn kernel_main(dtb: u64, from_el2: u64) -> ! {
         );
     }
     report_machine(&p);
+    report_intx(&p);
 
     let mut ram = [(0u64, 0u64); fdt::MAX_RANGES];
     let n = fdt::memory(boot, &mut ram).expect("no usable device tree");
@@ -599,14 +600,8 @@ fn uart_irq() -> u8 {
 }
 
 pub fn irq_routable(line: u8) -> bool {
-    line == uart_irq() || msi_lines().contains(&line) || INTX_LINES.contains(&line)
+    line == uart_irq() || msi_lines().contains(&line) || intx_lines().contains(&line)
 }
-
-/// QEMU `virt`'s four PCI interrupt wires: shared interrupts 3 to 6
-/// (interrupt IDs 35 to 38), level-triggered as every shared interrupt
-/// is until told otherwise. A function on bus 0 drives wire
-/// `(device + pin - 1) % 4`.
-const INTX_LINES: [u8; 4] = [35, 36, 37, 38];
 
 /// I/O ports for PCI BARs: the window of device memory that stands for
 /// ports from 0, as the firmware says (QEMU `virt`'s is just below its
@@ -616,16 +611,38 @@ pub fn pci_io_cap() -> Option<Capability> {
     Some(Capability::new(Object::DeviceUntyped { base, size_bits }, Rights::ALL))
 }
 
-/// The legacy PCI interrupt lines.
+/// The legacy PCI interrupt lines: the GIC's shared interrupts PCI's pins
+/// reach, as the firmware says (none if it does not).
 pub fn intx_lines() -> &'static [u8] {
-    &INTX_LINES
+    platform().intx.as_ref().map_or(&[], |x| &x.lines[..x.used])
 }
 
 /// Which of [`intx_lines`] pin `pin` (1 to 4) of root-bus device `device`
-/// reaches: on QEMU `virt`, wire `(device + pin - 1) % 4`, as its device
-/// tree's `interrupt-map` says.
+/// reaches, as the device tree's `interrupt-map` or ACPI's `_PRT` says.
 pub fn intx_line(device: u8, pin: u8) -> Option<usize> {
-    (device < 32 && (1..=4).contains(&pin)).then(|| (device as usize + pin as usize - 1) % 4)
+    platform().intx.as_ref()?.line(device, pin)
+}
+
+/// One line on PCI's interrupt pins, as x86-64 reports them.
+fn report_intx(p: &platform::Platform) {
+    let Some(x) = &p.intx else {
+        kprintln!("[ok] PCI interrupt pins: routing unknown (no interrupt-map or _PRT), only MSI");
+        return;
+    };
+    kprint!(
+        "[ok] PCI interrupt pins through the GIC, as {} says: {} pins on {} lines, at interrupts",
+        x.from,
+        x.pins,
+        x.used
+    );
+    for (i, line) in x.lines[..x.used].iter().enumerate() {
+        kprint!("{} {line}", if i == 0 { "" } else { "," });
+    }
+    if x.left > 0 {
+        kprintln!(" (level, active high); {} pins left without (not level-high, or past {} lines)", x.left, platform::MAX_INTX);
+    } else {
+        kprintln!(" (level, active high)");
+    }
 }
 
 /// The message a device writes to raise MSI line `line`, if it is one:

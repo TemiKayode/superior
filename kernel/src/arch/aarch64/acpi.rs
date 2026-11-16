@@ -49,6 +49,8 @@ pub struct Machine {
     /// The PCI root bridge's windows (DSDT), and how many.
     pub windows: [Window; MAX_WINDOWS],
     pub window_count: usize,
+    /// Where its interrupt pins go (the DSDT's `_PRT`), if it says.
+    pub routes: Option<crate::aml::Routes>,
 }
 
 fn byte(a: u64) -> u8 {
@@ -142,6 +144,7 @@ pub fn read(rsdp: u64) -> Result<Machine, &'static str> {
         smmu: None,
         windows: [Window::default(); MAX_WINDOWS],
         window_count: 0,
+        routes: None,
     };
 
     // MADT: interrupt controller structures from offset 44.
@@ -215,6 +218,7 @@ pub fn read(rsdp: u64) -> Result<Machine, &'static str> {
             // SAFETY: the DSDT, `len` bytes in the kernel's RAM.
             let bytes = unsafe { core::slice::from_raw_parts(dsdt as *const u8, len as usize) };
             m.window_count = crate::aml::root_windows(bytes, &mut m.windows).unwrap_or(0);
+            m.routes = crate::aml::root_routes(bytes).map(|r| r.0);
         }
     }
 

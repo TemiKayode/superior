@@ -16,10 +16,126 @@
 //! - the SMMUv3, if any;
 //! - PSCI's conduit, and how many CPUs to start.
 //!
-//! Not from the firmware yet: how PCI's interrupt pins reach the GIC (QEMU
-//! `virt`'s four wires, [`super::intx_line`]).
+//! - how PCI's interrupt pins on bus 0 reach the GIC: the device tree's
+//!   `interrupt-map` (with its mask) on the PCI host, or the root bridge's
+//!   `_PRT`; each distinct interrupt a line ([`Intx`]).
 
 use super::{acpi, fdt};
+
+/// Legacy PCI interrupt lines at most (the root task's slots for them).
+pub const MAX_INTX: usize = 8;
+
+/// PCI's interrupt pins: the lines (GIC interrupt IDs, level-triggered,
+/// active high), and for each device on bus 0 and pin INTA to INTD, which
+/// line it reaches (its index plus one; 0 for none).
+#[derive(Clone, Copy)]
+pub struct Intx {
+    /// What said so: "the device tree's interrupt-map", or "_PRT".
+    pub from: &'static str,
+    pub lines: [u8; MAX_INTX],
+    pub used: usize,
+    pub pin: [[u8; 4]; 32],
+    /// Pins routed, and pins left without a line (an interrupt that is
+    /// not level-high, above 255, or past [`MAX_INTX`] lines).
+    pub pins: usize,
+    pub left: usize,
+}
+
+impl Intx {
+    /// From `route(device, pin)`: the interrupt ID pin `pin` (1 to 4) of
+    /// device `device` reaches, if it is a level-high one. None if no pin
+    /// is routed.
+    fn build(from: &'static str, route: impl Fn(u8, u8) -> Option<Option<u32>>) -> Option<Intx> {
+        let mut x = Intx { from, lines: [0; MAX_INTX], used: 0, pin: [[0; 4]; 32], pins: 0, left: 0 };
+        for device in 0..32u8 {
+            for pin in 1..=4u8 {
+                // Not mentioned: no pin to route. Mentioned, but nothing the
+                // kernel can take: left without.
+                let Some(id) = route(device, pin) else { continue };
+                let line = id.filter(|&id| (32..256).contains(&id)).and_then(|id| {
+                    let id = id as u8;
+                    match x.lines[..x.used].iter().position(|&l| l == id) {
+                        Some(w) => Some(w),
+                        None if x.used < MAX_INTX => {
+                            x.lines[x.used] = id;
+                            x.used += 1;
+                            Some(x.used - 1)
+                        }
+                        None => None,
+                    }
+                });
+                match line {
+                    Some(w) => {
+                        x.pin[device as usize][pin as usize - 1] = w as u8 + 1;
+                        x.pins += 1;
+                    }
+                    None => x.left += 1,
+                }
+            }
+        }
+        (x.used > 0).then_some(x)
+    }
+
+    /// The line pin `pin` (1 to 4) of bus 0's device `device` reaches.
+    pub fn line(&self, device: u8, pin: u8) -> Option<usize> {
+        let w = *self.pin.get(device as usize)?.get((pin as usize).checked_sub(1)?)?;
+        (w != 0).then(|| w as usize - 1)
+    }
+}
+
+/// The PCI host's `interrupt-map`: entries of a child unit address (three
+/// cells, the device in bits 11 to 15 of the first), a child interrupt
+/// (one cell, the pin), the parent's phandle, its unit address and its
+/// interrupt (the GIC's: SPI or PPI, number, flags); looked up with the
+/// child's address and pin under `interrupt-map-mask`.
+fn interrupt_map(dtb: u64) -> Option<Intx> {
+    let host = b"pci-host-ecam-generic";
+    let map = fdt::prop(dtb, host, b"interrupt-map")?;
+    let mask = fdt::prop(dtb, host, b"interrupt-map-mask");
+    let child_int = fdt::prop(dtb, host, b"#interrupt-cells").and_then(|p| p.cell(0)).unwrap_or(1);
+    let gic = b"arm,gic-v3";
+    let gic_phandle = fdt::prop(dtb, gic, b"phandle")?.cell(0)?;
+    let gic_int = fdt::prop(dtb, gic, b"#interrupt-cells")?.cell(0)?;
+    // An interrupt parent with no #address-cells has none in the map.
+    let gic_addr = fdt::prop(dtb, gic, b"#address-cells").and_then(|p| p.cell(0)).unwrap_or(0);
+    if map.own_cells.0 != 3 || child_int != 1 || gic_int < 3 || gic_addr > 2 {
+        return None;
+    }
+    let m = |i: u64| mask.and_then(|p| p.cell(i)).unwrap_or(!0);
+    let entry = (3 + 1 + 1 + gic_addr + gic_int) as u64;
+    Intx::build("the device tree's interrupt-map", |device, pin| {
+        let (hi, pin) = (((device as u32) << 11) & m(0), pin as u32 & m(3));
+        let mut i = 0;
+        while map.cell(i + entry - 1).is_some() {
+            let cell = |k: u64| map.cell(i + k).unwrap_or(0);
+            if cell(0) == hi && cell(1) & m(1) == 0 && cell(2) & m(2) == 0 && cell(3) == pin {
+                if cell(4) != gic_phandle {
+                    return Some(None);
+                }
+                let at = 5 + gic_addr as u64;
+                let (kind, number, flags) = (cell(at), cell(at + 1), cell(at + 2));
+                // Level-triggered, active high (flags 4): what PCI's pins
+                // are once the host bridge has inverted them.
+                let base = match kind {
+                    0 => 32,
+                    1 => 16,
+                    _ => return Some(None),
+                };
+                return Some((flags & 0xf == 4).then_some(base + number));
+            }
+            i += entry;
+        }
+        None
+    })
+}
+
+/// The root bridge's `_PRT`, as the AML reader found it.
+fn prt(routes: &crate::aml::Routes) -> Option<Intx> {
+    Intx::build("_PRT", |device, pin| {
+        let r = routes[device as usize][pin as usize - 1]?;
+        Some((r.level && !r.active_low).then_some(r.gsi))
+    })
+}
 
 /// The largest block of `2^bits` bytes, aligned to its size, within
 /// `[base, base + len)`; no bigger than `2^max` nor smaller than a page.
@@ -51,6 +167,8 @@ pub struct Platform {
     /// CPUs to start at most (ACPI's MADT says how many there are; with a
     /// device tree, PSCI is asked until it refuses).
     pub cpus: Option<usize>,
+    /// PCI's interrupt pins, if the firmware says where they go.
+    pub intx: Option<Intx>,
 }
 
 impl Platform {
@@ -96,6 +214,7 @@ impl Platform {
         }
         p.smmu = fdt::find_device(dtb, b"arm,smmu-v3");
         p.psci_smc = fdt::device_prop_is(dtb, b"arm,psci-0.2", b"method", b"smc");
+        p.intx = interrupt_map(dtb);
         p
     }
 
@@ -124,6 +243,7 @@ impl Platform {
         p.smmu = m.smmu;
         p.psci_smc = m.psci == Some(false);
         p.cpus = Some(if m.psci.is_some() { m.cpus } else { 1 });
+        p.intx = m.routes.as_ref().and_then(prt);
         p
     }
 
