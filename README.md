@@ -116,6 +116,23 @@ holds the rest):
   takes a screenshot once the shell's prompt shows, from a BIOS (1280x720) and from
   UEFI (1280x800), and the first log lines must have every pixel as the host draws
   them.
+- The kernel's log over USB, on both ISAs, through the xHCI Debug Capability (DbC):
+  a USB device built into the host controller, which a second machine reads over a
+  USB 3 debug cable (it shows as 1d6b:0010, the IDs Linux's own DbC uses, which
+  Linux's `usb_debug` driver makes `/dev/ttyUSB0`). The log is kept from the first
+  line. At boot the kernel looks for an xHCI on the buses as the firmware numbered
+  them, takes it from the firmware's USB legacy support and enables its DbC
+  (`crates/xdbc`: its context, strings, event ring and OUT transfer ring in two
+  pages of RAM); what was kept goes out once a debug host configures it, and each
+  line after as it is printed. It closes before the IOMMU comes on (which would
+  block its DMA) and user space takes the controller, sending what is left first,
+  and after a panic it sends what it has. QEMU's xHCI has no DbC, so nothing under
+  QEMU shows the output: `cargo test` drives `crates/xdbc` against a simulated
+  controller (the layout the debug host reads, nothing sent before it configures
+  the device, a long log arriving whole and in order round both rings, unplugging,
+  a halted endpoint), and `cargo xtask uefi-test` (both ISAs) adds an xHCI the
+  firmware sets up, which the kernel must find and report has no DbC. Output itself
+  waits for a laptop and a debug cable.
 - Boot, serial console, GDT/TSS, exception handlers; the legacy PIC remapped to vector
   0x20 with every line masked, carrying COM1 only on a machine with no I/O APIC.
 - All usable physical memory handed to the root CNode as untyped capabilities; every

@@ -438,6 +438,7 @@ extern "C" fn kernel_main(dtb: u64, from_el2: u64) -> ! {
     }
     crate::report_memory(&mem);
     report_reserved(&p);
+    dbc_init(&p);
     let (gicd, gicr) = (p.gicd.unwrap_or(0), p.gicr.unwrap_or(0));
     for base in [gicd, gicr].into_iter().chain(p.its) {
         if !vm::map_device(base) {
@@ -456,6 +457,21 @@ extern "C" fn kernel_main(dtb: u64, from_el2: u64) -> ! {
         TICK_HZ
     );
     crate::kernel_start(mem.untyped_caps)
+}
+
+/// The log over USB, if an xHCI has a Debug Capability: found through
+/// ECAM (its first 16 buses), its registers mapped as device memory, its
+/// rings in pages of RAM (identity-mapped).
+fn dbc_init(p: &platform::Platform) {
+    let Some(ecam) = p.ecam.filter(|&e| vm::map_device(e)) else { return };
+    let at = move |bus: u8, devfn: u8, off: u16| (ecam + ((bus as u64) << 20 | (devfn as u64) << 12 | (off as u64 & 0xffc))) as *mut u32;
+    // SAFETY: ECAM, mapped as device memory.
+    let read = |bus, devfn, off| unsafe { core::ptr::read_volatile(at(bus, devfn, off)) };
+    // SAFETY: as above.
+    let write = |bus, devfn, off, v| unsafe { core::ptr::write_volatile(at(bus, devfn, off), v) };
+    let map = |pa: u64| vm::map_device(pa).then_some(pa);
+    let page = || crate::memory::user_page().map(|pa| (pa, pa as *mut u8));
+    crate::dbc::init(&crate::dbc::Pci { read: &read, write: &write, buses: 16, map: &map, page: &page }, "the PL011");
 }
 
 /// The IORT's reserved memory ranges: one line on how many, and one for

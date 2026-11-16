@@ -699,6 +699,7 @@ dependencies = [
  "spin",
  "superior-objects",
  "superior-toolkit",
+ "superior-xdbc",
  "uart_16550",
  "x86_64",
 ]
@@ -876,6 +877,10 @@ version = "0.1.0"
 dependencies = [
  "superior-objects",
 ]
+
+[[package]]
+name = "superior-xdbc"
+version = "0.1.0"
 
 [[package]]
 name = "superior-xhci"

@@ -19,6 +19,7 @@ selftest = []
 
 [dependencies]
 superior-objects = { path = "../crates/objects" }
+superior-xdbc = { path = "../crates/xdbc" }
 spin = { version = "0.9", default-features = false, features = ["spin_mutex", "lazy"] }
 
 [target.'cfg(target_arch = "x86_64")'.dependencies]

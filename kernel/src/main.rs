@@ -24,6 +24,7 @@ mod arch;
 mod arch;
 
 mod aml;
+mod dbc;
 mod entropy;
 mod rtc;
 mod iommu;
@@ -124,6 +125,9 @@ fn kernel_start(untyped_caps: usize) -> ! {
         }
         Err(e) => panic!("{e}"),
     }
+    // The IOMMU would block the DbC's DMA, and user space takes the
+    // controller: the log over USB ends here.
+    dbc::close("the IOMMU comes on next, then user space takes the controller");
     match arch::iommu_init() {
         Some(name) => kprintln!("[ok] IOMMU: {name}, all DMA blocked until bound"),
         None => kprintln!("[ok] no IOMMU"),
@@ -494,6 +498,7 @@ fn selftest(untyped_caps: usize) {
 fn panic(info: &PanicInfo) -> ! {
     arch::disable_interrupts();
     kprintln!("[panic] {info}");
+    dbc::flush();
     #[cfg(feature = "selftest")]
     arch::qemu_exit(false);
     #[allow(unreachable_code)]

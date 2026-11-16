@@ -71,6 +71,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     vm::init(offset);
     kprintln!("[ok] physical memory mapped at {offset:#x}");
     acpi::init(boot_info.rsdp_addr.into_option());
+    dbc_init();
     interrupts::init_routing();
     let timer_hz = apic::init();
     smp::note_boot_apic();
@@ -80,6 +81,31 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         apic::TICK_HZ
     );
     crate::kernel_start(mem.untyped_caps)
+}
+
+/// The log over USB, if an xHCI has a Debug Capability: found through
+/// configuration ports 0xcf8 and 0xcfc (nothing else uses them yet), its
+/// registers mapped as device memory, its rings in pages of RAM.
+fn dbc_init() {
+    use x86_64::instructions::port::Port;
+    let address = |bus: u8, devfn: u8, off: u16| 1u32 << 31 | (bus as u32) << 16 | (devfn as u32) << 8 | (off as u32 & 0xfc);
+    let read = |bus, devfn, off| {
+        // SAFETY: the PCI configuration ports, the kernel's alone at boot.
+        unsafe {
+            Port::<u32>::new(0xcf8).write(address(bus, devfn, off));
+            Port::<u32>::new(0xcfc).read()
+        }
+    };
+    let write = |bus, devfn, off, v| {
+        // SAFETY: as above.
+        unsafe {
+            Port::<u32>::new(0xcf8).write(address(bus, devfn, off));
+            Port::<u32>::new(0xcfc).write(v);
+        }
+    };
+    let map = |pa: u64| vm::map_mmio(x86_64::PhysAddr::new(pa & !0xfff)).ok().map(|va| va.as_u64() + (pa & 0xfff));
+    let page = || crate::memory::user_page().map(|pa| (pa, vm::phys_ptr(pa)));
+    crate::dbc::init(&crate::dbc::Pci { read: &read, write: &write, buses: 256, map: &map, page: &page }, "COM1");
 }
 
 /// User space is about to start: the kernel stops drawing on the boot

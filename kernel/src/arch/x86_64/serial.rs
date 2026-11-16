@@ -1,5 +1,5 @@
 //! COM1 serial console, and until user space starts the boot framebuffer
-//! too (`super::fbcon`). Everything here is debug output; user-facing
+//! too (`super::fbcon`), and USB's debug capability (`crate::dbc`). Everything here is debug output; user-facing
 //! consoles are user-space services.
 
 use core::fmt::{self, Write};
@@ -25,6 +25,7 @@ pub fn _print(args: fmt::Arguments) {
     x86_64::instructions::interrupts::without_interrupts(|| {
         let _ = COM1.lock().write_fmt(args);
         super::fbcon::print(args);
+        crate::dbc::print(args);
     });
 }
 

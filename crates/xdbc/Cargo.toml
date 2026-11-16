@@ -1,0 +1,9 @@
+[package]
+name = "superior-xdbc"
+description = "The xHCI Debug Capability (DbC) as a byte sink: the kernel's log over USB. no_std, host-testable against a simulated controller."
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+edition = "2024"
+
+[dependencies]

@@ -122,6 +122,9 @@ struct Image {
     /// A USB keyboard on an xHCI controller, typed on through QEMU's
     /// monitor (the keyboard test).
     keyboard: bool,
+    /// An xHCI controller alone, at [`XHCI_SLOT`], for the kernel to look
+    /// for a USB Debug Capability on (QEMU's has none).
+    xhci: bool,
     /// A USB mouse and a USB tablet on the same controller (the input
     /// test).
     mouse: bool,
@@ -866,6 +869,7 @@ fn image_sealed(
         linux_nic: linux_nic(manifest).map(|l| l.1),
         radio: manifest == "wifi",
         keyboard: matches!(manifest, "keyboard" | "input" | "windows" | "toolkit" | "panel" | "resize" | "widgets"),
+        xhci: false,
         mouse: matches!(manifest, "input" | "windows" | "toolkit" | "panel" | "resize" | "widgets"),
         hotplug: manifest == "hotplug",
         display: matches!(manifest, "display" | "desktop" | "input" | "windows" | "toolkit" | "panel" | "resize" | "widgets"),
@@ -970,6 +974,7 @@ fn sel4_image() -> Result<Image, String> {
         linux_nic: None,
         radio: false,
         keyboard: false,
+        xhci: false,
         mouse: false,
         hotplug: false,
         display: false,
@@ -1038,6 +1043,15 @@ fn uefi_image(arch: Arch, manifest: &str) -> Result<Image, String> {
     img.path = path;
     img.uefi = true;
     Ok(img)
+}
+
+/// The slot of the UEFI tests' lone xHCI controller, on bus 0.
+const XHCI_SLOT: u8 = 0x0e;
+
+/// What the kernel says of the UEFI tests' xHCI: found, with no Debug
+/// Capability (QEMU's has none), so the log stays where it was.
+fn no_dbc(serial: &str) -> String {
+    format!("[ok] USB debug: no xHCI with a Debug Capability (the first, at 00:{XHCI_SLOT:02x}.0, has none); the log stays on {serial}")
 }
 
 /// The q35 chipset slot the x86-64 LDE test's RTL-8139 sits in.
@@ -1529,6 +1543,9 @@ fn qemu_command(img: &Image) -> Command {
             "-device",
             "virtio-net-pci,netdev=r0,disable-legacy=on,iommu_platform=on",
         ]);
+    }
+    if img.xhci {
+        q.args(["-device", &format!("qemu-xhci,addr={XHCI_SLOT:#x}")]);
     }
     if img.keyboard {
         // A USB keyboard on an xHCI controller (its DMA through the
@@ -5799,6 +5816,7 @@ fn uefi_test_aarch64() -> Result<(), String> {
         let how = if acpi { "ACPI" } else { "device tree" };
         let mut img = uefi_image(Arch::Aarch64, "shell")?;
         img.acpi = acpi;
+        img.xhci = true;
         println!("== UEFI shell session ({how}) on {}", img.path.display());
         let out = drive_shell(&img, &[], SHELL_SCRIPT)?;
         // The firmware's boot manager starts the disk. What the firmware
@@ -5809,6 +5827,7 @@ fn uefi_test_aarch64() -> Result<(), String> {
         }
         let banner = "Superior UEFI loader (AArch64)";
         let out = out.find(banner).map_or("", |at| &out[at..]);
+        let usb = no_dbc("the PL011");
         let described: &[&str] = if acpi {
             &[
                 "; ACPI tables, RSDP at ",
@@ -5820,6 +5839,7 @@ fn uefi_test_aarch64() -> Result<(), String> {
                 "[ok] machine (ACPI): GICv3 at 0x8000000, redistributors at 0x80a0000, ITS at 0x8080000; timer interrupt 27; PL011 at 0x9000000, interrupt 33; PCI: ECAM at 0x3f000000, memory at 0x10000000 (256 MiB), I/O ports at 0x3eff0000",
                 "[ok] machine (ACPI): no SMMU",
                 "[ok] PCI interrupt pins through the GIC, as _PRT says: 128 pins on 4 lines, at interrupts 35, 36, 37, 38 (level, active high)",
+                &usb,
                 "[ok] 2 CPUs online",
                 "superior> ",
             ]
@@ -5830,6 +5850,7 @@ fn uefi_test_aarch64() -> Result<(), String> {
                 "Superior microkernel",
                 "[ok] MMU on; exception vectors installed",
                 "[ok] machine (device tree): GICv3 at 0x8000000, redistributors at 0x80a0000, ITS at 0x8080000; timer interrupt 27; PL011 at 0x9000000, interrupt 33; PCI: ECAM at 0x3f000000, memory at 0x10000000 (256 MiB), I/O ports at 0x3eff0000",
+                &usb,
                 "[ok] 2 CPUs online",
                 "superior> ",
             ]
@@ -5947,6 +5968,9 @@ fn uefi_test(arch: Arch) -> Result<(), String> {
     // 0, 1, 2 and 4, with a gap at 3 as on real machines. The kernel must
     // start the four ACPI's MADT lists enabled, not stop at the gap.
     img.smp = Some("4,sockets=2,cores=3,threads=1,maxcpus=6");
+    // An xHCI controller the firmware sets up: the kernel finds it and
+    // looks for a Debug Capability.
+    img.xhci = true;
     println!("== UEFI shell session on {}", img.path.display());
     let out = drive_shell(&img, &[], SHELL_SCRIPT)?;
     check_log(
@@ -5958,6 +5982,7 @@ fn uefi_test(arch: Arch) -> Result<(), String> {
             "Superior microkernel",
             "[ok] ACPI: 4 of 6 CPUs listed taken, APIC IDs [0, 1, 2, 4]",
             "[ok] ACPI: no DMAR (no VT-d)",
+            &no_dbc("COM1"),
             "[ok] 4 CPUs online",
             "superior> ",
         ],

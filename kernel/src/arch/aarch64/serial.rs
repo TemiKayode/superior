@@ -44,6 +44,7 @@ pub fn _print(args: fmt::Arguments) {
     // The kernel runs with interrupts masked, so a handler that logs can
     // never interrupt code holding the lock.
     let _ = CONSOLE.lock().write_fmt(args);
+    crate::dbc::print(args);
 }
 
 #[macro_export]
