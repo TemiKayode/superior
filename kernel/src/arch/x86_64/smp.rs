@@ -7,6 +7,11 @@
 //! switch), and jumps to [`ap_main`] on the CPU's own kernel stack. CPU 0
 //! fills in the trampoline's data (tables, stack, number, entry) before
 //! each start and waits for the CPU to come up before the next.
+//!
+//! Waking from S3 ([`super::sleep`]) goes through the same trampoline: the
+//! firmware starts CPU 0 in real mode at the page the FACS names, and it
+//! lands in [`super::sleep`]'s wake entry instead; then the other CPUs,
+//! which lost everything, are started again ([`restart_secondaries`]).
 
 use super::{apic, gdt, interrupts, syscall, vm};
 use crate::smp::{self, MAX_CPUS};
@@ -183,17 +188,15 @@ fn others() -> [Option<u32>; MAX_CPUS] {
     out
 }
 
-/// Starts the other CPUs ([`others`]), up to [`MAX_CPUS`] in all, each
-/// numbered in turn; stops at one that does not come up. Returns how many
-/// CPUs are online.
-pub fn start_secondaries() -> usize {
+/// Copies the trampoline to the start-up page and fills in what every
+/// start shares (its GDT, jumps, tables, CR0, and `entry`), with the page
+/// identity-mapped for the switch to long mode (until [`uninstall`]).
+/// Returns the page, if there is one the trampoline can use.
+fn install(entry: u64) -> Option<u64> {
     let page = STARTUP_PAGE.load(Ordering::Relaxed);
     let root = vm::kernel_root();
-    if page == 0 || root >= 1 << 32 {
-        return smp::online();
-    }
-    if vm::identity_map(page, true).is_err() {
-        return smp::online();
+    if page == 0 || root >= 1 << 32 || vm::identity_map(page, true).is_err() {
+        return None;
     }
     // SAFETY: the trampoline's bytes, and the start-up page, which nothing
     // else uses; the patched fields are inside the copy.
@@ -210,20 +213,86 @@ pub fn start_secondaries() -> usize {
         // Paging, protection, and CPU 0's other bits, but caching on.
         let cr0 = CR0.load(Ordering::Relaxed) | 1 << 31 | 1;
         (at(page, &raw const sup_ap_cr0) as *mut u64).write_unaligned(cr0);
-        (at(page, &raw const sup_ap_entry) as *mut u64)
-            .write_unaligned(ap_main as *const () as u64);
+        (at(page, &raw const sup_ap_entry) as *mut u64).write_unaligned(entry);
     }
+    Some(page)
+}
+
+/// Takes the start-up page's identity mapping away again.
+fn uninstall(page: u64) {
+    let _ = vm::identity_map(page, false);
+}
+
+/// Sets the stack and CPU number the next CPU through the trampoline at
+/// `page` starts with.
+fn set_start(page: u64, stack: u64, cpu: usize) {
+    // SAFETY: fields inside the trampoline's copy; no CPU is in it (the
+    // last one started came up, or none was).
+    unsafe {
+        (at(page, &raw const sup_ap_stack) as *mut u64).write_unaligned(stack);
+        (at(page, &raw const sup_ap_cpu) as *mut u64).write_unaligned(cpu as u64);
+    }
+}
+
+/// Readies the trampoline for CPU 0 to wake from S3 into `entry` (with
+/// `stack`, which `entry` replaces): the page to give the firmware, with
+/// it identity-mapped until [`wake_done`].
+pub fn prepare_wake(entry: u64, stack: u64) -> Option<u64> {
+    let page = install(entry)?;
+    set_start(page, stack, 0);
+    Some(page)
+}
+
+/// CPU 0 is awake (or did not sleep): the start-up page is not needed.
+pub fn wake_done(page: u64) {
+    uninstall(page);
+}
+
+/// Starts the other CPUs ([`others`]), up to [`MAX_CPUS`] in all, each
+/// numbered in turn; stops at one that does not come up. Returns how many
+/// CPUs are online.
+pub fn start_secondaries() -> usize {
+    let Some(page) = install(ap_main as *const () as u64) else {
+        return smp::online();
+    };
     for (cpu, apic) in others().into_iter().enumerate().skip(1) {
         let Some(apic) = apic else { break };
         APIC_OF[cpu].store(apic, Ordering::Relaxed);
-        // SAFETY: as above; the previous CPU is past the trampoline (it
-        // came up), so these fields are free to change.
-        unsafe {
-            // Below a page kept free for the first entry to user mode.
-            let stack = gdt::kernel_stack_top(cpu) - 4096;
-            (at(page, &raw const sup_ap_stack) as *mut u64).write_unaligned(stack);
-            (at(page, &raw const sup_ap_cpu) as *mut u64).write_unaligned(cpu as u64);
+        if !start_one(page, cpu, apic) {
+            APIC_OF[cpu].store(u32::MAX, Ordering::Relaxed);
+            break;
         }
+    }
+    uninstall(page);
+    smp::online()
+}
+
+/// After S3: starts the CPUs that were online before it again, as they
+/// were numbered (they lost all their state, and run the scheduler
+/// afresh). Returns how many CPUs are online.
+pub fn restart_secondaries(before: usize) -> usize {
+    smp::ONLINE.store(1, Ordering::Release);
+    let Some(page) = install(ap_main as *const () as u64) else {
+        return smp::online();
+    };
+    for cpu in 1..before {
+        let apic = apic_of(cpu);
+        crate::smp::restarted(cpu);
+        if apic == u32::MAX || !start_one(page, cpu, apic) {
+            break;
+        }
+    }
+    uninstall(page);
+    smp::online()
+}
+
+/// Starts CPU `cpu` (local APIC ID `apic`) through the trampoline at
+/// `page`; returns whether it came up.
+fn start_one(page: u64, cpu: usize, apic: u32) -> bool {
+    {
+        // Below a page kept free for the first entry to user mode.
+        let stack = gdt::kernel_stack_top(cpu) - 4096;
+        set_start(page, stack, cpu);
         apic::start_cpu(apic as usize, page);
         // Up to 200 ms to come up; QEMU starts nothing for an ID it does
         // not have.
@@ -232,20 +301,13 @@ pub fn start_secondaries() -> usize {
             apic::delay_us(1000);
             waited += 1;
         }
-        if smp::online() <= cpu {
-            APIC_OF[cpu].store(u32::MAX, Ordering::Relaxed);
-            break;
-        }
+        smp::online() > cpu
     }
-    let _ = vm::identity_map(page, false);
-    smp::online()
 }
 
-/// A started CPU in long mode on its own stack: CPU 0's control
-/// registers, its own GDT, TSS and `syscall` set-up, the IDT, its APIC and
-/// timer; then it schedules.
-extern "C" fn ap_main(cpu: u64) -> ! {
-    let cpu = cpu as usize;
+/// Loads CPU 0's CR4 (and XCR0) on this CPU: after the trampoline, which
+/// sets only what long mode needs.
+pub fn restore_control_registers() {
     // SAFETY: the same settings CPU 0 runs with.
     unsafe {
         let cr4 = CR4.load(Ordering::Relaxed) | CR4_PAE;
@@ -260,6 +322,14 @@ extern "C" fn ap_main(cpu: u64) -> ! {
             );
         }
     }
+}
+
+/// A started CPU in long mode on its own stack: CPU 0's control
+/// registers, its own GDT, TSS and `syscall` set-up, the IDT, its APIC and
+/// timer; then it schedules.
+extern "C" fn ap_main(cpu: u64) -> ! {
+    let cpu = cpu as usize;
+    restore_control_registers();
     gdt::init(cpu);
     interrupts::load();
     syscall::init(cpu);

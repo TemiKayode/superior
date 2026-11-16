@@ -25,6 +25,10 @@
 //!   on, and how it signals.
 //! - The DSDT (through the FADT): the PCI root bridge's `_PRT`, which says
 //!   which GSI each slot's interrupt pins reach ([`crate::aml`]).
+//! - For suspending to RAM (S3, [`super::sleep`]): the FADT's PM1 event
+//!   and control registers, the FACS (where the firmware looks for the
+//!   address to resume at), and the DSDT's `_S3_` (what to write to the
+//!   control registers).
 
 use super::aml;
 use super::vm::phys_ptr;
@@ -212,6 +216,53 @@ fn config_read(bus: u8, devfn: u8, offset: u8) -> u32 {
 static ISA: [AtomicU32; 16] = [const { AtomicU32::new(0) }; 16];
 /// The root bus's interrupt routes, from `_PRT`.
 static ROUTES: spin::Once<aml::Routes> = spin::Once::new();
+
+/// What suspending to RAM needs from the firmware's tables.
+#[derive(Clone, Copy, Debug)]
+pub struct Sleep {
+    /// The PM1a and PM1b event blocks (status, then enable, each half the
+    /// block long) and control registers: I/O ports (PM1b's 0 if absent).
+    pub pm1a_event: u16,
+    pub pm1b_event: u16,
+    pub pm1_event_len: u16,
+    pub pm1a_control: u16,
+    pub pm1b_control: u16,
+    /// The FACS's physical address.
+    pub facs: u64,
+    /// `_S3_`'s SLP_TYPa and SLP_TYPb.
+    pub s3: (u8, u8),
+}
+
+/// The FADT's PM1 registers and FACS, found by [`fadt`]; the sleep type
+/// from the DSDT is added by [`dsdt`].
+static PM1: spin::Once<(u16, u16, u16, u16, u16, u64)> = spin::Once::new();
+static SLEEP: spin::Once<Sleep> = spin::Once::new();
+
+/// What suspending to RAM needs, if the firmware supports S3: the PM1
+/// registers, a FACS, and an `_S3_` package.
+pub fn sleep() -> Option<Sleep> {
+    SLEEP.get().copied()
+}
+
+/// Reads the FADT's PM1 blocks and FACS address (ACPI 1.0 fields: ports
+/// and a 32-bit FACS address, or X_FIRMWARE_CTRL where that is 0).
+fn fadt(rsdp: u64) {
+    let Some((f, len)) = find(rsdp, b"FACP") else { return };
+    if len < 92 {
+        return;
+    }
+    let port = |at: u64| u16::try_from(u32_at(f + at)).unwrap_or(0);
+    let (a_evt, b_evt, a_cnt, b_cnt) = (port(56), port(60), port(64), port(68));
+    let evt_len = read::<1>(f + 88)[0] as u16;
+    let facs = match u32_at(f + 36) as u64 {
+        0 if len >= 140 => u64_at(f + 132),
+        x => x,
+    };
+    let facs_ok = facs != 0 && &read::<4>(facs) == b"FACS" && u32_at(facs + 4) >= 32;
+    if a_evt != 0 && a_cnt != 0 && evt_len >= 4 && facs_ok {
+        PM1.call_once(|| (a_evt, b_evt, evt_len, a_cnt, b_cnt, facs));
+    }
+}
 
 /// The structures of `table` (`len` bytes) after its 36-byte header and
 /// `skip` more: each one's (address, type, length), with a byte type and
@@ -584,6 +635,17 @@ fn dsdt(rsdp: u64) {
     };
     // SAFETY: the DSDT lies in RAM the kernel maps whole; read only.
     let bytes = unsafe { core::slice::from_raw_parts(phys_ptr(d) as *const u8, len as usize) };
+    match (PM1.get(), aml::sleep_type(bytes, *b"_S3_")) {
+        (Some(&(pm1a_event, pm1b_event, pm1_event_len, pm1a_control, pm1b_control, facs)), Some(s3)) => {
+            SLEEP.call_once(|| Sleep { pm1a_event, pm1b_event, pm1_event_len, pm1a_control, pm1b_control, facs, s3 });
+            kprintln!(
+                "[ok] ACPI: S3 (suspend to RAM): SLP_TYP {}, PM1a control at port {pm1a_control:#x}, FACS at {facs:#x}",
+                s3.0
+            );
+        }
+        (None, _) => kprintln!("[ok] ACPI: no PM1 registers or FACS: no S3"),
+        (_, None) => kprintln!("[ok] ACPI: no \\_S3_ in the DSDT: no S3"),
+    }
     match aml::root_routes(bytes) {
         Some((routes, entries)) => {
             let r = ROUTES.call_once(|| routes);
@@ -608,6 +670,7 @@ pub fn init(rsdp: Option<u64>) {
     };
     madt(rsdp);
     dmar(rsdp);
+    fadt(rsdp);
     dsdt(rsdp);
     // MCFG: 44 bytes of header, then 16 bytes for each segment's window:
     // its base, segment number, and first and last bus.

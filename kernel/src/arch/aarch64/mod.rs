@@ -592,6 +592,20 @@ pub fn breakpoint_selftest() {
 /// Waits for an interrupt and lets it be taken. `wfi` wakes on a pending
 /// interrupt even while interrupts are masked, so one that arrives before
 /// it is not missed; unmasking afterwards takes it.
+/// No suspend to RAM on QEMU's `virt` (it has no sleep states): the
+/// kernel suspends to idle instead.
+pub fn ram_sleep_available() -> bool {
+    false
+}
+
+pub fn ram_sleep(_seconds: u64) -> Result<&'static str, &'static str> {
+    Err("no suspend to RAM on this machine")
+}
+
+pub fn ram_sleep_restart_cpus(_before: usize) -> usize {
+    crate::smp::online()
+}
+
 pub fn idle_wait() {
     // SAFETY: the interrupt handler saves and restores everything.
     unsafe {

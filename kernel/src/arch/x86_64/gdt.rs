@@ -87,6 +87,15 @@ pub fn init(cpu: usize) {
         )
     });
     gdt.load();
+    // A TSS descriptor is marked busy once loaded, and loading a busy one
+    // faults: after S3 this CPU loads it again (its GDT kept in RAM), so
+    // mark it available first.
+    let table = x86_64::instructions::tables::sgdt();
+    let at = table.base.as_u64() + sel.tss.index() as u64 * 8 + 5;
+    // SAFETY: byte 5 (access) of the TSS descriptor in this CPU's own GDT,
+    // a static only this CPU loads; clearing bit 1 makes type 0xB
+    // (busy) 0x9 (available).
+    unsafe { (at as *mut u8).write_volatile((at as *const u8).read_volatile() & !2) };
     // SAFETY: the selectors index descriptors in the GDT just loaded.
     unsafe {
         CS::set_reg(sel.kernel_code);

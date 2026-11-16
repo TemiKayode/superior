@@ -10,6 +10,7 @@ pub mod iommu;
 pub mod qemu;
 pub mod serial;
 mod smp;
+mod sleep;
 pub mod syscall;
 pub mod vm;
 
@@ -209,6 +210,26 @@ pub fn breakpoint_selftest() {
 pub fn idle_wait() {
     x86_64::instructions::interrupts::enable_and_hlt();
     x86_64::instructions::interrupts::disable();
+}
+
+/// Whether the machine can suspend to RAM (ACPI S3).
+pub fn ram_sleep_available() -> bool {
+    sleep::available()
+}
+
+/// Suspends to RAM for `seconds` (CPU 0, interrupts off, the other CPUs
+/// parked). Returns what woke it, or why it did not sleep.
+pub fn ram_sleep(seconds: u64) -> Result<&'static str, &'static str> {
+    sleep::suspend(seconds).map(|w| match w {
+        sleep::Wake::Alarm => "the RTC alarm",
+        sleep::Wake::Button => "the power button (or a key)",
+        sleep::Wake::Other => "a wake event PM1 does not name",
+    })
+}
+
+/// After [`ram_sleep`]: starts the `before` CPUs that were online again.
+pub fn ram_sleep_restart_cpus(before: usize) -> usize {
+    sleep::restart_cpus(before)
 }
 
 /// The CMOS real-time clock's date and time: (year, month, day, hour,

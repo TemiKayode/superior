@@ -25,6 +25,13 @@
 //! and a fresh, empty domain. A device without FLR is left to the
 //! driver's own reset routine (virtio: writing 0 to the device status).
 //!
+//! Suspend (`power`, from the Component Manager, badge 0): on `SUSPEND`
+//! it keeps every function's configuration header, and on `RESUME` it
+//! writes it back, bridges before what is behind them: a suspend to RAM
+//! resets every device, losing its BARs, bus numbers and windows, which
+//! the drivers' own resume needs in place. (MSI and MSI-X are the
+//! drivers', which program them again.)
+//!
 //! Bridges: a PCI-to-PCI bridge (a PCIe root port, say) is not handed out
 //! but configured here. The scan gives it the next bus number, walks the
 //! bus behind it (and any bridges there); then everything found behind
@@ -78,7 +85,7 @@
 
 use superior_driver::dma_address;
 use superior_objects::abi::{CapTransfer, Error, ObjectType, PCI_BUSES, Syscall, root};
-use superior_objects::interfaces::{Status, pci};
+use superior_objects::interfaces::{Status, pci, power};
 use superior_sys::{print_line, syscall, syscall_x};
 
 const SERVICE: u64 = 0;
@@ -228,6 +235,8 @@ struct Func {
 
 struct Bus {
     funcs: [Option<Func>; MAX_FUNCS],
+    /// Each function's configuration header, kept across a suspend.
+    saved: [[u32; 16]; MAX_FUNCS],
     /// (function, BAR, page) of each BAR page original.
     bar_pages: [Option<(u8, u8, u16)>; MAX_BAR_PAGES],
     msi_owner: [Option<u8>; MSI_COUNT],
@@ -1254,8 +1263,55 @@ impl Bus {
         Ok((INTX + w as u64, w as u64))
     }
 
+    /// `power::SUSPEND`: keeps every function's configuration header (its
+    /// first 64 bytes).
+    fn suspend(&mut self) -> usize {
+        let mut n = 0;
+        for i in 0..MAX_FUNCS {
+            if self.funcs[i].is_some() {
+                for k in 0..16 {
+                    self.saved[i][k] = self.read(i, 4 * k as u64);
+                }
+                n += 1;
+            }
+        }
+        n
+    }
+
+    /// `power::RESUME`: writes back what [`Bus::suspend`] kept, in the
+    /// order the scan found the functions (a bridge before the bus behind
+    /// it, whose functions answer only once its bus numbers are back):
+    /// the BARs, bus numbers, windows and interrupt line, then the cache
+    /// line size, then the command register (decoding, bus mastering).
+    /// Returns how many functions answered.
+    fn resume(&mut self) -> usize {
+        let mut n = 0;
+        for i in 0..MAX_FUNCS {
+            if self.funcs[i].is_none() || self.read(i, 0) != self.saved[i][0] {
+                continue;
+            }
+            for k in 4..16 {
+                self.write(i, 4 * k as u64, self.saved[i][k], 4);
+            }
+            self.write(i, 0x0c, self.saved[i][3] & 0xffff, 2);
+            self.write(i, 0x04, self.saved[i][1] & 0xffff, 2);
+            n += 1;
+        }
+        n
+    }
+
     fn serve(&mut self, badge: u64, m: [u64; 4]) -> ([u64; 4], Option<u64>) {
         let status = |s: Status| ([s as u64, 0, 0, 0], None);
+        if badge == 0 && m[0] == power::SUSPEND {
+            let n = self.suspend();
+            say!("suspended: {n} functions' configuration kept");
+            return status(Status::Ok);
+        }
+        if badge == 0 && m[0] == power::RESUME {
+            let n = self.resume();
+            say!("resumed: {n} functions' configuration written back");
+            return status(Status::Ok);
+        }
         if m[0] == pci::OPEN || m[0] == pci::OPEN_CLASS {
             if m[1] != pci::VERSION {
                 return status(Status::Invalid);
@@ -1346,6 +1402,7 @@ pub extern "C" fn _start(_: u64) -> ! {
     };
     let mut bus = Bus {
         funcs: [None; MAX_FUNCS],
+        saved: [[0; 16]; MAX_FUNCS],
         bar_pages: [None; MAX_BAR_PAGES],
         msi_owner: [None; MSI_COUNT],
         intx_owner: [None; INTX_COUNT],

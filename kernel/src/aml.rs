@@ -563,3 +563,26 @@ pub fn root_routes(d: &[u8]) -> Option<(Routes, usize)> {
         }
     }
 }
+
+/// The values a sleep state's `\_Sx_` package (`name`, as `*b"_S3_"`)
+/// gives for SLP_TYPa and SLP_TYPb, if the DSDT `d` defines it at its
+/// root as a package of integers. Firmware writes it either with both
+/// values as elements or, as some older tables do, with both in the first
+/// element's low two bytes.
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
+pub fn sleep_type(d: &[u8], name: [u8; 4]) -> Option<(u8, u8)> {
+    let aml = Aml { d };
+    let (_, def) = aml.lookup(core::iter::once(Path::ROOT.child(name)?))?;
+    let DefAt::Name(o) = def else { return None };
+    if aml.byte(o)? != 0x12 {
+        return None;
+    }
+    let (body, _) = aml.package(o + 1)?;
+    let count = aml.byte(body)?;
+    let (a, next) = aml.integer(body + 1)?;
+    match count {
+        0 => None,
+        1 => Some((a as u8 & 7, (a >> 8) as u8 & 7)),
+        _ => Some((a as u8 & 7, aml.integer(next)?.0 as u8 & 7)),
+    }
+}

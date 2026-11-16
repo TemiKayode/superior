@@ -333,6 +333,26 @@ pub fn init() {
     IDT.load();
 }
 
+/// The PICs' masks, for [`resume`] to put back after S3.
+pub fn pic_masks() -> (u8, u8) {
+    use x86_64::instructions::port::Port;
+    // SAFETY: reading the PICs' mask registers.
+    unsafe { (Port::<u8>::new(0x21).read(), Port::<u8>::new(0xa1).read()) }
+}
+
+/// After S3, where the firmware set the PIC up its own way: remapped as
+/// [`init`] has it, with the masks it had (all of them where the I/O APIC
+/// carries the lines).
+pub fn resume(masks: (u8, u8)) {
+    use x86_64::instructions::port::Port;
+    disable_legacy_pic();
+    // SAFETY: the PICs' mask registers.
+    unsafe {
+        Port::<u8>::new(0x21).write(masks.0);
+        Port::<u8>::new(0xa1).write(masks.1);
+    }
+}
+
 /// Loads the IDT on another CPU.
 pub fn load() {
     IDT.load();

@@ -18,6 +18,11 @@ pub fn init() {
     Lazy::force(&COM1);
 }
 
+/// Programs COM1 again (after S3, which resets it).
+pub fn reinit() {
+    COM1.lock().init();
+}
+
 #[doc(hidden)]
 pub fn _print(args: fmt::Arguments) {
     // Interrupts off while holding the lock, so a handler that logs cannot

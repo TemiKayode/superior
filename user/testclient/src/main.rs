@@ -5580,8 +5580,13 @@ fn crasher() -> ! {
     superior_sys::park()
 }
 
-/// Ticks the suspend test sleeps for.
-const SUSPEND_TICKS: u64 = 200;
+/// Ticks each of the suspend test's suspends asks for: the first ends by
+/// its alarm; on x86-64, where the machine suspends to RAM, the second is
+/// long, and the test ends it early with a key press.
+#[cfg(target_arch = "x86_64")]
+const SUSPEND_TICKS: [u64; 2] = [200, 6000];
+#[cfg(not(target_arch = "x86_64"))]
+const SUSPEND_TICKS: [u64; 2] = [200, 200];
 
 /// The suspend test (`boot/suspend.manifest`): reads the disk, has the
 /// manager suspend the machine (the driver resets its device first, and
@@ -5602,14 +5607,14 @@ fn suspend_client() -> ! {
         r.status == 0 && r.msg[0] == Status::Invalid as u64,
         format_args!("the driver refuses SUSPEND from a client"),
     );
-    for round in 1..=2 {
+    for (round, asked) in (1..=2).zip(SUSPEND_TICKS) {
         let before = ticks();
-        let r = syscall(Syscall::Call, BLOCK_CONTROL, [power::OP_SUSPEND, SUSPEND_TICKS, 0, 0]);
+        let r = syscall(Syscall::Call, BLOCK_CONTROL, [power::OP_SUSPEND, asked, 0, 0]);
         let passed = ticks() - before;
         t.check(
-            r.status == 0 && r.msg[0] == Status::Ok as u64 && passed < SUSPEND_TICKS / 4,
+            r.status == 0 && r.msg[0] == Status::Ok as u64 && passed < 50,
             format_args!(
-                "suspend {round}: suspended to idle for {SUSPEND_TICKS} ticks and resumed, {passed} ticks passed meanwhile (status {})",
+                "suspend {round}: suspended for up to {asked} ticks and resumed, {passed} ticks passed meanwhile (status {})",
                 r.msg[0]
             ),
         );

@@ -77,6 +77,38 @@ pub fn init() -> bool {
     n > 0
 }
 
+/// Every chip's redirection entries, kept across S3 (which resets them).
+const MAX_PINS: usize = 120;
+static SAVED: Mutex<[[(u32, u32); MAX_PINS]; 4]> = Mutex::new([[(MASKED, 0); MAX_PINS]; 4]);
+
+/// Keeps every entry, for [`restore`] after S3.
+pub fn save() {
+    let chips = CHIPS.lock();
+    let mut saved = SAVED.lock();
+    for (c, keep) in chips.iter().zip(saved.iter_mut()) {
+        let Some(c) = c else { continue };
+        for pin in 0..(c.count as usize).min(MAX_PINS) {
+            keep[pin] = (read(c, 0x10 + 2 * pin as u32), read(c, 0x11 + 2 * pin as u32));
+        }
+    }
+}
+
+/// Writes back what [`save`] kept: the destination before the rest, so
+/// an unmasked entry is never half written.
+pub fn restore() {
+    let chips = CHIPS.lock();
+    let saved = SAVED.lock();
+    for (c, keep) in chips.iter().zip(saved.iter()) {
+        let Some(c) = c else { continue };
+        for pin in 0..(c.count as usize).min(MAX_PINS) {
+            let (lo, hi) = keep[pin];
+            write(c, 0x10 + 2 * pin as u32, MASKED);
+            write(c, 0x11 + 2 * pin as u32, hi);
+            write(c, 0x10 + 2 * pin as u32, lo);
+        }
+    }
+}
+
 /// The chip with `gsi`, and the GSI's entry number there.
 fn find(chips: &[Option<Chip>; 4], gsi: u32) -> Option<(Chip, u32)> {
     chips

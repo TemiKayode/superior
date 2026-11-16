@@ -138,6 +138,9 @@ struct Image {
     /// An empty PCI Express root port, and QEMU's monitor to plug cards
     /// into it (the hot-plug test).
     hotplug: bool,
+    /// QEMU's monitor alone (the suspend test presses a key through it to
+    /// wake the machine).
+    monitor: bool,
     /// QEMU's bochs-display as the only display, and its monitor to take
     /// screenshots through (the display test).
     display: bool,
@@ -887,6 +890,7 @@ fn image_sealed(
         xhci: false,
         mouse: matches!(manifest, "input" | "windows" | "toolkit" | "panel" | "resize" | "widgets"),
         hotplug: manifest == "hotplug",
+        monitor: manifest == "suspend",
         display: matches!(manifest, "display" | "desktop" | "input" | "windows" | "toolkit" | "panel" | "resize" | "widgets"),
         audio: (manifest == "audio").then(|| audio_wav(arch)),
         uefi: false,
@@ -992,6 +996,7 @@ fn sel4_image() -> Result<Image, String> {
         xhci: false,
         mouse: false,
         hotplug: false,
+        monitor: false,
         display: false,
         audio: None,
         uefi: false,
@@ -1344,7 +1349,10 @@ fn qemu_command(img: &Image) -> Command {
                     .args(["-m", "512M"]);
             }
             q.args(["-device", "isa-debug-exit,iobase=0xf4,iosize=0x04"]);
-            q.args(["-rtc", RTC_BASE]);
+            // The suspend test's clock keeps running while the machine is
+            // asleep, as a battery-backed one does (QEMU stops the
+            // machine's own clock in S3, so its alarm could never wake it).
+            q.args(["-rtc", if img.monitor && !img.keyboard && !img.hotplug && !img.display { RTC_SLEEPING } else { RTC_BASE }]);
             if img.radio {
                 // A CPU with random instructions, for the entropy pool.
                 q.args(["-cpu", "qemu64,+rdrand,+rdseed"]);
@@ -1607,8 +1615,9 @@ fn qemu_command(img: &Image) -> Command {
             ))
             .args(["-device", "ES1370,audiodev=snd0"]);
     }
-    if img.keyboard || img.hotplug || img.display {
-        // QEMU's monitor, to type, plug cards and take screenshots through.
+    if img.keyboard || img.hotplug || img.display || img.monitor {
+        // QEMU's monitor, to type, plug cards, take screenshots and wake
+        // the machine through.
         q.arg("-qmp").arg(format!("tcp:127.0.0.1:{QMP_PORT},server=on,wait=off"));
     }
     q.args(["-serial", "stdio", "-no-reboot"]);
@@ -3898,6 +3907,8 @@ fn toolkit_test(arch: Arch) -> Result<(), String> {
 /// Where every boot's real-time clock starts (QEMU's `-rtc`), running
 /// with the machine: the desktop shell's clock shows 09:41 at first.
 const RTC_BASE: &str = "base=2026-11-14T09:41:00,clock=vm";
+/// The same, on the host's clock, which runs on through a suspend.
+const RTC_SLEEPING: &str = "base=2026-11-14T09:41:00,clock=rt";
 
 /// Where every boot's clock starts, in seconds since 1970: 2026-11-14
 /// 09:41 UTC (`RTC_BASE`).
@@ -5276,52 +5287,90 @@ fn verified_boot_test(arch: Arch) -> Result<(), String> {
 }
 
 /// Boots `boot/suspend.manifest` and checks that the client's two
-/// suspends each quiesce the virtio-blk driver (which resets its disk),
-/// park every CPU with its tick stopped for the 200 ticks asked (2 s, which
-/// pass on the host's clock but not on the guest's), and bring the disk
-/// back so that it reads right after.
+/// suspends each quiesce the virtio-blk driver (which resets its disk) and
+/// the PCI bus server (which keeps every function's configuration), stop
+/// the machine, and bring the disk back so that it reads right after.
+///
+/// On x86-64 the machine suspends to RAM (ACPI S3: QEMU resets every
+/// device, keeping only memory): the first time for the 200 ticks asked
+/// (the RTC alarm wakes it, 2 s on the host's clock), the second time for
+/// a minute, which a key pressed on QEMU's PS/2 keyboard cuts short once
+/// QEMU says the machine is asleep. On AArch64 (QEMU's `virt` has no
+/// sleep states) every CPU parks with its tick stopped for 200 ticks,
+/// twice.
 fn suspend_test(arch: Arch) -> Result<(), String> {
     let img = image_with(false, arch, "suspend")?;
     println!("== suspend test on {}", img.path.display());
+    let ram = arch == Arch::X86_64;
     // When each suspend began and ended, on the host's clock.
     let marks: Arc<Mutex<Vec<(usize, Instant)>>> = Arc::default();
     let seen = marks.clone();
-    let out = run_to_exit_watching(&img, Duration::from_secs(60), move |all| {
+    let pressed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let press = pressed.clone();
+    let woken: Arc<Mutex<Option<Result<Duration, String>>>> = Arc::default();
+    let wake = woken.clone();
+    let out = run_to_exit_watching(&img, Duration::from_secs(120), move |all| {
         let n = all.matches("[power] suspending").count() + all.matches("[power] resumed").count();
         let mut m = seen.lock().unwrap();
         while m.len() < n {
             let k = m.len();
             m.push((k, Instant::now()));
         }
+        // The second suspend to RAM: press a key once QEMU has the
+        // machine asleep.
+        if ram && n == 3 && !press.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            let wake = wake.clone();
+            std::thread::spawn(move || {
+                *wake.lock().unwrap() = Some(press_key_when_asleep());
+            });
+        }
     })?;
-    let mut steps = vec![
+    let (to, woke_by) = if ram {
+        ("[power] suspending to RAM (ACPI S3) for", ["[power] woke from S3: the RTC alarm", "[power] woke from S3: the power button (or a key)"])
+    } else {
+        ("[power] suspending to idle for", ["[power] suspending to idle", "[power] suspending to idle"])
+    };
+    let mut steps = vec![];
+    if ram {
+        steps.push("[ok] ACPI: S3 (suspend to RAM): SLP_TYP");
+    }
+    steps.extend([
         "[cm] manifest: 3 components",
         "virtio-blk: ready:",
         "[pass] suspend: read 8 sectors before suspending: every word right",
         "[pass] suspend: the driver refuses SUSPEND from a client",
-    ];
-    for _ in 1..=2 {
+    ]);
+    for k in 0..2 {
         steps.extend([
             "virtio-blk: suspended: device reset, bus mastering off",
-            "[cm] every power component quiesced; suspending for 200 ticks",
-            "[power] suspending to idle for 200 ticks",
+            "pci: suspended: ",
+            "[cm] every power component quiesced; suspending for",
+            to,
+        ]);
+        if ram {
+            steps.push(woke_by[k]);
+        }
+        steps.extend([
             "[power] resumed at tick",
             "[cm] resumed",
+            "pci: resumed: ",
             "virtio-blk: ready:",
             "virtio-blk: resumed: device initialized again",
         ]);
     }
     steps.extend([
-        "[pass] suspend: suspend 1: suspended to idle for 200 ticks and resumed",
+        "[pass] suspend: suspend 1: suspended for up to 200 ticks and resumed",
         "[pass] suspend: suspend 1: the disk reads after the resume: every word right",
         "[pass] suspend: suspend 1: the ticks run again: a 10-tick sleep took",
-        "[pass] suspend: suspend 2: suspended to idle for 200 ticks and resumed",
+        "[pass] suspend: suspend 2: suspended for up to",
         "[pass] suspend: suspend 2: the disk reads after the resume: every word right",
         "[pass] suspend: suspend 2: the ticks run again: a 10-tick sleep took",
         "[cm] client asked to shut down (pass)",
     ]);
     check_log("suspend", &out, &steps)?;
-    // Each suspend lasted about 2 s of real time.
+    if ram && out.contains("S3 failed") {
+        return Err("suspend: the machine did not suspend to RAM".into());
+    }
     let m = marks.lock().unwrap();
     if m.len() != 4 {
         return Err(format!("suspend: saw {} suspend and resume lines, not 4", m.len()));
@@ -5329,12 +5378,70 @@ fn suspend_test(arch: Arch) -> Result<(), String> {
     for (k, pair) in m.chunks(2).enumerate() {
         let took = pair[1].1 - pair[0].1;
         println!("suspend {}: {:.2} s on the host's clock", k + 1, took.as_secs_f64());
-        if took < Duration::from_millis(1500) {
+        // The alarm's 2 s (at least); under S3 the second ends when the
+        // key is pressed, long before its minute.
+        if took < Duration::from_millis(1500) && !(ram && k == 1) {
             return Err(format!("suspend {}: over after {took:?}, not 2 s", k + 1));
+        }
+        if ram && k == 1 && took > Duration::from_secs(40) {
+            return Err(format!("suspend 2: over after {took:?}: the key press did not wake it"));
+        }
+    }
+    if ram {
+        match woken.lock().unwrap().take() {
+            Some(Ok(asleep)) => println!("suspend 2: QEMU said the machine was asleep after {:.2} s; a key woke it", asleep.as_secs_f64()),
+            Some(Err(e)) => return Err(format!("suspend 2: {e}")),
+            None => return Err("suspend 2: no key was pressed".into()),
         }
     }
     println!("suspend test passed");
     Ok(())
+}
+
+/// Waits (up to 30 s) for QEMU to report the machine suspended, then
+/// presses and releases a key on its PS/2 keyboard, which wakes it.
+/// Returns how long the wait was.
+fn press_key_when_asleep() -> Result<Duration, String> {
+    use std::io::{BufRead, BufReader};
+    use std::net::TcpStream;
+    let start = Instant::now();
+    loop {
+        let asleep = (|| -> Result<bool, String> {
+            let s = TcpStream::connect(("127.0.0.1", QMP_PORT)).map_err(|e| format!("QMP: {e}"))?;
+            s.set_read_timeout(Some(scaled(Duration::from_secs(20)))).map_err(|e| e.to_string())?;
+            let mut w = s.try_clone().map_err(|e| e.to_string())?;
+            let mut r = BufReader::new(s);
+            let mut line = String::new();
+            for c in ["{\"execute\":\"qmp_capabilities\"}", "{\"execute\":\"query-status\"}"] {
+                w.write_all(c.as_bytes()).and_then(|()| w.write_all(b"\n")).map_err(|e| format!("QMP: {e}"))?;
+                loop {
+                    line.clear();
+                    if r.read_line(&mut line).map_err(|e| format!("QMP: {e}"))? == 0 {
+                        return Err("QMP: the monitor hung up".into());
+                    }
+                    if line.contains("\"return\"") || line.contains("\"error\"") {
+                        break;
+                    }
+                }
+            }
+            Ok(line.contains("\"suspended\""))
+        })()?;
+        if asleep {
+            break;
+        }
+        if start.elapsed() > scaled(Duration::from_secs(30)) {
+            return Err("QEMU never said the machine was suspended".into());
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let asleep = start.elapsed();
+    let key = |down: bool| {
+        format!(
+            "{{\"execute\":\"input-send-event\",\"arguments\":{{\"events\":[{{\"type\":\"key\",\"data\":{{\"down\":{down},\"key\":{{\"type\":\"qcode\",\"data\":\"spc\"}}}}}}]}}}}"
+        )
+    };
+    qmp(&[key(true), key(false)])?;
+    Ok(asleep)
 }
 
 /// Boots `boot/audio.manifest`: Linux's ES1370 driver in the Linux Driver

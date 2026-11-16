@@ -111,6 +111,13 @@ pub fn init_ap() {
     write(INITIAL_COUNT, per_tick);
 }
 
+/// After S3, which resets it: enables CPU 0's APIC again, with its tick
+/// stopped (the suspend's end starts it).
+pub fn resume() {
+    init_ap();
+    tick_stop();
+}
+
 /// Stops this CPU's tick.
 pub fn tick_stop() {
     write(LVT_TIMER, LVT_MASKED | TIMER_VECTOR as u32);

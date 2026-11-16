@@ -1125,17 +1125,21 @@ fn sleep(k: &mut Kernel, cur: Tid, ticks: u64) -> Result<(), u64> {
     k.ipc.wait(n).map_err(|e| e.status())
 }
 
-/// A suspend under way: the thread that asked, and ticks left to wait.
+/// A suspend under way: the thread that asked, ticks left to wait, and
+/// whether to RAM (ACPI S3) rather than to idle.
 #[derive(Clone, Copy)]
 struct Suspended {
     caller: Tid,
     left: u64,
+    ram: bool,
 }
 
 /// `Suspend`: rdi = the root task's untyped capability, rsi = ticks.
 /// The caller waits on its own notification, as in `Sleep`, and every CPU
 /// parks the next time it would pick a thread ([`park`]); the CPUs in user
-/// mode are kicked into the kernel to do so.
+/// mode are kicked into the kernel to do so. Where the machine can, it
+/// then suspends to RAM ([`sleep_to_ram`]); else it stays suspended to
+/// idle, every CPU halted, until an alarm.
 fn suspend(k: &mut Kernel, cur: Tid, slot: u64, ticks: u64) -> Result<(), u64> {
     let root = cap_slot(k, ROOT_TID, superior_objects::abi::root::UNTYPED as usize);
     let own = own_slot(k, cur, slot);
@@ -1149,8 +1153,10 @@ fn suspend(k: &mut Kernel, cur: Tid, slot: u64, ticks: u64) -> Result<(), u64> {
     let n = sleep_ntfn(cur);
     let _ = k.ipc.clear_notification(n);
     k.ipc.wait(n).map_err(|e| e.status())?;
-    k.suspend = Some(Suspended { caller: cur, left: ticks });
-    kprintln!("[power] suspending to idle for {ticks} ticks at tick {}", k.stats.ticks);
+    let ram = arch::ram_sleep_available();
+    k.suspend = Some(Suspended { caller: cur, left: ticks, ram });
+    let to = if ram { "RAM (ACPI S3)" } else { "idle" };
+    kprintln!("[power] suspending to {to} for {ticks} ticks at tick {}", k.stats.ticks);
     let me = arch::cpu_id();
     for x in 0..smp::online() {
         if x != me {
@@ -1170,7 +1176,49 @@ fn park(k: &mut Kernel) {
     arch::tick_stop();
     if me == 0 {
         if let Some(s) = k.suspend.as_mut() {
-            s.left -= arch::alarm(s.left);
+            // To RAM: look each tick for the other CPUs to have parked.
+            let wait = if s.ram { 1 } else { s.left };
+            let waited = arch::alarm(wait);
+            if !s.ram {
+                s.left -= waited;
+            }
+        }
+    }
+}
+
+/// Whether CPU 0 may suspend to RAM now: every other CPU parked, and none
+/// waiting for the kernel lock (a CPU started again after S3 would never
+/// take the turn it is waiting for).
+fn ram_ready(k: &Kernel) -> bool {
+    let others_parked = (1..smp::online()).all(|x| k.parked[x]);
+    let waiting = TICKET_NEXT.load(Ordering::Acquire).wrapping_sub(TICKET_SERVING.load(Ordering::Acquire));
+    arch::cpu_id() == 0 && k.suspend.is_some_and(|s| s.ram) && others_parked && waiting == 1
+}
+
+/// CPU 0, with every other CPU parked: suspends the machine to RAM for
+/// the suspend's ticks (in whole seconds, the RTC alarm's), restarts the
+/// other CPUs, and ends the suspend. If the machine does not sleep, the
+/// suspend carries on to idle.
+fn sleep_to_ram(k: &mut Kernel) {
+    let Some(s) = k.suspend else { return };
+    let hz = arch::TICK_HZ as u64;
+    let seconds = s.left.div_ceil(hz).max(2);
+    let before = smp::online();
+    match arch::ram_sleep(seconds) {
+        Ok(wake) => {
+            for x in 1..before {
+                k.parked[x] = false;
+            }
+            let n = arch::ram_sleep_restart_cpus(before);
+            kprintln!("[power] woke from S3: {wake}; {n} CPUs running again");
+            end_suspend(k);
+        }
+        Err(e) => {
+            kprintln!("[power] S3 failed ({e}): suspending to idle instead");
+            if let Some(s) = k.suspend.as_mut() {
+                s.ram = false;
+                s.left -= arch::alarm(s.left);
+            }
         }
     }
 }
@@ -1201,10 +1249,21 @@ fn suspended_timer(k: &mut Kernel) {
         return;
     }
     let Some(s) = k.suspend.as_mut() else { return };
+    if s.ram {
+        // Still waiting for the other CPUs to park ([`resume`] sleeps).
+        arch::alarm(1);
+        return;
+    }
     if s.left > 0 {
         s.left -= arch::alarm(s.left);
         return;
     }
+    end_suspend(k);
+}
+
+/// The suspend is over: wakes the caller and every CPU.
+fn end_suspend(k: &mut Kernel) {
+    let Some(s) = k.suspend else { return };
     let caller = s.caller;
     k.suspend = None;
     unpark(k);
@@ -1503,6 +1562,10 @@ fn resume(mut guard: KernelGuard, frame: &mut UserFrame) -> Exit {
         if guard.suspend.is_some() {
             // No thread runs until the alarm ends the suspend.
             park(&mut guard);
+            if ram_ready(&guard) {
+                sleep_to_ram(&mut guard);
+                continue;
+            }
             drop(guard);
             arch::idle_wait();
             guard = lock_kernel();

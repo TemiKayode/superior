@@ -1240,6 +1240,26 @@ holds the rest):
   ISAs: the client reads the disk, suspends the machine twice for 200 ticks,
   each time 2 seconds on the host's clock and almost no ticks on the guest's,
   and reads it right after each resume.
+- Suspend to RAM (ACPI S3) on x86. The FADT gives the PM1 event and
+  control ports and the FACS, the DSDT's `\_S3_` package the sleep type. The
+  kernel parks the other CPUs, saves the PIC masks, every I/O APIC entry and
+  the chipset registers that place the ACPI registers in I/O space, sets the
+  RTC alarm (with PM1's RTC_EN) for when the suspend should end, writes the
+  start-up page into the FACS's waking vector, saves its callee-saved
+  registers and stack, and writes SLP_TYP with SLP_EN. The firmware resumes
+  through the SMP trampoline into `sup_s3_wake`, which returns from the sleep
+  as from a call; the kernel then puts back the chipset's ACPI decode,
+  control registers, GDT and TSS, IDT, `syscall` set-up, COM1, its local
+  APIC, the PIC and I/O APICs and the IOMMU's units, reads what woke it from
+  PM1's status (the alarm, or the power button: a key on QEMU), and starts
+  the other CPUs again. pcibus is a `power` component too: it keeps each
+  function's configuration header on `SUSPEND` and writes it back on
+  `RESUME`, since the machine resets every device. In `suspend-test` on x86
+  the first suspend is to RAM until the RTC alarm (at least 2 s on the
+  host's clock), the second asks for a minute and the harness presses a key
+  through QEMU's monitor once QEMU says the machine is asleep; the disk
+  reads right after each. (The test's RTC runs on the host's clock, as a
+  battery-backed one does: QEMU stops the machine's own clock in S3.)
 - Verified boot, first part. The boot bundle is signed: a trailer after it holds
   its version and an Ed25519 signature of the bundle and version
   (`superior_objects::bundle::Signed`). The kernel is built with the public key
@@ -1346,9 +1366,10 @@ and port multipliers; in the xHCI driver isochronous and bulk endpoints, USB 3 s
 hubs and more than one interrupter, and HID devices other than boot keyboards and pointing devices
 (keyboards in the report protocol, game controllers, touch screens with several contacts,
 devices with several interfaces of one kind); in the network server
-a second IPv6 router or a DHCPv6 server to test against (QEMU's network has one router and hands out no addresses, so the IPv6 route table and the DHCPv6 address client are proved by host tests alone), DNSSEC, DNS answers over TCP of more than a page, IPv4 routes beyond one gateway; in suspend and resume real sleep states (ACPI S3 with the CPUs' state saved
-and restored by firmware; QEMU's q35 has it, its AArch64 `virt` machine no
-equivalent), wake sources other than the alarm (a key, the network), power
+a second IPv6 router or a DHCPv6 server to test against (QEMU's network has one router and hands out no addresses, so the IPv6 route table and the DHCPv6 address client are proved by host tests alone), DNSSEC, DNS answers over TCP of more than a page, IPv4 routes beyond one gateway; in suspend and resume, a sleep state on AArch64 (QEMU's `virt` machine has
+no equivalent of S3, so it suspends to idle), wake sources beyond the RTC
+alarm and the power button or a key (the network), S3 on real chipsets whose
+firmware's resume path the kernel has not met, power
 handling in drivers other than virtio-blk and in the servers above them, and a
 timeout on a component that never answers `SUSPEND`; in verified boot the
 firmware's part (the bootloader and kernel checked by UEFI Secure Boot, or on
@@ -1443,7 +1464,7 @@ cargo xtask audio-test     # Linux's ES1370 driver and the mixer: two clients' s
 cargo xtask tcp-test       # just the TCP test (add aarch64 for that ISA)
 cargo xtask keyboard-test  # just the USB keyboard test (add aarch64 for that ISA)
 cargo xtask hotplug-test   # just the PCI hot-plug test (add aarch64 for that ISA)
-cargo xtask suspend-test   # suspend to idle twice around the virtio-blk driver, then read the disk (add aarch64 for that ISA)
+cargo xtask suspend-test   # suspend to RAM (S3) twice around the virtio-blk driver, woken by the RTC alarm then a key, reading the disk after each (aarch64: to idle)
 cargo xtask verified-boot-test  # a signed boot bundle verified and measured; changed, foreign-key, unsigned and old ones refused
 cargo xtask ab-test        # A/B system slots: an update staged, tried, fallen back from, confirmed; rollbacks refused
 cargo xtask packages-test  # signed app packages: bad ones refused, the app installed, kept across boots, uninstalled

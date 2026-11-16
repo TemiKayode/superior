@@ -2,9 +2,13 @@
 #
 # The client asks the Component Manager to suspend the machine (it is
 # `power-control`). The manager tells the virtio-blk driver (a `power`
-# component) to quiesce, and it resets its disk; the kernel stops every
-# CPU's tick and halts them all until a one-shot alarm; then the driver
-# brings the disk up again and the client reads it, twice over.
+# component) to quiesce, and it resets its disk, then the PCI bus server
+# (also `power`) to keep every function's configuration. On x86-64 the
+# kernel suspends the machine to RAM (ACPI S3) until the RTC alarm, the
+# second time until a key is pressed; on AArch64 it stops every CPU's tick
+# and halts them all until a one-shot alarm. Then the bus server puts the
+# configuration back, the driver brings the disk up again and the client
+# reads it.
 
 component pcibus
   image pcibus
@@ -21,6 +25,9 @@ component pcibus
   device iommu 11
   # Memory for the IOMMU domains: 64 KiB each, four at once.
   untyped 18 12
+  # Keeps every function's configuration across a suspend to RAM, which
+  # resets the devices; suspended last and resumed first.
+  power
 
 component virtio-blk
   image virtio-blk

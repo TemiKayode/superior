@@ -229,6 +229,37 @@ fn start(u: usize, remap: bool) -> Option<()> {
     Some(())
 }
 
+/// After S3, which resets the units: turns each on again with the tables
+/// it had (they are in RAM), the queue from its start, fault events,
+/// interrupt remapping and translation, and invalidates every cache.
+pub fn resume() {
+    let remap = remapping();
+    for u in units() {
+        w64(u, RTADDR, ROOT[u].load(Ordering::Relaxed));
+        command(u, GCMD_SRTP);
+        let queue = QUEUE[u].load(Ordering::Relaxed);
+        if queue != 0 {
+            QUEUE_TAIL[u].store(0, Ordering::Relaxed);
+            w64(u, IQT, 0);
+            w64(u, IQA, queue);
+            command(u, GCMD_QIE);
+        }
+        flush_context(u);
+        flush_unit(u);
+        w32(u, FEDATA, super::apic::IOMMU_VECTOR as u32);
+        w32(u, FEADDR, 0xfee0_0000 | (super::apic::id() as u32) << 12);
+        w32(u, FEUADDR, 0);
+        w32(u, FECTL, 0);
+        if remap {
+            w64(u, IRTA, IRT[u].load(Ordering::Relaxed) | IRT_SIZE);
+            command(u, GCMD_SIRTP);
+            invalidate(u, &[INV_IEC_GLOBAL]);
+            command(u, GCMD_IRE);
+        }
+        command(u, GCMD_TE);
+    }
+}
+
 /// Turns on unit `u`'s invalidation queue, which then replaces its context
 /// and IOTLB command registers.
 fn start_queue(u: usize) -> Option<()> {

@@ -107,6 +107,16 @@ pub fn kick(x: usize) {
     }
 }
 
+/// CPU `x` is being started again after S3, with nothing loaded and no
+/// request outstanding (none was made while it was off: the CPU that
+/// slept held the kernel lock throughout).
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
+pub fn restarted(x: usize) {
+    LOADED[x].store(0, Ordering::Release);
+    DONE[x].store(REQUESTED[x].load(Ordering::Acquire), Ordering::Release);
+    KICKED[x].store(false, Ordering::Release);
+}
+
 /// This CPU is in the kernel and will reschedule: a kick may be sent again.
 pub fn kicked() {
     KICKED[arch::cpu_id()].store(false, Ordering::Release);
