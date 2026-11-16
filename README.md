@@ -133,6 +133,19 @@ holds the rest):
   a halted endpoint), and `cargo xtask uefi-test` (both ISAs) adds an xHCI the
   firmware sets up, which the kernel must find and report has no DbC. Output itself
   waits for a laptop and a debug cable.
+- The shell on a PC's own screen and keyboard, for machines with no serial port
+  (`boot/console.manifest`, `cargo xtask console-image` for a USB stick): the
+  kernel gives the root task the boot framebuffer as device memory (`UntypedInfo`
+  on it also says its geometry) and the PS/2 controller's data and status ports
+  as one I/O-port capability each, and the shell, given both, draws what it
+  prints on the screen in the boot log's font and reads the keyboard (scancode
+  set 1, US layout, Shift and Caps Lock; touchpad bytes dropped), polling it
+  every tick. Where COM1 is missing the shell leaves it alone; where it is
+  there, it works beside the screen. With the keyboard controller, `reboot`
+  restarts the machine. It has run on an Acer laptop from a USB stick.
+  `cargo xtask console-shell-test` (part of `cargo xtask test`) types
+  `echo Hi PS/2!` on QEMU's PS/2 keyboard and checks every pixel of the
+  screen's first six lines, and the serial session beside it.
 - Boot, serial console, GDT/TSS, exception handlers; the legacy PIC remapped to vector
   0x20 with every line masked, carrying COM1 only on a machine with no I/O APIC.
 - All usable physical memory handed to the root CNode as untyped capabilities; every
@@ -1437,6 +1450,8 @@ cargo xtask packages-test  # signed app packages: bad ones refused, the app inst
 cargo xtask run            # boot the shell in QEMU (x86-64), its console on this terminal
 cargo xtask run aarch64    # the same on QEMU's AArch64 virt machine
 cargo xtask console-test   # the kernel's log on the boot framebuffer, from a BIOS and from UEFI, checked by screenshot
+cargo xtask console-image  # a USB-stick image whose shell is a console on the screen and the PS/2 keyboard
+cargo xtask console-shell-test  # type on QEMU's PS/2 keyboard; the screen console checked pixel by pixel
 cargo xtask uefi-test      # x86-64 booted by UEFI firmware (OVMF): the shell session and the driver test
 cargo xtask uefi-test aarch64  # AArch64 booted by UEFI firmware (edk2) through loader/, from its device tree and from ACPI: the shell session and the driver test
 cargo xtask el2-test       # AArch64 entered at EL2, from -kernel and from UEFI firmware: the shell session (and the driver test)

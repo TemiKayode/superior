@@ -235,6 +235,7 @@ fn main() -> ExitCode {
             .and_then(|_| el2_test())
             .and_then(|_| layout_test())
             .and_then(|_| console_test())
+            .and_then(|_| console_shell_test())
             .and_then(|_| sel4_image())
             .and_then(|img| shell_session(&img)),
         Some("sel4-test") => sel4_image().and_then(|img| shell_session(&img)),
@@ -2029,9 +2030,12 @@ fn fs_test(arch: Arch, driver: &'static str) -> Result<(), String> {
     std::fs::write(&disk, vec![0u8; 16 << 20])
         .map_err(|e| format!("writing {}: {e}", disk.display()))?;
     println!("== filesystem test, first boot: {}", first.path.display());
-    // Generous: 600 files into one directory under fault injection take
-    // AArch64 under emulated NVMe over two minutes.
-    let out = run_to_exit(&first, Duration::from_secs(360))?;
+    // Generous: 600 files into one directory under fault injection, each
+    // of the server's many restarts checking every one of them, take
+    // AArch64 under emulated NVMe some 800 s (4,367 kills in one run), and
+    // x86-64 now and then over 360 s: how long depends on where the kills
+    // fall. Only a run that hangs waits this long.
+    let out = run_to_exit(&first, Duration::from_secs(1200))?;
     // The server may be killed during the format (and format again, or
     // find it done); either way the first mount sees an empty filesystem.
     let steps = [

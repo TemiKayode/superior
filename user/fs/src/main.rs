@@ -578,9 +578,20 @@ impl Fs {
                 crash("no memory for buffers");
             }
         }
-        let info = syscall(Syscall::Call, BLOCK_EP, [block::INFO, block::VERSION, 0, 0]);
-        let blocks = (info.msg[1] * block::SECTOR / fs::BLOCK).min(MAX_DISK);
-        if info.status != 0 || blocks <= DATA + 8 {
+        // The disk driver may itself be restarting (killed, say, as this
+        // server was): give it up to 2 s to answer before crashing, which
+        // counts against this server's restart limit.
+        let mut blocks = 0;
+        for _ in 0..200 {
+            let info = syscall(Syscall::Call, BLOCK_EP, [block::INFO, block::VERSION, 0, 0]);
+            blocks = (info.msg[1] * block::SECTOR / fs::BLOCK).min(MAX_DISK);
+            if info.status == 0 && blocks > DATA + 8 {
+                break;
+            }
+            blocks = 0;
+            superior_sys::sleep(1);
+        }
+        if blocks == 0 {
             crash("no usable block device");
         }
         let mut f = Fs {
