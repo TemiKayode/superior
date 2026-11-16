@@ -2546,7 +2546,7 @@ fn wifi_test(arch: Arch) -> Result<(), String> {
             "[pass] wifi: the keys were renewed under way,",
             "[pass] wifi: a survey while linked finds the same networks, and the link stays up",
             "[pass] wifi: the radio is told to join \"superior-wpa3\"",
-            "virtio-net: wifi: found \"superior-wpa3\" at 02:57:49:46:49:03 (WPA3-SAE, CCMP); authenticating by SAE",
+            "virtio-net: wifi: found \"superior-wpa3\" at 02:57:49:46:49:03 (WPA3-SAE, CCMP); authenticating by SAE (hash-to-element)",
             "virtio-net: wifi: keyed, link up: frames sealed with CCMP",
             "[pass] wifi: joined by SAE and keyed in",
             "[pass] wifi: 10 of 10 pings answered over WPA3, the link up through a forged deauthentication",
@@ -2554,6 +2554,11 @@ fn wifi_test(arch: Arch) -> Result<(), String> {
     )?;
     if !out.contains("virtio-net: wifi: ignored an unprotected deauthentication (management frames are protected)") {
         return Err("Wi-Fi test: the station did not report ignoring the forged deauthentication".into());
+    }
+    // Both to every station (the one with no MMIE, then the one with a
+    // wrong MIC; reported once or twice, as they arrive together or not).
+    if !out.contains("virtio-net: wifi: ignored a deauthentication to every station: a wrong MIC under BIP (2 so far)") {
+        return Err("Wi-Fi test: the station did not report ignoring both deauthentications to every station (BIP)".into());
     }
     if out.contains("[fail]") {
         return Err("Wi-Fi test: a check failed".into());
@@ -2583,9 +2588,10 @@ fn wifi_test(arch: Arch) -> Result<(), String> {
         seen.wpa3_refused.load(Ordering::Relaxed),
     );
     println!(
-        "== WPA3 access point: station keyed by SAE, {wpa3_from} frames from it, {forged} forged deauthentication sent, {wpa3_refused} frames refused"
+        "== WPA3 access point: station keyed by SAE ({}), {wpa3_from} frames from it, {forged} forged deauthentications sent (one to the station, two to every station), {wpa3_refused} frames refused",
+        if seen.wpa3_h2e.load(Ordering::Relaxed) { "hash-to-element" } else { "hunting and pecking" }
     );
-    if !seen.wpa3_keyed.load(Ordering::Relaxed) || wpa3_from == 0 || forged == 0 || wpa3_refused != 0 {
+    if !seen.wpa3_keyed.load(Ordering::Relaxed) || !seen.wpa3_h2e.load(Ordering::Relaxed) || wpa3_from == 0 || forged == 0 || wpa3_refused != 0 {
         return Err("Wi-Fi test: the WPA3 access point did not see the station keyed by SAE and carrying frames".into());
     }
     println!("== Wi-Fi test passed ({})", arch.name());

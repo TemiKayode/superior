@@ -37,6 +37,10 @@ pub const SSID: u8 = 0;
 pub const RATES: u8 = 1;
 pub const DS_PARAMS: u8 = 3;
 pub const RSN: u8 = 48;
+/// The RSN extension element (RSNXE), and its first octet with SAE
+/// hash-to-element (bit 5) set: a network that takes H2E says so here.
+pub const RSNX: u8 = 244;
+pub const RSNX_H2E: u8 = 0x20;
 /// 1, 2, 5.5 and 11 Mb/s basic, 6, 9, 12 and 18 Mb/s supported (units of
 /// 500 kb/s).
 pub const RATE_SET: [u8; 8] = [0x82, 0x84, 0x8b, 0x96, 0x0c, 0x12, 0x18, 0x24];

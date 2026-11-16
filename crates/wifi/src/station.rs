@@ -13,8 +13,9 @@
 //! ([`crate::handshake`]) in EAPOL frames, which are the only data frames
 //! taken unencrypted. Under SAE management frame protection is on: once
 //! keyed, a deauthentication or disassociation is obeyed only if it comes
-//! sealed under the temporal key, so a forged one cannot knock the
-//! station off.
+//! sealed under the temporal key, or, sent to every station, with a valid
+//! MMIE under the integrity group key ([`crate::bip`]), so a forged one
+//! cannot knock the station off.
 //! Once keyed the link is up: Ethernet frames go out as data frames to the
 //! access point sealed with the temporal key, and data frames in are
 //! taken only sealed, under the temporal key (to the station) or the group
@@ -41,7 +42,7 @@
 use crate::ccmp;
 use crate::frame::{self, *};
 use crate::handshake::{Akm, Keys, Supplicant};
-use crate::sae::Sae;
+use crate::sae::{self, Sae};
 use crate::sha1::{prf, psk};
 
 /// Where joining has got to.
@@ -157,8 +158,14 @@ pub struct Station {
     akm: Akm,
     pmk: [u8; 32],
     sae: Option<Sae>,
+    /// Whether the network found takes SAE by hash-to-element, and its
+    /// password element PT (computed once per network joined).
+    h2e: bool,
+    pt: Option<crate::p256::Affine>,
     /// The last packet number of a sealed management frame taken.
     mgmt_pn: Option<u64>,
+    /// The last BIP packet number accepted from the access point.
+    bip_ipn: Option<u64>,
     seed: [u8; 32],
     nonces: u32,
     link: Link,
@@ -183,6 +190,10 @@ pub struct Station {
     /// Unprotected deauthentications and disassociations ignored under
     /// management frame protection (forgeries, as far as it can tell).
     pub ignored_deauths: u32,
+    /// Of those, the ones sent to every station (BIP refused them), and
+    /// why the last was refused.
+    pub ignored_group_deauths: u32,
+    pub last_bip_refusal: Option<crate::bip::Refused>,
     /// Rekeyings since the link came up: pairwise, and group.
     pub rekeys: u32,
     pub group_rekeys: u32,
@@ -205,7 +216,10 @@ impl Station {
             akm: Akm::Psk,
             pmk: [0; 32],
             sae: None,
+            h2e: false,
+            pt: None,
             mgmt_pn: None,
+            bip_ipn: None,
             seed: [0; 32],
             nonces: 0,
             link: Link::Idle,
@@ -224,6 +238,8 @@ impl Station {
             tries: 0,
             refused: 0,
             ignored_deauths: 0,
+            ignored_group_deauths: 0,
+            last_bip_refusal: None,
             rekeys: 0,
             group_rekeys: 0,
             survey: None,
@@ -328,6 +344,7 @@ impl Station {
         self.psk = psk(passphrase, ssid);
         self.password[..passphrase.len()].copy_from_slice(passphrase);
         self.password_len = passphrase.len();
+        self.pt = None;
         self.seed = seed;
         self.scan(now);
         true
@@ -336,7 +353,7 @@ impl Station {
     fn scan(&mut self, now: u64) {
         self.link = Link::Scanning;
         self.supplicant = None;
-        (self.sae, self.mgmt_pn) = (None, None);
+        (self.sae, self.mgmt_pn, self.bip_ipn) = (None, None, None);
         self.keys = None;
         (self.rx_pn, self.old_tk, self.groups, self.installs) = (None, None, [None; 4], 0);
         self.deadline = now;
@@ -352,6 +369,11 @@ impl Station {
     }
 
     /// The suite chosen for the network being joined (or joined).
+    /// Whether SAE runs by hash-to-element with this network.
+    pub fn hash_to_element(&self) -> bool {
+        self.akm == Akm::Sae && self.h2e
+    }
+
     pub fn akm(&self) -> Akm {
         self.akm
     }
@@ -423,7 +445,15 @@ impl Station {
                 let mut r = [0u8; 64];
                 r[..32].copy_from_slice(&self.nonce());
                 r[32..].copy_from_slice(&self.nonce());
-                self.sae = Sae::new(&self.password[..self.password_len], &self.mac, &self.bssid, &r);
+                self.sae = match self.h2e {
+                    true => {
+                        if self.pt.is_none() {
+                            self.pt = sae::pt(&self.ssid[..self.ssid_len], &self.password[..self.password_len]);
+                        }
+                        self.pt.as_ref().and_then(|pt| Sae::new_h2e(pt, &self.mac, &self.bssid, &r))
+                    }
+                    false => Sae::new(&self.password[..self.password_len], &self.mac, &self.bssid, &r),
+                };
                 if self.sae.is_some() {
                     break;
                 }
@@ -434,8 +464,10 @@ impl Station {
             // The access point's commit came: our confirm again.
             Some(c) => self.auth_frame(&[3, 0, 2, 0, 0, 0], &c, radio),
             None => {
+                // Status 126 marks a commit by hash-to-element.
                 let c = sae.commit();
-                self.auth_frame(&[3, 0, 1, 0, 0, 0], &c, radio);
+                let status = if self.h2e { 126 } else { 0 };
+                self.auth_frame(&[3, 0, 1, 0, status, 0], &c, radio);
             }
         }
     }
@@ -472,6 +504,12 @@ impl Station {
         let rsne = self.akm.rsne();
         f[n..n + rsne.len()].copy_from_slice(rsne);
         n += rsne.len();
+        // It takes hash-to-element, and says so whatever it heard: an
+        // access point that offers H2E then sees a downgrade if this
+        // exchange was by hunting and pecking.
+        if self.akm == Akm::Sae {
+            n = element(&mut f, n, RSNX, &[RSNX_H2E]);
+        }
         radio(&f[..n]);
     }
 
@@ -516,6 +554,11 @@ impl Station {
                 let rsne = rsne.unwrap();
                 self.akm = akm;
                 self.sae = None;
+                let h2e = akm == Akm::Sae && find_element(elems, RSNX).is_some_and(|e| e.first().is_some_and(|b| b & RSNX_H2E != 0));
+                if h2e != self.h2e {
+                    self.pt = None;
+                }
+                self.h2e = h2e;
                 self.rsne[..rsne.len()].copy_from_slice(rsne);
                 self.rsne_len = rsne.len();
                 self.bssid = a3;
@@ -529,7 +572,8 @@ impl Station {
                     (Akm::Psk, [0, 0, 2, 0, 0, 0]) => self.authenticated(self.psk, now, radio),
                     // SAE: the access point's commit, answered with our
                     // confirm; then its confirm, which gives the PMK.
-                    (Akm::Sae, [3, 0, 1, 0, 0, 0]) => {
+                    // (Status 126 under hash-to-element, 0 otherwise.)
+                    (Akm::Sae, [3, 0, 1, 0, status, 0]) if *status == if self.h2e { 126 } else { 0 } => {
                         let Some(s) = self.sae.as_mut() else { return };
                         match s.receive_commit(&body[6..]) {
                             Ok(c) => {
@@ -572,6 +616,24 @@ impl Station {
                         _ => {
                             self.refused += 1;
                             self.ignored_deauths += (fc1 & PROTECTED == 0) as u32;
+                            return;
+                        }
+                    }
+                }
+                self.scan(now);
+            }
+            DEAUTH | DISASSOC if a1 == BROADCAST && a2 == self.bssid && self.link != Link::Scanning => {
+                // To every station: under management frame protection,
+                // only with a valid MMIE under the integrity group key.
+                if self.akm == Akm::Sae && self.link == Link::Up {
+                    let Some(igtk) = self.keys.and_then(|k| k.igtk) else { return };
+                    match crate::bip::verify(&igtk, f, self.bip_ipn) {
+                        Ok(ipn) => self.bip_ipn = Some(ipn),
+                        Err(why) => {
+                            self.refused += 1;
+                            self.ignored_deauths += 1;
+                            self.ignored_group_deauths += 1;
+                            self.last_bip_refusal = Some(why);
                             return;
                         }
                     }
@@ -698,6 +760,8 @@ impl Station {
                 (self.rx_pn, self.old_tk, self.groups) = (None, None, [None; 4]);
                 self.groups[g] = Some((new.gtk.key, None));
                 (self.rekeys, self.group_rekeys) = (0, 0);
+                // BIP: only packet numbers above the one message 3 gave.
+                self.bip_ipn = new.igtk.map(|i| i.pn);
                 self.deadline = now;
             }
             Some(old) => {
@@ -712,6 +776,9 @@ impl Station {
                         self.groups[g] = Some((new.gtk.key, None));
                     }
                     self.group_rekeys += 1;
+                }
+                if new.igtk.map(|i| (i.index, i.key)) != old.igtk.map(|i| (i.index, i.key)) {
+                    self.bip_ipn = new.igtk.map(|i| i.pn);
                 }
                 self.keys = Some(new);
             }

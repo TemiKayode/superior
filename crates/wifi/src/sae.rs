@@ -15,11 +15,20 @@
 //! eavesdropper learns nothing to test passwords against offline, unlike
 //! WPA2's handshake.
 //!
+//! Hash-to-element (H2E, 802.11-2020 12.4.4.2.3), which WPA3 networks
+//! now prefer, finds the PWE without a loop whose length depends on the
+//! password: a password element PT is derived from the SSID and the
+//! password alone (HKDF-SHA256, then two field elements each mapped onto
+//! the curve by simplified SWU, added), which a device computes once per
+//! network; each exchange's PWE is then PT times a scalar from the two
+//! addresses. Its commit and confirm are as before; the frames say which
+//! method by their status code (126 for H2E).
+//!
 //! Frames carry the commit as the group (2 bytes, little-endian), the
 //! scalar (32 bytes) and the element (x then y, 32 bytes each), and the
 //! confirm as a send-confirm counter (2 bytes) and the HMAC (32 bytes).
 
-use crate::p256::{Affine, FIELD, N, ORDER, P, U256, curve_rhs, from_be, is_square, is_zero, less, sqrt, to_be};
+use crate::p256::{Affine, FIELD, N, ORDER, P, Point, U256, curve_rhs, from_be, is_square, is_zero, less, sqrt, to_be};
 use crate::sha256::{hmac_sha256, kdf_sha256};
 
 /// The group: 19, the NIST P-256 curve.
@@ -89,6 +98,90 @@ fn pwe(password: &[u8], a: &[u8; 6], b: &[u8; 6]) -> Option<Affine> {
     found
 }
 
+/// HKDF-Expand (RFC 5869) with SHA-256, into `out` (up to 64 bytes).
+fn hkdf_expand(prk: &[u8; 32], info: &[u8], out: &mut [u8]) {
+    let t1 = hmac_sha256(prk, &[info, &[1]]);
+    let n = out.len().min(32);
+    out[..n].copy_from_slice(&t1[..n]);
+    if out.len() > 32 {
+        let t2 = hmac_sha256(prk, &[&t1, info, &[2]]);
+        let rest = out.len() - 32;
+        out[32..].copy_from_slice(&t2[..rest]);
+    }
+}
+
+/// A 48-byte big-endian number modulo p (plain form): its top 16 bytes
+/// times 2²⁵⁶ (which is what Montgomery form multiplies by) plus the rest.
+fn mod_p(v: &[u8; 48]) -> U256 {
+    let mut hi = [0u8; 32];
+    hi[16..].copy_from_slice(&v[..16]);
+    let lo: [u8; 32] = v[16..].try_into().unwrap();
+    FIELD.add(&FIELD.to_mont(&from_be(&hi)), &FIELD.reduce(&from_be(&lo)))
+}
+
+/// `a` if `pick`, else `b`, without a branch on `pick`.
+fn select(pick: bool, a: &U256, b: &U256) -> U256 {
+    let m = 0u64.wrapping_sub(pick as u64);
+    core::array::from_fn(|i| (a[i] & m) | (b[i] & !m))
+}
+
+/// Simplified SWU (RFC 9380 6.6.2, as 802.11 writes it) for P-256, Z =
+/// −10: field element `u` (plain) onto the curve, y's lowest bit that of
+/// `u`.
+pub fn sswu(u: &U256) -> Affine {
+    let f = &FIELD;
+    let zero = [0u64; 4];
+    let um = f.to_mont(u);
+    let z = f.sub(&zero, &f.to_mont(&[10, 0, 0, 0]));
+    let a = f.sub(&zero, &f.to_mont(&[3, 0, 0, 0]));
+    let b = curve_rhs(&zero);
+    let zu2 = f.mul(&z, &f.mul(&um, &um));
+    let m = f.add(&f.mul(&zu2, &zu2), &zu2);
+    let t = f.inv(&m);
+    let exceptional = f.mul(&b, &f.inv(&f.mul(&z, &a)));
+    let usual = f.mul(&f.mul(&f.sub(&zero, &b), &f.inv(&a)), &f.add(&f.one(), &t));
+    let x1 = select(is_zero(&m), &exceptional, &usual);
+    let g = |x: &U256| f.add(&f.add(&f.mul(&f.mul(x, x), x), &f.mul(&a, x)), &b);
+    let gx1 = g(&x1);
+    let x2 = f.mul(&zu2, &x1);
+    let gx2 = g(&x2);
+    let first = is_square(&gx1);
+    let x = select(first, &x1, &x2);
+    let v = select(first, &gx1, &gx2);
+    let y = f.from_mont(&sqrt(&v));
+    let neg = f.sub(&zero, &y);
+    let y = select(u[0] & 1 == y[0] & 1, &y, &neg);
+    Affine { x: f.from_mont(&x), y }
+}
+
+/// H2E's password element PT for `password` on the network `ssid` (with
+/// no password identifier): two field elements from HKDF over the
+/// password, salted with the SSID, each mapped by [`sswu`], added.
+pub fn pt(ssid: &[u8], password: &[u8]) -> Option<Affine> {
+    let seed = hmac_sha256(ssid, &[password]);
+    let mut points = [Point::INFINITY; 2];
+    for (k, label) in [&b"SAE Hash to Element u1 P1"[..], b"SAE Hash to Element u2 P2"].into_iter().enumerate() {
+        let mut v = [0u8; 48];
+        hkdf_expand(&seed, label, &mut v);
+        points[k] = sswu(&mod_p(&v)).point();
+    }
+    points[0].add(&points[1]).affine()
+}
+
+/// H2E's PWE between addresses `a` and `b` from `pt`: PT times 1 + (an
+/// HMAC of the two addresses, larger first, mod (order − 1)).
+fn pwe_h2e(pt: &Affine, a: &[u8; 6], b: &[u8; 6]) -> Option<Affine> {
+    let mut macs = [0u8; 12];
+    let (hi, lo) = if a > b { (a, b) } else { (b, a) };
+    macs[..6].copy_from_slice(hi);
+    macs[6..].copy_from_slice(lo);
+    let v = from_be(&hmac_sha256(&[0; 32], &[&macs]));
+    let order_less_1 = [N[0] - 1, N[1], N[2], N[3]];
+    let v = if less(&v, &order_less_1) { v } else { ORDER.sub(&v, &order_less_1) };
+    let val = ORDER.add(&v, &[1, 0, 0, 0]);
+    pt.point().mul(&val).affine()
+}
+
 /// A scalar from 32 random bytes, if it is between 1 and the order
 /// (exclusive).
 fn scalar(b: &[u8; 32]) -> Option<U256> {
@@ -102,7 +195,15 @@ impl Sae {
     /// give an unusable scalar (draw again) or no PWE was found (all 40
     /// tries missed: about 2⁻⁴⁰).
     pub fn new(password: &[u8], own: &[u8; 6], peer: &[u8; 6], random: &[u8; 64]) -> Option<Sae> {
-        let pwe = pwe(password, own, peer)?;
+        Sae::with_pwe(pwe(password, own, peer)?, random)
+    }
+
+    /// An exchange by hash-to-element, from the network's [`pt`].
+    pub fn new_h2e(pt: &Affine, own: &[u8; 6], peer: &[u8; 6], random: &[u8; 64]) -> Option<Sae> {
+        Sae::with_pwe(pwe_h2e(pt, own, peer)?, random)
+    }
+
+    fn with_pwe(pwe: Affine, random: &[u8; 64]) -> Option<Sae> {
         let rand = scalar(random[..32].try_into().unwrap())?;
         let mask = scalar(random[32..].try_into().unwrap())?;
         let s = ORDER.add(&rand, &mask);

@@ -182,6 +182,8 @@ struct Nic {
     surveying: bool,
     /// Forged deauthentications ignored, as last reported.
     shown_ignored: u32,
+    /// Of them, deauthentications to every station (refused by BIP).
+    shown_group_ignored: u32,
 }
 
 /// Ethernet frames the station has delivered, waiting for the caller
@@ -425,6 +427,7 @@ fn start(radio: bool) -> Result<Nic, Failure> {
         shown_rekeys: (0, 0),
         surveying: false,
         shown_ignored: 0,
+        shown_group_ignored: 0,
     };
     if radio {
         let mac = nic.mac.to_be_bytes();
@@ -618,7 +621,9 @@ impl Nic {
         let deadline = st.deadline();
         let (link, bssid) = (st.link(), st.bssid());
         let rekeys = (st.rekeys, st.group_rekeys);
-        let (akm, ignored) = (st.akm(), st.ignored_deauths);
+        let (akm, group, h2e) = (st.akm(), st.ignored_group_deauths, st.hash_to_element());
+        let ignored = st.ignored_deauths - group;
+        let bip = st.last_bip_refusal;
         let surveyed = (self.surveying && !st.surveying()).then(|| st.networks().count());
         let mut ssid = [0u8; 32];
         let n = st.ssid().len();
@@ -650,7 +655,11 @@ impl Nic {
                     "wifi: found \"{name}\" at {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} ({}, CCMP); authenticating{}",
                     b[0], b[1], b[2], b[3], b[4], b[5],
                     if akm == Akm::Sae { "WPA3-SAE" } else { "WPA2-PSK" },
-                    if akm == Akm::Sae { " by SAE" } else { "" }
+                    match (akm, h2e) {
+                        (Akm::Sae, true) => " by SAE (hash-to-element)",
+                        (Akm::Sae, false) => " by SAE",
+                        _ => "",
+                    }
                 ),
                 Link::Associating => say!("wifi: associating"),
                 Link::Keying => say!("wifi: associated; 4-way handshake"),
@@ -665,6 +674,17 @@ impl Nic {
         if ignored > self.shown_ignored {
             self.shown_ignored = ignored;
             say!("wifi: ignored an unprotected deauthentication (management frames are protected)");
+        }
+        if group > self.shown_group_ignored {
+            self.shown_group_ignored = group;
+            let why = match bip {
+                Some(superior_wifi::bip::Refused::Unprotected) => "no MMIE",
+                Some(superior_wifi::bip::Refused::BadMic) => "a wrong MIC",
+                Some(superior_wifi::bip::Refused::WrongKey) => "another key",
+                Some(superior_wifi::bip::Refused::Replayed) => "a replayed packet number",
+                None => "refused",
+            };
+            say!("wifi: ignored a deauthentication to every station: {why} under BIP ({group} so far)");
         }
         if rekeys != self.shown_rekeys {
             if rekeys.0 > self.shown_rekeys.0 {

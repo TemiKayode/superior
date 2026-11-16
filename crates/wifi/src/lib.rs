@@ -11,6 +11,8 @@
 //! - [`handshake`]: the 4-way handshake, the station's side and the access
 //!   point's.
 //! - [`ccmp`]: data frames sealed and opened under the temporal key.
+//! - [`bip`]: management frames to a group protected under the integrity
+//!   group key (BIP-CMAC-128).
 //! - [`frame`]: the 802.11 frames used, and Ethernet frames to and from
 //!   data frames.
 //! - [`station`]: a station finding a network, joining it and carrying
@@ -22,6 +24,7 @@
 
 pub mod aes;
 pub mod ap;
+pub mod bip;
 pub mod ccmp;
 pub mod frame;
 pub mod handshake;

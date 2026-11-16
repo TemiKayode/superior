@@ -60,6 +60,10 @@ pub struct AccessPoint {
     /// SAE with the station, and the last commit it sent.
     sae: Option<Sae>,
     sae_commit: [u8; COMMIT_LEN],
+    /// Hash-to-element: the network's password element PT, if it takes
+    /// H2E, and whether the exchange with the station used it.
+    pt: Option<crate::p256::Affine>,
+    sae_h2e: bool,
     gtk: Gtk,
     igtk: Igtk,
     seed: [u8; 32],
@@ -70,6 +74,8 @@ pub struct AccessPoint {
     tk: [u8; 16],
     pn: u64,
     group_pn: u64,
+    /// BIP's packet number for management frames to a group.
+    ipn: u64,
     rx_pn: Option<u64>,
     /// The last packet number taken under a pending new temporal key.
     pending_pn: Option<u64>,
@@ -90,7 +96,7 @@ impl AccessPoint {
         let mut password = [0u8; 63];
         let password_len = passphrase.len().min(63);
         password[..password_len].copy_from_slice(&passphrase[..password_len]);
-        let mut igtk = Igtk { index: 4, key: [0; 16] };
+        let mut igtk = Igtk { index: 4, key: [0; 16], pn: 0 };
         prf(&seed, b"IGTK", &[&bssid], &mut igtk.key);
         AccessPoint {
             bssid,
@@ -106,6 +112,8 @@ impl AccessPoint {
             akm: Akm::Psk,
             sae: None,
             sae_commit: [0; COMMIT_LEN],
+            pt: None,
+            sae_h2e: false,
             gtk,
             igtk,
             seed,
@@ -116,6 +124,7 @@ impl AccessPoint {
             tk: [0; 16],
             pn: 0,
             group_pn: 0,
+            ipn: 0,
             rx_pn: None,
             pending_pn: None,
             seq: 0,
@@ -131,6 +140,18 @@ impl AccessPoint {
     pub fn offering(mut self, psk: bool, sae: bool) -> Self {
         (self.psk_ok, self.sae_ok) = (psk, sae);
         self
+    }
+
+    /// Takes SAE by hash-to-element too (and says so in an RSN extension
+    /// element): computes the network's PT once, here.
+    pub fn hash_to_element(mut self) -> Self {
+        self.pt = sae::pt(&self.ssid[..self.ssid_len], &self.password[..self.password_len]);
+        self
+    }
+
+    /// Whether the station's SAE exchange was by hash-to-element.
+    pub fn station_used_h2e(&self) -> bool {
+        self.authed == Some(Akm::Sae) && self.sae_h2e
     }
 
     /// The RSN element it advertises.
@@ -175,6 +196,35 @@ impl AccessPoint {
         self.auth = None;
     }
 
+    /// Tells every station to go (reason 3, leaving), to the broadcast
+    /// address: protected by BIP under the integrity group key when
+    /// management frames are protected (SAE), so the stations believe it.
+    pub fn deauth_all(&mut self, radio: &mut dyn FnMut(&[u8])) {
+        let mut f = [0u8; 64];
+        let seq = self.next_seq();
+        let mut n = header(&mut f, DEAUTH, 0, &BROADCAST, &self.bssid, &self.bssid, seq);
+        f[n..n + 2].copy_from_slice(&[3, 0]);
+        n += 2;
+        if self.akm == Akm::Sae {
+            self.ipn += 1;
+            let Some(m) = crate::bip::protect(&self.igtk, self.ipn, &mut f, n) else { return };
+            n = m;
+        }
+        radio(&f[..n]);
+        self.peer = Peer::None;
+        self.auth = None;
+    }
+
+    /// The integrity group key (the test harness forges frames with it).
+    pub fn igtk(&self) -> Igtk {
+        self.igtk
+    }
+
+    /// The last BIP packet number sent.
+    pub fn ipn(&self) -> u64 {
+        self.ipn
+    }
+
     pub fn station(&self) -> [u8; 6] {
         self.station
     }
@@ -198,7 +248,11 @@ impl AccessPoint {
         n = element(out, n, DS_PARAMS, &[6]);
         let rsne = self.rsne();
         out[n..n + rsne.len()].copy_from_slice(rsne);
-        n + rsne.len()
+        n += rsne.len();
+        if self.sae_ok && self.pt.is_some() {
+            n = element(out, n, RSNX, &[RSNX_H2E]);
+        }
+        n
     }
 
     /// A beacon, into `out` (200 bytes is room enough).
@@ -326,6 +380,17 @@ impl AccessPoint {
                         return;
                     }
                 };
+                // A station that takes hash-to-element, on a network that
+                // offers it, yet authenticated by hunting and pecking: the
+                // RSN extension element was stripped from what it heard (a
+                // downgrade). Refused (status 13, the method refused).
+                let says_h2e = body.get(4..).and_then(|e| find_element(e, RSNX)).is_some_and(|e| e.first().is_some_and(|b| b & RSNX_H2E != 0));
+                if akm == Akm::Sae && self.pt.is_some() && says_h2e && !self.sae_h2e {
+                    let cap = CAPABILITY.to_le_bytes();
+                    self.reply(ASSOC_RESP, &[cap[0], cap[1], 13, 0, 0, 0], radio);
+                    self.refused += 1;
+                    return;
+                }
                 self.akm = akm;
                 let cap = CAPABILITY.to_le_bytes();
                 // Status 0, association ID 1 (top two bits set).
@@ -334,7 +399,7 @@ impl AccessPoint {
                 self.reply(ASSOC_RESP, &resp, radio);
                 let anonce = self.nonce();
                 let auth = Authenticator::new(akm, self.station_pmk, self.bssid, sa, anonce, self.rsne(), self.gtk);
-                self.auth = Some(auth.with_igtk(self.igtk));
+                self.auth = Some(auth.with_igtk(Igtk { pn: self.ipn, ..self.igtk }));
                 self.peer = Peer::Keying;
                 self.rx_pn = None;
                 self.resend = now;
@@ -356,9 +421,20 @@ impl AccessPoint {
         match (body[2..4] == [1, 0], body[2..4] == [2, 0]) {
             (true, _) => {
                 let Some(commit) = body.get(6..6 + COMMIT_LEN) else { return };
-                if sa == self.station && commit == self.sae_commit && self.sae.is_some() {
+                // Status 0: hunting and pecking; 126: hash-to-element,
+                // if this network takes it.
+                let h2e = match body[4..6] {
+                    [0, 0] => false,
+                    [126, 0] if self.pt.is_some() => true,
+                    _ => {
+                        self.refused += 1;
+                        return;
+                    }
+                };
+                let status = if h2e { 126 } else { 0 };
+                if sa == self.station && commit == self.sae_commit && self.sae.is_some() && h2e == self.sae_h2e {
                     let ours = self.sae.as_ref().map(|s| s.commit()).unwrap();
-                    self.auth_reply(1, &ours, radio);
+                    self.auth_reply(1, status, &ours, radio);
                     return;
                 }
                 (self.station, self.peer, self.authed, self.auth) = (sa, Peer::None, None, None);
@@ -367,7 +443,10 @@ impl AccessPoint {
                     let mut r = [0u8; 64];
                     r[..32].copy_from_slice(&self.nonce());
                     r[32..].copy_from_slice(&self.nonce());
-                    fresh = Sae::new(&self.password[..self.password_len], &self.bssid, &sa, &r);
+                    fresh = match (h2e, self.pt.as_ref()) {
+                        (true, Some(pt)) => Sae::new_h2e(pt, &self.bssid, &sa, &r),
+                        _ => Sae::new(&self.password[..self.password_len], &self.bssid, &sa, &r),
+                    };
                     if fresh.is_some() {
                         break;
                     }
@@ -376,9 +455,10 @@ impl AccessPoint {
                 match s.receive_commit(commit) {
                     Ok(_) => {
                         self.sae_commit.copy_from_slice(commit);
+                        self.sae_h2e = h2e;
                         let ours = s.commit();
                         self.sae = Some(s);
-                        self.auth_reply(1, &ours, radio);
+                        self.auth_reply(1, status, &ours, radio);
                     }
                     // Status 77: the group is not supported (with ours).
                     Err(sae::Error::Group) => self.reply(AUTH, &[3, 0, 1, 0, 77, 0, 19, 0], radio),
@@ -391,7 +471,7 @@ impl AccessPoint {
                     Ok(Some(pmk)) => {
                         let ours = s.confirm().unwrap_or([0; sae::CONFIRM_LEN]);
                         (self.peer, self.authed, self.station_pmk) = (Peer::Authenticated, Some(Akm::Sae), pmk);
-                        self.auth_reply(2, &ours, radio);
+                        self.auth_reply(2, 0, &ours, radio);
                     }
                     _ => self.refused += 1,
                 }
@@ -401,10 +481,10 @@ impl AccessPoint {
     }
 
     /// An SAE authentication frame to the station: transaction `seq`,
-    /// status 0, then `body`.
-    fn auth_reply(&mut self, seq: u8, body: &[u8], radio: &mut dyn FnMut(&[u8])) {
+    /// `status` (0, or 126 for a commit by hash-to-element), then `body`.
+    fn auth_reply(&mut self, seq: u8, status: u8, body: &[u8], radio: &mut dyn FnMut(&[u8])) {
         let mut b = [0u8; 6 + COMMIT_LEN];
-        b[..6].copy_from_slice(&[3, 0, seq, 0, 0, 0]);
+        b[..6].copy_from_slice(&[3, 0, seq, 0, status, 0]);
         b[6..6 + body.len()].copy_from_slice(body);
         self.reply(AUTH, &b[..6 + body.len()], radio);
     }

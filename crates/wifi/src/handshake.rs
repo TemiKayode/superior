@@ -247,6 +247,9 @@ pub struct Igtk {
     /// Its key ID: 4 or 5.
     pub index: u16,
     pub key: [u8; 16],
+    /// The last BIP packet number sent under it (48 bits): a station takes
+    /// only frames above it.
+    pub pn: u64,
 }
 
 /// What a finished handshake gives the station: the keys for unicast and
@@ -276,7 +279,11 @@ fn elements(mut kd: &[u8]) -> impl Iterator<Item = (u8, &[u8])> {
 fn igtk_kde(kd: &[u8]) -> Option<Igtk> {
     elements(kd).find_map(|(t, body)| {
         (t == 0xdd && body.len() == 4 + 2 + 6 + 16 && body[..4] == [0x00, 0x0f, 0xac, 9])
-            .then(|| Igtk { index: u16::from_le_bytes([body[4], body[5]]), key: body[12..].try_into().unwrap() })
+            .then(|| {
+                let mut pn = [0u8; 8];
+                pn[..6].copy_from_slice(&body[6..12]);
+                Igtk { index: u16::from_le_bytes([body[4], body[5]]), key: body[12..].try_into().unwrap(), pn: u64::from_le_bytes(pn) }
+            })
     })
 }
 
@@ -617,10 +624,10 @@ impl Authenticator {
         plain[n + 8..n + 24].copy_from_slice(&self.gtk.key);
         n += 24;
         if let Some(igtk) = self.igtk.filter(|_| self.akm == Akm::Sae) {
-            // The IGTK KDE: key ID, packet number 0, key.
+            // The IGTK KDE: key ID, the packet number reached, key.
             let id = igtk.index.to_le_bytes();
-            plain[n..n + 12].copy_from_slice(&[0xdd, 28, 0x00, 0x0f, 0xac, 9, id[0], id[1], 0, 0, 0, 0]);
-            plain[n + 12..n + 14].fill(0);
+            plain[n..n + 8].copy_from_slice(&[0xdd, 28, 0x00, 0x0f, 0xac, 9, id[0], id[1]]);
+            plain[n + 8..n + 14].copy_from_slice(&igtk.pn.to_le_bytes()[..6]);
             plain[n + 14..n + 30].copy_from_slice(&igtk.key);
             n += 30;
         }

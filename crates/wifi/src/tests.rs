@@ -254,6 +254,9 @@ mod air {
         /// Whether to lose every other frame to the access point.
         pub lossy: bool,
         lost: bool,
+        /// Whether to strip the RSN extension element from what the
+        /// access point announces (a downgrade attempt).
+        pub strip_rsnx: bool,
     }
 
     impl Air {
@@ -274,7 +277,27 @@ mod air {
                 now: 0,
                 lossy: false,
                 lost: false,
+                strip_rsnx: false,
             }
+        }
+
+        /// With a WPA3-only access point that takes hash-to-element.
+        pub fn h2e(ap_pass: &[u8]) -> Air {
+            let gtk = Gtk { index: 1, key: [0x47; 16] };
+            let ap = AccessPoint::new(BSSID, b"superior", ap_pass, gtk, [9; 32]).offering(false, true).hash_to_element();
+            Air { ap, ..Air::offering(ap_pass, false, true) }
+        }
+
+        /// A beacon or probe response without its RSN extension element.
+        fn strip(f: &[u8]) -> Vec<u8> {
+            let mut out = f[..crate::frame::HEADER + 12].to_vec();
+            for (id, body) in crate::frame::elements(&f[crate::frame::HEADER + 12..]) {
+                if id != crate::frame::RSNX {
+                    out.extend([id, body.len() as u8]);
+                    out.extend(body);
+                }
+            }
+            out
         }
 
         /// Runs the channel for `ms` milliseconds, 10 at a time.
@@ -297,7 +320,10 @@ mod air {
                     self.to_sta.extend(back);
                     self.ap_up.extend(up);
                 }
-                for f in core::mem::take(&mut self.to_sta) {
+                for mut f in core::mem::take(&mut self.to_sta) {
+                    if self.strip_rsnx && matches!(f[0], crate::frame::BEACON | crate::frame::PROBE_RESP) {
+                        f = Air::strip(&f);
+                    }
                     let (mut back, mut up) = (Vec::new(), Vec::new());
                     self.sta.receive(&f, -40, self.now, &mut |r| back.push(r.to_vec()), &mut |e| up.push(e.to_vec()));
                     self.to_ap.extend(back);
@@ -724,7 +750,7 @@ fn sae_peers_reach_the_same_pmk_and_refuse_what_they_should() {
 fn the_4_way_handshake_under_sae_uses_cmac_and_delivers_the_igtk() {
     use crate::handshake::{Igtk, RSNE_SAE};
     let pmk = [0x3a; 32];
-    let igtk = Igtk { index: 4, key: [0x91; 16] };
+    let igtk = Igtk { index: 4, key: [0x91; 16], pn: 0x0102_0304_0506 };
     let mut ap = Authenticator::new(Akm::Sae, pmk, AA, SPA, [0xa1; 32], &RSNE_SAE, GTK).with_igtk(igtk);
     let mut sta = Supplicant::new(Akm::Sae, pmk, SPA, AA, [0x5e; 32], &RSNE_SAE, &RSNE_SAE);
     let m1 = ap.start();
@@ -772,6 +798,67 @@ fn a_transition_mode_access_point_is_joined_by_sae() {
     air.run(500);
     assert!(air.joined());
     assert_eq!(air.ap.akm(), Akm::Sae);
+}
+
+#[test]
+fn h2e_s_password_element_and_each_mapped_point_are_on_the_curve() {
+    use crate::p256::{FIELD, curve_rhs};
+    let on_curve = |p: &crate::p256::Affine| { let y = FIELD.to_mont(&p.y); FIELD.mul(&y, &y) == curve_rhs(&p.x) };
+    for k in 0..16u64 {
+        assert!(on_curve(&crate::sae::sswu(&[k.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1, k, 0, 0])), "u = {k}");
+    }
+    let pt = crate::sae::pt(b"superior", b"correct horse").unwrap();
+    assert!(on_curve(&pt));
+    // Per network: another SSID or password, another PT.
+    assert_ne!(crate::sae::pt(b"superior2", b"correct horse"), Some(pt));
+    assert_ne!(crate::sae::pt(b"superior", b"correct horsf"), Some(pt));
+}
+
+#[test]
+fn sae_by_hash_to_element_agrees_and_differs_from_hunting_and_pecking() {
+    use crate::sae::{Sae, pt};
+    let (a, b) = ([2u8, 0, 0, 0, 0, 1], [2u8, 0, 0, 0, 0, 2]);
+    let t = pt(b"superior", b"correct horse").unwrap();
+    let mut x = Sae::new_h2e(&t, &a, &b, &[0x11; 64]).unwrap();
+    let mut y = Sae::new_h2e(&t, &b, &a, &[0x22; 64]).unwrap();
+    let cx = x.receive_commit(&y.commit()).unwrap();
+    let cy = y.receive_commit(&x.commit()).unwrap();
+    x.receive_confirm(&cy).unwrap();
+    y.receive_confirm(&cx).unwrap();
+    assert!(x.pmk().is_some() && x.pmk() == y.pmk());
+    // Hunting and pecking with the same password and draws: another PWE.
+    let mut z = Sae::new(b"correct horse", &b, &a, &[0x22; 64]).unwrap();
+    let mut x2 = Sae::new_h2e(&t, &a, &b, &[0x11; 64]).unwrap();
+    let cz = z.receive_commit(&x2.commit()).unwrap();
+    x2.receive_commit(&z.commit()).unwrap();
+    assert!(x2.receive_confirm(&cz).is_err(), "methods do not mix");
+}
+
+#[test]
+fn a_station_joins_by_hash_to_element_when_the_network_offers_it() {
+    let mut air = air::Air::h2e(b"correct horse");
+    air.sta.join(b"superior", b"correct horse", [7; 32], 0);
+    air.run(500);
+    assert!(air.joined(), "{:?} / {:?}", air.sta.link(), air.ap.peer());
+    assert!(air.sta.hash_to_element() && air.ap.station_used_h2e());
+    assert_eq!(exchange(&mut air, 1), 2);
+    // Without it offered: hunting and pecking, as before.
+    let mut air = air::Air::offering(b"correct horse", false, true);
+    air.sta.join(b"superior", b"correct horse", [7; 32], 0);
+    air.run(500);
+    assert!(air.joined() && !air.sta.hash_to_element() && !air.ap.station_used_h2e());
+}
+
+#[test]
+fn stripping_the_h2e_advertisement_is_caught_as_a_downgrade() {
+    use crate::station::Link;
+    let mut air = air::Air::h2e(b"correct horse");
+    air.strip_rsnx = true;
+    air.sta.join(b"superior", b"correct horse", [7; 32], 0);
+    air.run(3000);
+    assert!(!air.sta.hash_to_element(), "the station heard no H2E");
+    assert_ne!(air.sta.link(), Link::Up, "never keyed by hunting and pecking");
+    assert!(air.ap.refused > 0, "the association refused");
 }
 
 #[test]
@@ -825,4 +912,83 @@ fn under_wpa3_only_a_sealed_deauthentication_is_obeyed() {
     air.to_sta.push(forged_deauth());
     air.run(10);
     assert_ne!(air.sta.link(), Link::Up);
+}
+
+/// A deauthentication to every station, from the access point, with no
+/// MMIE (or with `mmie`, as given).
+fn group_deauth(mmie: Option<(&crate::handshake::Igtk, u64)>) -> std::vec::Vec<u8> {
+    let mut f = [0u8; 64];
+    let mut n = crate::frame::header(&mut f, crate::frame::DEAUTH, 0, &crate::frame::BROADCAST, &air::BSSID, &air::BSSID, 9);
+    f[n..n + 2].copy_from_slice(&[7, 0]);
+    n += 2;
+    if let Some((igtk, ipn)) = mmie {
+        n = crate::bip::protect(igtk, ipn, &mut f, n).unwrap();
+    }
+    f[..n].to_vec()
+}
+
+#[test]
+fn bip_protects_round_trips_and_refuses_forgery_and_replay() {
+    use crate::bip::{protect, verify, Refused, MMIE_LEN};
+    use crate::handshake::Igtk;
+    let igtk = Igtk { index: 4, key: [0x5a; 16], pn: 0 };
+    let f = group_deauth(Some((&igtk, 7)));
+    assert_eq!(f.len(), 24 + 2 + MMIE_LEN);
+    assert_eq!(verify(&igtk, &f, None), Ok(7));
+    assert_eq!(verify(&igtk, &f, Some(6)), Ok(7));
+    assert_eq!(verify(&igtk, &f, Some(7)), Err(Refused::Replayed));
+    assert_eq!(verify(&igtk, &group_deauth(None), None), Err(Refused::Unprotected));
+    let other = Igtk { index: 5, key: [0x5a; 16], pn: 0 };
+    assert_eq!(verify(&other, &f, None), Err(Refused::WrongKey));
+    let wrong = Igtk { index: 4, key: [0x5b; 16], pn: 0 };
+    assert_eq!(verify(&wrong, &f, None), Err(Refused::BadMic));
+    // Any change to the body or the addresses breaks the MIC; a retry bit
+    // set on the way does not.
+    let mut changed = f.clone();
+    changed[24] ^= 1;
+    assert_eq!(verify(&igtk, &changed, None), Err(Refused::BadMic));
+    let mut changed = f.clone();
+    changed[10] ^= 1;
+    assert_eq!(verify(&igtk, &changed, None), Err(Refused::BadMic));
+    let mut retried = f.clone();
+    retried[1] |= 0x08;
+    assert_eq!(verify(&igtk, &retried, None), Ok(7));
+    // Too long a body is not protected.
+    let mut big = [0u8; 400];
+    assert_eq!(protect(&igtk, 1, &mut big, 24 + 300), None);
+}
+
+#[test]
+fn under_wpa3_only_a_deauthentication_to_all_under_bip_is_obeyed() {
+    use crate::station::Link;
+    let mut air = air::Air::offering(b"correct horse", false, true);
+    air.sta.join(b"superior", b"correct horse", [7; 32], 0);
+    air.run(500);
+    assert!(air.joined());
+    let igtk = air.ap.igtk();
+    // No MMIE; one under a key the station does not have; one replaying
+    // a packet number already used: all ignored.
+    air.to_sta.push(group_deauth(None));
+    air.to_sta.push(group_deauth(Some((&crate::handshake::Igtk { index: 4, key: [1; 16], pn: 0 }, 99))));
+    air.run(10);
+    assert_eq!(air.sta.link(), Link::Up, "forged deauthentications to all are ignored");
+    assert_eq!(air.sta.ignored_group_deauths, 2);
+    assert_eq!(air.sta.last_bip_refusal, Some(crate::bip::Refused::BadMic));
+    // The access point's own, under BIP, is obeyed.
+    air.ap.deauth_all(&mut |f| air.to_sta.push(f.to_vec()));
+    let sent = air.to_sta.last().unwrap().clone();
+    air.run(10);
+    assert_ne!(air.sta.link(), Link::Up, "the access point's own, under BIP, is obeyed");
+    // The station joins again; the same frame replayed is then refused.
+    air.run(500);
+    assert!(air.joined());
+    let mut replay = sent.clone();
+    replay[22] ^= 0x10; // another sequence number: the MMIE still matches
+    air.to_sta.push(replay);
+    air.run(10);
+    assert_eq!(air.sta.link(), Link::Up, "a replayed deauthentication to all is ignored");
+    assert_eq!(air.sta.last_bip_refusal, Some(crate::bip::Refused::Replayed));
+    // Message 3 told the rejoined station the packet number reached.
+    assert_eq!(air.ap.ipn(), 1);
+    let _ = igtk;
 }

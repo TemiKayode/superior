@@ -943,22 +943,33 @@ holds the rest):
   arithmetic of its own (`p256.rs`: Montgomery multiplication, constants
   derived from the moduli at compile time, Jacobian points), SHA-256's HMAC and
   key derivation, and AES-CMAC. The password element is found by hunting and
-  pecking (all 40 tries always made); commit and confirm give both sides the
+  pecking (all 40 tries always made), or by hash-to-element where the network
+  says it takes H2E in an RSN extension element: a PT computed once from the
+  SSID and password (HKDF, two field elements mapped by simplified SWU), then
+  PT times a scalar from the two addresses, commits marked with status 126.
+  The station always says it takes H2E when associating, so an access point
+  that offers it refuses one that came by hunting and pecking (its RSNXE was
+  stripped: a downgrade). Commit and confirm give both sides the
   PMK, which an eavesdropper cannot test passwords against offline. The 4-way
   handshake takes the suite: under SAE its PTK comes from the SHA-256 KDF, its
   MICs are AES-CMAC (key descriptor version 0) and message 3 also delivers
   the integrity group key. Management frames are protected: once keyed, the
   station obeys a deauthentication or disassociation only if it comes sealed
-  under the temporal key (CCMP now seals management frames too). The station
+  under the temporal key (CCMP now seals management frames too), and one to
+  every station only with a valid BIP-CMAC-128 MMIE under the integrity group
+  key and a packet number above the last (the IGTK KDE carries it, so a
+  rejoin cannot be replayed into). The station
   prefers SAE where an access point offers both. Host tests check P-256
   against known multiples of the generator, HMAC-SHA256 and CMAC against
   their RFCs, SAE peers agreeing (and refusing another password, a reflected
   commit, a bad group, scalar or element), joins by SAE over a clean and a
-  lossy channel, transition mode, and forged versus sealed
-  deauthentications. In `wifi-test` a second, WPA3-only access point serves
-  the same network: the client joins it after the WPA2 checks, the harness
-  forges an unprotected deauthentication, and the station ignores it and
-  pings on.
+  lossy channel, transition mode, by H2E (and a stripped RSNXE caught as a
+  downgrade), forged versus sealed deauthentications, and BIP refusing a
+  forged, wrong-key or replayed MMIE. In `wifi-test` a second, WPA3-only
+  access point, taking H2E, serves the same network: the client joins it by
+  hash-to-element after the WPA2 checks, the harness forges an unprotected
+  deauthentication to it and two to every station (no MMIE, then an MMIE
+  under a wrong key), and the station ignores all three and pings on.
 - Surveying the networks in range: the station's `survey` sends probe
   requests for any SSID (two, 200 ms apart) and for 400 ms records every
   beacon and probe response it hears, linked or not: BSSID, SSID, channel, the

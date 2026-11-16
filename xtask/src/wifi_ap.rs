@@ -11,8 +11,9 @@
 //!
 //! A second access point, WPA3-only (SAE, management frames protected),
 //! serves the same network as "superior-wpa3": once a station has joined
-//! it, it is sent a forged (unprotected) deauthentication, which it must
-//! ignore. An open network beacons too, on another channel and fainter,
+//! it, it is sent a forged (unprotected) deauthentication, and two to
+//! every station (one with no MMIE, one with a wrong MIC: BIP), which it
+//! must ignore. An open network beacons too, on another channel and fainter,
 //! for the station's survey. Every datagram to the radio starts with the
 //! signal strength it is "heard" at (dBm, one signed byte), as a real
 //! radio reports it.
@@ -107,6 +108,8 @@ pub struct Seen {
     /// The WPA3 access point: the station keyed by SAE, frames carried
     /// from it, forged deauthentications sent, frames refused.
     pub wpa3_keyed: AtomicBool,
+    /// Whether that SAE exchange was by hash-to-element.
+    pub wpa3_h2e: AtomicBool,
     pub wpa3_from_station: AtomicU64,
     pub forged_deauths: AtomicU64,
     pub wpa3_refused: AtomicU64,
@@ -130,7 +133,7 @@ pub fn start(stop: Arc<AtomicBool>, seen: Arc<Seen>) -> Result<JoinHandle<()>, S
     }
     Ok(std::thread::spawn(move || {
         let mut ap = AccessPoint::new(BSSID, SSID, PASSPHRASE, gtk, seed);
-        let mut ap3 = AccessPoint::new(WPA3_BSSID, WPA3_SSID, PASSPHRASE, gtk3, seed3).offering(false, true);
+        let mut ap3 = AccessPoint::new(WPA3_BSSID, WPA3_SSID, PASSPHRASE, gtk3, seed3).offering(false, true).hash_to_element();
         let (mut next_rekey, mut rekeyings, mut group_rekeys) = (REKEY_EVERY, 0usize, 0);
         let started = Instant::now();
         let radio = ("127.0.0.1", RADIO_PORT);
@@ -209,6 +212,7 @@ pub fn start(stop: Arc<AtomicBool>, seen: Arc<Seen>) -> Result<JoinHandle<()>, S
             seen.group_rekeys.store(ap.group_rekeys as u64, Ordering::Relaxed);
             seen.refused.store(ap.refused, Ordering::Relaxed);
             if ap3.peer() == Peer::Up && !seen.wpa3_keyed.swap(true, Ordering::Relaxed) {
+                seen.wpa3_h2e.store(ap3.station_used_h2e(), Ordering::Relaxed);
                 // Keyed by SAE: a deauthentication forged in its name,
                 // unprotected, which the station must not obey.
                 let mut f = [0u8; 26];
@@ -216,6 +220,18 @@ pub fn start(stop: Arc<AtomicBool>, seen: Arc<Seen>) -> Result<JoinHandle<()>, S
                 f[n..n + 2].copy_from_slice(&[7, 0]);
                 out3.push(f.to_vec());
                 seen.forged_deauths.fetch_add(1, Ordering::Relaxed);
+                // And two to every station: one with no MMIE, one whose
+                // MMIE is under a key the station does not have (BIP).
+                let mut g = [0u8; 64];
+                let bc = superior_wifi::frame::BROADCAST;
+                let n = superior_wifi::frame::header(&mut g, superior_wifi::frame::DEAUTH, 0, &bc, &WPA3_BSSID, &WPA3_BSSID, 0);
+                g[n..n + 2].copy_from_slice(&[7, 0]);
+                out3.push(g[..n + 2].to_vec());
+                let forged = superior_wifi::handshake::Igtk { key: [0x42; 16], ..ap3.igtk() };
+                if let Some(m) = superior_wifi::bip::protect(&forged, ap3.ipn() + 1, &mut g, n + 2) {
+                    out3.push(g[..m].to_vec());
+                }
+                seen.forged_deauths.fetch_add(2, Ordering::Relaxed);
             }
             seen.wpa3_refused.store(ap3.refused, Ordering::Relaxed);
             for (frames, signal) in [(out, SIGNAL), (out3, WPA3_SIGNAL)] {
