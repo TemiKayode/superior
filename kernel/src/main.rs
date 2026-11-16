@@ -23,6 +23,7 @@ mod arch;
 #[path = "arch/x86_64/mod.rs"]
 mod arch;
 
+mod aml;
 mod entropy;
 mod rtc;
 mod iommu;
@@ -308,7 +309,7 @@ fn start_component_manager() -> Result<(), &'static str> {
             Capability::new(Object::Irq { line }, rw),
         )
     });
-    let intx = intx.chain([(root::PCI_IO as usize, arch::pci_io_cap())]);
+    let intx = intx.chain(arch::pci_io_cap().map(|c| (root::PCI_IO as usize, c)));
     let spare = *SPARE.lock();
     let spare = spare.0[..spare.1].iter().enumerate().map(|(k, &(base, size_bits))| {
         (

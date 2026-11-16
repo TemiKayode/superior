@@ -1,8 +1,20 @@
 //! The architected generic timer: the EL1 virtual timer, a private
-//! interrupt (PPI 11, ID 27), re-armed every tick.
+//! interrupt (PPI 11, ID 27, unless the firmware says otherwise), re-armed
+//! every tick.
+
+use core::sync::atomic::{AtomicU32, Ordering};
 
 pub const TICK_HZ: u32 = 100;
-pub const INTID: u32 = 27;
+static INTID: AtomicU32 = AtomicU32::new(27);
+
+/// The timer's interrupt ID.
+pub fn intid() -> u32 {
+    INTID.load(Ordering::Relaxed)
+}
+
+pub fn set_intid(id: u32) {
+    INTID.store(id, Ordering::Relaxed);
+}
 
 static mut INTERVAL: u64 = 0;
 

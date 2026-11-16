@@ -22,6 +22,7 @@ mod fdt;
 mod gic;
 #[path = "smmu.rs"]
 pub mod iommu;
+mod platform;
 pub mod qemu;
 pub mod serial;
 mod timer;
@@ -38,9 +39,6 @@ use superior_objects::cap::{Capability, Object, Rights};
 
 pub const NAME: &str = "aarch64";
 
-/// The PL011's register page and its interrupt (SPI 1).
-const UART_BASE: u64 = 0x0900_0000;
-const UART_IRQ: u8 = 33;
 /// Where QEMU puts the device tree for a bare-metal image.
 const DTB_DEFAULT: u64 = 0x4000_0000;
 const BOOT_STACK_SIZE: usize = 128 * 1024;
@@ -49,17 +47,13 @@ const PSCI_CPU_ON: u64 = 0xc400_0003;
 /// The firmware's device tree, for drivers that look themselves up later
 /// (none when the machine is described by ACPI).
 static DTB: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-/// The machine is described by ACPI: the SMMU, if any (registers, and its
-/// event interrupt ID or 0), as its IORT gives it.
-static ACPI: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-static ACPI_SMMU: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-static ACPI_SMMU_IRQ: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-/// PSCI is called by `smc`, not `hvc`.
-static PSCI_SMC: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-/// CPUs to bring up at most: ACPI's MADT says how many there are.
-static CPU_LIMIT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(MAX_CPUS);
-/// QEMU `virt`'s ECAM with `highmem=off`: the kernel hands it out as it is.
-const ECAM_BASE: u64 = 0x3f00_0000;
+/// The machine, as the firmware describes it: set at boot, before the
+/// console is up.
+static PLATFORM: spin::Once<platform::Platform> = spin::Once::new();
+
+fn platform() -> &'static platform::Platform {
+    PLATFORM.get().expect("the machine is read at boot")
+}
 
 /// User space is about to start. Nothing to hand over: QEMU's `virt`
 /// machine boots with no framebuffer, so the log is on the PL011 alone.
@@ -67,16 +61,11 @@ pub fn console_hand_over() {}
 
 /// Finds and turns on the IOMMU, if the machine has one.
 pub fn iommu_init() -> Option<&'static str> {
-    use core::sync::atomic::Ordering::Relaxed;
-    if ACPI.load(Relaxed) {
-        let base = ACPI_SMMU.load(Relaxed);
-        let irq = ACPI_SMMU_IRQ.load(Relaxed);
-        if base == 0 {
-            return None;
-        }
-        return iommu::init(base, (irq != 0).then_some(irq));
+    let (base, irq) = platform().smmu?;
+    if !vm::map_device(base) {
+        kprintln!("[warn] IOMMU: the SMMUv3 at {base:#x} is where the kernel cannot map it");
+        return None;
     }
-    let (base, irq) = fdt::find_device(DTB.load(Relaxed), b"arm,smmu-v3")?;
     iommu::init(base, irq)
 }
 
@@ -121,7 +110,7 @@ pub fn send_ipi(cpu: usize, ipi: Ipi) {
 /// Starts the other CPUs, one at a time, until PSCI says there are no
 /// more (or [`MAX_CPUS`]). Returns how many CPUs are online.
 pub fn start_secondaries() -> usize {
-    let limit = CPU_LIMIT.load(core::sync::atomic::Ordering::Relaxed).min(MAX_CPUS);
+    let limit = platform().cpus.unwrap_or(MAX_CPUS).min(MAX_CPUS);
     for cpu in 1..limit {
         let r = psci(PSCI_CPU_ON, cpu as u64, ap_start as *const () as u64, cpu as u64);
         if r != 0 {
@@ -142,7 +131,7 @@ pub fn start_secondaries() -> usize {
 /// A PSCI call, by the conduit the firmware's description names.
 fn psci(function: u64, a1: u64, a2: u64, a3: u64) -> i64 {
     let r: i64;
-    if PSCI_SMC.load(core::sync::atomic::Ordering::Relaxed) {
+    if platform().psci_smc {
         // SAFETY: a PSCI call, which the caller makes for its own ends;
         // the firmware may clobber x0 to x17.
         unsafe {
@@ -190,7 +179,7 @@ extern "C" fn ap_main(cpu: u64) -> ! {
     exceptions::init();
     gic::init_cpu(cpu as usize);
     timer::init_cpu();
-    gic::unmask(timer::INTID);
+    gic::unmask(timer::intid());
     smp::ONLINE.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
     crate::task::start()
 }
@@ -357,29 +346,59 @@ core::arch::global_asm!(
 
 #[no_mangle]
 extern "C" fn kernel_main(dtb: u64, from_el2: u64) -> ! {
-    serial::init();
+    // The machine first, so the console is known: from the device tree,
+    // or the ACPI tables the UEFI loader points to. Nothing is printed
+    // before the console is up.
+    let boot = if fdt::valid(dtb) { dtb } else { DTB_DEFAULT };
+    let rsdp = fdt::chosen_u64(boot, b"superior,acpi-rsdp");
+    let named = fdt::chosen_u64(boot, b"superior,device-tree");
+    let devices = match named {
+        Some(d) if fdt::valid(d) => d,
+        Some(_) => 0,
+        None if rsdp.is_some() => 0,
+        None => boot,
+    };
+    DTB.store(devices, core::sync::atomic::Ordering::Relaxed);
+    let tables = rsdp.map(acpi::read);
+    let p = *PLATFORM.call_once(|| match &tables {
+        Some(Ok(m)) => platform::Platform::from_acpi(m),
+        Some(Err(_)) => platform::Platform { source: "ACPI", ..Default::default() },
+        None => platform::Platform::from_device_tree(devices),
+    });
+    if let Some((base, _)) = p.uart {
+        if vm::map_device(base) {
+            serial::init(base);
+        }
+    }
     crate::banner();
     exceptions::init();
     if from_el2 != 0 {
         kprintln!("[ok] entered at EL2: set EL1 up, with nothing trapped, and stepped down to it");
     }
     kprintln!("[ok] MMU on; exception vectors installed");
-
-    let boot = if fdt::valid(dtb) { dtb } else { DTB_DEFAULT };
-    // From the UEFI loader: where the firmware's description is.
-    let rsdp = fdt::chosen_u64(boot, b"superior,acpi-rsdp");
-    let devices = match fdt::chosen_u64(boot, b"superior,device-tree") {
-        Some(d) if fdt::valid(d) => d,
-        Some(d) => panic!("no device tree at {d:#x}, where the loader says"),
-        None if rsdp.is_some() => 0,
-        None => boot,
-    };
-    DTB.store(devices, core::sync::atomic::Ordering::Relaxed);
-    // The device tree's PSCI node says how PSCI is called (ACPI's FADT
-    // does, below).
-    if fdt::device_prop_is(devices, b"arm,psci-0.2", b"method", b"smc") {
-        PSCI_SMC.store(true, core::sync::atomic::Ordering::Relaxed);
+    if let Some(d) = named.filter(|_| devices == 0) {
+        panic!("no device tree at {d:#x}, where the loader says");
     }
+    if let Some(Err(e)) = &tables {
+        panic!("ACPI: {e}");
+    }
+    if let Some(what) = p.missing() {
+        panic!("the machine ({}): {what}", p.source);
+    }
+    if let Some(Ok(m)) = &tables {
+        kprintln!(
+            "[ok] ACPI (RSDP at {:#x}): {} CPUs (MADT), {}",
+            m.rsdp,
+            m.cpus,
+            match m.psci {
+                Some(true) => "PSCI by hvc (FADT)",
+                Some(false) => "PSCI by smc (FADT)",
+                None => "no PSCI (FADT): only this one started",
+            }
+        );
+    }
+    report_machine(&p);
+
     let mut ram = [(0u64, 0u64); fdt::MAX_RANGES];
     let n = fdt::memory(boot, &mut ram).expect("no usable device tree");
     let kernel_end = core::ptr::addr_of!(__kernel_end) as u64;
@@ -417,12 +436,17 @@ extern "C" fn kernel_main(dtb: u64, from_el2: u64) -> ! {
         }
     }
     crate::report_memory(&mem);
-    if let Some(rsdp) = rsdp {
-        use_acpi(&acpi::read(rsdp).unwrap_or_else(|e| panic!("ACPI: {e}")));
+    let (gicd, gicr) = (p.gicd.unwrap_or(0), p.gicr.unwrap_or(0));
+    for base in [gicd, gicr].into_iter().chain(p.its) {
+        if !vm::map_device(base) {
+            panic!("the GIC's registers at {base:#x} are where the kernel cannot map them");
+        }
     }
+    gic::set_bases(gicd, gicr, p.its);
+    timer::set_intid(p.timer.unwrap_or(27));
     gic::init();
     let hz = timer::init();
-    gic::unmask(timer::INTID);
+    gic::unmask(timer::intid());
     kprintln!(
         "[ok] GICv3{}, generic timer: {} kHz counter, {} Hz tick",
         if gic::its_present() { " with ITS" } else { "" },
@@ -432,68 +456,52 @@ extern "C" fn kernel_main(dtb: u64, from_el2: u64) -> ! {
     crate::kernel_start(mem.untyped_caps)
 }
 
-/// Takes what ACPI says of the machine: the CPUs to start, PSCI and the
-/// SMMU; and checks the rest is where the kernel drives it (QEMU `virt`'s
-/// layout, which the kernel has fixed: the GIC, the timer, the PL011 and
-/// ECAM), refusing to go on if not.
-fn use_acpi(m: &acpi::Machine) {
-    use core::sync::atomic::Ordering::Relaxed;
-    if !matches!(m.gic_version, 0 | 3) {
-        panic!("ACPI: a GICv{}, not the GICv3 the kernel drives", m.gic_version);
-    }
-    if m.gicd != gic::GICD || m.gicr != Some(gic::GICR) || m.its.is_some_and(|its| its != gic::GITS) {
-        panic!(
-            "ACPI: the GIC's distributor at {:#x}, redistributors at {:#x?}, ITS at {:#x?}; the kernel drives them at {:#x}, {:#x}, {:#x} only",
-            m.gicd, m.gicr, m.its, gic::GICD, gic::GICR, gic::GITS
-        );
-    }
-    if m.timer != Some(timer::INTID) {
-        panic!("ACPI: the virtual timer's interrupt is {:?} (GTDT), not {}", m.timer, timer::INTID);
-    }
-    let Some((kind, uart, uart_irq)) = m.uart else {
-        panic!("ACPI: no serial console (SPCR)");
-    };
-    // SPCR interface types 3 (PL011) and 0x0e (SBSA generic UART, a
-    // PL011 subset).
-    if !matches!(kind, 3 | 0x0e) || uart != UART_BASE || uart_irq != UART_IRQ as u32 {
-        panic!(
-            "ACPI: the serial console is type {kind:#x} at {uart:#x}, interrupt {uart_irq}; the kernel drives a PL011 at {UART_BASE:#x}, interrupt {UART_IRQ}"
-        );
-    }
-    let Some((ecam, first_bus, last_bus)) = m.ecam else {
-        panic!("ACPI: no PCI Express configuration space (MCFG)");
-    };
-    if ecam != ECAM_BASE || first_bus != 0 || last_bus < 15 {
-        panic!("ACPI: ECAM at {ecam:#x}, buses {first_bus} to {last_bus}; the kernel drives buses 0 to 15 at {ECAM_BASE:#x}");
-    }
-    ACPI.store(true, Relaxed);
-    if let Some((base, irq)) = m.smmu {
-        ACPI_SMMU.store(base, Relaxed);
-        ACPI_SMMU_IRQ.store(irq.unwrap_or(0), Relaxed);
-    }
-    PSCI_SMC.store(m.psci == Some(false), Relaxed);
-    CPU_LIMIT.store(if m.psci.is_some() { m.cpus } else { 1 }, Relaxed);
+/// One line on where everything is, as the firmware said.
+fn report_machine(p: &platform::Platform) {
+    let (uart, uart_irq) = p.uart.unwrap_or_default();
+    let (mem, mem_bits) = p.pci_mem.unwrap_or_default();
     kprintln!(
-        "[ok] ACPI (RSDP at {:#x}): {} CPUs (MADT){}; GICv3 at {:#x}{}; timer interrupt {} (GTDT); PL011 at {:#x} (SPCR); ECAM at {:#x}, buses {}-{} (MCFG)",
-        m.rsdp,
-        m.cpus,
-        match m.psci {
-            Some(true) => ", PSCI by hvc (FADT)",
-            Some(false) => ", PSCI by smc (FADT)",
-            None => ", no PSCI (FADT): only this one started",
+        "[ok] machine ({}): GICv3 at {:#x}, redistributors at {:#x}, {}; timer interrupt {}; PL011 at {:#x}, interrupt {}; PCI: ECAM at {:#x}, memory at {:#x} ({} MiB), {}",
+        p.source,
+        p.gicd.unwrap_or(0),
+        p.gicr.unwrap_or(0),
+        match p.its {
+            Some(its) => labelled_hex("ITS at ", its),
+            None => labelled_hex("no ITS", u64::MAX),
         },
-        m.gicd,
-        if m.its.is_some() { ", ITS" } else { ", no ITS" },
-        timer::INTID,
+        p.timer.unwrap_or(0),
         uart,
-        ecam,
-        first_bus,
-        last_bus
+        uart_irq,
+        p.ecam.unwrap_or(0),
+        mem,
+        (1u64 << mem_bits) >> 20,
+        match p.pci_io {
+            Some((io, _)) => labelled_hex("I/O ports at ", io),
+            None => labelled_hex("no I/O ports", u64::MAX),
+        }
     );
-    match m.smmu {
-        Some((base, Some(irq))) => kprintln!("[ok] ACPI: SMMUv3 at {base:#x}, event interrupt {irq}; stream IDs are requester IDs (IORT)"),
-        Some((base, None)) => kprintln!("[ok] ACPI: SMMUv3 at {base:#x}, no event interrupt; stream IDs are requester IDs (IORT)"),
-        None => kprintln!("[ok] ACPI: no SMMU (IORT)"),
+    match p.smmu {
+        Some((base, Some(irq))) => kprintln!("[ok] machine ({}): SMMUv3 at {base:#x}, event interrupt {irq}", p.source),
+        Some((base, None)) => kprintln!("[ok] machine ({}): SMMUv3 at {base:#x}, no event interrupt", p.source),
+        None => kprintln!("[ok] machine ({}): no SMMU", p.source),
+    }
+}
+
+/// `label` and `v` in hex (`label` alone if `v` is `u64::MAX`), for a log
+/// line, without the heap.
+fn labelled_hex(label: &'static str, v: u64) -> Hex {
+    Hex(label, v)
+}
+
+struct Hex(&'static str, u64);
+
+impl core::fmt::Display for Hex {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        if self.1 == u64::MAX {
+            f.write_str(self.0)
+        } else {
+            write!(f, "{}{:#x}", self.0, self.1)
+        }
     }
 }
 
@@ -503,12 +511,12 @@ pub fn console_caps() -> (Capability, Capability) {
     (
         Capability::new(
             Object::Frame {
-                paddr: UART_BASE,
+                paddr: platform().uart.unwrap_or_default().0,
                 size_bits: 12,
             },
             Rights::READ | Rights::WRITE | Rights::MAP,
         ),
-        Capability::new(Object::Irq { line: UART_IRQ }, Rights::READ | Rights::WRITE),
+        Capability::new(Object::Irq { line: uart_irq() }, Rights::READ | Rights::WRITE),
     )
 }
 
@@ -544,8 +552,7 @@ pub fn cycles() -> u64 {
 /// device tree has one.
 pub fn rtc_seconds() -> Option<u64> {
     let (base, _) = fdt::find_device(DTB.load(core::sync::atomic::Ordering::Relaxed), b"arm,pl031")?;
-    // Devices below 1 GiB are identity-mapped as device memory.
-    if base >= 0x4000_0000 {
+    if !vm::map_device(base) {
         return None;
     }
     // SAFETY: the PL031's data register (offset 0), read-only, at the
@@ -586,8 +593,13 @@ fn msi_lines() -> core::ops::Range<u8> {
     gic::MSI_LINE_BASE..gic::MSI_LINE_BASE + count
 }
 
+/// The console's interrupt line (its ID, below 256: checked at boot).
+fn uart_irq() -> u8 {
+    platform().uart.unwrap_or_default().1 as u8
+}
+
 pub fn irq_routable(line: u8) -> bool {
-    line == UART_IRQ || msi_lines().contains(&line) || INTX_LINES.contains(&line)
+    line == uart_irq() || msi_lines().contains(&line) || INTX_LINES.contains(&line)
 }
 
 /// QEMU `virt`'s four PCI interrupt wires: shared interrupts 3 to 6
@@ -596,16 +608,12 @@ pub fn irq_routable(line: u8) -> bool {
 /// `(device + pin - 1) % 4`.
 const INTX_LINES: [u8; 4] = [35, 36, 37, 38];
 
-/// I/O ports for PCI BARs: QEMU `virt`'s window of device memory that
-/// stands for ports 0 to 0xffff, just below the ECAM window.
-pub fn pci_io_cap() -> Capability {
-    Capability::new(
-        Object::DeviceUntyped {
-            base: 0x3eff_0000,
-            size_bits: 16,
-        },
-        Rights::ALL,
-    )
+/// I/O ports for PCI BARs: the window of device memory that stands for
+/// ports from 0, as the firmware says (QEMU `virt`'s is just below its
+/// low ECAM window); none without one.
+pub fn pci_io_cap() -> Option<Capability> {
+    let (base, size_bits) = platform().pci_io?;
+    Some(Capability::new(Object::DeviceUntyped { base, size_bits }, Rights::ALL))
 }
 
 /// The legacy PCI interrupt lines.
@@ -629,21 +637,22 @@ pub fn msi_message(line: u8, source: Option<u16>) -> Option<(u64, u64)> {
 
 /// For the root task's PCI bus server: the ECAM configuration window
 /// (buses 0-15), a device-memory window to assign BARs from, and the MSI
-/// lines. These are QEMU `virt`'s addresses with `highmem=off`, which keeps
-/// ECAM below 4 GiB: ECAM at 0x3f00_0000, PCI memory from 0x1000_0000.
+/// lines, where the firmware says they are (checked at boot).
 pub fn pci_caps() -> (Capability, Capability, core::ops::Range<u8>) {
+    let p = platform();
+    let (mem, mem_bits) = p.pci_mem.unwrap_or_default();
     (
         Capability::new(
             Object::DeviceUntyped {
-                base: ECAM_BASE,
+                base: p.ecam.unwrap_or(0),
                 size_bits: 24,
             },
             Rights::ALL,
         ),
         Capability::new(
             Object::DeviceUntyped {
-                base: 0x1000_0000,
-                size_bits: 28,
+                base: mem,
+                size_bits: mem_bits,
             },
             Rights::ALL,
         ),

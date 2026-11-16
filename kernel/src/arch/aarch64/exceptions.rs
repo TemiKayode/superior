@@ -320,7 +320,7 @@ extern "C" fn irq(frame: &mut UserFrame, _kind: u64) {
     let Some(id) = super::gic::acknowledge() else {
         return; // spurious
     };
-    if id == super::timer::INTID {
+    if id == super::timer::intid() {
         super::timer::rearm();
         super::gic::end_of_interrupt(id);
         crate::task::handle_timer(frame);

@@ -20,7 +20,7 @@
 //! - The MADT's interrupt source overrides: which GSI each ISA IRQ arrives
 //!   on, and how it signals.
 //! - The DSDT (through the FADT): the PCI root bridge's `_PRT`, which says
-//!   which GSI each slot's interrupt pins reach ([`super::aml`]).
+//!   which GSI each slot's interrupt pins reach ([`crate::aml`]).
 
 use super::aml;
 use super::vm::phys_ptr;

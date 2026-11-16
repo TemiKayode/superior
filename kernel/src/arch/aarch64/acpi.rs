@@ -10,12 +10,18 @@
 //! - MCFG: PCI Express configuration space (ECAM);
 //! - IORT: the SMMUv3, its interrupt, and how requester IDs reach it as
 //!   stream IDs;
-//! - FADT: whether PSCI is there, and called by `hvc` or `smc`.
+//! - FADT: whether PSCI is there, and called by `hvc` or `smc`; and the
+//!   DSDT, whose PCI root bridge's `_CRS` gives the windows of memory and
+//!   I/O ports it decodes ([`crate::aml`]).
 //!
 //! Every table must lie in the RAM the kernel maps (the second GiB), have
 //! a valid checksum and be long enough for what is read of it.
 
 use super::vm::KERNEL_RAM;
+use crate::aml::Window;
+
+/// Root bridge windows read at most.
+pub const MAX_WINDOWS: usize = 8;
 
 /// What the tables say.
 pub struct Machine {
@@ -40,6 +46,9 @@ pub struct Machine {
     pub ecam: Option<(u64, u8, u8)>,
     /// The SMMUv3: registers and event queue interrupt ID.
     pub smmu: Option<(u64, Option<u32>)>,
+    /// The PCI root bridge's windows (DSDT), and how many.
+    pub windows: [Window; MAX_WINDOWS],
+    pub window_count: usize,
 }
 
 fn byte(a: u64) -> u8 {
@@ -131,6 +140,8 @@ pub fn read(rsdp: u64) -> Result<Machine, &'static str> {
         uart: None,
         ecam: None,
         smmu: None,
+        windows: [Window::default(); MAX_WINDOWS],
+        window_count: 0,
     };
 
     // MADT: interrupt controller structures from offset 44.
@@ -190,6 +201,21 @@ pub fn read(rsdp: u64) -> Result<Machine, &'static str> {
     if let Some((fadt, len)) = tables.find(b"FACP")? {
         let flags = if len >= 131 { u16_at(fadt + 129) } else { 0 };
         m.psci = (flags & 1 != 0).then_some(flags & 2 != 0);
+        // The DSDT: X_DSDT (64-bit), else DSDT.
+        let x = if len >= 148 { u64_at(fadt + 140) } else { 0 };
+        let dsdt = if x != 0 { x } else { u32_at(fadt + 40) };
+        if dsdt != 0 {
+            if !mapped(dsdt, 36) || (0..4).any(|i| byte(dsdt + i) != b"DSDT"[i as usize]) {
+                return Err("no DSDT where the FADT says");
+            }
+            let len = u32_at(dsdt + 4);
+            if len < 36 || !mapped(dsdt, len) || !sums_to_zero(dsdt, len) {
+                return Err("the DSDT's length or checksum is wrong");
+            }
+            // SAFETY: the DSDT, `len` bytes in the kernel's RAM.
+            let bytes = unsafe { core::slice::from_raw_parts(dsdt as *const u8, len as usize) };
+            m.window_count = crate::aml::root_windows(bytes, &mut m.windows).unwrap_or(0);
+        }
     }
 
     // GTDT: the EL1 virtual timer's GSIV.

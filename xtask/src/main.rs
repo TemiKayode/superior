@@ -11,6 +11,8 @@
 //!   cargo xtask boot-test [arch]   just the boot self-tests
 //!   cargo xtask shell-test [arch]  just the shell session
 //!   cargo xtask el2-test           AArch64 entered at EL2 (-kernel and UEFI)
+//!   cargo xtask layout-test        AArch64 with ECAM moved (highmem=on): the
+//!                                  driver test from the device tree and ACPI
 //!   cargo xtask cm-test [arch]     the Component Manager's boot test: boot
 //!                                  `boot/test.manifest` and check the log
 //!   cargo xtask supervise-test [arch]  supervision: boot
@@ -141,6 +143,8 @@ struct Image {
     /// AArch64: the CPUs have EL2 (`virtualization=on`), where QEMU's
     /// `-kernel`, edk2 and PSCI start them.
     el2: bool,
+    /// AArch64: `highmem=on`, which moves PCI's ECAM above 256 GiB.
+    highmem: bool,
     /// QEMU's `-smp` in place of the usual CPU count (a CPU topology).
     smp: Option<&'static str>,
 }
@@ -212,6 +216,7 @@ fn main() -> ExitCode {
             .and_then(|_| uefi_test(Arch::X86_64))
             .and_then(|_| uefi_test(Arch::Aarch64))
             .and_then(|_| el2_test())
+            .and_then(|_| layout_test())
             .and_then(|_| console_test())
             .and_then(|_| sel4_image())
             .and_then(|img| shell_session(&img)),
@@ -219,6 +224,7 @@ fn main() -> ExitCode {
         Some("boot-test") => image(true, arch).and_then(|img| boot(&img, true)),
         Some("shell-test") => image(false, arch).and_then(|img| shell_session(&img)),
         Some("el2-test") => el2_test(),
+        Some("layout-test") => layout_test(),
         Some("uefi-test") => uefi_test(arch),
         Some("console-test") => console_test(),
         Some("cm-test") => image_with(false, arch, "test").and_then(|img| cm_test(&img)),
@@ -867,6 +873,7 @@ fn image_sealed(
         uefi: false,
         acpi: false,
         el2: false,
+        highmem: false,
         smp: None,
     })
 }
@@ -970,6 +977,7 @@ fn sel4_image() -> Result<Image, String> {
         uefi: false,
         acpi: false,
         el2: false,
+        highmem: false,
         smp: None,
     })
 }
@@ -1241,6 +1249,7 @@ fn qemu_command(img: &Image) -> Command {
             } else {
                 machine.to_string()
             };
+            let machine = if img.highmem { machine.replace("highmem=off", "highmem=on") } else { machine };
             let machine = machine.as_str();
             // The radio's test wants RNDR (FEAT_RNG), which "max" has.
             let cpu = if img.radio { "max" } else { "cortex-a72" };
@@ -5655,8 +5664,9 @@ fn uefi_test_aarch64() -> Result<(), String> {
                 "Superior microkernel",
                 "[ok] MMU on; exception vectors installed",
                 "[ok] ACPI (RSDP at ",
-                "2 CPUs (MADT), PSCI by hvc (FADT); GICv3 at 0x8000000, ITS; timer interrupt 27 (GTDT); PL011 at 0x9000000 (SPCR); ECAM at 0x3f000000, buses 0-15 (MCFG)",
-                "[ok] ACPI: no SMMU (IORT)",
+                "2 CPUs (MADT), PSCI by hvc (FADT)",
+                "[ok] machine (ACPI): GICv3 at 0x8000000, redistributors at 0x80a0000, ITS at 0x8080000; timer interrupt 27; PL011 at 0x9000000, interrupt 33; PCI: ECAM at 0x3f000000, memory at 0x10000000 (256 MiB), I/O ports at 0x3eff0000",
+                "[ok] machine (ACPI): no SMMU",
                 "[ok] 2 CPUs online",
                 "superior> ",
             ]
@@ -5666,6 +5676,7 @@ fn uefi_test_aarch64() -> Result<(), String> {
                 "loader: leaving boot services; the kernel's RAM is what the final memory map leaves free",
                 "Superior microkernel",
                 "[ok] MMU on; exception vectors installed",
+                "[ok] machine (device tree): GICv3 at 0x8000000, redistributors at 0x80a0000, ITS at 0x8080000; timer interrupt 27; PL011 at 0x9000000, interrupt 33; PCI: ECAM at 0x3f000000, memory at 0x10000000 (256 MiB), I/O ports at 0x3eff0000",
                 "[ok] 2 CPUs online",
                 "superior> ",
             ]
@@ -5680,7 +5691,7 @@ fn uefi_test_aarch64() -> Result<(), String> {
         let mut img = uefi_image(Arch::Aarch64, "drivers")?;
         img.acpi = acpi;
         let out = drivers_test_log(&img)?;
-        if acpi && !out.contains("[ok] ACPI: SMMUv3 at 0x9050000, event interrupt 106; stream IDs are requester IDs (IORT)") {
+        if acpi && !out.contains("[ok] machine (ACPI): SMMUv3 at 0x9050000, event interrupt 106") {
             return Err("UEFI test (aarch64, ACPI): the SMMU was not found from the IORT".into());
         }
     }
@@ -5735,13 +5746,35 @@ fn el2_test() -> Result<(), String> {
             entered,
         ];
         if acpi {
-            steps.push(", PSCI by smc (FADT);");
+            steps.push(", PSCI by smc (FADT)");
         }
         steps.extend(["[ok] 2 CPUs online", "superior> "]);
         check_log(&format!("EL2 test (UEFI, {how})"), out, &steps)?;
         println!("== UEFI shell session at EL2 passed ({how})");
     }
     println!("== EL2 test passed (aarch64)");
+    Ok(())
+}
+
+/// AArch64 with QEMU `virt`'s `highmem=on`, which puts PCI's ECAM at
+/// 0x40_1000_0000 rather than below 4 GiB: the kernel must take it from the
+/// firmware, map it and hand it to the bus server there. The driver
+/// framework test, from QEMU's device tree (`-kernel`) and from ACPI's MCFG
+/// (UEFI); in both the rest of the machine is where it always is.
+fn layout_test() -> Result<(), String> {
+    for acpi in [false, true] {
+        let how = if acpi { "ACPI" } else { "device tree" };
+        let mut img = if acpi { uefi_image(Arch::Aarch64, "drivers")? } else { image_with(false, Arch::Aarch64, "drivers")? };
+        img.acpi = acpi;
+        img.highmem = true;
+        println!("== driver test with ECAM moved ({how})");
+        let out = drivers_test_log(&img)?;
+        let want = format!("[ok] machine ({how}): GICv3 at 0x8000000, redistributors at 0x80a0000, ITS at 0x8080000; timer interrupt 27; PL011 at 0x9000000, interrupt 33; PCI: ECAM at 0x4010000000, memory at 0x10000000 (256 MiB), I/O ports at 0x3eff0000");
+        if !out.contains(&want) {
+            return Err(format!("layout test ({how}): the kernel did not report the machine as {want:?}"));
+        }
+    }
+    println!("== layout test passed (aarch64)");
     Ok(())
 }
 

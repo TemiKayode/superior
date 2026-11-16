@@ -18,19 +18,39 @@ use superior_objects::abi::PCI_BUSES;
 use core::sync::atomic::{AtomicU64, Ordering};
 use spin::Mutex;
 
-pub(super) const GICD: u64 = 0x0800_0000;
-pub(super) const GITS: u64 = 0x0808_0000;
-/// CPU 0's redistributor: its control frame, then its SGI/PPI frame. The
-/// next CPU's follows ([`REDIST_STRIDE`] on).
-pub(super) const GICR: u64 = 0x080a_0000;
-const REDIST_STRIDE: u64 = 0x2_0000;
+/// The distributor, the first CPU's redistributor and the ITS (0 if
+/// none), as the firmware says, and the redistributors' stride.
+static GICD_BASE: AtomicU64 = AtomicU64::new(0);
+static GICR_BASE: AtomicU64 = AtomicU64::new(0);
+static GITS_BASE: AtomicU64 = AtomicU64::new(0);
+static STRIDE: AtomicU64 = AtomicU64::new(0x2_0000);
+/// Where the GIC is: before [`init`].
+pub(super) fn set_bases(gicd: u64, gicr: u64, its: Option<u64>) {
+    GICD_BASE.store(gicd, Ordering::Relaxed);
+    GICR_BASE.store(gicr, Ordering::Relaxed);
+    GITS_BASE.store(its.unwrap_or(0), Ordering::Relaxed);
+}
+
+fn gicd() -> u64 {
+    GICD_BASE.load(Ordering::Relaxed)
+}
+
+/// CPU 0's redistributor: its control frame, then its SGI/PPI frame (and,
+/// on a GICv4, two more). The next CPU's follows.
+fn gicr0() -> u64 {
+    GICR_BASE.load(Ordering::Relaxed)
+}
+
+fn gits() -> u64 {
+    GITS_BASE.load(Ordering::Relaxed)
+}
 /// The SGIs CPUs send each other: a kick, and a shootdown request.
 pub const KICK_SGI: u32 = 1;
 pub const SHOOTDOWN_SGI: u32 = 2;
 
 /// CPU `cpu`'s redistributor control frame and SGI/PPI frame.
 fn gicr(cpu: usize) -> u64 {
-    GICR + cpu as u64 * REDIST_STRIDE
+    gicr0() + cpu as u64 * STRIDE.load(Ordering::Relaxed)
 }
 
 fn sgi(cpu: usize) -> u64 {
@@ -68,7 +88,10 @@ const GITS_CREADR: u64 = 0x90;
 const GITS_BASER: u64 = 0x100;
 const GITS_QUIESCENT: u32 = 1 << 31;
 /// The register devices write event IDs to.
-pub const GITS_TRANSLATER: u64 = GITS + 0x1_0040;
+/// The ITS's translation register, which devices write MSIs to.
+fn translater() -> u64 {
+    gits() + 0x1_0040
+}
 
 /// Table and queue attributes: valid, inner write-back cacheable,
 /// inner-shareable.
@@ -165,20 +188,24 @@ fn dsb() {
 }
 
 pub fn init() {
+    // GICv4 redistributors have four 64 KiB frames, not two (VLPIS).
+    if read64(gicr0() + GICR_TYPER) & 2 != 0 {
+        STRIDE.store(0x4_0000, Ordering::Relaxed);
+    }
     // Distributor: off while shared interrupts are set up, all group 1,
     // all disabled, routed to CPU 0.
-    write32(GICD + GICD_CTLR, 0);
-    wait_rwp(GICD + GICD_CTLR);
+    write32(gicd() + GICD_CTLR, 0);
+    wait_rwp(gicd() + GICD_CTLR);
     for id in (32..MAX_SPI).step_by(32) {
-        write32(GICD + GICD_ICENABLER + id as u64 / 8, !0);
-        write32(GICD + GICD_IGROUPR + id as u64 / 8, !0);
+        write32(gicd() + GICD_ICENABLER + id as u64 / 8, !0);
+        write32(gicd() + GICD_IGROUPR + id as u64 / 8, !0);
     }
     for id in 32..MAX_SPI {
-        write8(GICD + GICD_IPRIORITYR + id as u64, 0x80);
-        write64(GICD + GICD_IROUTER + 8 * id as u64, 0);
+        write8(gicd() + GICD_IPRIORITYR + id as u64, 0x80);
+        write64(gicd() + GICD_IROUTER + 8 * id as u64, 0);
     }
-    write32(GICD + GICD_CTLR, GICD_CTLR_ARE | GICD_CTLR_GRP1);
-    wait_rwp(GICD + GICD_CTLR);
+    write32(gicd() + GICD_CTLR, GICD_CTLR_ARE | GICD_CTLR_GRP1);
+    wait_rwp(gicd() + GICD_CTLR);
     init_cpu(0);
     init_its();
 }
@@ -233,8 +260,11 @@ pub fn send_sgi(cpu: usize, id: u32) {
 /// LPIs and the ITS, if the machine has one; without, MSI lines raise
 /// nothing.
 fn init_its() {
-    let typer = read64(GITS + GITS_TYPER);
-    if typer == 0 || typer == u64::MAX || read64(GICR + GICR_TYPER) & 1 == 0 {
+    if gits() == 0 {
+        return; // the firmware lists none
+    }
+    let typer = read64(gits() + GITS_TYPER);
+    if typer == 0 || typer == u64::MAX || read64(gicr0() + GICR_TYPER) & 1 == 0 {
         return; // no ITS, or the redistributor has no LPIs
     }
     let (Some(prop), Some(pend), Some(cmdq)) = (
@@ -256,19 +286,19 @@ fn init_its() {
     zero(cmdq, 4096);
     dsb();
     write64(
-        GICR + GICR_PROPBASER,
+        gicr0() + GICR_PROPBASER,
         prop | RD_INNER_WB | SHAREABLE | (LPI_ID_BITS - 1),
     );
-    write64(GICR + GICR_PENDBASER, pend | RD_INNER_WB | SHAREABLE | 1 << 62);
-    write32(GICR + GICR_CTLR, read32(GICR + GICR_CTLR) | 1);
+    write64(gicr0() + GICR_PENDBASER, pend | RD_INNER_WB | SHAREABLE | 1 << 62);
+    write32(gicr0() + GICR_CTLR, read32(gicr0() + GICR_CTLR) | 1);
 
     // The ITS: off while its tables are set up.
-    write32(GITS + GITS_CTLR, 0);
-    while read32(GITS + GITS_CTLR) & GITS_QUIESCENT == 0 {
+    write32(gits() + GITS_CTLR, 0);
+    while read32(gits() + GITS_CTLR) & GITS_QUIESCENT == 0 {
         core::hint::spin_loop();
     }
     for n in 0..8 {
-        let reg = GITS + GITS_BASER + 8 * n;
+        let reg = gits() + GITS_BASER + 8 * n;
         let baser = read64(reg);
         let kind = (baser >> 56) & 7;
         if kind == 0 {
@@ -294,11 +324,11 @@ fn init_its() {
         }
     }
     // Physical target addresses, or processor numbers.
-    let rdbase = if typer & 1 << 19 != 0 { GICR } else { 0 };
+    let rdbase = if typer & 1 << 19 != 0 { gicr0() } else { 0 };
     RDBASE.store(rdbase, Ordering::Relaxed);
-    write64(GITS + GITS_CBASER, VALID | INNER_WB | SHAREABLE | cmdq);
-    write64(GITS + GITS_CWRITER, 0);
-    write32(GITS + GITS_CTLR, 1);
+    write64(gits() + GITS_CBASER, VALID | INNER_WB | SHAREABLE | cmdq);
+    write64(gits() + GITS_CWRITER, 0);
+    write32(gits() + GITS_CTLR, 1);
     PROP.store(prop, Ordering::Relaxed);
     CMDQ.store(cmdq, Ordering::Relaxed);
     let mut routes = ROUTES.lock();
@@ -321,9 +351,9 @@ fn command(routes: &mut Routes, cmds: &[[u64; 4]]) {
         routes.cmd_tail = (routes.cmd_tail + 32) % 4096;
     }
     dsb();
-    write64(GITS + GITS_CWRITER, routes.cmd_tail);
+    write64(gits() + GITS_CWRITER, routes.cmd_tail);
     loop {
-        let read = read64(GITS + GITS_CREADR);
+        let read = read64(gits() + GITS_CREADR);
         if read & 1 != 0 {
             panic!("the ITS stalled on a command at {:#x}", read & !0x1f);
         }
@@ -381,7 +411,7 @@ pub fn route(line: u8, source: Option<u16>) -> Option<(u64, u64)> {
         routes.line[event as usize] = Some(dev);
     }
     command(&mut routes, &cmds[..n]);
-    Some((GITS_TRANSLATER, event))
+    Some((translater(), event))
 }
 
 /// Unmaps device `dev` from the ITS: none of its writes raise anything.
@@ -424,16 +454,16 @@ pub fn enable_edge_spi(id: u32) {
     if !(32..MAX_SPI).contains(&id) {
         return;
     }
-    let reg = GICD + GICD_ICFGR + 4 * (id / 16) as u64;
+    let reg = gicd() + GICD_ICFGR + 4 * (id / 16) as u64;
     write32(reg, read32(reg) | 2 << (2 * (id % 16)));
-    write32(GICD + GICD_ISENABLER + 4 * (id / 32) as u64, 1 << (id % 32));
+    write32(gicd() + GICD_ISENABLER + 4 * (id / 32) as u64, 1 << (id % 32));
 }
 
 pub fn unmask(line: u32) {
     match line {
         0..32 => write32(sgi(super::cpu_id()) + GICD_ISENABLER, 1 << line),
         l if is_msi(l) => {} // LPIs stay enabled
-        l if l < MAX_SPI => write32(GICD + GICD_ISENABLER + 4 * (l / 32) as u64, 1 << (l % 32)),
+        l if l < MAX_SPI => write32(gicd() + GICD_ISENABLER + 4 * (l / 32) as u64, 1 << (l % 32)),
         _ => {}
     }
 }
@@ -442,7 +472,7 @@ pub fn mask(line: u32) {
     match line {
         0..32 => write32(sgi(super::cpu_id()) + GICD_ICENABLER, 1 << line),
         l if is_msi(l) => {}
-        l if l < MAX_SPI => write32(GICD + GICD_ICENABLER + 4 * (l / 32) as u64, 1 << (l % 32)),
+        l if l < MAX_SPI => write32(gicd() + GICD_ICENABLER + 4 * (l / 32) as u64, 1 << (l % 32)),
         _ => {}
     }
 }
@@ -467,5 +497,8 @@ pub fn end_of_interrupt(id: u32) {
 }
 
 /// The page holding the translation register, which every device's I/O
-/// address space maps so its MSI writes get through the SMMU.
-pub const MSI_DOORBELL: u64 = GITS_TRANSLATER;
+/// address space maps so its MSI writes get through the SMMU (none
+/// without an ITS).
+pub fn msi_doorbell() -> Option<u64> {
+    (gits() != 0).then(translater)
+}

@@ -148,8 +148,30 @@ fn alloc_frame() -> Option<u64> {
 
 /// Zeroes the 4 KiB frame at `pa`, so memory handed to a new owner never
 /// carries a previous owner's data.
-/// The kernel's pointer to physical address `pa`: RAM and devices below
-/// 1 GiB are identity-mapped.
+/// Maps the GiB holding device `pa` into the kernel's identity map, as
+/// device memory (the first GiB is from boot). False if it cannot be: in
+/// the GiB of RAM, or beyond the first 512 GiB, which one top-level entry
+/// covers.
+pub fn map_device(pa: u64) -> bool {
+    let i = (pa >> 30) as usize;
+    if i >= 512 || (KERNEL_RAM.start >> 30..KERNEL_RAM.end >> 30).contains(&(i as u64)) {
+        return false;
+    }
+    // SAFETY: the kernel's own table; an entry is only ever set from
+    // invalid, by the boot CPU before others start or under the
+    // scheduler's lock (rtc), and to the same block whoever sets it.
+    unsafe {
+        let l1 = &raw mut KERNEL_L1;
+        if (*l1).0[i] & VALID == 0 {
+            (*l1).0[i] = (i as u64) << 30 | KERNEL_DEVICE_BLOCK;
+            core::arch::asm!("dsb ishst", "isb", options(nostack));
+        }
+    }
+    true
+}
+
+/// The kernel's pointer to physical address `pa`: RAM and devices (those
+/// [`map_device`] has mapped) are identity-mapped.
 pub fn phys_ptr(pa: u64) -> *mut u8 {
     pa as *mut u8
 }

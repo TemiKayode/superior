@@ -198,8 +198,11 @@ pub fn sync_tables() {
 /// the function's MSI writes get through (the ITS then decides whether
 /// they raise anything).
 pub fn fixed_pages() -> &'static [u64] {
-    const PAGES: [u64; 1] = [gic::MSI_DOORBELL & !0xfff];
-    &PAGES
+    static PAGES: spin::Once<Option<[u64; 1]>> = spin::Once::new();
+    PAGES
+        .call_once(|| gic::msi_doorbell().map(|d| [d & !0xfff]))
+        .as_ref()
+        .map_or(&[], |p| &p[..])
 }
 
 /// Pages a function keeps using whatever it is given: none known here

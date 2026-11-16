@@ -1,6 +1,7 @@
 //! Just enough of ACPI's AML to find how the PCI root bridge's interrupt
-//! pins reach the I/O APIC: its `_PRT` (PCI routing table), read from the
-//! DSDT's bytecode without running any of it.
+//! pins reach the I/O APIC (its `_PRT`, PCI routing table, on x86-64) and
+//! the windows of addresses it decodes (its `_CRS`, on AArch64), read from
+//! the DSDT's bytecode without running any of it.
 //!
 //! The DSDT is walked as a tree of definitions (scopes, devices, names,
 //! methods and the like); the root bridge is the device named PNP0A08 or
@@ -420,19 +421,111 @@ enum DefAt {
 /// `EisaId` dwords.
 const ROOT_BRIDGE: [u64; 2] = [0x080a_d041, 0x030a_d041];
 
-/// The root bridge's routes from the DSDT `d` (whole, header included),
-/// and how many entries its table has; `None` if the walk cannot tell.
-pub fn root_routes(d: &[u8]) -> Option<(Routes, usize)> {
+impl Aml<'_> {
+    /// The first root bridge's path: the device whose `_HID` or `_CID` is
+    /// PNP0A08 or PNP0A03 (as an EisaId or a string).
+    fn root_bridge(&self) -> Option<Path> {
+        let mut bridge = None;
+        self.walk_all(&mut |p, def| {
+            if let (None, Def::Name(o), Some(b"_HID" | b"_CID")) = (bridge, def, p.last().as_ref()) {
+                // An EisaId, or the ID as a string (QEMU's Arm tables).
+                let eisa = self.integer(o).is_some_and(|(v, _)| ROOT_BRIDGE.contains(&v));
+                let string = self.byte(o) == Some(0x0d)
+                    && [&b"PNP0A08 "[..], b"PNP0A03 "].iter().any(|id| self.d.get(o + 1..o + 9) == Some(*id));
+                if eisa || string {
+                    bridge = Some(p.parent());
+                }
+            }
+        })?;
+        bridge
+    }
+}
+
+/// A window of addresses the root bridge decodes: PCI addresses `pci` on,
+/// `len` long, which the CPU reaches at `cpu` on; memory or I/O ports.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Window {
+    pub io: bool,
+    pub pci: u64,
+    pub cpu: u64,
+    pub len: u64,
+}
+
+/// The root bridge's memory and I/O windows from the DSDT `d` (whole,
+/// header included), from its `_CRS`: a buffer, or a method returning one
+/// (written out, or by name). Fills `out`, returning how many.
+#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
+pub fn root_windows(d: &[u8], out: &mut [Window]) -> Option<usize> {
     let aml = Aml { d };
-    let mut bridge = None;
-    aml.walk_all(&mut |p, def| {
-        if let (None, Def::Name(o), Some(b"_HID" | b"_CID")) = (bridge, def, p.last().as_ref()) {
-            if aml.integer(o).is_some_and(|(v, _)| ROOT_BRIDGE.contains(&v)) {
-                bridge = Some(p.parent());
+    let bridge = aml.root_bridge()?;
+    let buffer = match aml.lookup(core::iter::once(bridge.child(*b"_CRS")?))?.1 {
+        DefAt::Name(o) => o,
+        DefAt::Method(at, end) => {
+            // The first Return of a buffer, written out or by name.
+            let mut at = at;
+            loop {
+                if at >= end {
+                    return None;
+                }
+                if aml.byte(at)? == 0xa4 {
+                    if aml.byte(at + 1)? == 0x11 {
+                        break at + 1;
+                    }
+                    if let Some((n, _)) = aml.name(at + 1) {
+                        if let Some((_, DefAt::Name(o))) = aml.lookup(n.candidates(&bridge)) {
+                            break o;
+                        }
+                    }
+                }
+                at += 1;
             }
         }
-    })?;
-    let bridge = bridge?;
+    };
+    if aml.byte(buffer)? != 0x11 {
+        return None;
+    }
+    let (body, end) = aml.package(buffer + 1)?;
+    let (_, mut r) = aml.integer(body)?; // the buffer's size
+    let le = |at: usize, n: usize| -> Option<u64> {
+        Some(d.get(at..at + n)?.iter().rev().fold(0u64, |v, &x| v << 8 | x as u64))
+    };
+    let mut n = 0;
+    while r < end {
+        let tag = aml.byte(r)?;
+        if tag & 0x80 == 0 {
+            if tag >> 3 == 0x0f {
+                break; // end tag
+            }
+            r += 1 + (tag & 7) as usize;
+            continue;
+        }
+        let len = le(r + 1, 2)? as usize;
+        // Address space descriptors: resource type (0 memory, 1 I/O, 2
+        // bus numbers), then minimum, maximum, translation and length.
+        let w = match tag {
+            0x87 if len >= 23 => Some((aml.byte(r + 3)?, le(r + 10, 4)?, le(r + 14, 4)?, le(r + 18, 4)?, le(r + 22, 4)?)),
+            0x8a if len >= 43 => Some((aml.byte(r + 3)?, le(r + 14, 8)?, le(r + 22, 8)?, le(r + 30, 8)?, le(r + 38, 8)?)),
+            0x88 if len >= 13 => Some((aml.byte(r + 3)?, le(r + 8, 2)?, le(r + 10, 2)?, le(r + 12, 2)?, le(r + 14, 2)?)),
+            _ => None,
+        };
+        if let Some((kind @ (0 | 1), min, max, tra, length)) = w {
+            let length = if length == 0 { max.wrapping_sub(min).wrapping_add(1) } else { length };
+            if n < out.len() && length > 0 {
+                out[n] = Window { io: kind == 1, pci: min, cpu: min.wrapping_add(tra), len: length };
+                n += 1;
+            }
+        }
+        r += 3 + len;
+    }
+    Some(n)
+}
+
+/// The root bridge's routes from the DSDT `d` (whole, header included),
+/// and how many entries its table has; `None` if the walk cannot tell.
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
+pub fn root_routes(d: &[u8]) -> Option<(Routes, usize)> {
+    let aml = Aml { d };
+    let bridge = aml.root_bridge()?;
     let (_, prt) = aml.lookup(core::iter::once(bridge.child(*b"_PRT")?))?;
     match prt {
         DefAt::Name(o) => aml.table(o, &bridge),
