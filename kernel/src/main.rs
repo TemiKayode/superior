@@ -309,6 +309,17 @@ fn start_component_manager() -> Result<(), &'static str> {
         )
     });
     let intx = intx.chain([(root::PCI_IO as usize, arch::pci_io_cap())]);
+    let ps2 = arch::ps2_caps()
+        .into_iter()
+        .flatten()
+        .enumerate()
+        .map(|(k, c)| (root::PS2 as usize + k, c));
+    let screen = arch::framebuffer_cap().map(|c| (root::FRAMEBUFFER as usize, c));
+    if let Some((_, c)) = screen {
+        if let Object::DeviceUntyped { base, size_bits } = c.object {
+            kprintln!("[ok] the boot framebuffer for user space: {:#x}, 2^{} bytes", base, size_bits);
+        }
+    }
     let spare = *SPARE.lock();
     let spare = spare.0[..spare.1].iter().enumerate().map(|(k, &(base, size_bits))| {
         (
@@ -316,9 +327,9 @@ fn start_component_manager() -> Result<(), &'static str> {
             Capability::new(Object::Untyped { base, size_bits }, Rights::ALL),
         )
     });
-    let mut all = [(0, caps[0].1); 48 + root::SPARE_COUNT as usize];
+    let mut all = [(0, caps[0].1); 56 + root::SPARE_COUNT as usize];
     let mut n = 0;
-    for c in caps.into_iter().chain(pci).chain(iommu).chain(state).chain(intx).chain(spare) {
+    for c in caps.into_iter().chain(pci).chain(iommu).chain(state).chain(intx).chain(ps2).chain(screen).chain(spare) {
         all[n] = c;
         n += 1;
     }

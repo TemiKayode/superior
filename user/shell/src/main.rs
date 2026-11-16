@@ -16,9 +16,20 @@
 //! | 3 | the timer notification (one signal per 10 ms tick) |
 //! | 4 | 64 KiB of untyped memory |
 //! | 5 | I/O port 0xf4, QEMU's exit device (emulated on AArch64) |
+//! | 10, 11 | (`console.manifest`) the PS/2 controller's data and status ports |
+//! | 12 | (`console.manifest`) the boot framebuffer, as device memory |
+//!
+//! Given the PS/2 controller and the framebuffer, the shell is also a
+//! console on the machine's own screen and keyboard ([`screen`], [`ps2`]),
+//! for PCs with no serial port: what it prints goes to both, and it reads
+//! from both. Where COM1 is missing (its status port reads as all ones),
+//! the shell leaves it alone.
 
 #![no_std]
 #![no_main]
+
+mod ps2;
+mod screen;
 
 use core::fmt::{self, Write};
 use superior_objects::abi::{ObjectType, Syscall};
@@ -34,6 +45,12 @@ const EXIT_PORT: u64 = 5;
 const ECHO_EP: u64 = 7;
 const ECHO_TCB: u64 = 8;
 const ECHO_STACK: u64 = 9;
+// The screen console's devices, when the manifest gives them, and the
+// framebuffer's frame, made here.
+const PS2_DATA: u64 = 10;
+const PS2_STATUS: u64 = 11;
+const FB_MEMORY: u64 = 12;
+const FB_FRAME: u64 = 13;
 /// The echo thread's endpoint, in its own CSpace.
 const ECHO_SLOT: u64 = 0;
 
@@ -67,6 +84,13 @@ mod uart {
     /// The kernel already enabled the receive interrupt for its console.
     pub fn init() -> u64 {
         0
+    }
+
+    /// Whether there is a UART at COM1: with nothing there, its line
+    /// status reads as all ones (which would look like a byte always
+    /// waiting).
+    pub fn present() -> bool {
+        port_in(PORT_LSR) & 0xff != 0xff
     }
 
     pub fn try_read() -> Option<u8> {
@@ -122,6 +146,11 @@ mod uart {
         status
     }
 
+    /// The PL011 is always there on the machines the shell runs on.
+    pub fn present() -> bool {
+        true
+    }
+
     pub fn try_read() -> Option<u8> {
         (read_reg(FR) & FR_RXFE == 0).then(|| read_reg(DR) as u8)
     }
@@ -138,11 +167,32 @@ mod uart {
     }
 }
 
-fn put_byte(b: u8) {
-    uart::write(b);
+/// What the shell talks through: the UART if there is one, and the
+/// screen and the PS/2 keyboard if it was given them.
+struct Devices {
+    uart: bool,
+    keyboard: Option<ps2::Keyboard>,
 }
 
-/// The console: output goes straight to the UART.
+static mut DEVICES: Devices = Devices {
+    uart: true,
+    keyboard: None,
+};
+
+fn devices() -> &'static mut Devices {
+    // SAFETY: only the shell's main thread touches it (the echo thread
+    // never prints), and nothing holds it past a call.
+    unsafe { &mut *core::ptr::addr_of_mut!(DEVICES) }
+}
+
+fn put_byte(b: u8) {
+    if devices().uart {
+        uart::write(b);
+    }
+    screen::put(b);
+}
+
+/// The console: output goes to the UART, and to the screen if there is one.
 struct Console;
 
 impl Write for Console {
@@ -164,16 +214,27 @@ macro_rules! outln {
     ($($arg:tt)*) => {{ let _ = writeln!(Console, $($arg)*); }};
 }
 
-/// Next byte typed: read whatever the UART holds, else sleep until its
-/// interrupt.
+/// Next byte typed: read whatever the UART or the keyboard holds, else
+/// sleep until the UART's interrupt, or with a keyboard until the next
+/// tick at the latest (the keyboard is polled), on the same notification.
 fn get_byte() -> u8 {
     loop {
-        if let Some(b) = uart::try_read() {
-            return b;
+        if devices().uart {
+            if let Some(b) = uart::try_read() {
+                return b;
+            }
+        }
+        if let Some(k) = devices().keyboard.as_mut() {
+            if let Some(b) = k.poll() {
+                return b;
+            }
+            syscall(Syscall::TimerSignal, UART_NTFN, [1, 0, 0, 0]);
         }
         syscall(Syscall::Wait, UART_NTFN, [0; 4]);
-        uart::clear_interrupt();
-        syscall(Syscall::IrqAck, UART_IRQ, [0; 4]);
+        if devices().uart {
+            uart::clear_interrupt();
+            syscall(Syscall::IrqAck, UART_IRQ, [0; 4]);
+        }
     }
 }
 
@@ -212,6 +273,9 @@ fn help() {
     outln!("  sleep <ticks>   sleep on the timer notification (100 ticks a second)");
     outln!("  ipc [rounds]    time call/reply round trips to a thread this shell starts");
     outln!("  shutdown        power off (exits QEMU)");
+    if devices().keyboard.is_some() {
+        outln!("  reboot          restart the machine (through the keyboard controller)");
+    }
 }
 
 fn about() {
@@ -222,6 +286,26 @@ fn about() {
     );
     outln!("This shell is a user process and its own serial driver: the kernel");
     outln!("gave it the UART and its interrupt line as capabilities.");
+    if devices().keyboard.is_some() {
+        outln!("It also reads the PS/2 keyboard and draws on the boot framebuffer,");
+        outln!("given to it as an I/O-port capability and as device memory.");
+    }
+}
+
+fn reboot() {
+    if devices().keyboard.is_none() {
+        outln!("reboot needs the keyboard controller (boot the console image)");
+        return;
+    }
+    outln!("restarting");
+    if let Some(k) = devices().keyboard.as_ref() {
+        k.reset_machine();
+    }
+    // The reset takes a moment; if it never comes, say so.
+    for _ in 0..100 {
+        syscall(Syscall::Wait, TIMER, [0; 4]);
+    }
+    outln!("the machine did not restart");
 }
 
 fn sleep(arg: &str) {
@@ -388,13 +472,21 @@ fn shutdown() -> ! {
 pub extern "C" fn _start(_: u64) -> ! {
     let mapped = uart::init();
     let bound = syscall(Syscall::IrqSetNotification, UART_IRQ, [UART_NTFN, 0, 0, 0]);
+    devices().uart = uart::present();
+    let screen = screen::init(FB_MEMORY, FB_FRAME);
+    devices().keyboard = ps2::Keyboard::new(PS2_DATA, PS2_STATUS);
     outln!();
     outln!("Superior shell. Type 'help' for commands.");
-    if mapped != 0 || bound.status != 0 {
+    if devices().uart && (mapped != 0 || bound.status != 0) {
         outln!(
             "(serial interrupt not set up: map {mapped}, bind {})",
             bound.status
         );
+    }
+    if let Some((w, h)) = screen {
+        let keyboard = if devices().keyboard.is_some() { "the PS/2 keyboard" } else { "no keyboard" };
+        let serial = if devices().uart { "and COM1" } else { "no serial port" };
+        outln!("Console on the screen ({w}x{h}), {keyboard}, {serial}.");
     }
     let mut echo_started = false;
     let mut buf = [0u8; LINE_MAX];
@@ -411,6 +503,7 @@ pub extern "C" fn _start(_: u64) -> ! {
             "sleep" => sleep(arg),
             "ipc" => ipc(arg, &mut echo_started),
             "shutdown" | "exit" => shutdown(),
+            "reboot" => reboot(),
             other => outln!("unknown command: {other} (try 'help')"),
         }
     }

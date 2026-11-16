@@ -1322,21 +1322,25 @@ fn io_fault_notify(k: &mut Kernel, cur: Tid, space: u64, ntfn: u64) -> Result<()
 
 /// `IoFaults`: rdi = I/O address space (Read). Returns the requests the
 /// IOMMU blocked since the last call, and the first one's page and kind.
-/// `UntypedInfo`: rdi = an untyped capability.
+/// `UntypedInfo`: rdi = an untyped capability. Returns its size in bits and
+/// how much is uncarved; for the boot framebuffer's device memory, also
+/// its geometry (`abi::framebuffer::Geometry::pack`), else zeros.
 fn untyped_info(k: &mut Kernel, cur: Tid, slot: u64) -> Result<(), u64> {
     let s = own_slot(k, cur, slot).ok_or(Error::InvalidCapability.code())?;
-    let (_, bits) = k
-        .caps
-        .get(s)
-        .and_then(|c| c.object.untyped())
-        .ok_or(Error::InvalidCapability.code())?;
+    let cap = k.caps.get(s).ok_or(Error::InvalidCapability.code())?;
+    let screen = match cap.object {
+        Object::DeviceUntyped { base, .. } => arch::framebuffer_geometry(base),
+        _ => None,
+    }
+    .unwrap_or([0, 0]);
+    let (_, bits) = cap.object.untyped().ok_or(Error::InvalidCapability.code())?;
     // What carving would find free: all of it once nothing made from it
     // is left, as `carve` resets.
     let free = match k.caps.has_children(s) {
         false => 1u64 << bits,
         true => k.caps.untyped_free(s).unwrap_or(0),
     };
-    k.ipc.set_msg_of(cur, [bits as u64, free, 0, 0]);
+    k.ipc.set_msg_of(cur, [bits as u64, free, screen[0], screen[1]]);
     Ok(())
 }
 

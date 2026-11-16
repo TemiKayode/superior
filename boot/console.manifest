@@ -1,0 +1,20 @@
+# The shell on a PC's own screen and keyboard: the normal boot (shell.manifest)
+# plus the boot framebuffer, which the shell draws its console on, and the
+# PS/2 controller, where a laptop's built-in keyboard is. For machines with
+# no serial port; COM1 still works where there is one. Nothing else touches
+# the screen or the controller, so the shell holds both.
+
+component shell
+  image shell
+  memory 21
+  # Page tables for the framebuffer's mapping (8 MiB needs four, and the
+  # tables above them).
+  vspace 18
+  device uart 0
+  device uart-irq 1
+  notification 2
+  device timer 3
+  untyped 16 4
+  device exit 5
+  device ps2 10
+  device framebuffer 12

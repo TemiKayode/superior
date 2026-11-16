@@ -415,6 +415,20 @@ pub fn console_caps() -> (Capability, Capability) {
     )
 }
 
+/// No PS/2 controller on Arm machines.
+pub fn ps2_caps() -> Option<[Capability; 2]> {
+    None
+}
+
+/// No boot framebuffer is handed out on AArch64 (yet).
+pub fn framebuffer_cap() -> Option<Capability> {
+    None
+}
+
+pub fn framebuffer_geometry(_base: u64) -> Option<[u64; 2]> {
+    None
+}
+
 /// `brk` must trap into the kernel's handler and return.
 #[cfg_attr(not(feature = "selftest"), allow(dead_code))]
 pub fn breakpoint_selftest() {

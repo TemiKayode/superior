@@ -579,6 +579,22 @@ mod tests {
         assert_eq!(CapTransfer::decode(0), Some(CapTransfer::NONE));
         assert_eq!(CapTransfer::decode(1 << 32), None, "reserved bits");
     }
+
+    #[test]
+    fn framebuffer_geometry_round_trips() {
+        use framebuffer::{BGR, Geometry, RGB};
+        for g in [
+            Geometry { width: 1280, height: 720, stride: 1280, bytes_per_pixel: 4, format: BGR },
+            Geometry { width: 1366, height: 768, stride: 1376, bytes_per_pixel: 3, format: RGB },
+            Geometry { width: 3840, height: 2160, stride: 3840, bytes_per_pixel: 4, format: RGB },
+        ] {
+            assert_eq!(Geometry::unpack(g.pack()), Some(g));
+            assert_ne!(g.pack()[0], 0);
+        }
+        assert_eq!(Geometry::unpack([0, 0]), None, "no screen");
+        let bad = Geometry { width: 800, height: 600, stride: 640, bytes_per_pixel: 4, format: RGB };
+        assert_eq!(Geometry::unpack(bad.pack()), None, "stride shorter than a row");
+    }
 }
 
 /// What the kernel gives the root task, the Component Manager, at boot.
@@ -629,11 +645,21 @@ pub mod root {
     /// I/O ports for PCI BARs: a range of ports on x86-64, on AArch64 the
     /// window of device memory that stands for them.
     pub const PCI_IO: u64 = INTX + INTX_COUNT;
+    /// The PS/2 controller (the i8042, where a PC's built-in keyboard
+    /// is): its data port 0x60 and its status/command port 0x64, two I/O
+    /// port capabilities in consecutive slots. Empty on AArch64.
+    pub const PS2: u64 = PCI_IO + 1;
+    pub const PS2_COUNT: u64 = 2;
+    /// The screen the firmware or bootloader set up (a VESA mode or UEFI's
+    /// GOP), as device memory from its first byte, if there is one:
+    /// [`Syscall::UntypedInfo`] on it also says its geometry (see
+    /// [`framebuffer`](super::framebuffer)). Empty on AArch64.
+    pub const FRAMEBUFFER: u64 = PS2 + PS2_COUNT;
     /// The rest of RAM, all the kernel does not keep for itself: up to
     /// [`SPARE_COUNT`] untyped blocks in consecutive slots, from the first
     /// (the rest empty). The Component Manager gives them to the Memory
     /// Server (`untyped spare` in the manifest).
-    pub const SPARE: u64 = PCI_IO + 1;
+    pub const SPARE: u64 = FRAMEBUFFER + 1;
     pub const SPARE_COUNT: u64 = 32;
     /// The first slot with nothing in it.
     pub const FIRST_FREE: u64 = SPARE + SPARE_COUNT;
@@ -646,4 +672,58 @@ pub mod root {
     pub const BUNDLE_OFFSET: u64 = 0x1_0000_0000;
     /// The root task's priority; a component can be given at most this.
     pub const PRIORITY: u8 = 60;
+}
+
+/// The boot framebuffer's geometry, as [`Syscall::UntypedInfo`] gives it
+/// for the framebuffer's device memory ([`root::FRAMEBUFFER`]) in its
+/// third and fourth words (both 0 for any other untyped memory).
+pub mod framebuffer {
+    /// Pixel formats: red, green and blue in that byte order, or blue,
+    /// green and red.
+    pub const RGB: u64 = 0;
+    pub const BGR: u64 = 1;
+
+    /// The screen: its size in pixels, the pixels from one row to the
+    /// next, the bytes a pixel takes, and its format.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct Geometry {
+        pub width: u64,
+        pub height: u64,
+        pub stride: u64,
+        pub bytes_per_pixel: u64,
+        pub format: u64,
+    }
+
+    impl Geometry {
+        /// Packs into two words: width | height << 16 | bytes per pixel <<
+        /// 32 | format << 40, and the stride. The first word is never 0.
+        pub fn pack(&self) -> [u64; 2] {
+            [
+                self.width & 0xffff
+                    | (self.height & 0xffff) << 16
+                    | (self.bytes_per_pixel & 0xff) << 32
+                    | (self.format & 0xff) << 40,
+                self.stride,
+            ]
+        }
+
+        /// The geometry packed in `words`, if there is one.
+        pub fn unpack(words: [u64; 2]) -> Option<Geometry> {
+            let [a, stride] = words;
+            let g = Geometry {
+                width: a & 0xffff,
+                height: a >> 16 & 0xffff,
+                bytes_per_pixel: a >> 32 & 0xff,
+                format: a >> 40 & 0xff,
+                stride,
+            };
+            let ok = g.width > 0 && g.height > 0 && g.stride >= g.width && (3..=4).contains(&g.bytes_per_pixel);
+            ok.then_some(g)
+        }
+
+        /// The bytes the screen's rows take.
+        pub fn bytes(&self) -> u64 {
+            self.stride * self.height * self.bytes_per_pixel
+        }
+    }
 }

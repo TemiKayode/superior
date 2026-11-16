@@ -50,6 +50,17 @@ fn phys_offset() -> u64 {
     unsafe { (&raw const PHYS_OFFSET).read() }
 }
 
+/// The physical address the kernel's own tables map virtual address `va`
+/// to, if they map it (the bootloader's mappings, the framebuffer's
+/// among them, are there).
+pub fn translate(va: u64) -> Option<u64> {
+    use x86_64::structures::paging::mapper::Translate;
+    // SAFETY: the kernel's PML4, with physical memory mapped at PHYS_OFFSET;
+    // a walk only reads it.
+    let mapper = unsafe { OffsetPageTable::new(table(kernel_pml4()), VirtAddr::new(phys_offset())) };
+    mapper.translate_addr(VirtAddr::new(va)).map(|pa| pa.as_u64())
+}
+
 /// The kernel's pointer to physical address `pa` (RAM or a mapped
 /// device page).
 pub fn phys_ptr(pa: u64) -> *mut u8 {
