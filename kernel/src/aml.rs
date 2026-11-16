@@ -444,6 +444,7 @@ impl Aml<'_> {
 /// A window of addresses the root bridge decodes: PCI addresses `pci` on,
 /// `len` long, which the CPU reaches at `cpu` on; memory or I/O ports.
 #[derive(Clone, Copy, Debug, Default)]
+#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
 pub struct Window {
     pub io: bool,
     pub pci: u64,
