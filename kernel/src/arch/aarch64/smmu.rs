@@ -205,11 +205,15 @@ pub fn fixed_pages() -> &'static [u64] {
         .map_or(&[], |p| &p[..])
 }
 
-/// Pages a function keeps using whatever it is given: none known here
-/// (on Arm they would come from IORT's reserved memory ranges, or a
-/// device tree's `iommu-addresses`, neither of which QEMU's virt has).
-pub fn reserved_pages(_sid: u16) -> core::iter::Empty<u64> {
-    core::iter::empty()
+/// The pages stream `sid` keeps using whatever it is given (IORT's
+/// reserved memory ranges for it), to be mapped where they are before its
+/// DMA is translated. Any the kernel counts as RAM are left out: it may
+/// have given them to anyone.
+pub fn reserved_pages(sid: u16) -> impl Iterator<Item = u64> {
+    super::platform()
+        .reserved_for(sid)
+        .flat_map(|(start, end)| (start..end).step_by(4096))
+        .filter(|&pa| !crate::memory::is_ram(pa))
 }
 
 /// Writes a new space's context descriptor into its header page: stage-1

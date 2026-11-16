@@ -41,8 +41,10 @@ holds the rest):
   the caches to the point of coherency, turns the MMU and caches off and enters the
   kernel with x0 the device tree. Given ACPI, the kernel reads the MADT (the CPUs by
   MPIDR, the GICv3's distributor, redistributors and ITS), GTDT (the timer's
-  interrupt), SPCR (the console), MCFG (ECAM), IORT (the SMMUv3 and its interrupt, and
-  that stream IDs are requester IDs), FADT (PSCI by `hvc` or `smc`) and the DSDT
+  interrupt), SPCR (the console), MCFG (ECAM), IORT (the SMMUv3 and its interrupt,
+  that stream IDs are requester IDs, and its reserved memory ranges, RMR nodes: each
+  mapped where it is in the I/O space of a function it names when that is bound, as
+  x86-64 does the DMAR's; every IORT listed is read), FADT (PSCI by `hvc` or `smc`) and the DSDT
   (the PCI root bridge's `_CRS`, its memory and I/O port windows, and its `_PRT`,
   read by the same AML reader x86-64 uses), before any RAM is handed out. Either way the kernel
   drives the machine where the firmware says it is, not at QEMU `virt`'s addresses:
@@ -58,7 +60,11 @@ holds the rest):
   NVMe disk under QEMU's edk2 for `virt` twice, with the firmware's device tree
   (`acpi=off`) and with its ACPI tables alone: each time the firmware's boot manager,
   the loader and the shell session must show, then the driver framework test with
-  the SMMUv3. `cargo xtask el2-test` boots with EL2 (`virtualization=on`): from
+  the SMMUv3. QEMU's Arm machines take no `-acpitable`, so the loader can carry ACPI
+  tables of its own (`SUPERIOR_EXTRA_ACPI` when it is built), installed through the
+  firmware's ACPI table protocol when the kernel is to read ACPI: the driver test's
+  loader adds a second IORT reserving 0x400_0000 to 0x400_ffff (flash, not RAM) for
+  the disk at 00:10.0, mapped on every bind. `cargo xtask el2-test` boots with EL2 (`virtualization=on`): from
   `-kernel` the shell session and the driver test, and from edk2 running at EL2 the
   shell session with its device tree and with its ACPI tables. `cargo xtask
   layout-test` runs the driver test with `highmem=on`, which moves ECAM to
@@ -85,7 +91,11 @@ holds the rest):
   GPU's stolen memory) are mapped where they are in a function's I/O space when it
   is bound, except any pages firmware left usable RAM; the x86-64 virtio-blk test
   adds a second DMAR reserving 0xf0000 to 0xfffff for its disk at 00:10.0, which
-  QEMU's own cannot say. Legacy interrupts go through the I/O APIC (from the
+  QEMU's own cannot say. A region may name a function behind bridges, by its path
+  from a bus (a discrete GPU below a root port): the bus server numbers buses after
+  boot, so the kernel follows the path through each bridge's secondary bus in
+  configuration space when a function is bound. The NVMe test's second DMAR names
+  its controller as 00:0c.0/00.0, which the kernel must find at 0a:00.0. Legacy interrupts go through the I/O APIC (from the
   MADT, every entry masked until its line is claimed), not the 8259 PIC: COM1 on
   the GSI the MADT's interrupt source overrides give ISA IRQ 4, and PCI's
   interrupt pins as the root bridge's `_PRT` says. A small AML reader walks the

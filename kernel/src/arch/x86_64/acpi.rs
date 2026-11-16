@@ -17,6 +17,10 @@
 //!   And the requester ID each I/O APIC's interrupts carry, which
 //!   interrupt remapping checks. And its reserved memory regions: memory
 //!   a function keeps using whatever it is told, which binding it maps.
+//!   A region names its functions by path: a start bus, then a device
+//!   and function on it, and on down through each bridge's secondary bus;
+//!   the bus server numbers the buses after boot, so a path is followed
+//!   through configuration space when a function is bound.
 //! - The MADT's interrupt source overrides: which GSI each ISA IRQ arrives
 //!   on, and how it signals.
 //! - The DSDT (through the FADT): the PCI root bridge's `_PRT`, which says
@@ -111,11 +115,99 @@ static IOAPIC_ID: [AtomicU32; 4] = [const { AtomicU32::new(0) }; 4];
 /// that names it << 24, APIC ID << 16, requester ID.
 static IOAPIC_SID: [AtomicU32; 4] = [const { AtomicU32::new(0) }; 4];
 /// The DMAR's reserved memory regions (up to 8): each one's first byte
-/// and end (exclusive; 0 for no region), and the requester IDs of up to 4
-/// functions it names (bit 31 set).
+/// and end (exclusive; 0 for no region), and the paths of up to 4
+/// functions it names ([`Path`]; 0 for none).
 const MAX_RESERVED: usize = 8;
 static RESERVED: [[AtomicU64; 2]; MAX_RESERVED] = [const { [const { AtomicU64::new(0) }; 2] }; MAX_RESERVED];
-static RESERVED_SID: [[AtomicU32; 4]; MAX_RESERVED] = [const { [const { AtomicU32::new(0) }; 4] }; MAX_RESERVED];
+static RESERVED_PATH: [[AtomicU64; 4]; MAX_RESERVED] = [const { [const { AtomicU64::new(0) }; 4] }; MAX_RESERVED];
+
+/// A device scope's path, packed: its start bus (bits 0 to 7), how many
+/// device/function steps (bits 8 to 15, 1 to [`Path::MAX`]), and each
+/// step's device << 3 | function, a byte each from bit 16.
+#[derive(Clone, Copy)]
+struct Path(u64);
+
+impl Path {
+    const MAX: usize = 6;
+
+    /// From a scope's start bus and its path (`len` bytes at `at`).
+    fn read(bus: u8, at: u64, len: u64) -> Option<Path> {
+        let steps = (len / 2) as usize;
+        if len % 2 != 0 || !(1..=Self::MAX).contains(&steps) {
+            return None;
+        }
+        let mut p = bus as u64 | (steps as u64) << 8;
+        for i in 0..steps {
+            let [dev, func] = read::<2>(at + 2 * i as u64);
+            p |= ((dev as u64 & 31) << 3 | func as u64 & 7) << (16 + 8 * i);
+        }
+        Some(Path(p))
+    }
+
+    fn steps(self) -> impl Iterator<Item = u8> {
+        let n = (self.0 >> 8 & 0xff) as usize;
+        (0..n).map(move |i| (self.0 >> (16 + 8 * i)) as u8)
+    }
+
+    /// The requester ID it leads to as the buses are numbered now: each
+    /// step but the last must be a PCI-to-PCI bridge, whose secondary bus
+    /// the next step is on. None if one is not there or not numbered.
+    fn resolve(self) -> Option<u16> {
+        let mut bus = self.0 as u8;
+        let mut steps = self.steps().peekable();
+        while let Some(devfn) = steps.next() {
+            if steps.peek().is_none() {
+                return Some((bus as u16) << 8 | devfn as u16);
+            }
+            let id = config_read(bus, devfn, 0);
+            // Header type 1: a bridge (bit 7 says only multi-function).
+            if id & 0xffff == 0xffff || config_read(bus, devfn, 0x0c) >> 16 & 0x7f != 1 {
+                return None;
+            }
+            let next = (config_read(bus, devfn, 0x18) >> 8) as u8;
+            if next <= bus {
+                return None;
+            }
+            bus = next;
+        }
+        None
+    }
+}
+
+impl core::fmt::Display for Path {
+    /// The first step as bus:device.function, each after it device.function
+    /// (on the bridge's secondary bus): 00:1c.0/00.0.
+    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+        for (i, devfn) in self.steps().enumerate() {
+            if i == 0 {
+                write!(f, "{:02x}:", self.0 as u8)?;
+            } else {
+                f.write_str("/")?;
+            }
+            write!(f, "{:02x}.{}", devfn >> 3, devfn & 7)?;
+        }
+        Ok(())
+    }
+}
+
+/// Reads a 32-bit word of configuration space through ports 0xcf8 and
+/// 0xcfc, where the bus server reaches it too. Called under the kernel
+/// lock, from a bus server call: the address it left in 0xcf8 is put
+/// back, so a read of its own between its two port calls is unharmed.
+fn config_read(bus: u8, devfn: u8, offset: u8) -> u32 {
+    use x86_64::instructions::port::Port;
+    let mut address = Port::<u32>::new(0xcf8);
+    let mut data = Port::<u32>::new(0xcfc);
+    // SAFETY: the PCI configuration ports, which only the bus server
+    // otherwise uses; its address is restored.
+    unsafe {
+        let saved = address.read();
+        address.write(1 << 31 | (bus as u32) << 16 | (devfn as u32) << 8 | (offset as u32 & 0xfc));
+        let v = data.read();
+        address.write(saved);
+        v
+    }
+}
 /// ISA IRQ overrides: bit 31 set, the MPS flags << 24, the GSI.
 static ISA: [AtomicU32; 16] = [const { AtomicU32::new(0) }; 16];
 /// The root bus's interrupt routes, from `_PRT`.
@@ -340,8 +432,8 @@ fn dmar(rsdp: u64) {
         let [start, end] = [0, 1].map(|j| RESERVED[i][j].load(Ordering::Relaxed));
         kprint!("[ok] ACPI: reserved memory {start:#x} to {:#x}, for", end - 1);
         let mut any = false;
-        for sid in RESERVED_SID[i].iter().map(|s| s.load(Ordering::Relaxed)).filter(|s| s >> 31 == 1) {
-            kprint!(" {:02x}:{:02x}.{}", sid >> 8 & 0xff, sid >> 3 & 31, sid & 7);
+        for p in RESERVED_PATH[i].iter().map(|s| s.load(Ordering::Relaxed)).filter(|&p| p != 0) {
+            kprint!(" {}", Path(p));
             any = true;
         }
         kprintln!("{}", if any { "" } else { " no function the kernel can name" });
@@ -377,16 +469,14 @@ fn reserved_regions(rsdp: u64) -> (usize, usize) {
             if u16::from_le_bytes([s0, s1]) != 0 || base & 0xfff != 0 || limit & 0xfff != 0xfff || limit < base || kept == MAX_RESERVED {
                 continue;
             }
-            let mut sids = 0;
+            let mut named = 0;
             for (kind, _, bus, path, plen) in scopes(e, n, 24) {
-                // An endpoint on its start bus (a path of one), as the
-                // functions firmware reserves memory for are: integrated
-                // USB controllers and graphics, on bus 0.
-                if kind == 1 && plen == 2 && sids < 4 {
-                    let [dev, func] = read::<2>(path);
-                    let sid = (bus as u32) << 8 | (dev as u32 & 31) << 3 | func as u32 & 7;
-                    RESERVED_SID[kept][sids].store(1 << 31 | sid, Ordering::Relaxed);
-                    sids += 1;
+                // An endpoint: on its start bus (integrated USB
+                // controllers and graphics, on bus 0), or behind bridges
+                // (a discrete GPU, below a root port).
+                if let (1, Some(p), true) = (kind, Path::read(bus, path, plen), named < 4) {
+                    RESERVED_PATH[kept][named].store(p.0, Ordering::Relaxed);
+                    named += 1;
                 }
             }
             RESERVED[kept][0].store(base, Ordering::Relaxed);
@@ -397,13 +487,18 @@ fn reserved_regions(rsdp: u64) -> (usize, usize) {
     (found, kept)
 }
 
-/// The reserved memory regions the DMAR names requester `sid` in: each
-/// one's first byte and end (exclusive).
+/// The reserved memory regions the DMAR names requester `sid` in, its
+/// paths followed through the buses as now numbered: each one's first
+/// byte and end (exclusive).
 pub fn reserved_for(sid: u16) -> impl Iterator<Item = (u64, u64)> {
     (0..MAX_RESERVED).filter_map(move |i| {
         let end = RESERVED[i][1].load(Ordering::Relaxed);
-        let named = RESERVED_SID[i].iter().any(|s| s.load(Ordering::Relaxed) == 1 << 31 | sid as u32);
-        (end != 0 && named).then(|| (RESERVED[i][0].load(Ordering::Relaxed), end))
+        let named = end != 0
+            && RESERVED_PATH[i]
+                .iter()
+                .map(|p| p.load(Ordering::Relaxed))
+                .any(|p| p != 0 && Path(p).resolve() == Some(sid));
+        named.then(|| (RESERVED[i][0].load(Ordering::Relaxed), end))
     })
 }
 

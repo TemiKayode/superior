@@ -169,6 +169,12 @@ pub struct Platform {
     pub cpus: Option<usize>,
     /// PCI's interrupt pins, if the firmware says where they go.
     pub intx: Option<Intx>,
+    /// Memory functions keep using whatever they are told (IORT's
+    /// reserved memory ranges): how many the firmware lists, and those
+    /// kept.
+    pub reserved_found: usize,
+    pub reserved: [acpi::Reserved; acpi::MAX_RESERVED],
+    pub reserved_count: usize,
 }
 
 impl Platform {
@@ -244,7 +250,18 @@ impl Platform {
         p.psci_smc = m.psci == Some(false);
         p.cpus = Some(if m.psci.is_some() { m.cpus } else { 1 });
         p.intx = m.routes.as_ref().and_then(prt);
+        p.reserved_found = m.reserved_found;
+        p.reserved = m.reserved;
+        p.reserved_count = m.reserved_count;
         p
+    }
+
+    /// The reserved memory ranges for stream ID `sid`.
+    pub fn reserved_for(&self, sid: u16) -> impl Iterator<Item = (u64, u64)> + '_ {
+        self.reserved[..self.reserved_count]
+            .iter()
+            .filter(move |r| (r.sid..r.sid.saturating_add(r.sids)).contains(&(sid as u32)))
+            .map(|r| (r.start, r.end))
     }
 
     /// The first thing the kernel needs that the firmware did not say.

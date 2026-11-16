@@ -51,7 +51,7 @@ static DTB: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0
 /// console is up.
 static PLATFORM: spin::Once<platform::Platform> = spin::Once::new();
 
-fn platform() -> &'static platform::Platform {
+pub(super) fn platform() -> &'static platform::Platform {
     PLATFORM.get().expect("the machine is read at boot")
 }
 
@@ -437,6 +437,7 @@ extern "C" fn kernel_main(dtb: u64, from_el2: u64) -> ! {
         }
     }
     crate::report_memory(&mem);
+    report_reserved(&p);
     let (gicd, gicr) = (p.gicd.unwrap_or(0), p.gicr.unwrap_or(0));
     for base in [gicd, gicr].into_iter().chain(p.its) {
         if !vm::map_device(base) {
@@ -455,6 +456,36 @@ extern "C" fn kernel_main(dtb: u64, from_el2: u64) -> ! {
         TICK_HZ
     );
     crate::kernel_start(mem.untyped_caps)
+}
+
+/// The IORT's reserved memory ranges: one line on how many, and one for
+/// each kept, with the functions it is for (stream IDs are requester
+/// IDs). Once RAM is known: pages of it the kernel has as RAM are not
+/// mapped for the function, and that is said.
+fn report_reserved(p: &platform::Platform) {
+    if p.source != "ACPI" {
+        return;
+    }
+    kprintln!(
+        "[ok] ACPI: {} reserved memory range{} (IORT){}",
+        p.reserved_found,
+        if p.reserved_found == 1 { "" } else { "s" },
+        if p.reserved_count < p.reserved_found { ", some not used (not whole pages, for another SMMU, or too many)" } else { "" }
+    );
+    let bdf = |sid: u32| (sid >> 8 & 0xff, sid >> 3 & 31, sid & 7);
+    for r in &p.reserved[..p.reserved_count] {
+        let (b, d, f) = bdf(r.sid);
+        kprint!("[ok] ACPI: reserved memory {:#x} to {:#x}, for {b:02x}:{d:02x}.{f}", r.start, r.end - 1);
+        if r.sids > 1 {
+            let (b, d, f) = bdf(r.sid + r.sids - 1);
+            kprint!(" to {b:02x}:{d:02x}.{f}");
+        }
+        kprintln!();
+        let usable = (r.start..r.end).step_by(4096).filter(|&pa| crate::memory::is_ram(pa)).count();
+        if usable > 0 {
+            kprintln!("[warn] ACPI: {usable} of its pages are usable RAM too: they are not mapped for it");
+        }
+    }
 }
 
 /// One line on where everything is, as the firmware said.

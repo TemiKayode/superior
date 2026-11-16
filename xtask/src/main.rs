@@ -1043,10 +1043,23 @@ fn uefi_image(arch: Arch, manifest: &str) -> Result<Image, String> {
 /// The q35 chipset slot the x86-64 LDE test's RTL-8139 sits in.
 const LDE_SLOT: u8 = 0x1b;
 
-/// The x86-64 virtio-blk disk's device on bus 0, and the memory its test
-/// DMAR reserves for it: the BIOS area, which no firmware calls usable.
+/// The virtio-blk disk's device on bus 0, and the memory its test DMAR
+/// (x86-64) reserves for it: the BIOS area, which no firmware calls
+/// usable; or its test IORT (AArch64, under ACPI): a piece of `virt`'s
+/// second flash device, not RAM either.
 const RESERVED_FOR: u8 = 0x10;
 const RESERVED_RANGE: (u64, u64) = (0xf_0000, 0xf_ffff);
+const RESERVED_RANGE_ARM: (u64, u64) = (0x0400_0000, 0x0400_ffff);
+
+/// The x86-64 NVMe test's root port, on bus 0, with the controller
+/// behind it (00:0c.0/00.0): the test DMAR reserves memory for it by that
+/// path, and the bus server numbers the port's bus 10, after nine empty
+/// ports.
+const NVME_PORT: u8 = 0x0c;
+
+/// QEMU `virt`'s SMMUv3: its registers and event interrupt, as its IORT
+/// says.
+const VIRT_SMMU: (u64, u32) = (0x0905_0000, 106);
 /// The device on bus 0 the test DMAR puts under a second VT-d unit, and
 /// where that unit's registers would be (nothing is there: QEMU emulates
 /// one unit).
@@ -1054,19 +1067,27 @@ const SECOND_UNIT_FOR: u8 = 0x11;
 const SECOND_UNIT: u64 = 0xfed9_a000;
 
 /// A second DMAR, for QEMU's `-acpitable`, with what QEMU's own cannot
-/// say: a second VT-d unit (DRHD) naming 00:11.0, as a laptop's graphics
-/// have one of their own, and a reserved memory region (RMRR) for
-/// 00:10.0.
-fn test_dmar() -> Vec<u8> {
-    // A device scope: an endpoint on bus 0, its path one device/function.
-    let endpoint = |dev: u8| [1, 8, 0, 0, 0, 0, dev, 0];
+/// say: for the driver test, a second VT-d unit (DRHD) naming 00:11.0, as
+/// a laptop's graphics have one of their own, and a reserved memory
+/// region (RMRR) for 00:10.0; for the NVMe test, a reserved memory region
+/// for the controller behind its root port, named by its path through it.
+fn test_dmar(nvme: bool) -> Vec<u8> {
+    // A device scope: an endpoint, its start bus 0, then a device and
+    // function on it and each bus below.
+    let endpoint = |path: &[(u8, u8)]| {
+        let mut e = vec![1, 6 + 2 * path.len() as u8, 0, 0, 0, 0];
+        e.extend(path.iter().flat_map(|&(d, f)| [d, f]));
+        e
+    };
     let mut drhd = Vec::new();
-    drhd.extend(0u16.to_le_bytes()); // type: remapping unit
-    drhd.extend(24u16.to_le_bytes());
-    drhd.extend([0, 0, 0, 0]); // flags (just the functions named), size, segment 0
-    drhd.extend(SECOND_UNIT.to_le_bytes());
-    drhd.extend(endpoint(SECOND_UNIT_FOR));
-    let scope = endpoint(RESERVED_FOR);
+    if !nvme {
+        drhd.extend(0u16.to_le_bytes()); // type: remapping unit
+        drhd.extend(24u16.to_le_bytes());
+        drhd.extend([0, 0, 0, 0]); // flags (just the functions named), size, segment 0
+        drhd.extend(SECOND_UNIT.to_le_bytes());
+        drhd.extend(endpoint(&[(SECOND_UNIT_FOR, 0)]));
+    }
+    let scope = if nvme { endpoint(&[(NVME_PORT, 0), (0, 0)]) } else { endpoint(&[(RESERVED_FOR, 0)]) };
     let mut rmrr = Vec::new();
     rmrr.extend(1u16.to_le_bytes()); // type: reserved memory region
     rmrr.extend((24 + scope.len() as u16).to_le_bytes());
@@ -1093,6 +1114,63 @@ fn test_dmar() -> Vec<u8> {
     t
 }
 
+/// A second IORT, which the UEFI loader installs (QEMU's Arm machines take
+/// no `-acpitable`), with what QEMU's own cannot say: a reserved memory
+/// range (RMR node) for 00:10.0, whose stream ID is its requester ID, on
+/// `virt`'s SMMUv3 (a node of its own for it, the same registers).
+fn test_iort() -> Vec<u8> {
+    const SMMU_AT: u32 = 48;
+    let mut smmu = Vec::new();
+    smmu.extend([4u8]); // type: SMMUv3
+    smmu.extend(68u16.to_le_bytes());
+    smmu.extend([4u8]); // revision
+    smmu.extend(0u32.to_le_bytes()); // identifier
+    smmu.extend(0u32.to_le_bytes()); // ID mappings: none
+    smmu.extend(0u32.to_le_bytes());
+    smmu.extend(VIRT_SMMU.0.to_le_bytes());
+    smmu.extend([0u8; 4 + 4 + 8 + 4]); // flags, reserved, VATOS, model
+    smmu.extend(VIRT_SMMU.1.to_le_bytes()); // event interrupt
+    smmu.extend([0u8; 4 * 5]); // PRI, GERR, sync, proximity, ID index
+    assert_eq!(smmu.len(), 68);
+    let mut rmr = Vec::new();
+    rmr.extend([6u8]); // type: reserved memory range
+    rmr.extend(68u16.to_le_bytes());
+    rmr.extend([3u8]); // revision
+    rmr.extend(1u32.to_le_bytes()); // identifier
+    rmr.extend(1u32.to_le_bytes()); // one ID mapping, at 28
+    rmr.extend(28u32.to_le_bytes());
+    rmr.extend(0u32.to_le_bytes()); // flags
+    rmr.extend(1u32.to_le_bytes()); // one memory range, at 48
+    rmr.extend(48u32.to_le_bytes());
+    // The ID mapping: input base, number of IDs less one, output base (the
+    // stream ID), output reference (the SMMU node), flags.
+    let sid = (RESERVED_FOR as u32) << 3;
+    for v in [0, 0, sid, SMMU_AT, 0] {
+        rmr.extend(v.to_le_bytes());
+    }
+    let (start, end) = RESERVED_RANGE_ARM;
+    rmr.extend(start.to_le_bytes());
+    rmr.extend((end + 1 - start).to_le_bytes());
+    rmr.extend(0u32.to_le_bytes());
+    assert_eq!(rmr.len(), 68);
+    let mut t = Vec::new();
+    t.extend(b"IORT");
+    t.extend((48 + smmu.len() as u32 + rmr.len() as u32).to_le_bytes());
+    t.extend([5, 0]); // revision (E.d, with RMR nodes), checksum (below)
+    t.extend(b"SUPERI");
+    t.extend(b"TESTIORT");
+    t.extend(1u32.to_le_bytes());
+    t.extend(b"SUPR");
+    t.extend(1u32.to_le_bytes());
+    t.extend(2u32.to_le_bytes()); // nodes
+    t.extend(SMMU_AT.to_le_bytes());
+    t.extend(0u32.to_le_bytes());
+    t.extend(smmu);
+    t.extend(rmr);
+    t[9] = 0u8.wrapping_sub(t.iter().fold(0u8, |s, &b| s.wrapping_add(b)));
+    t
+}
+
 /// The AArch64 image for `boot/<manifest>.manifest` as a UEFI disk: a GPT
 /// disk whose EFI system partition holds `EFI/BOOT/BOOTAA64.EFI`, the
 /// loader (`loader/`) with the kernel inside it.
@@ -1100,8 +1178,18 @@ fn uefi_image_aarch64(manifest: &str) -> Result<Image, String> {
     let mut img = image_with(false, Arch::Aarch64, manifest)?;
     println!("== building the UEFI loader (aarch64)");
     let kernel = std::fs::canonicalize(&img.path).map_err(|e| format!("{}: {e}", img.path.display()))?;
+    // The driver test's loader carries a second IORT, with memory reserved
+    // for its disk, to install when the kernel is to read ACPI.
+    let extra = if manifest == "drivers" {
+        let path = root().join("target").join("test-iort.bin");
+        std::fs::write(&path, test_iort()).map_err(|e| format!("writing {}: {e}", path.display()))?;
+        path.into_os_string()
+    } else {
+        Default::default()
+    };
     run(cargo()
         .env("SUPERIOR_KERNEL_ELF", &kernel)
+        .env("SUPERIOR_EXTRA_ACPI", &extra)
         .args(["build", "--quiet", "-p", "superior-uefi-loader", "--release", "--target", "aarch64-unknown-uefi"]))?;
     let efi = root().join("target").join("aarch64-unknown-uefi").join("release").join("superior-uefi-loader.efi");
     let name = if manifest == "shell" { "superior-uefi-aarch64.img".to_string() } else { format!("superior-uefi-aarch64-{manifest}.img") };
@@ -1326,7 +1414,7 @@ fn qemu_command(img: &Image) -> Command {
             )
             .args([
                 "-device",
-                "pcie-root-port,id=rp0,chassis=1",
+                if img.arch == Arch::X86_64 { "pcie-root-port,id=rp0,chassis=1,addr=0xc" } else { "pcie-root-port,id=rp0,chassis=1" },
                 "-device",
                 "nvme,id=nvme0,serial=superior0,bus=rp0",
                 "-device",
@@ -1344,6 +1432,18 @@ fn qemu_command(img: &Image) -> Command {
                 "-device",
                 "nvme-ns,drive=nvm1,bus=nvme0,nsid=2",
             ]);
+        if img.arch == Arch::X86_64 {
+            // Memory reserved for the controller behind its root port,
+            // named by its path from bus 0: the kernel must follow the
+            // path through the port's bus as the bus server numbers it.
+            let path = Path::new("target").join("test-dmar-nvme.bin");
+            match std::fs::write(root().join(&path), test_dmar(true)) {
+                Ok(()) => {
+                    q.current_dir(root()).arg("-acpitable").arg(format!("file={}", path.display()));
+                }
+                Err(e) => eprintln!("writing {}: {e}", path.display()),
+            }
+        }
     } else if let (Some(disk), "ahci") = (&img.disk, img.driver) {
         // q35 has an AHCI controller (ICH9, 00:1f.2); virt needs one added.
         // Its DMA goes through the IOMMU. Two disks: the test disk on port
@@ -1372,8 +1472,7 @@ fn qemu_command(img: &Image) -> Command {
             ))
             .arg("-device")
             .arg(format!(
-                "virtio-blk-pci,drive=blk0,disable-legacy=on,iommu_platform=on{}",
-                if img.arch == Arch::X86_64 { format!(",addr={RESERVED_FOR:#x}") } else { String::new() }
+                "virtio-blk-pci,drive=blk0,disable-legacy=on,iommu_platform=on,addr={RESERVED_FOR:#x}"
             ));
         if img.arch == Arch::X86_64 {
             // At a known address, with memory the firmware reserves for
@@ -1383,7 +1482,7 @@ fn qemu_command(img: &Image) -> Command {
             // second DMAR says both.
             q.arg("-device").arg(format!("virtio-rng-pci,disable-legacy=on,iommu_platform=on,addr={SECOND_UNIT_FOR:#x}"));
             let path = Path::new("target").join("test-dmar.bin");
-            match std::fs::write(root().join(&path), test_dmar()) {
+            match std::fs::write(root().join(&path), test_dmar(false)) {
                 Ok(()) => {
                     // The path must be relative: QEMU splits it at colons.
                     q.current_dir(root()).arg("-acpitable").arg(format!("file={}", path.display()));
@@ -1788,6 +1887,47 @@ fn drivers_test_log(img: &Image) -> Result<String, String> {
         if !out.contains(line) {
             return Err(format!("driver framework test: missing {line:?}"));
         }
+    }
+    // Memory reserved for a function, by a second IORT the UEFI loader
+    // installs (AArch64 under ACPI, for the virtio-blk disk), or a second
+    // DMAR naming the NVMe controller behind its root port by its path
+    // (x86-64): read at boot, and mapped each time the function is bound
+    // to a domain (first, and the restarted driver's fresh one).
+    let bound = |bdf: &str, (start, end): (u64, u64)| {
+        format!("[ok] IOMMU: {bdf} bound, with its {} pages of reserved memory mapped where they are", (end + 1 - start) / 4096)
+    };
+    let reserved: Option<Vec<String>> = match (img.arch, d) {
+        (Arch::Aarch64, "virtio-blk") if img.uefi && img.acpi => {
+            let (start, end) = RESERVED_RANGE_ARM;
+            let b = bound(&format!("00:{RESERVED_FOR:02x}.0"), RESERVED_RANGE_ARM);
+            Some(vec![
+                "loader: installed its own ACPI table IORT (0xb8 bytes)".to_string(),
+                "[ok] ACPI: 1 reserved memory range (IORT)".to_string(),
+                format!("[ok] ACPI: reserved memory {start:#x} to {end:#x}, for 00:{RESERVED_FOR:02x}.0"),
+                b.clone(),
+                b,
+            ])
+        }
+        (Arch::X86_64, "nvme") => {
+            let (start, end) = RESERVED_RANGE;
+            let b = bound("0a:00.0", RESERVED_RANGE);
+            Some(vec![
+                "[ok] ACPI: 1 VT-d unit; 1 reserved memory region".to_string(),
+                format!("[ok] ACPI: reserved memory {start:#x} to {end:#x}, for 00:{NVME_PORT:02x}.0/00.0"),
+                b.clone(),
+                b,
+            ])
+        }
+        _ => None,
+    };
+    if let Some(steps) = &reserved {
+        let steps: Vec<&str> = steps.iter().map(String::as_str).collect();
+        if let Err(step) = find_in_order(&out, &steps) {
+            return Err(format!("driver framework test: missing (in order) {step:?}"));
+        }
+    }
+    if img.arch == Arch::Aarch64 && img.uefi && !img.acpi && !out.contains("loader: its built-in ACPI tables are not installed: the kernel reads the device tree") {
+        return Err("driver framework test: the loader did not say its ACPI tables went unused".into());
     }
     // x86-64's virtio-blk disk has memory reserved for it in a second
     // DMAR: the kernel reads it, and maps it each time the function is

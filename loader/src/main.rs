@@ -17,6 +17,9 @@
 //!   ACPI tables or reserved memory), and under `/chosen` where the
 //!   firmware's description is: `superior,device-tree` or
 //!   `superior,acpi-rsdp`, a 64-bit address.
+//! - ACPI tables built into the loader, if any (`SUPERIOR_EXTRA_ACPI` when
+//!   it is built), are installed alongside the firmware's through its ACPI
+//!   table protocol, when the kernel is to read ACPI.
 //! - Then boot services end, interrupts are masked, what the loader wrote
 //!   is cleaned from the caches to memory, the MMU and caches go off, and
 //!   the kernel is entered.
@@ -78,7 +81,20 @@ struct BootServices {
     // AllocatePool .. UnloadImage.
     other: [usize; 21],
     exit_boot_services: extern "efiapi" fn(Handle, usize) -> Status,
+    // GetNextMonotonicCount .. LocateHandleBuffer.
+    more: [usize; 10],
+    locate_protocol: extern "efiapi" fn(*const [u8; 16], *mut c_void, *mut *mut c_void) -> Status,
 }
+
+/// EFI_ACPI_TABLE_PROTOCOL (ffe06bdd-6107-46a6-7bb2-5a9c7ec5275c):
+/// installs a table in the firmware's, checksum and XSDT entry included.
+#[repr(C)]
+struct AcpiTableProtocol {
+    install: extern "efiapi" fn(*mut AcpiTableProtocol, *const u8, usize, *mut usize) -> Status,
+}
+
+const ACPI_TABLE_PROTOCOL_GUID: [u8; 16] =
+    guid(0xffe0_6bdd, 0x6107, 0x46a6, [0x7b, 0xb2, 0x5a, 0x9c, 0x7e, 0xc5, 0x27, 0x5c]);
 
 /// AllocatePages: any address, or below one, or exactly at one; pages
 /// the loader owns (EfiLoaderData), free once boot services end.
@@ -102,6 +118,43 @@ const fn guid(a: u32, b: u16, c: u16, d: [u8; 8]) -> [u8; 16] {
 const KERNEL_RAM_END: u64 = 0x8000_0000;
 
 static KERNEL: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/kernel.elf"));
+
+/// ACPI tables to install alongside the firmware's: one after another,
+/// each as long as its header says. Usually none.
+static EXTRA_ACPI: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/acpi.bin"));
+
+/// Installs [`EXTRA_ACPI`]'s tables, saying which.
+fn install_acpi(bs: &BootServices, con: &Console) -> Result<(), ()> {
+    let mut protocol = core::ptr::null_mut();
+    if (bs.locate_protocol)(&ACPI_TABLE_PROTOCOL_GUID, core::ptr::null_mut(), &mut protocol) != SUCCESS || protocol.is_null() {
+        con.say("loader: the firmware cannot take more ACPI tables (no ACPI table protocol)\n");
+        return Err(());
+    }
+    let protocol = protocol as *mut AcpiTableProtocol;
+    let mut rest = EXTRA_ACPI;
+    while !rest.is_empty() {
+        let len = if rest.len() >= 36 { u32_at(rest, 4) as usize } else { 0 };
+        if len < 36 || len > rest.len() {
+            con.say("loader: its built-in ACPI tables are cut short\n");
+            return Err(());
+        }
+        let mut key = 0;
+        // SAFETY: the firmware's protocol; it copies the table.
+        if unsafe { ((*protocol).install)(protocol, rest.as_ptr(), len, &mut key) } != SUCCESS {
+            con.say("loader: the firmware would not install a built-in ACPI table\n");
+            return Err(());
+        }
+        con.say("loader: installed its own ACPI table ");
+        // The signature: four ASCII letters.
+        let sig = &rest[..4];
+        con.say(if sig.iter().all(u8::is_ascii_alphanumeric) { core::str::from_utf8(sig).unwrap_or("?") } else { "?" });
+        con.say(" (");
+        con.hex(len as u64);
+        con.say(" bytes)\n");
+        rest = &rest[len..];
+    }
+    Ok(())
+}
 
 /// The memory map ExitBootServices needs the key of.
 const MAP_SIZE: usize = 64 * 1024;
@@ -364,6 +417,16 @@ extern "efiapi" fn efi_main(image: Handle, st: *const SystemTable) -> Status {
     // long.
     let tables = unsafe { core::slice::from_raw_parts(st.configuration_table, st.number_of_table_entries) };
     let dtb = tables.iter().find(|t| t.guid == DTB_GUID).map(|t| t.table as u64);
+    if !EXTRA_ACPI.is_empty() {
+        if dtb.is_some() {
+            con.say("loader: its built-in ACPI tables are not installed: the kernel reads the device tree\n");
+        } else if install_acpi(bs, &con).is_err() {
+            return LOAD_ERROR;
+        }
+    }
+    // Read after any are installed: the firmware may move its tables.
+    // SAFETY: as above.
+    let tables = unsafe { core::slice::from_raw_parts(st.configuration_table, st.number_of_table_entries) };
     let rsdp = tables.iter().find(|t| t.guid == ACPI_GUID).map(|t| t.table as u64);
     let dtb_size = match (dtb, rsdp) {
         (Some(dtb), _) => {
