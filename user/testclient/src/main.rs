@@ -1268,6 +1268,9 @@ fn fs_call(m: [u64; 4], lend: bool) -> ([u64; 4], u64) {
         if r.status != Error::PeerRestarted.code() {
             break;
         }
+        // A tick for the server to come back (and mount) before the
+        // next try, so the tries outlast a slow restart.
+        superior_sys::sleep(1);
     }
     ([u64::MAX; 4], 50)
 }
