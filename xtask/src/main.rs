@@ -2170,7 +2170,7 @@ fn tcp_echo_server(
                     let echoed = echoed.clone();
                     std::thread::spawn(move || {
                         let _ = s.set_nonblocking(false);
-                        let _ = s.set_read_timeout(Some(Duration::from_secs(30)));
+                        let _ = s.set_read_timeout(Some(scaled(Duration::from_secs(30))));
                         let mut buf = [0u8; 16384];
                         loop {
                             match s.read(&mut buf) {
@@ -2213,7 +2213,7 @@ fn tcp_inbound(n: u64, len: u64, stop: std::sync::Arc<std::sync::atomic::AtomicB
             std::thread::sleep(Duration::from_millis(200));
             continue;
         };
-        let _ = s.set_read_timeout(Some(Duration::from_secs(20)));
+        let _ = s.set_read_timeout(Some(scaled(Duration::from_secs(20))));
         let data: Vec<u8> = (0..len).map(|j| tcp_byte(k, j)).collect();
         let writer = s.try_clone().map(|mut w| {
             let data = data.clone();
@@ -2693,7 +2693,7 @@ fn screendump(path: &Path) -> Result<(), String> {
     use std::io::{BufRead, BufReader};
     use std::net::TcpStream;
     let s = TcpStream::connect(("127.0.0.1", QMP_PORT)).map_err(|e| format!("QMP: {e}"))?;
-    s.set_read_timeout(Some(Duration::from_secs(20))).map_err(|e| e.to_string())?;
+    s.set_read_timeout(Some(scaled(Duration::from_secs(20)))).map_err(|e| e.to_string())?;
     let mut w = s.try_clone().map_err(|e| e.to_string())?;
     let mut r = BufReader::new(s);
     let mut line = String::new();
@@ -3077,7 +3077,7 @@ fn qmp(commands: &[String]) -> Result<(), String> {
     use std::io::{BufRead, BufReader};
     use std::net::TcpStream;
     let s = TcpStream::connect(("127.0.0.1", QMP_PORT)).map_err(|e| format!("QMP: {e}"))?;
-    s.set_read_timeout(Some(Duration::from_secs(20))).map_err(|e| e.to_string())?;
+    s.set_read_timeout(Some(scaled(Duration::from_secs(20)))).map_err(|e| e.to_string())?;
     let mut w = s.try_clone().map_err(|e| e.to_string())?;
     let mut r = BufReader::new(s);
     let mut line = String::new();
@@ -5514,6 +5514,15 @@ fn reboot_test(img: &Image) -> Result<(), String> {
     Ok(())
 }
 
+/// Stretches a QEMU time limit by `SUPERIOR_TIMEOUT_SCALE` (a number, 1 when
+/// unset), for slow hosts where emulation cannot finish inside the limits.
+fn scaled(limit: Duration) -> Duration {
+    match env::var("SUPERIOR_TIMEOUT_SCALE").ok().and_then(|s| s.parse::<f64>().ok()) {
+        Some(k) if k.is_finite() && k > 0.0 => limit.mul_f64(k),
+        _ => limit,
+    }
+}
+
 /// Boots `img` with no input until QEMU exits, echoing its output, and
 /// returns the output if it exited with the pass code.
 fn run_to_exit(img: &Image, limit: Duration) -> Result<String, String> {
@@ -5568,7 +5577,7 @@ fn run_capture(
         }
         all
     });
-    let deadline = Instant::now() + limit;
+    let deadline = Instant::now() + scaled(limit);
     let status = loop {
         if let Some(s) = child.try_wait().map_err(|e| e.to_string())? {
             break Some(s);
@@ -5865,7 +5874,7 @@ fn drive_shell_at(
     // Waits until `want` appears after byte `from` of the output; returns
     // the position just past it.
     let expect = |want: &str, from: usize| -> Result<usize, String> {
-        let deadline = Instant::now() + Duration::from_secs(60);
+        let deadline = Instant::now() + scaled(Duration::from_secs(60));
         loop {
             {
                 let out = seen.lock().unwrap();
@@ -5907,7 +5916,7 @@ fn drive_shell_at(
             std::thread::sleep(Duration::from_millis(5));
         }
     }
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + scaled(Duration::from_secs(30));
     let status = loop {
         if let Some(s) = child.try_wait().map_err(|e| e.to_string())? {
             break Some(s);
