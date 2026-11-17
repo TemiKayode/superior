@@ -1,8 +1,9 @@
 //! The desktop shell's panel: a strip along the bottom of the screen,
 //! drawn with the toolkit. At its left an "Apps" button opens the launcher
 //! menu, a window above it with a button for each `start launch`
-//! component in the manifest (with the icon its manifest names): pressing
-//! one asks the Component Manager to start it and closes the menu (as does
+//! component in the manifest (with the icon its manifest names, built in
+//! or from an image file): pressing one asks the Component Manager to
+//! start it and closes the menu (as does
 //! "Apps" again). Then a button for each other client's window (its icon
 //! and title), the one with the keyboard focus selected: pressing one puts
 //! that window in front with the focus (drawing it again if it was
@@ -36,7 +37,7 @@ use superior_objects::idl::window;
 use superior_objects::interfaces::launch;
 use superior_objects::time::{self, ZONES};
 use superior_sys::{USER_BASE, print_line, syscall, syscall_x};
-use superior_toolkit::{BOX_H, Event, Id, PAD, Rect, Surface, Ui, icon_by_name, keymap};
+use superior_toolkit::{BOX_H, Event, Id, PAD, PICTURE_PIXELS, Rect, Surface, Ui, icon_by_name, keymap};
 
 const WINDOWS: u64 = 0;
 const MANAGER: u64 = 1;
@@ -91,6 +92,21 @@ fn rect_word(r: Rect) -> u64 {
 fn clock_text(seconds: Option<u64>, zone: usize) -> [u8; 16] {
     let Some(s) = seconds else { return *b"--- -- --- --:--" };
     time::clock(&ZONES[zone], s as i64)
+}
+
+/// Launcher `k`'s icon as a picture, when its manifest's `icon` names an
+/// image file (`launch::OP_ICON_PIXELS`).
+fn icon_picture(k: usize) -> Option<[u32; PICTURE_PIXELS]> {
+    const _: () = assert!(launch::ICON_PIXELS == PICTURE_PIXELS);
+    let mut px = [0; PICTURE_PIXELS];
+    for from in (0..PICTURE_PIXELS).step_by(launch::ICON_PIXELS_PER_CALL) {
+        let r = syscall(Syscall::Call, MANAGER, [launch::OP_ICON_PIXELS, k as u64, from as u64, 0]);
+        if r.status != 0 || r.msg[0] != 0 {
+            return None;
+        }
+        launch::take_icon_words([r.msg[1], r.msg[2], r.msg[3]], from, &mut px);
+    }
+    Some(px)
 }
 
 fn text(t: &[u8]) -> &str {
@@ -322,7 +338,7 @@ impl Panel {
             Menu::Zones => ZONES.len(),
             Menu::Layouts => keymap::NAMES.len(),
         };
-        self.menu.ui = Ui::new(MENU_W, menu_height(rows));
+        self.menu.ui.renew(MENU_W, menu_height(rows));
         let x = match menu {
             Menu::Launchers => {
                 menu_layout(&mut self.menu.ui, &self.launchers[..self.nlaunchers], &self.icons);
@@ -580,6 +596,8 @@ pub extern "C" fn _start(_: u64) -> ! {
     let mut launchers = [Name::EMPTY; MAX_LAUNCHERS];
     let mut icons = [0; MAX_LAUNCHERS];
     let mut nlaunchers = 0;
+    // The menu, holding the launchers' icons from image files.
+    let mut menu = Ui::new(MENU_W, menu_height(1));
     while nlaunchers < MAX_LAUNCHERS {
         let r = syscall(Syscall::Call, MANAGER, [launch::OP_LAUNCHERS, nlaunchers as u64, 0, 0]);
         if r.status != 0 || r.msg[0] != 0 {
@@ -591,12 +609,18 @@ pub extern "C" fn _start(_: u64) -> ! {
         if r.status == 0 && r.msg[0] == 0 {
             let (bytes, len) = launch::name([r.msg[1], r.msg[2], r.msg[3]]);
             icons[nlaunchers] = icon_by_name(&bytes[..len]);
+            if icons[nlaunchers] == 0 && len > 0 {
+                if let Some(px) = icon_picture(nlaunchers) {
+                    icons[nlaunchers] = menu.picture(&px);
+                    say!("{}: its icon from {}", launchers[nlaunchers].as_str(), text(&bytes[..len]));
+                }
+            }
         }
         nlaunchers += 1;
     }
     let mut p = Panel {
         bar: Own { ui: Ui::row(width, HEIGHT), window: None, va: VA },
-        menu: Own { ui: Ui::new(MENU_W, menu_height(1)), window: None, va: MENU_VA },
+        menu: Own { ui: menu, window: None, va: MENU_VA },
         open: None,
         launchers,
         icons,

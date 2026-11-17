@@ -68,6 +68,7 @@ use superior_objects::abi::{
     Syscall, TICK_HZ, root,
 };
 use superior_objects::bundle::{Bundle, BundleError, Signed};
+use superior_objects::image::Image;
 use superior_objects::elf::{Elf, Machine};
 use superior_objects::ab::{self, Record};
 use superior_objects::interfaces::{Status as Reply, block, install, launch, mem, power, update};
@@ -327,13 +328,7 @@ impl<'a> Manager<'a> {
         retype(ut, ObjectType::AddressSpace, c.vspace_bits as u64, vspace)
             .map_err(|e| ("address space", e))?;
         retype(ut, ObjectType::Thread, 0, tcb).map_err(|e| ("thread", e))?;
-        // A package's images are its own; otherwise the system bundle's
-        // first, then the boot bundle's.
-        let image = match self.origin[i] {
-            Some(k) => self.packages[k].and_then(|(b, _)| b.get(c.image)),
-            None => self.system.and_then(|b| b.get(c.image)).or_else(|| self.bundle.get(c.image)),
-        }
-        .ok_or(("image not in the bundle", 0))?;
+        let image = self.file(i, c.image).ok_or(("image not in the bundle", 0))?;
         let entry = load(image, ut, block, vspace)?;
         for p in 0..STACK_PAGES {
             let f = block + B_STACK + p;
@@ -482,6 +477,30 @@ impl<'a> Manager<'a> {
     }
 
     /// The `k`th component with `start launch`.
+    /// Component `i`'s file `name`: a package's files are its own;
+    /// otherwise the system bundle's first, then the boot bundle's.
+    fn file(&self, i: usize, name: &str) -> Option<&'a [u8]> {
+        match self.origin[i] {
+            Some(k) => self.packages[k].and_then(|(b, _)| b.get(name)),
+            None => self.system.and_then(|b| b.get(name)).or_else(|| self.bundle.get(name)),
+        }
+    }
+
+    /// `[OP_ICON_PIXELS, k, from]`: pixels of the image file launcher
+    /// `k`'s icon names.
+    fn icon_pixels(&self, k: usize, from: usize) -> [u64; 4] {
+        let image = self
+            .launcher(k)
+            .and_then(|i| self.file(i, self.component(i).icon))
+            .and_then(|b| Image::parse(b).ok())
+            .filter(|im| (im.width, im.height) == (launch::ICON_SIDE, launch::ICON_SIDE));
+        match image.map(|im| launch::icon_words(&im, from)) {
+            None => [Reply::NotFound as u64, 0, 0, 0],
+            Some(None) => [Reply::Invalid as u64, 0, 0, 0],
+            Some(Some(w)) => [Reply::Ok as u64, w[0], w[1], w[2]],
+        }
+    }
+
     fn launcher(&self, k: usize) -> Option<usize> {
         self.manifest.iter().filter(|(_, c)| c.start == Start::Launch).nth(k).map(|(i, _)| i)
     }
@@ -1633,9 +1652,11 @@ pub extern "C" fn _start(arg: u64) -> ! {
             BADGE_REPORT
                 if i < MAX_COMPONENTS
                     && m.component(i).launch_control
-                    && (launch::OP_LAUNCHERS..=launch::OP_ICON).contains(&msg.msg[0]) =>
+                    && (launch::OP_LAUNCHERS..=launch::OP_ICON_PIXELS).contains(&msg.msg[0]) =>
             {
-                Some(if msg.msg[0] != launch::OP_LAUNCH {
+                Some(if msg.msg[0] == launch::OP_ICON_PIXELS {
+                    m.icon_pixels(msg.msg[1] as usize, msg.msg[2] as usize)
+                } else if msg.msg[0] != launch::OP_LAUNCH {
                     match m.launcher(msg.msg[1] as usize) {
                         Some(t) => {
                             let c = m.component(t);

@@ -785,6 +785,38 @@ pub mod launch {
     /// `k`th component with `start launch` (`icon`), none if it gives
     /// none. Reply `[status, name words...]`, `NotFound` past the last.
     pub const OP_ICON: u64 = 18;
+    /// `[OP_ICON_PIXELS, k, from]`: when the `k`th launcher's icon names an
+    /// image file in its bundle (`superior_objects::image`), `ICON_SIDE`
+    /// pixels square, its pixels `from` to `from + ICON_PIXELS_PER_CALL - 1`
+    /// (left to right, top to bottom), each `0xAARRGGBB`, two to a word,
+    /// the first in the low half. Reply `[status, words...]`: `NotFound`
+    /// past the last launcher or if its icon is no such image, `Invalid`
+    /// if `from` is past the last pixel.
+    pub const OP_ICON_PIXELS: u64 = 19;
+    /// An icon image's width and height.
+    pub const ICON_SIDE: usize = 16;
+    pub const ICON_PIXELS: usize = ICON_SIDE * ICON_SIDE;
+    pub const ICON_PIXELS_PER_CALL: usize = 6;
+
+    /// Pixels `from` on of `image` as `OP_ICON_PIXELS` replies them: the
+    /// image must be `ICON_SIDE` square.
+    pub fn icon_words(image: &crate::image::Image, from: usize) -> Option<[u64; 3]> {
+        if (image.width, image.height) != (ICON_SIDE, ICON_SIDE) || from >= ICON_PIXELS {
+            return None;
+        }
+        let px = |k: usize| image.pixel(k % ICON_SIDE, k / ICON_SIDE) as u64;
+        Some(core::array::from_fn(|w| px(from + 2 * w) | px(from + 2 * w + 1) << 32))
+    }
+
+    /// The pixels an `OP_ICON_PIXELS` reply's words hold, from `from`,
+    /// into `out`.
+    pub fn take_icon_words(w: [u64; 3], from: usize, out: &mut [u32; ICON_PIXELS]) {
+        for k in 0..ICON_PIXELS_PER_CALL {
+            if let Some(p) = out.get_mut(from + k) {
+                *p = (w[k / 2] >> (32 * (k % 2))) as u32;
+            }
+        }
+    }
 
     /// A name as three words.
     pub fn words(name: &[u8]) -> [u64; 3] {

@@ -182,7 +182,8 @@ pub struct Component<'a> {
     pub install_control: bool,
     /// May start `start launch` components.
     pub launch_control: bool,
-    /// The icon a launcher shows for it (the toolkit's names), if any.
+    /// The icon a launcher shows for it (one of the toolkit's names, or an
+    /// image file in its bundle, `superior_objects::image`), if any.
     pub icon: &'a str,
     pub caps: [Option<CapSpec<'a>>; MAX_CAPS],
 }

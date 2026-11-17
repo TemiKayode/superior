@@ -656,6 +656,16 @@ fn bundle(arch: Arch, manifest: &str, driver: &str) -> Result<PathBuf, String> {
         let bytes = std::fs::read(&path).map_err(|e| format!("reading {}: {e}", path.display()))?;
         files.push((name.to_string(), bytes));
     }
+    // Icon images (`icon NAME.pam` in a manifest), by their file names.
+    let mut icons: Vec<_> = std::fs::read_dir(root().join("boot/icons"))
+        .map_err(|e| format!("reading boot/icons: {e}"))?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .collect();
+    icons.sort();
+    for path in icons {
+        let bytes = std::fs::read(&path).map_err(|e| format!("reading {}: {e}", path.display()))?;
+        files.push((path.file_name().unwrap().to_string_lossy().into_owned(), bytes));
+    }
     // The key a system in the A/B slots must be signed with (the kernel
     // verifies this bundle; the Component Manager trusts what it holds).
     files.push(("trust.key".to_string(), signing_key()?.verifying_key().to_bytes().to_vec()));
@@ -4021,9 +4031,26 @@ const MENU_AT: (usize, usize) = (0, SCREEN.1 - PANEL_H - MENU_H);
 fn menu_ui() -> superior_toolkit::Ui {
     let mut ui = superior_toolkit::Ui::new(MENU_W as u32, MENU_H as u32);
     for (l, icon) in PANEL_LAUNCHERS {
-        ui.icon_button(superior_toolkit::icon_by_name(icon.as_bytes()), l);
+        let mut k = superior_toolkit::icon_by_name(icon.as_bytes());
+        if k == 0 {
+            k = ui.picture(&icon_file_pixels(icon));
+        }
+        ui.icon_button(k, l);
     }
     ui
+}
+
+/// The pixels of `boot/icons/<name>`, as the Component Manager hands them
+/// to the panel (`launch::OP_ICON_PIXELS`).
+fn icon_file_pixels(name: &str) -> [u32; superior_toolkit::PICTURE_PIXELS] {
+    use superior_objects::interfaces::launch;
+    let bytes = std::fs::read(root().join("boot/icons").join(name)).expect("an icon file");
+    let image = superior_objects::image::Image::parse(&bytes).expect("an icon image");
+    let mut px = [0; superior_toolkit::PICTURE_PIXELS];
+    for from in (0..launch::ICON_PIXELS).step_by(launch::ICON_PIXELS_PER_CALL) {
+        launch::take_icon_words(launch::icon_words(&image, from).expect("16 pixels square"), from, &mut px);
+    }
+    px
 }
 
 /// The time zones' menu (user/panel's `zone_layout`): a button for each
@@ -4135,7 +4162,7 @@ fn panel_layer(tasks: &[(&str, bool, bool)], menu: ShellMenu, clock: &str, kb: u
 
 /// The apps boot/panel.manifest may launch, in manifest order, and their
 /// icons.
-const PANEL_LAUNCHERS: &[(&str, &str)] = &[("greeter", "person"), ("hello", "wave")];
+const PANEL_LAUNCHERS: &[(&str, &str)] = &[("greeter", "person"), ("hello", "hello.pam")];
 
 /// Where the desktop shell test's pointer goes: "Apps", the menu's two
 /// launchers, the greeter's and Hello's task buttons (with both apps'
@@ -5179,6 +5206,7 @@ fn panel_test(arch: Arch) -> Result<(), String> {
                 "relative X and Y",
                 "absolute X and Y",
                 "compositor: input subscribed",
+                "panel: hello: its icon from hello.pam",
                 "panel: ready",
                 "panel: the clock shows Sat 14 Nov 09:4",
                 "panel: windows: none",
@@ -5221,6 +5249,7 @@ fn panel_test(arch: Arch) -> Result<(), String> {
     let (out, shots) = run_script(&img, arch, "desktop shell test", script, panel_act)?;
     let log = [
         "compositor: ready: the desktop on a 800x600 screen",
+        "panel: hello: its icon from hello.pam",
         "panel: windows: none",
         "panel: ready: 800x32 at the bottom, 2 launchers in its menu",
         "panel: the clock shows Sat 14 Nov 09:4",

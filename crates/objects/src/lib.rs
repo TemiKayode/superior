@@ -17,6 +17,7 @@ pub mod cap;
 pub mod crypto;
 pub mod elf;
 pub mod idl;
+pub mod image;
 pub mod interfaces;
 pub mod ipc;
 pub mod manifest;

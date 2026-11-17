@@ -99,6 +99,24 @@ pub const ICONS: [(&str, [u8; 8]); 6] = [
     ("keyboard", [0x00, 0xff, 0xd5, 0xab, 0x81, 0xbd, 0xff, 0x00]),
 ];
 
+/// Pictures an app gives the toolkit to use as icons (read from image
+/// files, say): up to `MAX_PICTURES`, each `ICON_SIZE` pixels square, row
+/// by row, each `0xAARRGGBB` (blended over the button by its top byte).
+/// [`Ui::picture`] numbers them as icons from `PICTURE_ICON`.
+pub const MAX_PICTURES: usize = 6;
+pub const PICTURE_ICON: u8 = 0x80;
+pub const PICTURE_PIXELS: usize = (ICON_SIZE * ICON_SIZE) as usize;
+
+/// `over` blended over the opaque `under` by `over`'s top byte.
+pub fn blend(over: u32, under: u32) -> u32 {
+    let a = over >> 24;
+    let mix = |shift: u32| {
+        let (o, u) = (over >> shift & 0xff, under >> shift & 0xff);
+        ((o * a + u * (255 - a) + 127) / 255) << shift
+    };
+    mix(16) | mix(8) | mix(0)
+}
+
 /// The icon called `name` (its number, from 1), or 0 if none is.
 pub fn icon_by_name(name: &[u8]) -> u8 {
     ICONS.iter().position(|(n, _)| n.as_bytes() == name).map_or(0, |k| k as u8 + 1)
@@ -510,6 +528,9 @@ pub struct Ui {
     area_len: usize,
     /// Whether the text area wraps its lines.
     area_wrap: bool,
+    /// The pictures given for icons ([`Ui::picture`]); kept when cleared.
+    pictures: [[u32; PICTURE_PIXELS]; MAX_PICTURES],
+    npictures: usize,
 }
 
 impl Ui {
@@ -554,7 +575,34 @@ impl Ui {
             area: [0; AREA_TEXT],
             area_len: 0,
             area_wrap: false,
+            pictures: [[0; PICTURE_PIXELS]; MAX_PICTURES],
+            npictures: 0,
         }
+    }
+
+    /// Takes `pixels` as a picture to use as an icon: its icon number, or
+    /// 0 if `MAX_PICTURES` are taken. Pictures stay through
+    /// [`Ui::clear`].
+    pub fn picture(&mut self, pixels: &[u32; PICTURE_PIXELS]) -> u8 {
+        if self.npictures == MAX_PICTURES {
+            return 0;
+        }
+        self.pictures[self.npictures] = *pixels;
+        self.npictures += 1;
+        PICTURE_ICON + self.npictures as u8 - 1
+    }
+
+    /// Starts again at `w` by `h`, as new (a row still a row), the
+    /// pictures given kept.
+    pub fn renew(&mut self, w: u32, h: u32) {
+        let (row, pictures, npictures) = (self.row, self.pictures, self.npictures);
+        *self = Ui { row, pictures, npictures, ..Ui::new(w, h) };
+    }
+
+    /// Whether `icon` is a built-in icon or a picture given.
+    fn has_icon(&self, icon: u8) -> bool {
+        (1..=ICONS.len() as u8).contains(&icon)
+            || icon.checked_sub(PICTURE_ICON).is_some_and(|k| (k as usize) < self.npictures)
     }
 
     /// A row, left to right.
@@ -732,7 +780,7 @@ impl Ui {
     /// A button with icon `icon` (see [`ICONS`]; 0 for none, a plain
     /// button) before its text.
     pub fn icon_button(&mut self, icon: u8, text: &str) -> Id {
-        if !(1..=ICONS.len() as u8).contains(&icon) {
+        if !self.has_icon(icon) {
             return self.button(text);
         }
         let w = font::width(text.as_bytes(), SCALE) + 2 * BUTTON_SIDE + ICON_SIZE + ICON_GAP;
@@ -923,8 +971,14 @@ impl Ui {
                 s.fill(r, face);
                 s.outline(r, EDGE);
                 let tw = font::width(t, SCALE);
-                if let Some((_, rows)) = ICONS.get((w.icon as usize).wrapping_sub(1)) {
-                    let (ix, iy) = (r.x + BUTTON_SIDE, r.y + (r.h - ICON_SIZE) / 2);
+                let (ix, iy) = (r.x + BUTTON_SIDE, r.y + (r.h.saturating_sub(ICON_SIZE)) / 2);
+                if let Some(pixels) = w.icon.checked_sub(PICTURE_ICON).and_then(|k| self.pictures.get(k as usize)) {
+                    for (k, &p) in pixels.iter().enumerate() {
+                        let (x, y) = (k as u32 % ICON_SIZE, k as u32 / ICON_SIZE);
+                        s.fill(Rect { x: ix + x, y: iy + y, w: 1, h: 1 }, blend(p, face));
+                    }
+                    s.text(ix + ICON_SIZE + ICON_GAP, r.y + (r.h - th) / 2, t, SCALE, INK);
+                } else if let Some((_, rows)) = ICONS.get((w.icon as usize).wrapping_sub(1)) {
                     for (y, row) in rows.iter().enumerate() {
                         for x in (0..8).filter(|x| row & 0x80 >> x != 0) {
                             let at = Rect { x: ix + x * SCALE, y: iy + y as u32 * SCALE, w: SCALE, h: SCALE };
@@ -1772,5 +1826,34 @@ mod tests {
         // The wave's second row, 0x66: its second pixel lit, its first not.
         assert_eq!(s.px[(10 * 800 + 22) as usize], ICON_INK);
         assert_eq!(s.px[(10 * 800 + 20) as usize], FACE);
+    }
+
+    #[test]
+    fn a_picture_is_an_icon_blended_over_its_button() {
+        let mut ui = Ui::row(800, 32);
+        // Opaque red on top, then clear, then half see-through white.
+        let pixels: [u32; PICTURE_PIXELS] = core::array::from_fn(|k| match k / 16 {
+            0 => 0xffff_0000,
+            1..8 => 0x00ff_ffff,
+            _ => 0x80ff_ffff,
+        });
+        let icons: [u8; MAX_PICTURES] = core::array::from_fn(|_| ui.picture(&pixels));
+        assert_eq!(icons, [0x80, 0x81, 0x82, 0x83, 0x84, 0x85]);
+        assert_eq!(ui.picture(&pixels), 0, "all taken");
+        ui.clear();
+        ui.renew(800, 32);
+        let a = ui.icon_button(0x81, "Hello");
+        assert_eq!(ui.widget(a).rect.w, 82 + ICON_SIZE + ICON_GAP, "kept through clear and renew");
+        let b = ui.icon_button(0x86, "Hello");
+        assert_eq!(ui.widget(b).rect.w, 82, "no such picture");
+        let mut px = [0u32; 800 * 32];
+        let mut s = Surface { px: &mut px, w: 800, h: 32 };
+        ui.draw(&mut s);
+        let (ix, iy) = (8 + BUTTON_SIDE, 3 + (26 - ICON_SIZE) / 2);
+        assert_eq!(s.px[(iy * 800 + ix) as usize], 0xff_0000);
+        assert_eq!(s.px[((iy + 4) * 800 + ix + 15) as usize], FACE);
+        assert_eq!(s.px[((iy + 15) * 800 + ix) as usize], blend(0x80ff_ffff, FACE));
+        assert_eq!(blend(0x80ff_ffff, 0), 0x80_8080);
+        assert_eq!(blend(0xff12_3456, 0xabcdef), 0x12_3456);
     }
 }

@@ -93,7 +93,8 @@ component greeter
 
 component hello
   image greeter
-  icon wave
+  # Its launcher's icon: an image file in the bundle (boot/icons/).
+  icon hello.pam
   arg 1
   start launch
   restart never
