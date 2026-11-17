@@ -603,7 +603,9 @@ fn help() {
             continue;
         }
         sout!("  {line}\n");
-        let usage = line[..16].trim_end();
+        // `get`, not `[..16]`: a slice of a `str` panics through code that
+        // does not link position-independent on AArch64.
+        let usage = line.get(..16).unwrap_or(line).trim_end();
         scr!(Ink::Strong, "{usage:<16}");
         scr!(Ink::Muted, "{short}\n");
     }
