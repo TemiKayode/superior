@@ -10,7 +10,10 @@
 //! a clock: the date and time of day ("Sat 14 Nov 09:41") in a time zone,
 //! from the kernel's real-time clock (`Time`). Pressing it opens a menu of
 //! time zones above it (UTC at first); pressing one shows the clock in
-//! that zone, its daylight saving and all.
+//! that zone, its daylight saving and all. Left of the clock a keyboard
+//! button names the keyboard layout keys type under; pressing it opens a
+//! menu of the layouts, and pressing one has the compositor use it (the
+//! panel sets it again when the compositor restarts).
 //!
 //! It manages the compositor (`manages window`): it may list, describe,
 //! activate and minimise every window, the compositor tells its window
@@ -33,7 +36,7 @@ use superior_objects::idl::window;
 use superior_objects::interfaces::launch;
 use superior_objects::time::{self, ZONES};
 use superior_sys::{USER_BASE, print_line, syscall, syscall_x};
-use superior_toolkit::{BOX_H, Event, Id, PAD, Rect, Surface, Ui, icon_by_name};
+use superior_toolkit::{BOX_H, Event, Id, PAD, Rect, Surface, Ui, icon_by_name, keymap};
 
 const WINDOWS: u64 = 0;
 const MANAGER: u64 = 1;
@@ -47,16 +50,21 @@ const HEIGHT: u32 = 32;
 const MAX_PAGES: u64 = (1024 * HEIGHT as u64 * 4).div_ceil(4096);
 const MAX_LAUNCHERS: usize = 6;
 const MAX_TASKS: usize = window::MAX_WINDOWS as usize;
-/// The menu (the launchers or the time zones): its width, the most pages
-/// it takes (a button for every launcher or zone), and where they go.
+/// The menu (the launchers, the time zones or the keyboard layouts): its
+/// width, the most pages it takes (a button for every launcher, zone or
+/// layout), and where they go.
 const MENU_W: u32 = 160;
-const MENU_ROWS: usize = if MAX_LAUNCHERS > ZONES.len() { MAX_LAUNCHERS } else { ZONES.len() };
+const MENU_ROWS: usize = max(max(MAX_LAUNCHERS, ZONES.len()), keymap::NAMES.len());
 const MENU_PAGES: u64 = (MENU_W as u64 * menu_height(MENU_ROWS) as u64 * 4).div_ceil(4096);
 const MENU_SLOTS: u64 = PAGE_SLOTS + MAX_PAGES;
 const MENU_VA: u64 = VA + 0x10_0000;
 
 macro_rules! say {
     ($($t:tt)*) => { print_line(format_args!("panel: {}", format_args!($($t)*))) };
+}
+
+const fn max(a: usize, b: usize) -> usize {
+    if a > b { a } else { b }
 }
 
 /// The menu's height for `n` launchers: a button each, in a column.
@@ -122,13 +130,27 @@ const NO_TASK: Task = Task { window: 0, title: Name::EMPTY, focused: false, mini
 enum Menu {
     Launchers,
     Zones,
+    Layouts,
+}
+
+impl Menu {
+    /// What the log calls it.
+    fn name(self) -> &'static str {
+        match self {
+            Menu::Launchers => "menu",
+            Menu::Zones => "time zones",
+            Menu::Layouts => "keyboard layouts",
+        }
+    }
 }
 
 /// Lays the panel out: "Apps" (selected while the launcher menu is open),
-/// a button for each of `tasks` (the focused one selected), then the clock
-/// at the right end (selected while the time zones' menu is open). "Apps"
-/// is button 0, the tasks' buttons follow in order, and the clock is last.
-fn layout(ui: &mut Ui, tasks: &[Task], menu: Option<Menu>, clock: &[u8; 16]) {
+/// a button for each of `tasks` (the focused one selected), then at the
+/// right end the keyboard button naming layout `kb` (selected while the
+/// layouts' menu is open) and the clock (selected while the time zones'
+/// menu is open). "Apps" is button 0, the tasks' buttons follow in order,
+/// then the keyboard button, and the clock is last.
+fn layout(ui: &mut Ui, tasks: &[Task], menu: Option<Menu>, clock: &[u8; 16], kb: usize) {
     ui.clear();
     let apps = ui.button("Apps");
     ui.select(apps, menu == Some(Menu::Launchers));
@@ -136,9 +158,12 @@ fn layout(ui: &mut Ui, tasks: &[Task], menu: Option<Menu>, clock: &[u8; 16]) {
         let id = ui.icon_button(t.icon, if t.title.len == 0 { "untitled" } else { t.title.as_str() });
         ui.select(id, t.focused);
     }
+    let k = ui.icon_button(icon_by_name(b"keyboard"), keymap::NAMES[kb]);
+    ui.select(k, menu == Some(Menu::Layouts));
     let c = ui.icon_button(icon_by_name(b"clock"), text(clock));
     ui.select(c, menu == Some(Menu::Zones));
     ui.push_right(c);
+    ui.push_left_of(k, c);
 }
 
 /// Lays the launcher menu out: a button for each of `launchers` (with its
@@ -157,6 +182,16 @@ fn zone_layout(ui: &mut Ui, zone: usize) {
     for (k, z) in ZONES.iter().enumerate() {
         let id = ui.button(z.name);
         ui.select(id, k == zone);
+    }
+}
+
+/// Lays the keyboard layouts' menu out: a button for each layout, in a
+/// column, `kb`'s selected.
+fn keyboard_layout(ui: &mut Ui, kb: usize) {
+    ui.clear();
+    for (k, name) in keymap::NAMES.iter().enumerate() {
+        let id = ui.button(name);
+        ui.select(id, k == kb);
     }
 }
 
@@ -242,6 +277,8 @@ struct Panel {
     clock: [u8; 16],
     /// The clock's time zone, of `ZONES`.
     zone: usize,
+    /// The keyboard layout, of `keymap::NAMES`.
+    kb: usize,
     /// Where the pointer last was on the panel (it is laid out anew under
     /// it), none once it left.
     pointer: Option<(i32, i32)>,
@@ -251,6 +288,10 @@ impl Panel {
     fn open(&mut self) -> bool {
         for _ in 0..50 {
             if self.bar.create(self.at, PAGE_SLOTS) {
+                // A restarted compositor starts on the US layout.
+                if self.kb != keymap::US as usize {
+                    let _ = call(window::set_layout(self.kb as u64), None);
+                }
                 self.refresh(true);
                 return true;
             }
@@ -261,18 +302,26 @@ impl Panel {
 
     /// The panel's button that opens `menu`.
     fn opener(&self, menu: Menu) -> Id {
-        if menu == Menu::Launchers { 0 } else { self.bar.ui.len() - 1 }
+        match menu {
+            Menu::Launchers => 0,
+            Menu::Layouts => self.bar.ui.len() - 2,
+            Menu::Zones => self.bar.ui.len() - 1,
+        }
     }
 
     /// Opens `menu` (the launchers above "Apps", the time zones above the
-    /// clock), or closes it if it is open; another menu open closes.
+    /// clock, the keyboard layouts above the keyboard button), or closes it if it is open; another menu open closes.
     fn toggle_menu(&mut self, menu: Menu) {
         let was = self.open;
         self.close_menu();
         if was == Some(menu) {
             return;
         }
-        let rows = if menu == Menu::Launchers { self.nlaunchers.max(1) } else { ZONES.len() };
+        let rows = match menu {
+            Menu::Launchers => self.nlaunchers.max(1),
+            Menu::Zones => ZONES.len(),
+            Menu::Layouts => keymap::NAMES.len(),
+        };
         self.menu.ui = Ui::new(MENU_W, menu_height(rows));
         let x = match menu {
             Menu::Launchers => {
@@ -282,6 +331,11 @@ impl Panel {
             Menu::Zones => {
                 zone_layout(&mut self.menu.ui, self.zone);
                 self.width.saturating_sub(MENU_W) as u64
+            }
+            Menu::Layouts => {
+                keyboard_layout(&mut self.menu.ui, self.kb);
+                let x = self.bar.ui.widget(self.opener(menu)).rect.x;
+                x.min(self.width.saturating_sub(MENU_W)) as u64
             }
         };
         let h = self.menu.ui.h;
@@ -299,10 +353,10 @@ impl Panel {
                     Ok(())
                 }
             }
-            if menu == Menu::Launchers {
-                say!("menu open: {}", Names(&self.launchers[..self.nlaunchers]));
-            } else {
-                say!("time zones open: {} chosen", ZONES[self.zone].name);
+            match menu {
+                Menu::Launchers => say!("menu open: {}", Names(&self.launchers[..self.nlaunchers])),
+                Menu::Zones => say!("time zones open: {} chosen", ZONES[self.zone].name),
+                Menu::Layouts => say!("keyboard layouts open: {} chosen", keymap::NAMES[self.kb]),
             }
         }
     }
@@ -314,7 +368,7 @@ impl Panel {
         }
         let d = self.bar.ui.select(self.opener(menu), false);
         self.bar.show(d);
-        say!("{} closed", if menu == Menu::Launchers { "menu" } else { "time zones" });
+        say!("{} closed", menu.name());
     }
 
     /// Asks the compositor which windows there are; if they changed (or
@@ -351,7 +405,7 @@ impl Panel {
 
     /// Lays the panel out anew (under the pointer) and shows all of it.
     fn lay_out(&mut self) {
-        layout(&mut self.bar.ui, &self.tasks[..self.ntasks], self.open, &self.clock);
+        layout(&mut self.bar.ui, &self.tasks[..self.ntasks], self.open, &self.clock, self.kb);
         if let Some((x, y)) = self.pointer {
             self.bar.ui.event(Event::Pointer { x, y, buttons: 0 });
         }
@@ -395,8 +449,8 @@ impl Panel {
         say!("windows: {}", Tasks(&self.tasks[..self.ntasks]));
     }
 
-    /// Button `id` of the panel was clicked: "Apps" opens or closes the
-    /// menu; a task button puts its window in front, or minimises it if it
+    /// Button `id` of the panel was clicked: "Apps", the keyboard button
+    /// and the clock open or close their menus; a task button puts its window in front, or minimises it if it
     /// has the focus.
     fn clicked(&mut self, id: Id) {
         if id == 0 {
@@ -405,6 +459,10 @@ impl Panel {
         }
         if id == self.bar.ui.len() - 1 {
             self.toggle_menu(Menu::Zones);
+            return;
+        }
+        if id == self.bar.ui.len() - 2 {
+            self.toggle_menu(Menu::Layouts);
             return;
         }
         let Some(&t) = self.tasks[..self.ntasks].get(id - 1) else { return };
@@ -461,6 +519,22 @@ impl Panel {
         self.tick();
     }
 
+    /// Layout `k` in the keyboard layouts' menu was clicked: the menu
+    /// closes, the compositor has keys type under it, and the keyboard
+    /// button names it.
+    fn choose_layout(&mut self, k: usize) {
+        if k >= keymap::NAMES.len() {
+            return;
+        }
+        self.close_menu();
+        let r = call(window::set_layout(k as u64), None).map_or(u64::MAX, |m| m[0]);
+        if r == 0 {
+            self.kb = k;
+            self.lay_out();
+        }
+        say!("keyboard layout {} (status {r})", keymap::NAMES[k]);
+    }
+
     fn menu_event(&mut self, kind: u64, a: u64, b: u64) {
         let clicked = match kind {
             window::POINTER => self.menu.pointer(Some((a, b))),
@@ -470,6 +544,7 @@ impl Panel {
         match (clicked, self.open) {
             (Some(k), Some(Menu::Launchers)) => self.launch(k),
             (Some(k), Some(Menu::Zones)) => self.choose_zone(k),
+            (Some(k), Some(Menu::Layouts)) => self.choose_layout(k),
             _ => {}
         }
     }
@@ -532,6 +607,7 @@ pub extern "C" fn _start(_: u64) -> ! {
         width,
         clock: clock_text(superior_sys::time(), 0),
         zone: 0,
+        kb: call(window::layout(), None).filter(|m| m[0] == 0).map_or(0, |m| m[1] as usize).min(keymap::NAMES.len() - 1),
         pointer: None,
     };
     if !p.open() {

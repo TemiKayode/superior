@@ -84,7 +84,7 @@ pub const ICON_INK: u32 = 0x0035_6a9e;
 pub const ICON_SIZE: u32 = 8 * SCALE;
 /// The gap between an icon and its button's text.
 pub const ICON_GAP: u32 = 4;
-pub const ICONS: [(&str, [u8; 8]); 5] = [
+pub const ICONS: [(&str, [u8; 8]); 6] = [
     // A window.
     ("app", [0xff, 0xff, 0x81, 0x81, 0x81, 0x81, 0x81, 0xff]),
     // Head and shoulders.
@@ -95,6 +95,8 @@ pub const ICONS: [(&str, [u8; 8]); 5] = [
     ("list", [0x00, 0xdf, 0x00, 0xdf, 0x00, 0xdf, 0x00, 0xdf]),
     // A clock face.
     ("clock", [0x3c, 0x52, 0x91, 0x9d, 0x81, 0x81, 0x42, 0x3c]),
+    // A keyboard: two rows of keys and a space bar.
+    ("keyboard", [0x00, 0xff, 0xd5, 0xab, 0x81, 0xbd, 0xff, 0x00]),
 ];
 
 /// The icon called `name` (its number, from 1), or 0 if none is.
@@ -603,6 +605,14 @@ impl Ui {
     pub fn push_right(&mut self, id: Id) {
         let r = &mut self.widgets[id].rect;
         r.x = self.w.saturating_sub(PAD + r.w);
+    }
+
+    /// In a row, moves widget `id` to just left of widget `of` (after
+    /// `push_right(of)`, to keep both at the right end).
+    pub fn push_left_of(&mut self, id: Id, of: Id) {
+        let x = self.widgets[of].rect.x;
+        let r = &mut self.widgets[id].rect;
+        r.x = x.saturating_sub(PAD + r.w);
     }
 
     /// Lays out across the window the line that starts with `start`: the

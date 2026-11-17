@@ -5324,12 +5324,10 @@ fn panel_watcher() -> ! {
         if apps() == steps[at].1 {
             say!("panel test: {} (step {})", steps[at].0, at + 1);
             at += 1;
-            if at == 3 {
-                // Keys type as on a Dvorak keyboard from now on (a
-                // manager's call).
-                let r = window_call(window::set_layout(window::LAYOUT_DVORAK), None).map_or(u64::MAX, |m| m[0]);
+            if at == 5 {
+                // The layout the panel's keyboard menu chose.
                 let l = window_call(window::layout(), None).map_or(u64::MAX, |m| m[1]);
-                say!("panel test: keyboard layout {l} (status {r})");
+                say!("panel test: keyboard layout {l}");
             }
         }
         superior_sys::sleep(5);

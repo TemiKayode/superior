@@ -3974,6 +3974,7 @@ enum ShellMenu {
     Closed,
     Apps,
     Zones,
+    Layouts,
 }
 
 /// The icon each test app's window has (its client's `SET_ICON`).
@@ -3985,7 +3986,8 @@ fn task_icon(title: &str) -> u8 {
     })
 }
 
-fn panel_ui(tasks: &[(&str, bool, bool)], menu: ShellMenu, clock: &str) -> superior_toolkit::Ui {
+fn panel_ui(tasks: &[(&str, bool, bool)], menu: ShellMenu, clock: &str, kb: u64) -> superior_toolkit::Ui {
+    use superior_toolkit::keymap;
     let mut ui = superior_toolkit::Ui::row(SCREEN.0 as u32, PANEL_H as u32);
     let apps = ui.button("Apps");
     ui.select(apps, menu == ShellMenu::Apps);
@@ -3993,9 +3995,12 @@ fn panel_ui(tasks: &[(&str, bool, bool)], menu: ShellMenu, clock: &str) -> super
         let id = ui.icon_button(task_icon(title), title);
         ui.select(id, *focused);
     }
+    let k = ui.icon_button(superior_toolkit::icon_by_name(b"keyboard"), keymap::NAMES[kb as usize]);
+    ui.select(k, menu == ShellMenu::Layouts);
     let c = ui.icon_button(superior_toolkit::icon_by_name(b"clock"), clock);
     ui.select(c, menu == ShellMenu::Zones);
     ui.push_right(c);
+    ui.push_left_of(k, c);
     ui
 }
 
@@ -4024,6 +4029,26 @@ fn zones_ui() -> superior_toolkit::Ui {
     for (k, z) in superior_objects::time::ZONES.iter().enumerate() {
         let id = ui.button(z.name);
         ui.select(id, k == 0);
+    }
+    ui
+}
+
+/// The keyboard layouts' menu (user/panel's `keyboard_layout`): a button
+/// for each layout, `kb` chosen, above the panel's keyboard button (on
+/// the US layout).
+const LAYOUTS_H: usize = 8 + superior_toolkit::keymap::NAMES.len() * 34;
+
+fn layouts_at() -> (usize, usize) {
+    let ui = panel_ui(&[], ShellMenu::Closed, &panel_clock(0, 0), superior_toolkit::keymap::US);
+    let x = ui.widget(ui.len() - 2).rect.x as usize;
+    (x.min(SCREEN.0 - MENU_W), SCREEN.1 - PANEL_H - LAYOUTS_H)
+}
+
+fn layouts_ui(kb: u64) -> superior_toolkit::Ui {
+    let mut ui = superior_toolkit::Ui::new(MENU_W as u32, LAYOUTS_H as u32);
+    for (k, name) in superior_toolkit::keymap::NAMES.iter().enumerate() {
+        let id = ui.button(name);
+        ui.select(id, k as u64 == kb);
     }
     ui
 }
@@ -4088,11 +4113,11 @@ fn greeter_layer(hello: bool, focused: bool) -> Layer {
 }
 
 /// The panel, laid out for `tasks` (the menu open or not, the clock at
-/// `clock`) with the pointer at `pointer` (on the screen) if it is on the
-/// panel.
-fn panel_layer(tasks: &[(&str, bool, bool)], menu: ShellMenu, clock: &str, pointer: Option<(usize, usize)>) -> Layer {
+/// `clock`, keyboard layout `kb`) with the pointer at `pointer` (on the
+/// screen) if it is on the panel.
+fn panel_layer(tasks: &[(&str, bool, bool)], menu: ShellMenu, clock: &str, kb: u64, pointer: Option<(usize, usize)>) -> Layer {
     use superior_toolkit::Event;
-    let mut ui = panel_ui(tasks, menu, clock);
+    let mut ui = panel_ui(tasks, menu, clock, kb);
     if let Some((x, y)) = pointer.filter(|&(_, y)| y >= SCREEN.1 - PANEL_H) {
         ui.event(Event::Pointer { x: x as i32, y: (y - (SCREEN.1 - PANEL_H)) as i32, buttons: 0 });
     }
@@ -4108,11 +4133,14 @@ const PANEL_LAUNCHERS: &[(&str, &str)] = &[("greeter", "person"), ("hello", "wav
 /// Where the desktop shell test's pointer goes: "Apps", the menu's two
 /// launchers, the greeter's and Hello's task buttons (with both apps'
 /// windows on the panel), the greeter's minimise and close boxes, the
-/// clock and the time zones' menu's Lagos.
+/// clock and the time zones' menu's Lagos, the keyboard button and the
+/// layouts' menu's Dvorak.
 struct PanelSpots {
     apps: (usize, usize),
     clock: (usize, usize),
     lagos: (usize, usize),
+    keyboard: (usize, usize),
+    dvorak: (usize, usize),
     run: [(usize, usize); 2],
     greeter_task: (usize, usize),
     hello_task: (usize, usize),
@@ -4121,11 +4149,14 @@ struct PanelSpots {
 }
 
 fn panel_spots() -> PanelSpots {
-    let ui = panel_ui(&[("Greeter", false, false), ("Hello", true, false)], ShellMenu::Closed, &panel_clock(0, 0));
+    use superior_toolkit::keymap;
+    let ui = panel_ui(&[("Greeter", false, false), ("Hello", true, false)], ShellMenu::Closed, &panel_clock(0, 0), keymap::US);
     PanelSpots {
         apps: panel_spot(&ui, 0),
-        clock: panel_spot(&ui, 3),
+        clock: panel_spot(&ui, 4),
         lagos: menu_spot_of(&zones_ui(), ZONES_AT, 2),
+        keyboard: panel_spot(&ui, 3),
+        dvorak: menu_spot_of(&layouts_ui(keymap::US), layouts_at(), keymap::DVORAK as usize),
         run: [menu_spot(0), menu_spot(1)],
         greeter_task: panel_spot(&ui, 1),
         hello_task: panel_spot(&ui, 2),
@@ -4142,18 +4173,20 @@ fn panel_spots() -> PanelSpots {
 /// the windows back to front, and where the pointer is.
 fn panel_pictures(minute: u64) -> Vec<(Vec<Layer>, Option<(usize, usize)>)> {
     use ShellMenu::*;
+    use superior_toolkit::keymap::{DVORAK, US};
     let s = panel_spots();
     let (utc, lagos) = (panel_clock(minute, 0), panel_clock(minute, 2));
     let panel = |tasks: &[(&str, bool, bool)], menu: ShellMenu, pointer: (usize, usize)| {
-        panel_layer(tasks, menu, &lagos, Some(pointer))
+        panel_layer(tasks, menu, &lagos, US, Some(pointer))
     };
+    let both = [("Greeter", false, false), ("Hello", true, false)];
     vec![
-        (vec![panel_layer(&[], Closed, &utc, None)], None),
+        (vec![panel_layer(&[], Closed, &utc, US, None)], None),
         (
-            vec![panel_layer(&[], Zones, &utc, Some(s.clock)), menu_layer_of(zones_ui(), ZONES_AT, Some(s.clock))],
+            vec![panel_layer(&[], Zones, &utc, US, Some(s.clock)), menu_layer_of(zones_ui(), ZONES_AT, Some(s.clock))],
             Some(s.clock),
         ),
-        (vec![panel_layer(&[], Closed, &lagos, Some(s.lagos))], Some(s.lagos)),
+        (vec![panel_layer(&[], Closed, &lagos, US, Some(s.lagos))], Some(s.lagos)),
         (vec![panel(&[], Apps, s.apps), menu_layer(Some(s.apps))], Some(s.apps)),
         (
             vec![
@@ -4172,7 +4205,41 @@ fn panel_pictures(minute: u64) -> Vec<(Vec<Layer>, Option<(usize, usize)>)> {
             vec![greeter_layer(false, true), panel(&[("Greeter", true, false), ("Hello", false, true)], Closed, s.run[0])],
             Some(s.run[0]),
         ),
+        (
+            vec![
+                greeter_layer(false, false),
+                greeter_layer(true, true),
+                panel(&both, Layouts, s.keyboard),
+                menu_layer_of(layouts_ui(US), layouts_at(), Some(s.keyboard)),
+            ],
+            Some(s.keyboard),
+        ),
+        (
+            vec![greeter_layer(false, false), hello_dvorak(), panel_layer(&both, Closed, &lagos, DVORAK, None)],
+            Some(PANEL_HELLO_FIELD),
+        ),
     ]
+}
+
+/// Hello's window with the focus, its field pressed and "pear" typed on
+/// the Dvorak layout by the keys under "rdao" on a US keyboard.
+fn hello_dvorak() -> Layer {
+    use superior_toolkit::{Event, keymap};
+    let mut layer = greeter_layer(true, true);
+    let (mut ui, field, ..) = greeter_ui();
+    ui.event(Event::Focus(true));
+    let (x, y) = ((PANEL_HELLO_FIELD.0 - layer.at.0) as i32, (PANEL_HELLO_FIELD.1 - layer.at.1) as i32);
+    for buttons in [0, 1, 0] {
+        ui.event(Event::Pointer { x, y, buttons });
+    }
+    for usage in [21, 7, 4, 18] {
+        for down in [true, false] {
+            ui.event(Event::Key { usage, down, modifiers: 0, ch: keymap::character(keymap::DVORAK, usage, 0) });
+        }
+    }
+    assert_eq!(ui.text(field), "pear");
+    ui.draw(&mut superior_toolkit::Surface { px: &mut layer.pixels, w: layer.size.0 as u32, h: layer.size.1 as u32 });
+    layer
 }
 
 /// Checks the desktop shell test's screenshot `k` (from 1) pixel by pixel,
@@ -4985,9 +5052,10 @@ const PANEL_GREETER_FIELD: (usize, usize) = (360, 220);
 /// the compositor and may launch the greeter and "Hello". Through QEMU's
 /// monitor the host launches both from the panel, puts the greeter back
 /// in front from its task button, closes it from its close box (it exits)
-/// and launches it again; then, the watcher having set the Dvorak layout,
-/// types "pear" in Hello by the keys that type it there, copies it and
-/// pastes it in the greeter. Eight screenshots must have every pixel right:
+/// and launches it again; then chooses the Dvorak layout from the panel's
+/// keyboard menu, types "pear" in Hello by the keys that type it there,
+/// copies it and pastes it in the greeter. Ten screenshots must have every
+/// pixel right:
 /// the panel as the toolkit lays it out on the host, the apps' windows in
 /// their titled frames, the focus and the stacking.
 fn panel_test(arch: Arch) -> Result<(), String> {
@@ -5028,14 +5096,18 @@ fn panel_test(arch: Arch) -> Result<(), String> {
         (vec!["greeter: closed", "panel: windows: \"Hello\" (minimised)"], with(None, click(s.apps))),
         (vec!["3x panel: menu open: greeter, hello"], with(None, click(s.run[0]))),
         (vec!["2x greeter: ready", "2x panel: windows: \"Greeter\" (focused), \"Hello\" (minimised)"], with(Some(8), click(s.hello_task))),
+        // The Dvorak layout chosen from the panel's keyboard menu.
+        (vec!["2x panel: windows: \"Greeter\", \"Hello\" (focused)"], click(s.keyboard)),
+        (vec!["panel: keyboard layouts open: US chosen"], with(Some(9), click(s.dvorak))),
         // The clipboard: "pear" copied in Hello's field, pasted in the
-        // greeter's. Typed on the Dvorak layout the watcher set: the keys
-        // under "rdao" on a US keyboard.
-        (vec!["panel test: keyboard layout 2 (status 0)", "2x panel: windows: \"Greeter\", \"Hello\" (focused)"], {
+        // greeter's. Typed on the Dvorak layout: the keys under "rdao" on a
+        // US keyboard.
+        (vec!["panel: keyboard layout Dvorak (status 0)"], {
             let mut v = click(PANEL_HELLO_FIELD);
-            v.extend([Type("rdao"), Key("ctrl+a"), Key("ctrl+c")]);
+            v.push(Type("rdao"));
             v
         }),
+        (vec!["hello: the field holds \"pear\", the cursor at 4"], with(Some(10), vec![Key("ctrl+a"), Key("ctrl+c")])),
         (vec!["hello: copied \"pear\" to the clipboard"], click(s.greeter_task)),
         (vec!["greeter: the clipboard holds \"pear\""], {
             let mut v = click(PANEL_GREETER_FIELD);
@@ -5079,8 +5151,10 @@ fn panel_test(arch: Arch) -> Result<(), String> {
         "panel test: both apps minimised (step 1)",
         "panel test: the greeter gone, Hello minimised (step 2)",
         "panel test: the greeter back with the focus, Hello minimised (step 3)",
+        "panel: keyboard layouts open: US chosen",
+        "panel: keyboard layouts closed",
         "compositor: keyboard layout Dvorak",
-        "panel test: keyboard layout 2 (status 0)",
+        "panel: keyboard layout Dvorak (status 0)",
         "hello: the field holds \"pear\", the cursor at 4",
         "hello: copied \"pear\" to the clipboard",
         "compositor: window 2 copied 4 bytes to the clipboard",
@@ -5089,11 +5163,12 @@ fn panel_test(arch: Arch) -> Result<(), String> {
         "greeter: the field holds \"pear\", the cursor at 4",
         "panel test: Hello back with the focus (step 4)",
         "panel test: the greeter with the focus again (step 5)",
+        "panel test: keyboard layout 2",
         "[cm] watcher asked to shut down (pass)",
     ];
     check_log("desktop shell test", &out, &log)?;
-    if shots != 8 {
-        return Err(format!("desktop shell test: {shots} screenshots taken, want 8"));
+    if shots != 10 {
+        return Err(format!("desktop shell test: {shots} screenshots taken, want 10"));
     }
     println!("== desktop shell test passed ({})", arch.name());
     Ok(())

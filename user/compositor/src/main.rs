@@ -799,9 +799,10 @@ impl Compositor {
         }
     }
 
+    /// Gives window `to` the focus (none for `None`); a manager's window
+    /// (the panel's menu newly shown) never takes it, and the focus stays.
     fn set_focus(&mut self, to: Option<usize>) {
-        let to = to.filter(|&i| !self.manager(i));
-        if to == self.focus {
+        if to.is_some_and(|i| self.manager(i)) || to == self.focus {
             return;
         }
         self.stop_repeat();

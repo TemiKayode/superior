@@ -1143,9 +1143,14 @@ holds the rest):
   character it types under the system's layout (`crates/toolkit/src/keymap.rs`:
   US, UK, Dvorak and French AZERTY, ASCII only) and gives it with the `KEY`
   event; a manager sets the layout (`SET_LAYOUT`), anyone may ask (`LAYOUT`).
-  Apps type the character and take shortcuts by the key's place. In
-  `panel-test` the watcher sets Dvorak and the host types the keys under
-  "rdao" on a US keyboard into Hello: its field holds "pear".
+  Apps type the character and take shortcuts by the key's place. The
+  panel's keyboard button, left of the clock, names the layout and opens a
+  menu of them; choosing one sets it, and the panel sets it again if the
+  compositor restarts. A manager's newly shown window (such a menu) no longer
+  takes the focus from the app that has it. In `panel-test` the host picks
+  Dvorak from that menu and types the keys under "rdao" on a US keyboard into
+  Hello: its field holds "pear"; two more screenshots check the menu and the
+  panel naming Dvorak.
 - The desktop shell's panel (`user/panel/`), a strip along the bottom of the
   screen drawn with the toolkit (now with row layouts and selected buttons). It
   has a launcher button for each `start launch` component in the manifest, which
@@ -1505,7 +1510,7 @@ cargo xtask lde-test       # the network test over Linux's 8139cp driver (needs 
 cargo xtask lde-e100-test  # the same over Linux's e100 driver
 cargo xtask display-test   # Linux's bochs display driver: two pictures, checked pixel by pixel from QEMU screenshots
 cargo xtask desktop-test   # the compositor: two clients' windows through restarts, five screenshots checked pixel by pixel
-cargo xtask panel-test     # the desktop shell: apps launched from its menu, activated, minimised and restored, closed and launched again, its clock, six screenshots checked
+cargo xtask panel-test     # the desktop shell: apps launched from its menu, activated, minimised and restored, closed and launched again, its clock, its keyboard layout menu, ten screenshots checked
 cargo xtask resize-test    # a resizable window: its frame dragged out and in past its least size, a long name scrolled in its field, its top-left corner dragged out, seven screenshots checked
 cargo xtask widgets-test   # the List app: a list chosen in, scrolled by keys, wheel and scroll bar, text selected, cut and pasted, seven screenshots checked
 cargo xtask notes-test     # the Notes app: lines typed, joined, split and scrolled in a text area, four screenshots checked
