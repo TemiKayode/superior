@@ -1101,14 +1101,19 @@ holds the rest):
   window's title bar in another colour. A button pressed on a title bar gives
   the window the focus, puts it in front and drags it with the pointer, its frame
   kept on the screen, until let go; its client is told where it ended (`MOVED`)
-  and gets no pointer events meanwhile. One pressed on the close box asks the
+  and gets no pointer events meanwhile. When a window moves, appears or goes
+  away under a pointer that stays still, the window now under it is told where
+  the pointer is in it, and the one it left gets `LEAVE`, as if the pointer had
+  moved. One pressed on the close box asks the
   client to close it (`CLOSE`). Decorations that would reach off the screen, and
   unknown styles, are refused. `cargo xtask windows-test` boots
   `boot/windows.manifest` on both ISAs: window B, translucent and decorated, is
   shown over window A, decorated; the host drags A by its title bar from (100,
   120) to (300, 270), in front of B, and presses B's close box, and B's client
   closes it. Three screenshots must have every pixel right, the blend computed
-  by xtask from the same formula.
+  by xtask from the same formula. Then A's client moves A under the pointer,
+  which has not moved, and is told where the pointer is in it, and moves it
+  away again and is told the pointer left.
 - The toolkit (`crates/toolkit/`) and the first app on it. A 5x7 bitmap font for
   printable ASCII, drawing into a window's pixels, and widgets laid out in a
   column: labels, buttons (clicked when pressed and let go over them, the face
@@ -1388,8 +1393,7 @@ holds the rest):
   notifications, a 256-slot CNode pool) so filling them stays quick; normal kernels have
   32 of each, 32 address spaces and a 4096-slot pool.
 
-Not yet: in the desktop shell icons as image files and more time zones than its table; in the toolkit selection and copying in text areas, wrapped lines and a clipboard larger than 32 bytes; a hardware cursor plane,
-pointer events when a window moves or appears under a still pointer, keyboard
+Not yet: in the desktop shell icons as image files and more time zones than its table; in the toolkit selection and copying in text areas, wrapped lines and a clipboard larger than 32 bytes; a hardware cursor plane, keyboard
 layouts beyond US, UK, Dvorak and French and characters beyond ASCII, a key
 repeat rate apps can set, and surviving a client
 that dies at the very moment its window is read (the compositor then faults and
@@ -1506,7 +1510,7 @@ cargo xtask resize-test    # a resizable window: its frame dragged out and in pa
 cargo xtask widgets-test   # the List app: a list chosen in, scrolled by keys, wheel and scroll bar, text selected, cut and pasted, seven screenshots checked
 cargo xtask notes-test     # the Notes app: lines typed, joined, split and scrolled in a text area, four screenshots checked
 cargo xtask toolkit-test   # the greeter on the toolkit: a field typed in and edited at its cursor, a button clicked, closed, five screenshots checked against the toolkit drawn on the host
-cargo xtask windows-test   # translucent and decorated windows: a blend, a drag by the title bar, a close box, three screenshots checked
+cargo xtask windows-test   # translucent and decorated windows: a blend, a drag by the title bar, a close box, three screenshots checked, a window moved under a still pointer
 cargo xtask input-test     # the compositor's pointer, focus, keys and wheel from a USB mouse, tablet and keyboard, seven screenshots checked
 cargo xtask audio-test     # Linux's ES1370 driver and the mixer: two clients' sounds through restarts, every recorded sample checked
 cargo xtask tcp-test       # just the TCP test (add aarch64 for that ISA)

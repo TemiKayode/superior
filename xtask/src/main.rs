@@ -3689,6 +3689,10 @@ fn windows_test(arch: Arch) -> Result<(), String> {
         "[pass] windows: window A dragged by its title bar to (300, 270), in front, with the focus, and no pointer events of its own (0): picture 2 on the screen",
         "compositor: window 1: its close box was pressed",
         "[pass] windows: window B closed from its close box: picture 3 on the screen",
+        "[pass] windows: window A moved to (480, 150), under the pointer",
+        "[pass] windows: window A moved under the still pointer and was told it is at (130, 60) in it",
+        "[pass] windows: window A moved away from the pointer",
+        "[pass] windows: window A was told the still pointer left it",
         "windows: done (0 failed)",
         "[cm] second asked to shut down (pass)",
     ];

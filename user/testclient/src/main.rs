@@ -5139,7 +5139,9 @@ fn translucence(x: u64, y: u64) -> u64 {
 }
 
 /// Window A of the window style test: decorated, opaque; the host drags
-/// it by its title bar.
+/// it by its title bar. Once window B is closed (and its picture taken),
+/// A moves under the pointer, which stays where B's close box was: A must
+/// be told where the pointer is in it; then away, and told it left.
 fn styled_first() -> ! {
     let mut t = Checks(0, "windows");
     let mut w = TestWindow { id: 0, size: (300, 200), at: (100, 120), phase: 0, window: None };
@@ -5148,15 +5150,22 @@ fn styled_first() -> ! {
     let r = open_styled(&mut w, window::DECORATED);
     t.check(r[0] == 0 && listen(&w), format_args!("window A shown, decorated"));
     let mut pointed = 0;
+    // 0 until dragged; 1 waiting for B to go; 2 moved under the pointer;
+    // 3 moved away from it; 4 done.
+    let mut stage = 0;
+    let move_to = |w: &TestWindow, x: u64, y: u64| {
+        let n = w.window.unwrap_or(u64::MAX);
+        window_call(window::move_to(n, x | y << 16), None).map(|m| m[0])
+    };
     loop {
         wait_events(5);
         while let Some(e) = next_event(&w) {
-            match e {
+            match (stage, e) {
                 // The pointer may cross it on its way to the title bar; from
                 // the press there (which gives it the focus) it gets none.
-                WindowEvent::Focus(true) => pointed = 0,
-                WindowEvent::Pointer(..) => pointed += 1,
-                WindowEvent::Moved(x, y) => {
+                (0, WindowEvent::Focus(true)) => pointed = 0,
+                (0, WindowEvent::Pointer(..)) => pointed += 1,
+                (0, WindowEvent::Moved(x, y)) => {
                     settled();
                     t.check(
                         (x, y) == (300, 270) && pointed == 0,
@@ -5165,9 +5174,32 @@ fn styled_first() -> ! {
                              and no pointer events of its own ({pointed}): picture 2 on the screen"
                         ),
                     );
+                    stage = 1;
+                }
+                (2, WindowEvent::Pointer(x, y, b)) => {
+                    t.check(
+                        (x, y, b) == (130, 60, 0),
+                        format_args!("window A moved under the still pointer and was told it is at ({x}, {y}) in it"),
+                    );
+                    let r = move_to(&w, 300, 270);
+                    t.check(r == Ok(OK), format_args!("window A moved away from the pointer"));
+                    stage = 3;
+                }
+                (3, WindowEvent::Leave) => {
+                    t.check(true, format_args!("window A was told the still pointer left it"));
+                    stage = 4;
                 }
                 _ => {}
             }
+        }
+        if stage == 1 && window_info()[3] == 1 {
+            // B is gone: once its picture is taken, A moves under the
+            // pointer, still at (610, 210) where B's close box was.
+            superior_sys::sleep(SCREENSHOT_TICKS);
+            while next_event(&w).is_some() {}
+            let r = move_to(&w, 480, 150);
+            t.check(r == Ok(OK), format_args!("window A moved to (480, 150), under the pointer"));
+            stage = 2;
         }
     }
 }
@@ -5217,7 +5249,9 @@ fn styled_second() -> ! {
                     r == Ok([0; 4]) && window_info()[3] == 1,
                     format_args!("window B closed from its close box: picture 3 on the screen"),
                 );
-                superior_sys::sleep(SCREENSHOT_TICKS);
+                // Time for the picture, then for window A to move under the
+                // pointer and away.
+                superior_sys::sleep(3 * SCREENSHOT_TICKS);
                 say!("windows: done ({} failed)", t.0);
                 syscall(Syscall::Call, DESKTOP_CONTROL, [OP_SHUTDOWN, t.0, 0, 0]);
                 superior_sys::park()

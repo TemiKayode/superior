@@ -482,6 +482,8 @@ struct Compositor {
     /// The window under the pointer (or holding it), the one holding it
     /// while buttons are held, and the one with the keyboard focus.
     hover: Option<usize>,
+    /// The last pointer event posted: to which window, and where in it.
+    posted: Option<(usize, u64)>,
     grab: Option<usize>,
     focus: Option<usize>,
     /// The key held, repeating.
@@ -702,6 +704,7 @@ impl Compositor {
         }
         self.paint(r);
         self.flush(r);
+        self.pointer_still();
     }
 
     fn flush(&mut self, r: Rect) {
@@ -850,8 +853,27 @@ impl Compositor {
     /// Tells window `i` (if any) where the pointer is.
     fn post_pointer(&mut self, i: Option<usize>) {
         if let Some(i) = i {
-            self.post(i, window::POINTER, self.local(i), self.buttons);
+            let at = self.local(i);
+            self.posted = Some((i, at));
+            self.post(i, window::POINTER, at, self.buttons);
         }
+    }
+
+    /// The windows changed under a pointer that did not move (one moved,
+    /// appeared, went, was raised, minimised or resized): the window now
+    /// under it is told where it is, and one it left that it left, as if
+    /// the pointer had moved. Not while a button holds the pointer to a
+    /// window or a frame is dragged.
+    fn pointer_still(&mut self) {
+        if !self.cursor || self.grab.is_some() || self.drag.is_some() || self.resize.is_some() || self.buttons != 0 {
+            return;
+        }
+        let target = self.window_at();
+        if target == self.hover && target.is_none_or(|i| self.posted == Some((i, self.local(i)))) {
+            return;
+        }
+        self.hover_to(target);
+        self.post_pointer(target);
     }
 
     /// The window under the pointer changed to `to`: the one it left is
@@ -1659,6 +1681,7 @@ pub extern "C" fn _start(_: u64) -> ! {
         cursor: false,
         buttons: 0,
         hover: None,
+        posted: None,
         grab: None,
         focus: None,
         clipboard: [0; window::CLIPBOARD_BYTES as usize],

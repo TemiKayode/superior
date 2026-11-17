@@ -626,6 +626,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "superior-console"
+version = "0.1.0"
+dependencies = [
+ "superior-toolkit",
+]
+
+[[package]]
 name = "superior-counter"
 version = "0.1.0"
 dependencies = [
@@ -639,13 +646,6 @@ version = "0.1.0"
 dependencies = [
  "superior-objects",
  "superior-sys",
-]
-
-[[package]]
-name = "superior-console"
-version = "0.1.0"
-dependencies = [
- "superior-toolkit",
 ]
 
 [[package]]
