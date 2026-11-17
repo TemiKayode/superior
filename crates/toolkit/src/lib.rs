@@ -1638,10 +1638,10 @@ mod tests {
         key(&mut ui, KEY_A, 0x01);
         assert!(key(&mut ui, KEY_C, 0x01).copied);
         let (w, n) = ui.clipboard_words();
-        assert_eq!((w[0], n), (u64::from_le_bytes(*b"hello   "), 1));
+        assert_eq!((w[0], n), (u64::from_le_bytes(*b"hello\0\0\0"), 1));
         // What another app copied (cut at the clipboard's size) is pasted.
         ui.set_clipboard(b"pear");
-        assert_eq!(ui.clipboard_words().0[0], u64::from_le_bytes(*b"pear    "));
+        assert_eq!(ui.clipboard_words().0[0], u64::from_le_bytes(*b"pear\0\0\0\0"));
         key(&mut ui, END, 0);
         key(&mut ui, KEY_V, 0x01);
         assert_eq!(ui.text(field), "hellopear");
