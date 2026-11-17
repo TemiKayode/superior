@@ -2,12 +2,20 @@
 //! 1970-01-01 00:00 UTC (what the kernel's `Time` gives) turned into a
 //! zone's local date and time.
 //!
-//! The zones are a small built-in table, each a standard offset from UTC
-//! and a daylight-saving rule: the European Union's (an hour ahead from the
-//! last Sunday of March to the last Sunday of October, changing at 01:00
-//! UTC) or the United States' (an hour ahead from the second Sunday of
-//! March, 02:00 local standard time, to the first Sunday of November, 02:00
-//! local daylight time).
+//! The zones are a built-in table, each a standard offset from UTC (in
+//! minutes, so half hours too) and a daylight-saving rule, an hour ahead
+//! between two changeovers:
+//!
+//! - the European Union's: the last Sunday of March to the last Sunday of
+//!   October, changing at 01:00 UTC;
+//! - the United States': the second Sunday of March, 02:00 local standard
+//!   time, to the first Sunday of November, 02:00 local daylight time;
+//! - south-eastern Australia's: the first Sunday of October, 02:00 local
+//!   standard time, to the first Sunday of April, 03:00 local daylight time;
+//! - New Zealand's: the last Sunday of September, 02:00 local standard
+//!   time, to the first Sunday of April, 03:00 local daylight time.
+//!
+//! The southern rules' daylight time runs over the new year.
 
 /// A daylight-saving rule.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -15,6 +23,8 @@ pub enum Dst {
     None,
     Eu,
     Us,
+    Au,
+    Nz,
 }
 
 /// A time zone: what clocks call it, its standard offset from UTC in
@@ -26,15 +36,30 @@ pub struct Zone {
     pub dst: Dst,
 }
 
-/// The built-in zones, UTC first.
-pub const ZONES: [Zone; 6] = [
+/// The built-in zones: UTC, then from west to east.
+pub const ZONES: [Zone; 16] = [
     Zone { name: "UTC", offset: 0, dst: Dst::None },
+    Zone { name: "Los Angeles", offset: -480, dst: Dst::Us },
+    Zone { name: "Chicago", offset: -360, dst: Dst::Us },
+    Zone { name: "New York", offset: -300, dst: Dst::Us },
+    Zone { name: "Sao Paulo", offset: -180, dst: Dst::None },
     Zone { name: "London", offset: 0, dst: Dst::Eu },
     Zone { name: "Lagos", offset: 60, dst: Dst::None },
     Zone { name: "Berlin", offset: 60, dst: Dst::Eu },
-    Zone { name: "New York", offset: -300, dst: Dst::Us },
+    Zone { name: "Johannesburg", offset: 120, dst: Dst::None },
+    Zone { name: "Dubai", offset: 240, dst: Dst::None },
+    Zone { name: "Kolkata", offset: 330, dst: Dst::None },
+    Zone { name: "Singapore", offset: 480, dst: Dst::None },
     Zone { name: "Tokyo", offset: 540, dst: Dst::None },
+    Zone { name: "Adelaide", offset: 570, dst: Dst::Au },
+    Zone { name: "Sydney", offset: 600, dst: Dst::Au },
+    Zone { name: "Auckland", offset: 720, dst: Dst::Nz },
 ];
+
+/// The zone named `name`, of `ZONES`.
+pub fn zone_named(name: &str) -> Option<usize> {
+    ZONES.iter().position(|z| z.name == name)
+}
 
 /// Days from 1970-01-01 to `y`-`m`-`d` (Howard Hinnant's civil calendar
 /// arithmetic; any proleptic Gregorian date).
@@ -82,15 +107,19 @@ fn sunday(y: i64, m: u32, n: u32) -> u32 {
 /// 1970, UTC).
 pub fn daylight(zone: &Zone, t: i64) -> bool {
     let (y, ..) = civil_from_days(t.div_euclid(86_400));
-    let at = |m: u32, d: u32, utc_hour: i64| days_from_civil(y, m, d) * 86_400 + utc_hour * 3600;
+    // Day `d` of month `m` this year at `hour` o'clock UTC, or on the zone's
+    // standard time.
+    let utc = |m: u32, d: u32, hour: i64| days_from_civil(y, m, d) * 86_400 + hour * 3600;
+    let std = |m: u32, d: u32, hour: i64| utc(m, d, hour) - zone.offset as i64 * 60;
     match zone.dst {
         Dst::None => false,
-        Dst::Eu => t >= at(3, sunday(y, 3, 0), 1) && t < at(10, sunday(y, 10, 0), 1),
-        Dst::Us => {
-            // 02:00 local: standard time going on, daylight time coming off.
-            let std = -(zone.offset as i64) / 60;
-            t >= at(3, sunday(y, 3, 2), 2 + std) && t < at(11, sunday(y, 11, 1), 1 + std)
-        }
+        Dst::Eu => t >= utc(3, sunday(y, 3, 0), 1) && t < utc(10, sunday(y, 10, 0), 1),
+        // 02:00 local: standard time going on, daylight time coming off.
+        Dst::Us => t >= std(3, sunday(y, 3, 2), 2) && t < std(11, sunday(y, 11, 1), 1),
+        // Daylight time from 02:00 standard time to 03:00 daylight time, in
+        // the southern spring, summer and new year.
+        Dst::Au => t >= std(10, sunday(y, 10, 1), 2) || t < std(4, sunday(y, 4, 1), 2),
+        Dst::Nz => t >= std(9, sunday(y, 9, 0), 2) || t < std(4, sunday(y, 4, 1), 2),
     }
 }
 
@@ -150,9 +179,19 @@ mod tests {
         assert_eq!(sunday(2026, 3, 1), 1);
     }
 
+    fn zone(name: &str) -> Zone {
+        ZONES[zone_named(name).unwrap()]
+    }
+
+    /// Daylight saving goes on or off in `name` at `t`.
+    fn changes(name: &str, t: i64, on: bool) {
+        let z = zone(name);
+        assert_eq!((daylight(&z, t - 1), daylight(&z, t)), (!on, on), "{name} at {t}");
+    }
+
     #[test]
     fn daylight_saving_changes_on_time() {
-        let [_, london, lagos, berlin, new_york, _] = ZONES;
+        let [london, lagos, berlin, new_york] = ["London", "Lagos", "Berlin", "New York"].map(zone);
         // The EU's: 2026-03-29 01:00 UTC to 2026-10-25 01:00 UTC.
         assert!(!daylight(&london, 1_774_746_000 - 1) && daylight(&london, 1_774_746_000));
         assert!(daylight(&berlin, 1_792_890_000 - 1) && !daylight(&berlin, 1_792_890_000));
@@ -160,18 +199,54 @@ mod tests {
         assert!(!daylight(&new_york, 1_772_953_200 - 1) && daylight(&new_york, 1_772_953_200));
         assert!(daylight(&new_york, 1_793_512_800 - 1) && !daylight(&new_york, 1_793_512_800));
         assert!(!daylight(&lagos, 1_780_000_000));
+        // The other US zones change at their own 02:00 (the tz database's
+        // instants).
+        changes("Los Angeles", 1_772_964_000, true);
+        changes("Los Angeles", 1_793_523_600, false);
+        changes("Chicago", 1_772_956_800, true);
+        changes("Chicago", 1_793_516_400, false);
+        // The south: off in April, on in October (Australia) or late
+        // September (New Zealand), and on over the new year.
+        changes("Sydney", 1_775_318_400, false);
+        changes("Sydney", 1_791_043_200, true);
+        changes("Adelaide", 1_775_320_200, false);
+        changes("Adelaide", 1_791_045_000, true);
+        changes("Auckland", 1_775_311_200, false);
+        changes("Auckland", 1_790_431_200, true);
+        for z in ["Sydney", "Adelaide", "Auckland"] {
+            assert!(daylight(&zone(z), 1_767_225_600), "{z} on 2026-01-01");
+            assert!(!daylight(&zone(z), 1_780_000_000), "{z} in May");
+        }
+        for z in ["UTC", "Sao Paulo", "Johannesburg", "Dubai", "Kolkata", "Singapore", "Tokyo"] {
+            assert!((0..365).all(|d| !daylight(&zone(z), 1_767_225_600 + d * 86_400)), "{z}");
+        }
+    }
+
+    #[test]
+    fn zones_go_west_to_east() {
+        assert_eq!(ZONES[0].name, "UTC");
+        assert!(ZONES[1..].windows(2).all(|w| w[0].offset <= w[1].offset));
+        assert!(ZONES.iter().all(|z| z.name.len() <= 12 && z.name.is_ascii()));
     }
 
     #[test]
     fn clocks_show_local_dates_and_times() {
-        let show = |z: usize, t: i64| clock(&ZONES[z], t);
-        assert_eq!(&show(0, NOW), b"Sat 14 Nov 09:41");
-        assert_eq!(&show(2, NOW), b"Sat 14 Nov 10:41");
-        assert_eq!(&show(4, NOW), b"Sat 14 Nov 04:41");
-        assert_eq!(&show(5, NOW), b"Sat 14 Nov 18:41");
+        let show = |z: &str, t: i64| clock(&zone(z), t);
+        assert_eq!(&show("UTC", NOW), b"Sat 14 Nov 09:41");
+        assert_eq!(&show("Lagos", NOW), b"Sat 14 Nov 10:41");
+        assert_eq!(&show("New York", NOW), b"Sat 14 Nov 04:41");
+        assert_eq!(&show("Tokyo", NOW), b"Sat 14 Nov 18:41");
         // A summer time, and a date the zone has already turned over to.
-        assert_eq!(&show(3, 1_780_000_000), b"Thu 28 May 22:26");
-        assert_eq!(&show(5, NOW + 6 * 3600), b"Sun 15 Nov 00:41");
-        assert_eq!(&show(0, 0), b"Thu 01 Jan 00:00");
+        assert_eq!(&show("Berlin", 1_780_000_000), b"Thu 28 May 22:26");
+        assert_eq!(&show("Tokyo", NOW + 6 * 3600), b"Sun 15 Nov 00:41");
+        assert_eq!(&show("UTC", 0), b"Thu 01 Jan 00:00");
+        // Half hours, and the south's summer.
+        assert_eq!(&show("Kolkata", NOW), b"Sat 14 Nov 15:11");
+        assert_eq!(&show("Adelaide", NOW), b"Sat 14 Nov 20:11");
+        assert_eq!(&show("Sydney", NOW), b"Sat 14 Nov 20:41");
+        assert_eq!(&show("Auckland", NOW), b"Sat 14 Nov 22:41");
+        assert_eq!(&show("Los Angeles", NOW), b"Sat 14 Nov 01:41");
+        assert_eq!(&show("Sao Paulo", NOW), b"Sat 14 Nov 06:41");
+        assert_eq!(&show("Sydney", 1_780_000_000), b"Fri 29 May 06:26");
     }
 }

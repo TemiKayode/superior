@@ -74,8 +74,8 @@ component panel
   control 1
   launch-control
   cspace 8
-  # Its window: up to 1024x32 at 32 bits is 32 pages; its menu's, up to
-  # 34; and a notification (512 KiB in all).
+  # Its window: up to 1024x32 at 32 bits is 32 pages; its menu's (sixteen
+  # time zones), up to 87; and a notification (512 KiB in all).
   memory 21
   untyped 19 2
 

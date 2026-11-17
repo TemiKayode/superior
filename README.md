@@ -1203,12 +1203,13 @@ holds the rest):
   buttons show them (the greeter a person, Hello a wave, the List app a
   list). The panel's clock is now a button showing the date and time
   ("Sat 14 Nov 09:41"), from the new `superior_objects::time` (civil dates,
-  weekdays, and zones with the EU's and the US's daylight-saving rules,
-  tested on the host against the real changeovers); pressed, it opens a menu
-  of time zones (UTC, London, Lagos, Berlin, New York, Tokyo) above it, and
-  the chosen zone's time is shown. `cargo xtask resize-test` now maximises the
+  weekdays, and sixteen zones from Los Angeles to Auckland, some half an
+  hour off the hour, with the EU's, the US's, Australia's and New Zealand's
+  daylight-saving rules, the southern ones' summer over the new year, tested
+  on the host against the tz database's changeovers); pressed, it opens a
+  menu of the zones above it, and the chosen zone's time is shown. `cargo xtask resize-test` now maximises the
   greeter (600x400 at the top left, as big as it takes) and puts it back;
-  `cargo xtask panel-test` picks Lagos first (the clock then shows 10:41), and
+  `cargo xtask panel-test` picks Adelaide first (the clock then shows 20:11), and
   its eight screenshots show the icons and the date.
 - Resizing windows by their frame (`window` version 7). A window styled
   `RESIZABLE` is resized by dragging any border of its frame (the top one is the
@@ -1410,7 +1411,7 @@ holds the rest):
   notifications, a 256-slot CNode pool) so filling them stays quick; normal kernels have
   32 of each, 32 address spaces and a 4096-slot pool.
 
-Not yet: in the desktop shell icons as image files and more time zones than its table; in the toolkit a clipboard larger than 32 bytes; a hardware cursor plane, keyboard
+Not yet: in the desktop shell icons as image files and zones beyond its built-in table; in the toolkit a clipboard larger than 32 bytes; a hardware cursor plane, keyboard
 layouts beyond US, UK, Dvorak and French and characters beyond ASCII, a key
 repeat rate apps can set, and surviving a client
 that dies at the very moment its window is read (the compositor then faults and

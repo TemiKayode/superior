@@ -3957,6 +3957,12 @@ const RTC_SECONDS: u64 = 1_794_649_260;
 /// test's screenshots.
 const PANEL_MINUTES: u64 = 5;
 
+/// The zone the panel test chooses: half an hour off the hour, and in its
+/// summer time in November.
+fn adelaide_zone() -> usize {
+    superior_objects::time::zone_named("Adelaide").unwrap()
+}
+
 /// The clock's text `minute` minutes past `RTC_SECONDS` in time zone
 /// `zone` (of `ZONES`), as the panel shows it.
 fn panel_clock(minute: u64, zone: usize) -> String {
@@ -4134,12 +4140,12 @@ const PANEL_LAUNCHERS: &[(&str, &str)] = &[("greeter", "person"), ("hello", "wav
 /// Where the desktop shell test's pointer goes: "Apps", the menu's two
 /// launchers, the greeter's and Hello's task buttons (with both apps'
 /// windows on the panel), the greeter's minimise and close boxes, the
-/// clock and the time zones' menu's Lagos, the keyboard button and the
+/// clock and the time zones' menu's Adelaide, the keyboard button and the
 /// layouts' menu's Dvorak.
 struct PanelSpots {
     apps: (usize, usize),
     clock: (usize, usize),
-    lagos: (usize, usize),
+    adelaide: (usize, usize),
     keyboard: (usize, usize),
     dvorak: (usize, usize),
     run: [(usize, usize); 2],
@@ -4155,7 +4161,7 @@ fn panel_spots() -> PanelSpots {
     PanelSpots {
         apps: panel_spot(&ui, 0),
         clock: panel_spot(&ui, 4),
-        lagos: menu_spot_of(&zones_ui(), ZONES_AT, 2),
+        adelaide: menu_spot_of(&zones_ui(), ZONES_AT, adelaide_zone()),
         keyboard: panel_spot(&ui, 3),
         dvorak: menu_spot_of(&layouts_ui(keymap::US), layouts_at(), keymap::DVORAK as usize),
         run: [menu_spot(0), menu_spot(1)],
@@ -4170,15 +4176,15 @@ fn panel_spots() -> PanelSpots {
 }
 
 /// What each of the desktop shell test's screenshots must show, the
-/// clock `minute` minutes past 09:41 UTC (shown in UTC, then in Lagos):
+/// clock `minute` minutes past 09:41 UTC (shown in UTC, then in Adelaide):
 /// the windows back to front, and where the pointer is.
 fn panel_pictures(minute: u64) -> Vec<(Vec<Layer>, Option<(usize, usize)>)> {
     use ShellMenu::*;
     use superior_toolkit::keymap::{DVORAK, US};
     let s = panel_spots();
-    let (utc, lagos) = (panel_clock(minute, 0), panel_clock(minute, 2));
+    let (utc, adelaide) = (panel_clock(minute, 0), panel_clock(minute, adelaide_zone()));
     let panel = |tasks: &[(&str, bool, bool)], menu: ShellMenu, pointer: (usize, usize)| {
-        panel_layer(tasks, menu, &lagos, US, Some(pointer))
+        panel_layer(tasks, menu, &adelaide, US, Some(pointer))
     };
     let both = [("Greeter", false, false), ("Hello", true, false)];
     vec![
@@ -4187,7 +4193,7 @@ fn panel_pictures(minute: u64) -> Vec<(Vec<Layer>, Option<(usize, usize)>)> {
             vec![panel_layer(&[], Zones, &utc, US, Some(s.clock)), menu_layer_of(zones_ui(), ZONES_AT, Some(s.clock))],
             Some(s.clock),
         ),
-        (vec![panel_layer(&[], Closed, &lagos, US, Some(s.lagos))], Some(s.lagos)),
+        (vec![panel_layer(&[], Closed, &adelaide, US, Some(s.adelaide))], Some(s.adelaide)),
         (vec![panel(&[], Apps, s.apps), menu_layer(Some(s.apps))], Some(s.apps)),
         (
             vec![
@@ -4216,7 +4222,7 @@ fn panel_pictures(minute: u64) -> Vec<(Vec<Layer>, Option<(usize, usize)>)> {
             Some(s.keyboard),
         ),
         (
-            vec![greeter_layer(false, false), hello_dvorak(), panel_layer(&both, Closed, &lagos, DVORAK, None)],
+            vec![greeter_layer(false, false), hello_dvorak(), panel_layer(&both, Closed, &adelaide, DVORAK, None)],
             Some(PANEL_HELLO_FIELD),
         ),
     ]
@@ -5179,8 +5185,8 @@ fn panel_test(arch: Arch) -> Result<(), String> {
             ],
             with(Some(1), click(s.clock)),
         ),
-        (vec!["panel: time zones open: UTC chosen"], with(Some(2), click(s.lagos))),
-        (vec!["panel: the clock shows Sat 14 Nov 10:4"], with(Some(3), click(s.apps))),
+        (vec!["panel: time zones open: UTC chosen"], with(Some(2), click(s.adelaide))),
+        (vec!["panel: the clock shows Sat 14 Nov 20:1"], with(Some(3), click(s.apps))),
         (vec!["panel: menu open: greeter, hello"], with(Some(4), click(s.run[0]))),
         (vec!["greeter: ready", "panel: windows: \"Greeter\" (focused)"], with(None, click(s.apps))),
         (vec!["2x panel: menu open: greeter, hello"], with(None, click(s.run[1]))),
@@ -5220,8 +5226,8 @@ fn panel_test(arch: Arch) -> Result<(), String> {
         "panel: the clock shows Sat 14 Nov 09:4",
         "panel: time zones open: UTC chosen",
         "panel: time zones closed",
-        "panel: time zone Lagos",
-        "panel: the clock shows Sat 14 Nov 10:4",
+        "panel: time zone Adelaide",
+        "panel: the clock shows Sat 14 Nov 20:1",
         "panel: menu open: greeter, hello",
         "panel: menu closed",
         "panel: launched greeter (status 0)",
