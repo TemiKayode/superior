@@ -400,6 +400,9 @@ pub struct Response {
     pub entered: Option<Id>,
     /// The list whose chosen item changed.
     pub picked: Option<Id>,
+    /// Text was copied or cut: the app may put [`Ui::clipboard`] where
+    /// other apps can paste it.
+    pub copied: bool,
 }
 
 /// The character a key types, if it types one: `usage` is its USB HID
@@ -734,6 +737,23 @@ impl Ui {
     /// What was last copied or cut from a field.
     pub fn clipboard(&self) -> &str {
         self.clipboard.as_str()
+    }
+
+    /// Sets what Control-V pastes (as copied in another app), cut at
+    /// [`MAX_TEXT`] bytes.
+    pub fn set_clipboard(&mut self, text: &[u8]) {
+        self.clipboard = Text::new(text);
+    }
+
+    /// The clipboard as the compositor's `CLIP_PUT` takes it: 8 bytes a
+    /// word, the first in its low byte, zero after the text; and how many
+    /// words hold it and the zero byte ending it (all of them if full).
+    pub fn clipboard_words(&self) -> ([u64; MAX_TEXT / 8], usize) {
+        let mut b = [0u8; MAX_TEXT];
+        let t = self.clipboard.as_bytes();
+        b[..t.len()].copy_from_slice(t);
+        let words = core::array::from_fn(|k| u64::from_le_bytes(b[k * 8..k * 8 + 8].try_into().unwrap()));
+        (words, (t.len() / 8 + 1).min(MAX_TEXT / 8))
     }
 
     /// Sets widget `id`'s text: the part of the window to show again. A
@@ -1122,6 +1142,7 @@ impl Ui {
             KEY_C | KEY_X if control => {
                 if let Some((a, b)) = sel {
                     self.clipboard = Text::new(&w.text.as_bytes()[a..b]);
+                    r.copied = true;
                     if usage == KEY_X {
                         w.cut();
                     }
@@ -1603,6 +1624,31 @@ mod tests {
         }
         assert_eq!(ui.chosen(list), None);
         assert_eq!(ui.item(other, 0), "x");
+    }
+
+    #[test]
+    fn copies_are_reported_and_pastes_take_another_apps_text() {
+        let (mut ui, field, ..) = greeter();
+        press(&mut ui, 100, 40);
+        ui.event(Event::Focus(true));
+        for u in [11, 8, 15, 15, 18] {
+            key(&mut ui, u, 0);
+        }
+        assert!(!key(&mut ui, KEY_C, 0x01).copied, "nothing selected, nothing copied");
+        key(&mut ui, KEY_A, 0x01);
+        assert!(key(&mut ui, KEY_C, 0x01).copied);
+        let (w, n) = ui.clipboard_words();
+        assert_eq!((w[0], n), (u64::from_le_bytes(*b"hello   "), 1));
+        // What another app copied (cut at the clipboard's size) is pasted.
+        ui.set_clipboard(b"pear");
+        assert_eq!(ui.clipboard_words().0[0], u64::from_le_bytes(*b"pear    "));
+        key(&mut ui, END, 0);
+        key(&mut ui, KEY_V, 0x01);
+        assert_eq!(ui.text(field), "hellopear");
+        ui.set_clipboard(&[b'x'; 40]);
+        assert_eq!((ui.clipboard().len(), ui.clipboard_words().1), (MAX_TEXT, MAX_TEXT / 8));
+        ui.set_clipboard(b"12345678");
+        assert_eq!(ui.clipboard_words().1, 2, "the zero byte ending it in a word of its own");
     }
 
     #[test]

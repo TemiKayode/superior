@@ -57,7 +57,13 @@
 #
 # Icons: a client may say what its window is (`SET_ICON`), a number the
 # desktop shell draws a picture for, and a manager may ask (`ICON`).
-interface window version 9
+#
+# The clipboard (`CLIP_PUT`, `CLIP_GET`): text copied in one app to be
+# pasted in any other. Only the client of the window with the keyboard
+# focus may put text there or read it, so an app in the background can
+# neither read what the user copied nor change it. A restarted
+# compositor's clipboard is empty.
+interface window version 10
 
 # The most windows on the screen, all clients together.
 const MAX_WINDOWS = 8
@@ -209,3 +215,17 @@ op SET_ICON = 17 (window, icon)
 
 # A manager's: what window `window`'s client says it is (`SET_ICON`).
 op ICON = 18 (window) -> (icon)
+
+# The most bytes the clipboard holds.
+const CLIPBOARD_BYTES = 32
+
+# Puts 8 bytes in the clipboard at byte `8 * part` (`bytes`, the first in
+# its low byte); part 0 empties it first. Its text ends at its first zero
+# byte. `Denied` unless the window has the keyboard focus; `Invalid` past
+# `CLIPBOARD_BYTES`.
+op CLIP_PUT = 19 (window, part, bytes)
+
+# The clipboard's 8 bytes at byte `8 * part` (as `CLIP_PUT` takes them) and
+# how long its text is. `Denied` unless the window has the keyboard focus;
+# `Invalid` past `CLIPBOARD_BYTES`.
+op CLIP_GET = 20 (window, part) -> (bytes, len)

@@ -460,6 +460,8 @@ struct Compositor {
     hover: Option<usize>,
     grab: Option<usize>,
     focus: Option<usize>,
+    /// The clipboard's text, a zero byte ending it early.
+    clipboard: [u8; window::CLIPBOARD_BYTES as usize],
     /// The window dragged by its title bar, and where the pointer is on it
     /// (from its top left); whether it has moved.
     drag: Option<(usize, (i32, i32))>,
@@ -1466,7 +1468,9 @@ impl Compositor {
             | window::STYLE
             | window::SET_TITLE
             | window::SET_SIZE
-            | window::SET_ICON) => {
+            | window::SET_ICON
+            | window::CLIP_PUT
+            | window::CLIP_GET) => {
                 let Some(i) = self.own(m[1], badge) else {
                     return status(Status::NotFound);
                 };
@@ -1479,6 +1483,7 @@ impl Compositor {
                     window::STYLE => status(self.set_style(i, m[2])),
                     window::SET_TITLE => status(self.set_title(i, m[2], m[3])),
                     window::SET_SIZE => status(self.set_size(i, m[2])),
+                    window::CLIP_PUT | window::CLIP_GET => self.clip(op, i, m[2], m[3]),
                     window::SET_ICON => {
                         if let Some(w) = self.windows[i].as_mut() {
                             w.icon = m[2];
@@ -1506,6 +1511,33 @@ impl Compositor {
             }
             _ => status(Status::Invalid),
         }
+    }
+
+    /// `CLIP_PUT` or `CLIP_GET` for window `i`: only while it has the
+    /// keyboard focus.
+    fn clip(&mut self, op: u64, i: usize, part: u64, bytes: u64) -> [u64; 4] {
+        if self.focus != Some(i) {
+            say!("window {i}: the clipboard refused, it has not the focus");
+            return [Status::Denied as u64, 0, 0, 0];
+        }
+        let Some(at) = usize::try_from(part).ok().filter(|&p| p < self.clipboard.len() / 8).map(|p| p * 8) else {
+            return [Status::Invalid as u64, 0, 0, 0];
+        };
+        let len = |c: &[u8]| c.iter().position(|&b| b == 0).unwrap_or(c.len());
+        if op == window::CLIP_PUT {
+            if at == 0 {
+                self.clipboard = [0; window::CLIPBOARD_BYTES as usize];
+            }
+            self.clipboard[at..at + 8].copy_from_slice(&bytes.to_le_bytes());
+            // The part that ends the text (with a zero byte, or the last).
+            if bytes.to_le_bytes().contains(&0) || at + 8 == self.clipboard.len() {
+                let n = len(&self.clipboard);
+                say!("window {i} copied {n} bytes to the clipboard");
+            }
+            return [Status::Ok as u64, 0, 0, 0];
+        }
+        let word = u64::from_le_bytes(self.clipboard[at..at + 8].try_into().unwrap());
+        [Status::Ok as u64, word, len(&self.clipboard) as u64, 0]
     }
 
     /// The timer: windows whose clients went, and a driver that may have
@@ -1549,6 +1581,7 @@ pub extern "C" fn _start(_: u64) -> ! {
         hover: None,
         grab: None,
         focus: None,
+        clipboard: [0; window::CLIPBOARD_BYTES as usize],
         drag: None,
         dragged: false,
         resize: None,

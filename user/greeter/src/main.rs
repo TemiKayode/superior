@@ -189,6 +189,36 @@ impl App {
         say!("said \"{}\"", self.ui.text(self.out));
     }
 
+    /// Puts what was copied in the compositor's clipboard, for any app to
+    /// paste.
+    fn give_clipboard(&mut self) {
+        let Some(n) = self.window else { return };
+        let (words, used) = self.ui.clipboard_words();
+        let put = (0..used).all(|p| ok(call(window::clip_put(n, p as u64, words[p]), None)));
+        say!("copied \"{}\" to the clipboard{}", self.ui.clipboard(), if put { "" } else { " (refused)" });
+    }
+
+    /// Takes the compositor's clipboard (on getting the focus): what
+    /// Control-V pastes, whichever app it was copied in.
+    fn take_clipboard(&mut self) {
+        let Some(n) = self.window else { return };
+        let mut b = [0u8; window::CLIPBOARD_BYTES as usize];
+        let mut len = 0;
+        for p in 0..b.len() / 8 {
+            let Some(m) = call(window::clip_get(n, p as u64), None).filter(|m| m[0] == 0) else { return };
+            b[p * 8..p * 8 + 8].copy_from_slice(&m[1].to_le_bytes());
+            len = (m[2] as usize).min(b.len());
+            if len < p * 8 + 8 {
+                break;
+            }
+        }
+        let had = self.ui.clipboard().as_bytes() == &b[..len];
+        self.ui.set_clipboard(&b[..len]);
+        if !had {
+            say!("the clipboard holds \"{}\"", self.ui.clipboard());
+        }
+    }
+
     /// One event from the compositor; false once the window is closed.
     fn event(&mut self, kind: u64, a: u64, b: u64) -> bool {
         let e = match kind {
@@ -214,8 +244,14 @@ impl App {
             }
             _ => return true,
         };
+        if e == Event::Focus(true) {
+            self.take_clipboard();
+        }
         let before = (self.ui.widget(self.field).text, self.ui.cursor(self.field));
         let r = self.ui.event(e);
+        if r.copied {
+            self.give_clipboard();
+        }
         self.show(r.damage);
         if (self.ui.widget(self.field).text, self.ui.cursor(self.field)) != before {
             say!("the field holds \"{}\", the cursor at {}", self.ui.text(self.field), self.ui.cursor(self.field));

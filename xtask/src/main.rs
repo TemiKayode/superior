@@ -4722,11 +4722,17 @@ fn panel_act(act: &Act, arch: Arch) -> Result<Option<String>, String> {
     check_panel(&path, *k).map(Some)
 }
 
+/// Where the panel test clicks Hello's and the greeter's text fields: a
+/// way into each window (at (330, 250) and (260, 180)) down to its field.
+const PANEL_HELLO_FIELD: (usize, usize) = (430, 290);
+const PANEL_GREETER_FIELD: (usize, usize) = (360, 220);
+
 /// Boots `boot/panel.manifest`: the desktop shell's panel, which manages
 /// the compositor and may launch the greeter and "Hello". Through QEMU's
 /// monitor the host launches both from the panel, puts the greeter back
 /// in front from its task button, closes it from its close box (it exits)
-/// and launches it again. Five screenshots must have every pixel right:
+/// and launches it again; then copies text in Hello and pastes it in the
+/// greeter. Eight screenshots must have every pixel right:
 /// the panel as the toolkit lays it out on the host, the apps' windows in
 /// their titled frames, the focus and the stacking.
 fn panel_test(arch: Arch) -> Result<(), String> {
@@ -4766,7 +4772,21 @@ fn panel_test(arch: Arch) -> Result<(), String> {
         (vec!["panel: windows: \"Greeter\" (focused), \"Hello\" (minimised)"], with(None, click(s.close))),
         (vec!["greeter: closed", "panel: windows: \"Hello\" (minimised)"], with(None, click(s.apps))),
         (vec!["3x panel: menu open: greeter, hello"], with(None, click(s.run[0]))),
-        (vec!["2x greeter: ready", "2x panel: windows: \"Greeter\" (focused), \"Hello\" (minimised)"], vec![Shot(8)]),
+        (vec!["2x greeter: ready", "2x panel: windows: \"Greeter\" (focused), \"Hello\" (minimised)"], with(Some(8), click(s.hello_task))),
+        // The clipboard: "pear" copied in Hello's field, pasted in the
+        // greeter's.
+        (vec!["2x panel: windows: \"Greeter\", \"Hello\" (focused)"], {
+            let mut v = click(PANEL_HELLO_FIELD);
+            v.extend([Type("pear"), Key("ctrl+a"), Key("ctrl+c")]);
+            v
+        }),
+        (vec!["hello: copied \"pear\" to the clipboard"], click(s.greeter_task)),
+        (vec!["greeter: the clipboard holds \"pear\""], {
+            let mut v = click(PANEL_GREETER_FIELD);
+            v.push(Key("ctrl+v"));
+            v
+        }),
+        (vec!["greeter: the field holds \"pear\", the cursor at 4"], vec![]),
     ];
     let (out, shots) = run_script(&img, arch, "desktop shell test", script, panel_act)?;
     let log = [
@@ -4803,6 +4823,12 @@ fn panel_test(arch: Arch) -> Result<(), String> {
         "panel test: both apps minimised (step 1)",
         "panel test: the greeter gone, Hello minimised (step 2)",
         "panel test: the greeter back with the focus, Hello minimised (step 3)",
+        "hello: the field holds \"pear\", the cursor at 4",
+        "hello: copied \"pear\" to the clipboard",
+        "compositor: window 2 copied 4 bytes to the clipboard",
+        "compositor: window 1 activated by the desktop shell",
+        "greeter: the clipboard holds \"pear\"",
+        "greeter: the field holds \"pear\", the cursor at 4",
         "[cm] watcher asked to shut down (pass)",
     ];
     check_log("desktop shell test", &out, &log)?;

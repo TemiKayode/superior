@@ -60,10 +60,16 @@
 ///
 /// Icons: a client may say what its window is (`SET_ICON`), a number the
 /// desktop shell draws a picture for, and a manager may ask (`ICON`).
+///
+/// The clipboard (`CLIP_PUT`, `CLIP_GET`): text copied in one app to be
+/// pasted in any other. Only the client of the window with the keyboard
+/// focus may put text there or read it, so an app in the background can
+/// neither read what the user copied nor change it. A restarted
+/// compositor's clipboard is empty.
 pub mod window {
     use crate::interfaces::Status;
 
-    pub const VERSION: u64 = 9;
+    pub const VERSION: u64 = 10;
 
     /// The most windows on the screen, all clients together.
     pub const MAX_WINDOWS: u64 = 8;
@@ -147,6 +153,9 @@ pub mod window {
 
     /// The most bytes of a window's title.
     pub const TITLE_BYTES: u64 = 16;
+
+    /// The most bytes the clipboard holds.
+    pub const CLIPBOARD_BYTES: u64 = 32;
 
     /// The screen's size, and how many windows are shown on it (every
     /// client's).
@@ -411,6 +420,41 @@ pub mod window {
         match Status::from_u64(m[0]) {
             Status::Ok => Ok(IconReply {
                 icon: m[1],
+            }),
+            s => Err(s),
+        }
+    }
+
+    /// Puts 8 bytes in the clipboard at byte `8 * part` (`bytes`, the first in
+    /// its low byte); part 0 empties it first. Its text ends at its first zero
+    /// byte. `Denied` unless the window has the keyboard focus; `Invalid` past
+    /// `CLIPBOARD_BYTES`.
+    pub const CLIP_PUT: u64 = 19;
+    /// The message of a `CLIP_PUT` call.
+    pub const fn clip_put(window: u64, part: u64, bytes: u64) -> [u64; 4] {
+        [CLIP_PUT, window, part, bytes]
+    }
+
+    /// The clipboard's 8 bytes at byte `8 * part` (as `CLIP_PUT` takes them) and
+    /// how long its text is. `Denied` unless the window has the keyboard focus;
+    /// `Invalid` past `CLIPBOARD_BYTES`.
+    pub const CLIP_GET: u64 = 20;
+    /// The message of a `CLIP_GET` call.
+    pub const fn clip_get(window: u64, part: u64) -> [u64; 4] {
+        [CLIP_GET, window, part, 0]
+    }
+    /// What a `CLIP_GET` call answers.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct ClipGetReply {
+        pub bytes: u64,
+        pub len: u64,
+    }
+    /// Reads a `CLIP_GET` reply: its results, or the status it failed with.
+    pub fn clip_get_reply(m: [u64; 4]) -> Result<ClipGetReply, Status> {
+        match Status::from_u64(m[0]) {
+            Status::Ok => Ok(ClipGetReply {
+                bytes: m[1],
+                len: m[2],
             }),
             s => Err(s),
         }

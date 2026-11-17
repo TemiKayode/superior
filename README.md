@@ -1215,8 +1215,13 @@ holds the rest):
   wheel scrolls it (the compositor's `WHEEL` events), and its scroll bar pages
   it or follows its thumb dragged. Text in a field is selected by dragging, by
   Shift with the arrows, Home, End or a press, or all of it with Control-A;
-  typing replaces the selection, and Control-C, -X and -V copy, cut and paste
-  within the app. The List app keeps a list (ten fruits at first): "Add" (or
+  typing replaces the selection, and Control-C, -X and -V copy, cut and paste,
+  between apps too: a copy puts the text in the compositor's clipboard
+  (`window` version 10, `CLIP_PUT` and `CLIP_GET`, up to 32 bytes), and an app
+  takes it when its window gets the focus. Only the client of the window with
+  the focus may put text there or read it, so an app in the background can
+  neither read what was copied nor change it. `cargo xtask panel-test` copies
+  "pear" in Hello's field and pastes it in the greeter's. The List app keeps a list (ten fruits at first): "Add" (or
   Enter) adds the field's text and chooses it, "Remove" takes the chosen item
   out, a status label tells which is chosen. `cargo xtask widgets-test` boots
   `boot/widgets.manifest` on both ISAs: the host chooses a row, moves down past
@@ -1359,7 +1364,7 @@ holds the rest):
   notifications, a 256-slot CNode pool) so filling them stays quick; normal kernels have
   32 of each, 32 address spaces and a 4096-slot pool.
 
-Not yet: in the desktop shell icons as image files and more time zones than its table; in the toolkit a clipboard shared between apps, and multi-line text; a hardware cursor plane,
+Not yet: in the desktop shell icons as image files and more time zones than its table; in the toolkit multi-line text and a clipboard larger than 32 bytes; a hardware cursor plane,
 pointer events when a window moves or appears under a still pointer, keyboard
 layouts and key repeat (keys are USB usages), and surviving a client
 that dies at the very moment its window is read (the compositor then faults and

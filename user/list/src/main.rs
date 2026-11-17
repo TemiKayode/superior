@@ -267,6 +267,36 @@ impl App {
         say!("removed \"{}\"", core::str::from_utf8(&item[..n]).unwrap_or("?"));
     }
 
+    /// Puts what was copied in the compositor's clipboard, for any app to
+    /// paste.
+    fn give_clipboard(&mut self) {
+        let Some(n) = self.window else { return };
+        let (words, used) = self.ui.clipboard_words();
+        let put = (0..used).all(|p| ok(call(window::clip_put(n, p as u64, words[p]), None)));
+        say!("copied \"{}\" to the clipboard{}", self.ui.clipboard(), if put { "" } else { " (refused)" });
+    }
+
+    /// Takes the compositor's clipboard (on getting the focus): what
+    /// Control-V pastes, whichever app it was copied in.
+    fn take_clipboard(&mut self) {
+        let Some(n) = self.window else { return };
+        let mut b = [0u8; window::CLIPBOARD_BYTES as usize];
+        let mut len = 0;
+        for p in 0..b.len() / 8 {
+            let Some(m) = call(window::clip_get(n, p as u64), None).filter(|m| m[0] == 0) else { return };
+            b[p * 8..p * 8 + 8].copy_from_slice(&m[1].to_le_bytes());
+            len = (m[2] as usize).min(b.len());
+            if len < p * 8 + 8 {
+                break;
+            }
+        }
+        let had = self.ui.clipboard().as_bytes() == &b[..len];
+        self.ui.set_clipboard(&b[..len]);
+        if !had {
+            say!("the clipboard holds \"{}\"", self.ui.clipboard());
+        }
+    }
+
     /// One event from the compositor; false once the window is closed.
     fn event(&mut self, kind: u64, a: u64, b: u64) -> bool {
         let (x, y) = (a as u16 as i16 as i32, (a >> 16) as u16 as i16 as i32);
@@ -297,7 +327,13 @@ impl App {
         let f = self.w.field;
         let field = |ui: &Ui| (ui.widget(f).text, ui.cursor(f), ui.selection(f));
         let (field_before, list_before) = (field(&self.ui), self.list_state());
+        if e == Event::Focus(true) {
+            self.take_clipboard();
+        }
         let r = self.ui.event(e);
+        if r.copied {
+            self.give_clipboard();
+        }
         let mut damage = r.damage;
         if r.picked.is_some() {
             damage = damage.union(status_text(&mut self.ui, &self.w));
