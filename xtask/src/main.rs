@@ -3734,15 +3734,15 @@ fn toolkit_pictures() -> Vec<(Option<Vec<u32>>, Option<(usize, usize)>)> {
     let first = draw(&ui);
     click(&mut ui, TOOLKIT_FIELD);
     for usage in [4, 7, 4] {
-        ui.event(Event::Key { usage, down: true, modifiers: 0 });
-        ui.event(Event::Key { usage, down: false, modifiers: 0 });
+        ui.event(Event::us_key(usage, true, 0));
+        ui.event(Event::us_key(usage, false, 0));
     }
     assert_eq!(ui.text(field), "ada");
     let typed = draw(&ui);
     // Back two, the 'd' deleted, "nn" typed there.
     let key = |ui: &mut superior_toolkit::Ui, usage: u64| {
-        ui.event(Event::Key { usage, down: true, modifiers: 0 });
-        ui.event(Event::Key { usage, down: false, modifiers: 0 });
+        ui.event(Event::us_key(usage, true, 0));
+        ui.event(Event::us_key(usage, false, 0));
     };
     for usage in [80, 80, 76, 17, 17] {
         key(&mut ui, usage);
@@ -3889,7 +3889,7 @@ fn toolkit_test(arch: Arch) -> Result<(), String> {
             vec!["greeter: said \"Hello, joanna!\""],
             // Back to the field's end, and Backspace held: key repeat
             // takes all six letters out.
-            vec![Shot(4), rel(TOOLKIT_BUTTON, TOOLKIT_FIELD), Button(true), Button(false), Key("end"), Hold("backspace", 1000)],
+            vec![Shot(4), rel(TOOLKIT_BUTTON, TOOLKIT_FIELD), Button(true), Button(false), Key("end"), Hold("backspace", 2500)],
         ),
         (
             vec!["greeter: the field holds \"\", the cursor at 0", "compositor: window 0: key 42 held, repeated"],
@@ -4343,8 +4343,8 @@ fn greeter_typed_ui(home: bool) -> superior_toolkit::Ui {
     }
     let usages = LONG_NAME.bytes().map(|c| 4 + (c - b'a') as u64).chain(home.then_some(74));
     for usage in usages {
-        ui.event(Event::Key { usage, down: true, modifiers: 0 });
-        ui.event(Event::Key { usage, down: false, modifiers: 0 });
+        ui.event(Event::us_key(usage, true, 0));
+        ui.event(Event::us_key(usage, false, 0));
     }
     assert_eq!(ui.text(field), LONG_NAME);
     assert_eq!(ui.widget(field).scroll, if home { 0 } else { 3 });
@@ -4524,8 +4524,8 @@ impl ListUi {
 
     fn key(&mut self, usage: u64, modifiers: u8) -> superior_toolkit::Response {
         use superior_toolkit::Event;
-        let r = self.event(Event::Key { usage, down: true, modifiers });
-        self.event(Event::Key { usage, down: false, modifiers });
+        let r = self.event(Event::us_key(usage, true, modifiers));
+        self.event(Event::us_key(usage, false, modifiers));
         r
     }
 
@@ -4753,8 +4753,9 @@ const PANEL_GREETER_FIELD: (usize, usize) = (360, 220);
 /// the compositor and may launch the greeter and "Hello". Through QEMU's
 /// monitor the host launches both from the panel, puts the greeter back
 /// in front from its task button, closes it from its close box (it exits)
-/// and launches it again; then copies text in Hello and pastes it in the
-/// greeter. Eight screenshots must have every pixel right:
+/// and launches it again; then, the watcher having set the Dvorak layout,
+/// types "pear" in Hello by the keys that type it there, copies it and
+/// pastes it in the greeter. Eight screenshots must have every pixel right:
 /// the panel as the toolkit lays it out on the host, the apps' windows in
 /// their titled frames, the focus and the stacking.
 fn panel_test(arch: Arch) -> Result<(), String> {
@@ -4796,10 +4797,11 @@ fn panel_test(arch: Arch) -> Result<(), String> {
         (vec!["3x panel: menu open: greeter, hello"], with(None, click(s.run[0]))),
         (vec!["2x greeter: ready", "2x panel: windows: \"Greeter\" (focused), \"Hello\" (minimised)"], with(Some(8), click(s.hello_task))),
         // The clipboard: "pear" copied in Hello's field, pasted in the
-        // greeter's.
-        (vec!["2x panel: windows: \"Greeter\", \"Hello\" (focused)"], {
+        // greeter's. Typed on the Dvorak layout the watcher set: the keys
+        // under "rdao" on a US keyboard.
+        (vec!["panel test: keyboard layout 2 (status 0)", "2x panel: windows: \"Greeter\", \"Hello\" (focused)"], {
             let mut v = click(PANEL_HELLO_FIELD);
-            v.extend([Type("pear"), Key("ctrl+a"), Key("ctrl+c")]);
+            v.extend([Type("rdao"), Key("ctrl+a"), Key("ctrl+c")]);
             v
         }),
         (vec!["hello: copied \"pear\" to the clipboard"], click(s.greeter_task)),
@@ -4845,12 +4847,16 @@ fn panel_test(arch: Arch) -> Result<(), String> {
         "panel test: both apps minimised (step 1)",
         "panel test: the greeter gone, Hello minimised (step 2)",
         "panel test: the greeter back with the focus, Hello minimised (step 3)",
+        "compositor: keyboard layout Dvorak",
+        "panel test: keyboard layout 2 (status 0)",
         "hello: the field holds \"pear\", the cursor at 4",
         "hello: copied \"pear\" to the clipboard",
         "compositor: window 2 copied 4 bytes to the clipboard",
         "compositor: window 1 activated by the desktop shell",
         "greeter: the clipboard holds \"pear\"",
         "greeter: the field holds \"pear\", the cursor at 4",
+        "panel test: Hello back with the focus (step 4)",
+        "panel test: the greeter with the focus again (step 5)",
         "[cm] watcher asked to shut down (pass)",
     ];
     check_log("desktop shell test", &out, &log)?;

@@ -5281,12 +5281,22 @@ fn panel_watcher() -> ! {
         ("both apps minimised", [minimised, minimised]),
         ("the greeter gone, Hello minimised", [(false, false, false), minimised]),
         ("the greeter back with the focus, Hello minimised", [(true, false, true), minimised]),
+        // Then text copied in Hello and pasted in the greeter.
+        ("Hello back with the focus", [(true, false, false), (true, false, true)]),
+        ("the greeter with the focus again", [(true, false, true), (true, false, false)]),
     ];
     let mut at = 0;
     while at < steps.len() {
         if apps() == steps[at].1 {
             say!("panel test: {} (step {})", steps[at].0, at + 1);
             at += 1;
+            if at == 3 {
+                // Keys type as on a Dvorak keyboard from now on (a
+                // manager's call).
+                let r = window_call(window::set_layout(window::LAYOUT_DVORAK), None).map_or(u64::MAX, |m| m[0]);
+                let l = window_call(window::layout(), None).map_or(u64::MAX, |m| m[1]);
+                say!("panel test: keyboard layout {l} (status {r})");
+            }
         }
         superior_sys::sleep(5);
     }

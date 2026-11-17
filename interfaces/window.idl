@@ -68,7 +68,11 @@
 # with the focus every `REPEAT_INTERVAL` ms once it has been held
 # `REPEAT_DELAY` ms, until it is let go, another key is pressed or the
 # focus moves.
-interface window version 11
+#
+# Keyboard layouts: each `KEY` event carries the character the key types
+# under the system's layout, which a manager sets (`SET_LAYOUT`); apps
+# type that, and take shortcuts (Control and a letter) by the key's place.
+interface window version 12
 
 # The most windows on the screen, all clients together.
 const MAX_WINDOWS = 8
@@ -110,7 +114,8 @@ op DESTROY = 7 (window)
 # The kinds of event `NEXT` gives, and what `a` and `b` say.
 # A key went down or up while the window had the focus: `a` is its USB
 # HID usage, `b` is 1 if pressed and 0 if released (3 if pressed again
-# by key repeat), with the modifier byte in bits 8 to 15.
+# by key repeat), with the modifier byte in bits 8 to 15 and the ASCII
+# character the key types under the layout in bits 16 to 23 (0 if none).
 const KEY = 1
 # The pointer moved over the window (or anywhere, while it is held to the
 # window), or a button went down or up: `a` is where it is in the window
@@ -239,3 +244,18 @@ op CLIP_GET = 20 (window, part) -> (bytes, len)
 # in milliseconds.
 const REPEAT_DELAY = 500
 const REPEAT_INTERVAL = 50
+
+# The keyboard layouts: what a key types by its place on the keyboard
+# (only ASCII; a key typing anything else, or a dead key, types nothing).
+const LAYOUT_US = 0
+const LAYOUT_UK = 1
+const LAYOUT_DVORAK = 2
+const LAYOUT_FRENCH = 3
+const LAYOUTS = 4
+
+# A manager's: has keys type under layout `layout` from now on. `Invalid`
+# for an unknown one.
+op SET_LAYOUT = 21 (layout)
+
+# The keyboard layout keys type under.
+op LAYOUT = 22 () -> (layout)

@@ -32,6 +32,7 @@
 #![no_std]
 
 pub mod font;
+pub mod keymap;
 
 pub const MAX_WIDGETS: usize = 16;
 pub const MAX_TEXT: usize = 32;
@@ -383,8 +384,10 @@ pub enum Event {
     Wheel { x: i32, y: i32, up: i32 },
     /// The pointer left the window.
     Leave,
-    /// A key (its USB HID usage) went down or up, with the modifier byte.
-    Key { usage: u64, down: bool, modifiers: u8 },
+    /// A key (its USB HID usage) went down or up, with the modifier byte
+    /// and the character it types under the keyboard's layout, if any (the
+    /// compositor's `KEY` event says).
+    Key { usage: u64, down: bool, modifiers: u8, ch: Option<u8> },
     /// The window got or lost the keyboard focus.
     Focus(bool),
 }
@@ -405,26 +408,26 @@ pub struct Response {
     pub copied: bool,
 }
 
-/// The character a key types, if it types one: `usage` is its USB HID
-/// usage, `modifiers` the modifier byte (Shift is bit 1 or bit 5).
+impl Event {
+    /// A key going down or up on the US layout.
+    pub fn us_key(usage: u64, down: bool, modifiers: u8) -> Event {
+        Event::Key { usage, down, modifiers, ch: keymap::character(keymap::US, usage, modifiers) }
+    }
+
+    /// The compositor's `KEY` event (`a`, `b`): the usage, pressed (bit 0
+    /// of `b`), the modifier byte (bits 8 to 15) and the character the key
+    /// types (bits 16 to 23, 0 for none).
+    pub fn from_key(a: u64, b: u64) -> Event {
+        let ch = (b >> 16) as u8;
+        Event::Key { usage: a, down: b & 1 == 1, modifiers: (b >> 8) as u8, ch: (ch != 0).then_some(ch) }
+    }
+}
+
+/// The character a key types on the US layout, if it types one: `usage` is
+/// its USB HID usage, `modifiers` the modifier byte (Shift is bit 1 or bit
+/// 5). Other layouts: [`keymap::character`].
 pub fn character(usage: u64, modifiers: u8) -> Option<u8> {
-    let shift = modifiers & SHIFT != 0;
-    Some(match usage {
-        4..=29 => (if shift { b'A' } else { b'a' }) + (usage - 4) as u8,
-        30..=38 if !shift => b'1' + (usage - 30) as u8,
-        39 if !shift => b'0',
-        30 => b'!',
-        31 => b'@',
-        44 => b' ',
-        45 => if shift { b'_' } else { b'-' },
-        46 => if shift { b'+' } else { b'=' },
-        51 => if shift { b':' } else { b';' },
-        52 => if shift { b'"' } else { b'\'' },
-        54 => if shift { b'<' } else { b',' },
-        55 => if shift { b'>' } else { b'.' },
-        56 => if shift { b'?' } else { b'/' },
-        _ => return None,
-    })
+    keymap::character(keymap::US, usage, modifiers)
 }
 
 /// The modifier byte's Shift and Control bits (left or right).
@@ -1010,10 +1013,10 @@ impl Ui {
                     r.damage = self.rect(self.field);
                 }
             }
-            Event::Key { usage, down, modifiers } => {
+            Event::Key { usage, down, modifiers, ch } => {
                 self.modifiers = modifiers;
                 match self.keyboard() {
-                    Some(id) if down && self.widgets[id].kind == Kind::Field => self.field_key(id, usage, modifiers, &mut r),
+                    Some(id) if down && self.widgets[id].kind == Kind::Field => self.field_key(id, usage, modifiers, ch, &mut r),
                     Some(id) if down && self.widgets[id].kind == Kind::List => self.list_key(id, usage, &mut r),
                     _ => {}
                 }
@@ -1115,7 +1118,7 @@ impl Ui {
     }
 
     /// A key down for field `id`.
-    fn field_key(&mut self, id: Id, usage: u64, modifiers: u8, r: &mut Response) {
+    fn field_key(&mut self, id: Id, usage: u64, modifiers: u8, ch: Option<u8>, r: &mut Response) {
         let (shift, control) = (modifiers & SHIFT != 0, modifiers & CONTROL != 0);
         let mut w = self.widgets[id];
         let before = (w.text, w.cursor, w.anchor, w.scroll);
@@ -1171,7 +1174,7 @@ impl Ui {
             }
             ENTER => r.entered = Some(id),
             _ if !control => {
-                if let Some(c) = character(usage, modifiers) {
+                if let Some(c) = ch {
                     w.cut();
                     if w.text.insert(w.cursor, c) {
                         w.cursor += 1;
@@ -1244,8 +1247,8 @@ mod tests {
     }
 
     fn key(ui: &mut Ui, usage: u64, modifiers: u8) -> Response {
-        let r = ui.event(Event::Key { usage, down: true, modifiers });
-        ui.event(Event::Key { usage, down: false, modifiers });
+        let r = ui.event(Event::us_key(usage, true, modifiers));
+        ui.event(Event::us_key(usage, false, modifiers));
         r
     }
 
@@ -1689,9 +1692,9 @@ mod tests {
         key(&mut ui, KEY_C, 0x01);
         assert_eq!((ui.clipboard(), ui.text(field)), ("oh", "helohelo"));
         // Shift and a press stretch it; Backspace takes it out.
-        ui.event(Event::Key { usage: 225, down: true, modifiers: 0x02 });
+        ui.event(Event::us_key(225, true, 0x02));
         press(&mut ui, gap(7), 40);
-        ui.event(Event::Key { usage: 225, down: false, modifiers: 0 });
+        ui.event(Event::us_key(225, false, 0));
         assert_eq!(ui.selection(field), Some((3, 7)));
         key(&mut ui, BACKSPACE, 0);
         assert_eq!((ui.text(field), ui.cursor(field)), ("helo", 3));

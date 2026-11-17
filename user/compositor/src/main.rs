@@ -93,6 +93,14 @@ const SCREEN_PAGES: u64 = display::SURFACE_PAGES;
 const _: () = assert!(SCREEN + SCREEN_PAGES <= WINDOW_SLOTS);
 /// Rights for a copy of a lent page.
 const ALL: u64 = 0x1f;
+// The toolkit's keymap numbers its layouts as `window` does.
+const _: () = {
+    use superior_toolkit::keymap;
+    assert!(keymap::US == window::LAYOUT_US && keymap::UK == window::LAYOUT_UK);
+    assert!(keymap::DVORAK == window::LAYOUT_DVORAK && keymap::FRENCH == window::LAYOUT_FRENCH);
+    assert!(keymap::LAYOUTS == window::LAYOUTS);
+};
+
 /// Key repeat's delay and interval in ticks.
 const REPEAT_DELAY_TICKS: u64 = window::REPEAT_DELAY * TICK_HZ / 1000;
 const REPEAT_TICKS: u64 = window::REPEAT_INTERVAL * TICK_HZ / 1000;
@@ -478,6 +486,8 @@ struct Compositor {
     focus: Option<usize>,
     /// The key held, repeating.
     repeat: Option<Repeat>,
+    /// The keyboard layout (`window::LAYOUT_*`).
+    layout: u64,
     /// The clipboard's text, a zero byte ending it early.
     clipboard: [u8; window::CLIPBOARD_BYTES as usize],
     /// The window dragged by its title bar, and where the pointer is on it
@@ -860,7 +870,7 @@ impl Compositor {
         match kind {
             input::KEY => {
                 if let Some(f) = self.focus {
-                    self.post(f, window::KEY, a, b);
+                    self.post(f, window::KEY, a, self.typed(a, b));
                 }
                 let modifier = (0xe0..=0xe7).contains(&a);
                 if b & 1 == 1 && !modifier {
@@ -1435,9 +1445,20 @@ impl Compositor {
                 [Status::Ok as u64, self.width as u64, self.height as u64, self.shown as u64]
             }
             window::CREATE => self.create(m[1], m[2], badge),
-            window::LIST | window::DESCRIBE | window::ACTIVATE | window::ICON if badge & MANAGER_BADGE == 0 => {
+            window::LIST | window::DESCRIBE | window::ACTIVATE | window::ICON | window::SET_LAYOUT
+                if badge & MANAGER_BADGE == 0 =>
+            {
                 status(Status::Denied)
             }
+            window::SET_LAYOUT => {
+                if m[1] >= window::LAYOUTS {
+                    return status(Status::Invalid);
+                }
+                self.layout = m[1];
+                say!("keyboard layout {}", superior_toolkit::keymap::NAMES[m[1] as usize]);
+                status(Status::Ok)
+            }
+            window::LAYOUT => [Status::Ok as u64, self.layout, 0, 0],
             window::MINIMISE => {
                 // A manager's (any other client's window), or the window's
                 // own client's.
@@ -1542,6 +1563,13 @@ impl Compositor {
         }
     }
 
+    /// A `KEY` event's `b` for key `usage`, pressed or let go (`b`), with
+    /// the character it types under the layout in bits 16 to 23.
+    fn typed(&self, usage: u64, b: u64) -> u64 {
+        let ch = superior_toolkit::keymap::character(self.layout, usage, (b >> 8) as u8).unwrap_or(0);
+        b & 0xffff | (ch as u64) << 16
+    }
+
     /// The held key stops repeating.
     fn stop_repeat(&mut self) {
         if let Some(r) = self.repeat.take().filter(|r| r.count > 0) {
@@ -1557,7 +1585,7 @@ impl Compositor {
             return None;
         }
         if now >= r.next {
-            self.post(r.window, window::KEY, r.usage, r.b | 2);
+            self.post(r.window, window::KEY, r.usage, self.typed(r.usage, r.b | 2));
             // One at a time: a late wakeup does not flood the window.
             (r.next, r.count) = (now + REPEAT_TICKS, r.count + 1);
             self.repeat = Some(r);
@@ -1635,6 +1663,7 @@ pub extern "C" fn _start(_: u64) -> ! {
         focus: None,
         clipboard: [0; window::CLIPBOARD_BYTES as usize],
         repeat: None,
+        layout: window::LAYOUT_US,
         drag: None,
         dragged: false,
         resize: None,

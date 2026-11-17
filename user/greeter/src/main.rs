@@ -223,7 +223,7 @@ impl App {
     fn event(&mut self, kind: u64, a: u64, b: u64) -> bool {
         let e = match kind {
             window::POINTER => Event::Pointer { x: a as u16 as i16 as i32, y: (a >> 16) as u16 as i16 as i32, buttons: b },
-            window::KEY => Event::Key { usage: a, down: b & 1 == 1, modifiers: (b >> 8) as u8 },
+            window::KEY => Event::from_key(a, b),
             window::FOCUS => Event::Focus(a == 1),
             window::LEAVE => Event::Leave,
             window::MOVED => {

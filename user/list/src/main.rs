@@ -303,7 +303,7 @@ impl App {
         let e = match kind {
             window::POINTER => Event::Pointer { x, y, buttons: b },
             window::WHEEL => Event::Wheel { x, y, up: b as u32 as i32 },
-            window::KEY => Event::Key { usage: a, down: b & 1 == 1, modifiers: (b >> 8) as u8 },
+            window::KEY => Event::from_key(a, b),
             window::FOCUS => Event::Focus(a == 1),
             window::LEAVE => Event::Leave,
             window::MOVED => {

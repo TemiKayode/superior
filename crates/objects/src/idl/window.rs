@@ -71,10 +71,14 @@
 /// with the focus every `REPEAT_INTERVAL` ms once it has been held
 /// `REPEAT_DELAY` ms, until it is let go, another key is pressed or the
 /// focus moves.
+///
+/// Keyboard layouts: each `KEY` event carries the character the key types
+/// under the system's layout, which a manager sets (`SET_LAYOUT`); apps
+/// type that, and take shortcuts (Control and a letter) by the key's place.
 pub mod window {
     use crate::interfaces::Status;
 
-    pub const VERSION: u64 = 11;
+    pub const VERSION: u64 = 12;
 
     /// The most windows on the screen, all clients together.
     pub const MAX_WINDOWS: u64 = 8;
@@ -85,7 +89,8 @@ pub mod window {
     /// The kinds of event `NEXT` gives, and what `a` and `b` say.
     /// A key went down or up while the window had the focus: `a` is its USB
     /// HID usage, `b` is 1 if pressed and 0 if released (3 if pressed again
-    /// by key repeat), with the modifier byte in bits 8 to 15.
+    /// by key repeat), with the modifier byte in bits 8 to 15 and the ASCII
+    /// character the key types under the layout in bits 16 to 23 (0 if none).
     pub const KEY: u64 = 1;
 
     /// The pointer moved over the window (or anywhere, while it is held to the
@@ -167,6 +172,18 @@ pub mod window {
     pub const REPEAT_DELAY: u64 = 500;
 
     pub const REPEAT_INTERVAL: u64 = 50;
+
+    /// The keyboard layouts: what a key types by its place on the keyboard
+    /// (only ASCII; a key typing anything else, or a dead key, types nothing).
+    pub const LAYOUT_US: u64 = 0;
+
+    pub const LAYOUT_UK: u64 = 1;
+
+    pub const LAYOUT_DVORAK: u64 = 2;
+
+    pub const LAYOUT_FRENCH: u64 = 3;
+
+    pub const LAYOUTS: u64 = 4;
 
     /// The screen's size, and how many windows are shown on it (every
     /// client's).
@@ -466,6 +483,35 @@ pub mod window {
             Status::Ok => Ok(ClipGetReply {
                 bytes: m[1],
                 len: m[2],
+            }),
+            s => Err(s),
+        }
+    }
+
+    /// A manager's: has keys type under layout `layout` from now on. `Invalid`
+    /// for an unknown one.
+    pub const SET_LAYOUT: u64 = 21;
+    /// The message of a `SET_LAYOUT` call.
+    pub const fn set_layout(layout: u64) -> [u64; 4] {
+        [SET_LAYOUT, layout, 0, 0]
+    }
+
+    /// The keyboard layout keys type under.
+    pub const LAYOUT: u64 = 22;
+    /// The message of a `LAYOUT` call.
+    pub const fn layout() -> [u64; 4] {
+        [LAYOUT, 0, 0, 0]
+    }
+    /// What a `LAYOUT` call answers.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct LayoutReply {
+        pub layout: u64,
+    }
+    /// Reads a `LAYOUT` reply: its results, or the status it failed with.
+    pub fn layout_reply(m: [u64; 4]) -> Result<LayoutReply, Status> {
+        match Status::from_u64(m[0]) {
+            Status::Ok => Ok(LayoutReply {
+                layout: m[1],
             }),
             s => Err(s),
         }
