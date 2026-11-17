@@ -1,5 +1,6 @@
 //! Notes: a toolkit app for lines of text, to show the toolkit's text
-//! area. A decorated window titled "Notes": a text area of six lines, and
+//! area. A decorated window titled "Notes": a text area of six rows, its
+//! lines wrapped at spaces to fit, and
 //! a label saying where the cursor is. The close box closes it, and it
 //! exits. Text copied or cut in it goes to the compositor's clipboard,
 //! and it takes the clipboard when it gets the focus, so text is pasted
@@ -61,10 +62,11 @@ fn rect_word(r: Rect) -> u64 {
     r.x as u64 | (r.y as u64) << 16 | (r.w as u64) << 32 | (r.h as u64) << 48
 }
 
-/// Lays the window out: the text area, then the label under it. The area
-/// and the label.
+/// Lays the window out: the text area (its lines wrapped), then the label
+/// under it. The area and the label.
 pub fn layout(ui: &mut Ui) -> (Id, Id) {
     let area = ui.area(ROWS);
+    ui.set_area_wrap(true);
     let status = ui.label("");
     status_text(ui, status);
     (area, status)

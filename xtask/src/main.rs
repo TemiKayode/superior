@@ -3376,6 +3376,7 @@ fn input_act(act: &Act, arch: Arch) -> Result<Option<String>, String> {
         }
         Act::Type(keys) => {
             for k in keys.chars() {
+                let k = if k == ' ' { "spc".to_string() } else { k.to_string() };
                 for down in [true, false] {
                     qmp(&[send(format!(
                         "{{\"type\":\"key\",\"data\":{{\"down\":{down},\"key\":{{\"type\":\"qcode\",\"data\":\"{k}\"}}}}}}"
@@ -4826,6 +4827,7 @@ struct NotesUi {
 fn notes_ui() -> NotesUi {
     let mut ui = superior_toolkit::Ui::new(NOTES_SIZE.0 as u32, NOTES_SIZE.1 as u32);
     ui.area(6);
+    ui.set_area_wrap(true);
     let status = ui.label("");
     let mut n = NotesUi { ui, status };
     n.status();
@@ -4903,6 +4905,16 @@ const BACKSPACE_KEY: u64 = 42;
 /// What each of the notes test's screenshots must show: the Notes window
 /// after the same events, and the pointer.
 fn notes_pictures() -> Vec<(Layer, Option<(usize, usize)>)> {
+    notes_session().0
+}
+
+/// The words the notes test types on a line of their own, wider than the
+/// area: they wrap.
+const NOTES_WORDS: &str = "the quick brown fox jumps over the lazy dog";
+
+/// The notes test's screenshots as the toolkit draws them after the same
+/// events, and the window's state at the end.
+fn notes_session() -> (Vec<(Layer, Option<(usize, usize)>)>, NotesUi) {
     use superior_toolkit::Event;
     let mut n = notes_ui();
     let mut shots = Vec::new();
@@ -4962,7 +4974,22 @@ fn notes_pictures() -> Vec<(Layer, Option<(usize, usize)>)> {
     assert_eq!(n.ui.area_text(), "bread\njam\ntea\nrice\nsalt\nmilk\neggs\n");
     assert_eq!((n.ui.area_cursor(), n.ui.widget(0).scroll), ((7, 0), 2));
     shots.push((n.layer(), Some(NOTES_THIRD)));
-    shots
+    // A line of words wider than the area: it wraps; Up goes to the row
+    // above within it.
+    for c in NOTES_WORDS.bytes() {
+        n.key(if c == b' ' { 44 } else { 4 + (c - b'a') as u64 });
+    }
+    assert_eq!((n.ui.area_lines(), n.ui.area_rows()), (8, 9));
+    n.key(UP_KEY);
+    assert_eq!(n.ui.area_cursor().0, 7, "still on the last line");
+    shots.push((n.layer(), Some(NOTES_THIRD)));
+    (shots, n)
+}
+
+/// The Notes app's log line for `n`'s text area as it stands.
+fn notes_state(n: &NotesUi) -> &'static str {
+    let ui = &n.ui;
+    notes_line(ui.area_lines(), ui.area_cursor(), ui.widget(0).scroll, ui.area_text())
 }
 
 fn notes_act(act: &Act, arch: Arch) -> Result<Option<String>, String> {
@@ -4995,8 +5022,10 @@ fn notes_line_selected(lines: usize, cursor: (usize, usize), top: usize, text: &
 /// wheel up a step, presses past the first line's end (the cursor goes
 /// there); drags from the first line's start to the third's (two lines
 /// selected), cuts them with Control-X and pastes them after the last line
-/// with Control-V; and closes the window. Six screenshots must have every
-/// pixel as the toolkit draws the window after the same events.
+/// with Control-V; types a line of words wider than the area (it wraps)
+/// and goes up a row within it; and closes the window. Seven screenshots
+/// must have every pixel as the toolkit draws the window after the same
+/// events.
 fn notes_test(arch: Arch) -> Result<(), String> {
     use Act::*;
     let img = image_with(false, arch, "notes")?;
@@ -5009,6 +5038,17 @@ fn notes_test(arch: Arch) -> Result<(), String> {
     let selected = notes_line_selected(7, (2, 0), 0, all, 10);
     let cut = notes_line(5, (0, 0), 0, "bread\njam\ntea\nrice\nsalt");
     let pasted = notes_line(8, (7, 0), 2, "bread\njam\ntea\nrice\nsalt\nmilk\neggs\n");
+    let up = notes_state(&notes_session().1);
+    // Nine rows, six shown: scrolled by three.
+    let with_words = format!("bread
+jam
+tea
+rice
+salt
+milk
+eggs
+{NOTES_WORDS}");
+    let typed = notes_line(8, (7, NOTES_WORDS.len()), 3, &with_words);
     let script = vec![
         (
             vec!["relative X and Y", "absolute X and Y", "compositor: input subscribed", "notes: ready", "notes: the Notes window is on the screen"],
@@ -5054,7 +5094,9 @@ fn notes_test(arch: Arch) -> Result<(), String> {
             vec![cut, "notes: copied 10 bytes to the clipboard"],
             vec![Key("down"), Key("down"), Key("down"), Key("down"), Key("end"), Key("ret"), Key("ctrl+v")],
         ),
-        (vec![pasted], vec![Shot(6), to(NOTES_THIRD, NOTES_CLOSE), Button(true), Button(false)]),
+        (vec![pasted], vec![Shot(6), Type(NOTES_WORDS)]),
+        (vec![typed], vec![Key("up")]),
+        (vec![up], vec![Shot(7), to(NOTES_THIRD, NOTES_CLOSE), Button(true), Button(false)]),
         (vec!["notes: the Notes window is gone"], vec![]),
     ];
     let (out, shots) = run_script(&img, arch, "notes test", script, notes_act)?;
@@ -5074,6 +5116,8 @@ fn notes_test(arch: Arch) -> Result<(), String> {
         "notes: copied 10 bytes to the clipboard",
         cut,
         pasted,
+        typed,
+        up,
         "compositor: window 0: its close box was pressed",
         "notes: closed",
         "notes: the Notes window is gone",

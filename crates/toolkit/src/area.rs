@@ -1,19 +1,24 @@
 //! A text area: lines of text, edited at a cursor. One per [`Ui`], its
 //! text (up to [`AREA_TEXT`] bytes, lines ended by `\n`) kept by the `Ui`.
 //!
+//! The area shows rows: each line is one, or with wrapping on
+//! ([`Ui::set_area_wrap`]) as many as it takes to fit the area's width,
+//! broken after the last space that fits (or where the row is full, in a
+//! word longer than a row).
+//!
 //! Typing inserts at the cursor and Enter starts a new line; Backspace and
 //! Delete take out the character before or after it (joining lines when
 //! that is a line's end). Left and Right move by a character, across
-//! lines; Up and Down to the line above or below, as near the same column
-//! as it reaches; Home and End to the line's start or end; Page Up and
-//! Down by the lines shown. A press puts the cursor at the gap nearest it,
-//! and the wheel scrolls. Lines wider than the area scroll sideways with
-//! the cursor; the area scrolls down and up to keep the cursor's line
-//! shown.
+//! lines; Up and Down to the row above or below, as near the same column
+//! as it reaches; Home and End to the row's start or end; Page Up and Down
+//! by the rows shown. A press puts the cursor at the gap nearest it, and
+//! the wheel scrolls. Without wrapping, lines wider than the area scroll
+//! sideways with the cursor; the area scrolls down and up to keep the
+//! cursor's row shown.
 //!
 //! Text is selected as in a field: by dragging across it (down past its
-//! last line shown, or up past its first, it scrolls), by Shift with any
-//! of the keys that move the cursor or with a press, and by Control-A.
+//! last row shown, or up past its first, it scrolls), by Shift with any of
+//! the keys that move the cursor or with a press, and by Control-A.
 //! Typing, Enter, Backspace and Delete replace the selection; Control-C
 //! copies it and Control-X cuts it (the first [`crate::MAX_TEXT`] bytes,
 //! newlines kept), and Control-V pastes at the cursor.
@@ -26,14 +31,71 @@ use crate::{
 /// The most bytes of text an area holds, newlines included.
 pub const AREA_TEXT: usize = 512;
 
-/// The height of an area's line.
+/// The height of an area's row.
 pub const LINE_H: u32 = font::HEIGHT * SCALE + 4;
 
-/// Space between an area's edge and its first line.
+/// Space between an area's edge and its first row.
 const TOP: u32 = 4;
 
+/// A row the area shows: the bytes from `start` to `end` (a line's
+/// newline not among them), and whether its line goes on in the next row
+/// (`wrapped`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Row {
+    start: usize,
+    end: usize,
+    wrapped: bool,
+}
+
+impl Row {
+    /// The last gap the cursor may be at in it: a wrapped row's end is the
+    /// next row's start, so the gap before its last character.
+    fn last_gap(self) -> usize {
+        if self.wrapped { self.end - 1 } else { self.end }
+    }
+
+    /// Whether the cursor at `at` is shown in it.
+    fn holds(self, at: usize) -> bool {
+        self.start <= at && (at < self.end || (at == self.end && !self.wrapped))
+    }
+}
+
+/// The rows of `text` at most `cols` characters wide (lines unbroken if
+/// `cols` is `usize::MAX`).
+struct Rows<'a> {
+    text: &'a [u8],
+    at: usize,
+    cols: usize,
+    done: bool,
+}
+
+impl Iterator for Rows<'_> {
+    type Item = Row;
+
+    fn next(&mut self) -> Option<Row> {
+        if self.done {
+            return None;
+        }
+        let (t, s) = (self.text, self.at);
+        let line_end = t[s..].iter().position(|&c| c == b'\n').map_or(t.len(), |k| s + k);
+        if line_end - s <= self.cols {
+            if line_end == t.len() {
+                self.done = true;
+            } else {
+                self.at = line_end + 1;
+            }
+            return Some(Row { start: s, end: line_end, wrapped: false });
+        }
+        // Broken after the last space that fits, or where the row is full.
+        let full = s + self.cols;
+        let end = t[s..full].iter().rposition(|&c| c == b' ').map_or(full, |k| s + k + 1);
+        self.at = end;
+        Some(Row { start: s, end, wrapped: true })
+    }
+}
+
 impl Ui {
-    /// An empty text area showing `rows` lines, the window's width (on a
+    /// An empty text area showing `rows` rows, the window's width (on a
     /// line, what the others leave). One per `Ui`.
     pub fn area(&mut self, rows: u32) -> Id {
         assert!(self.area_id.is_none(), "one text area per Ui");
@@ -42,6 +104,17 @@ impl Ui {
         self.area_id = Some(id);
         (self.widgets[id].cursor, self.widgets[id].anchor) = (0, 0);
         id
+    }
+
+    /// Wraps the text area's lines to its width (`on`), or shows each line
+    /// on one row, scrolling sideways: the part of the window to show
+    /// again.
+    pub fn set_area_wrap(&mut self, on: bool) -> Rect {
+        let Some(id) = self.area_id else { return Rect::NONE };
+        self.area_wrap = on;
+        self.widgets[id].hscroll = 0;
+        self.keep_area_cursor_shown(id);
+        self.widgets[id].rect
     }
 
     /// The text area's text.
@@ -86,49 +159,62 @@ impl Ui {
     pub fn area_cursor(&self) -> (usize, usize) {
         let Some(id) = self.area_id else { return (0, 0) };
         let c = self.widgets[id].cursor;
-        (self.line_of(c), c - self.line_start(c))
+        let start = self.area_bytes()[..c].iter().rposition(|&b| b == b'\n').map_or(0, |k| k + 1);
+        (self.area_bytes()[..c].iter().filter(|&&b| b == b'\n').count(), c - start)
     }
 
     /// How many lines the text area's text has (at least one).
     pub fn area_lines(&self) -> usize {
-        self.line_of(self.area_len) + 1
+        self.area_bytes().iter().filter(|&&c| c == b'\n').count() + 1
+    }
+
+    /// How many rows the text area shows its text in (more than its lines
+    /// if they wrap).
+    pub fn area_rows(&self) -> usize {
+        self.area_id.map_or(1, |id| self.rows(id).count())
     }
 
     fn area_bytes(&self) -> &[u8] {
         &self.area[..self.area_len]
     }
 
-    /// The start of the line holding byte `at`.
-    fn line_start(&self, at: usize) -> usize {
-        self.area_bytes()[..at].iter().rposition(|&c| c == b'\n').map_or(0, |k| k + 1)
+    /// The text's rows in area `id`.
+    fn rows(&self, id: Id) -> Rows<'_> {
+        let cols = if self.area_wrap { self.area_shown(id).1 } else { usize::MAX };
+        Rows { text: self.area_bytes(), at: 0, cols, done: false }
     }
 
-    /// The end of the line holding byte `at` (its newline, or the text's
-    /// end).
-    fn line_end(&self, at: usize) -> usize {
-        self.area_bytes()[at..].iter().position(|&c| c == b'\n').map_or(self.area_len, |k| at + k)
-    }
-
-    /// Which line byte `at` is on.
-    fn line_of(&self, at: usize) -> usize {
-        self.area_bytes()[..at].iter().filter(|&&c| c == b'\n').count()
-    }
-
-    /// Where line `n` starts (the text's end past the last line).
-    fn start_of_line(&self, n: usize) -> usize {
-        if n == 0 {
-            return 0;
+    /// The text area's row `n` (the last if past it).
+    fn area_row(&self, id: Id, n: usize) -> Row {
+        let mut last = Row { start: 0, end: 0, wrapped: false };
+        for (k, r) in self.rows(id).enumerate() {
+            last = r;
+            if k == n {
+                break;
+            }
         }
-        self.area_bytes().iter().enumerate().filter(|&(_, &c)| c == b'\n').nth(n - 1).map_or(self.area_len, |(k, _)| k + 1)
+        last
     }
 
-    /// Byte `col` of line `n`, or its end if shorter.
-    fn at_line_col(&self, n: usize, col: usize) -> usize {
-        let s = self.start_of_line(n.min(self.area_lines() - 1));
-        (s + col).min(self.line_end(s))
+    /// The row the cursor at `at` is shown in, and which it is.
+    fn row_of(&self, id: Id, at: usize) -> (usize, Row) {
+        let mut last = (0, Row { start: 0, end: 0, wrapped: false });
+        for (k, r) in self.rows(id).enumerate() {
+            last = (k, r);
+            if r.holds(at) {
+                break;
+            }
+        }
+        last
     }
 
-    /// How many lines, and characters of a line, the area shows (with room
+    /// The gap `col` characters into row `n`, or its last if shorter.
+    fn at_row_col(&self, id: Id, n: usize, col: usize) -> usize {
+        let r = self.area_row(id, n);
+        (r.start + col).min(r.last_gap())
+    }
+
+    /// How many rows, and characters of a row, the area shows (with room
     /// for the cursor after the last).
     fn area_shown(&self, id: Id) -> (usize, usize) {
         let r = self.widgets[id].rect;
@@ -139,19 +225,24 @@ impl Ui {
     }
 
     /// Scrolls the area as little as keeps its cursor shown: `scroll` its
-    /// first line shown, `hscroll` its first column.
+    /// first row shown, `hscroll` its first column (none when wrapping).
     pub(crate) fn keep_area_cursor_shown(&mut self, id: Id) {
         let (rows, cols) = self.area_shown(id);
-        let (line, col) = self.area_cursor();
-        let lines = self.area_lines();
+        let c = self.widgets[id].cursor;
+        let (row, r) = self.row_of(id, c);
+        let col = c - r.start;
+        let count = self.rows(id).count();
+        let wrap = self.area_wrap;
         let w = &mut self.widgets[id];
-        if line < w.scroll {
-            w.scroll = line;
-        } else if line >= w.scroll + rows {
-            w.scroll = line + 1 - rows;
+        if row < w.scroll {
+            w.scroll = row;
+        } else if row >= w.scroll + rows {
+            w.scroll = row + 1 - rows;
         }
-        w.scroll = w.scroll.min(lines.saturating_sub(rows));
-        if col < w.hscroll {
+        w.scroll = w.scroll.min(count.saturating_sub(rows));
+        if wrap {
+            w.hscroll = 0;
+        } else if col < w.hscroll {
             w.hscroll = col;
         } else if col > w.hscroll + cols - 1 {
             w.hscroll = col + 1 - cols;
@@ -166,7 +257,9 @@ impl Ui {
         let before = (self.area_len, w.cursor, w.anchor, w.scroll, w.hscroll);
         let c = w.cursor;
         let sel = w.selection();
-        let (line, col) = self.area_cursor();
+        let (row, here) = self.row_of(id, c);
+        let col = c - here.start;
+        let count = self.rows(id).count();
         let rows = self.area_shown(id).0;
         // Moved with Shift (the selection stretched), or a key that leaves
         // the selection be: the anchor stays.
@@ -178,14 +271,14 @@ impl Ui {
             RIGHT if !shift && sel.is_some() => sel.map_or(c, |s| s.1),
             LEFT => c.saturating_sub(1),
             RIGHT => (c + 1).min(self.area_len),
-            HOME => self.line_start(c),
-            END => self.line_end(c),
-            UP if line > 0 => self.at_line_col(line - 1, col),
+            HOME => here.start,
+            END => here.last_gap(),
+            UP if row > 0 => self.at_row_col(id, row - 1, col),
             UP => 0,
-            DOWN if line + 1 < self.area_lines() => self.at_line_col(line + 1, col),
+            DOWN if row + 1 < count => self.at_row_col(id, row + 1, col),
             DOWN => self.area_len,
-            PAGE_UP => self.at_line_col(line.saturating_sub(rows), col),
-            PAGE_DOWN => self.at_line_col(line + rows, col),
+            PAGE_UP => self.at_row_col(id, row.saturating_sub(rows), col),
+            PAGE_DOWN => self.at_row_col(id, row + rows, col),
             KEY_A if control => {
                 self.widgets[id].anchor = 0;
                 keep = true;
@@ -264,15 +357,15 @@ impl Ui {
         self.area_len -= 1;
     }
 
-    /// The gap in the text nearest (x, y): on the line there (the first or
-    /// last line shown's neighbour above or below the area).
+    /// The gap in the text nearest (x, y): on the row there (the first or
+    /// last row shown's neighbour above or below the area).
     fn area_gap_at(&self, id: Id, x: i32, y: i32) -> usize {
         let w = self.widgets[id];
         let dy = y - (w.rect.y + TOP) as i32;
         let row = dy.div_euclid(LINE_H as i32).clamp(-1, self.area_shown(id).0 as i32);
         let from = x - (w.rect.x + FIELD_INSET) as i32 + STEP as i32 / 2;
         let col = w.hscroll + (from.max(0) as u32 / STEP) as usize;
-        self.at_line_col((w.scroll as i64 + row as i64).max(0) as usize, col)
+        self.at_row_col(id, (w.scroll as i64 + row as i64).max(0) as usize, col)
     }
 
     /// A press at (x, y) in the text area: the cursor to the gap nearest
@@ -303,7 +396,7 @@ impl Ui {
     /// window to show again.
     pub(crate) fn area_wheel(&mut self, id: Id, up: i32) -> Rect {
         let rows = self.area_shown(id).0;
-        let most = self.area_lines().saturating_sub(rows);
+        let most = self.rows(id).count().saturating_sub(rows);
         let w = &mut self.widgets[id];
         let to = (w.scroll as i64 - up as i64).clamp(0, most as i64) as usize;
         if to == w.scroll {
@@ -313,42 +406,36 @@ impl Ui {
         w.rect
     }
 
-    /// Draws the text area: its lines shown, and the cursor if it has the
-    /// keyboard.
+    /// Draws the text area: its rows shown, the selection behind them and
+    /// the cursor if it has the keyboard.
     pub(crate) fn draw_area(&self, s: &mut Surface, id: Id) {
         let w = self.widgets[id];
         let r = w.rect;
         let keyboard = self.keyboard() == Some(id);
         s.fill(r, FIELD);
         s.outline(r, if keyboard { FOCUS_EDGE } else { EDGE });
-        let (rows, cols) = self.area_shown(id);
+        let (shown, cols) = self.area_shown(id);
         let th = font::HEIGHT * SCALE;
         let tx = r.x + FIELD_INSET;
-        let (cl, cc) = self.area_cursor();
         let sel = w.selection().filter(|_| keyboard);
-        for row in 0..rows {
-            let n = w.scroll + row;
-            if n >= self.area_lines() {
-                break;
-            }
-            let ty = r.y + TOP + row as u32 * LINE_H + (LINE_H - th) / 2;
-            let s0 = self.start_of_line(n);
-            let line = &self.area_bytes()[s0..self.line_end(s0)];
+        for (k, row) in self.rows(id).skip(w.scroll).take(shown).enumerate() {
+            let ty = r.y + TOP + k as u32 * LINE_H + (LINE_H - th) / 2;
+            let line = &self.area_bytes()[row.start..row.end];
             if let Some((a, b)) = sel {
                 // The selected characters' cells behind them, and the
                 // line's end's if its newline is selected.
-                let e0 = s0 + line.len();
-                let from = a.max(s0) - s0;
-                let to = (b.min(e0 + 1)).max(s0) - s0;
+                let past = if row.wrapped { row.end } else { row.end + 1 };
+                let from = a.max(row.start) - row.start;
+                let to = b.min(past).max(row.start) - row.start;
                 for k in from.max(w.hscroll)..to.min(w.hscroll + cols) {
                     let x = tx + (k - w.hscroll) as u32 * STEP - SCALE / 2;
                     s.fill(Rect { x, y: ty - 2, w: STEP, h: th + 4 }, SELECTION);
                 }
             }
-            let shown = &line[w.hscroll.min(line.len())..(w.hscroll + cols).min(line.len())];
-            s.text(tx, ty, shown, SCALE, INK);
-            if keyboard && n == cl && cc >= w.hscroll {
-                let cx = tx + (cc - w.hscroll) as u32 * STEP - SCALE;
+            let text = &line[w.hscroll.min(line.len())..(w.hscroll + cols).min(line.len())];
+            s.text(tx, ty, text, SCALE, INK);
+            if keyboard && row.holds(w.cursor) && w.cursor - row.start >= w.hscroll {
+                let cx = tx + (w.cursor - row.start - w.hscroll) as u32 * STEP - SCALE;
                 s.fill(Rect { x: cx, y: ty - 1, w: SCALE, h: th + 2 }, INK);
             }
         }
@@ -507,6 +594,57 @@ mod tests {
         assert_eq!(ui.area_selection(), Some((0, 2)));
         key(&mut ui, RIGHT);
         assert_eq!((ui.area_selection(), ui.area_cursor()), (None, (0, 2)));
+    }
+
+    #[test]
+    fn rows_break_after_the_last_space_that_fits() {
+        use super::{Row, Rows};
+        let rows = |t: &str, cols| Rows { text: t.as_bytes(), at: 0, cols, done: false }.collect::<std::vec::Vec<_>>();
+        let r = |start, end, wrapped| Row { start, end, wrapped };
+        assert_eq!(rows("the quick fox", 10), [r(0, 10, true), r(10, 13, false)]);
+        assert_eq!(rows("the quick fox", 8), [r(0, 4, true), r(4, 10, true), r(10, 13, false)]);
+        // A word longer than a row is broken where the row is full; a
+        // line of exactly the width is not broken.
+        assert_eq!(rows("abcdefghijkl\nabcd", 5), [r(0, 5, true), r(5, 10, true), r(10, 12, false), r(13, 17, false)]);
+        assert_eq!(rows("abcde\n", 5), [r(0, 5, false), r(6, 6, false)]);
+        assert_eq!(rows("", 5), [r(0, 0, false)]);
+    }
+
+    #[test]
+    fn wrapped_lines_are_moved_through_by_row() {
+        let (mut ui, a) = notes();
+        ui.set_area_wrap(true);
+        let cols = ui.area_shown(a).1;
+        // A line of words twice the width or so: wrapped into three rows.
+        let words = "jam tea rice salt milk eggs bread cheese flour sugar honey";
+        assert!(words.len() > 2 * cols && words.len() < 3 * cols, "{cols} columns");
+        typ(&mut ui, words);
+        assert_eq!((ui.area_lines(), ui.area_rows()), (1, 3));
+        // End of the last row; Up keeps the column on the row above; Home
+        // and End go to its ends (End before the space it ends with).
+        let (row1, row2) = (ui.area_row(a, 1), ui.area_row(a, 2));
+        assert_eq!(ui.widget(a).cursor, words.len());
+        key(&mut ui, UP);
+        assert_eq!(ui.widget(a).cursor, (row1.start + (words.len() - row2.start)).min(row1.end - 1));
+        key(&mut ui, HOME);
+        assert_eq!(ui.widget(a).cursor, row1.start);
+        key(&mut ui, END);
+        assert_eq!((ui.widget(a).cursor, words.as_bytes()[row1.end - 1]), (row1.end - 1, b' '));
+        // Down at a row's end goes to the next row, not past it; Right
+        // from the gap before the space goes to the next row's start.
+        key(&mut ui, RIGHT);
+        assert_eq!(ui.widget(a).cursor, row2.start);
+        // A press on the second row shown, past its end: before its last
+        // space.
+        let r = ui.widget(a).rect;
+        ui.event(Event::Pointer { x: (r.x + r.w - 2) as i32, y: (r.y + super::TOP + super::LINE_H + 4) as i32, buttons: 1 });
+        ui.event(Event::Pointer { x: (r.x + r.w - 2) as i32, y: (r.y + super::TOP + super::LINE_H + 4) as i32, buttons: 0 });
+        assert_eq!(ui.widget(a).cursor, row1.end - 1);
+        // Wrapping off: one row, scrolled sideways to the cursor.
+        ui.set_area_wrap(false);
+        key(&mut ui, END);
+        assert_eq!(ui.area_rows(), 1);
+        assert!(ui.widget(a).hscroll > 0);
     }
 
     #[test]

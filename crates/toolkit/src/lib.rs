@@ -508,6 +508,8 @@ pub struct Ui {
     area_id: Option<Id>,
     area: [u8; AREA_TEXT],
     area_len: usize,
+    /// Whether the text area wraps its lines.
+    area_wrap: bool,
 }
 
 impl Ui {
@@ -551,6 +553,7 @@ impl Ui {
             area_id: None,
             area: [0; AREA_TEXT],
             area_len: 0,
+            area_wrap: false,
         }
     }
 
@@ -567,7 +570,7 @@ impl Ui {
         (self.next_x, self.next_y) = (PAD, PAD);
         (self.field, self.hover, self.pressed) = (None, None, None);
         (self.dragging, self.selecting) = (None, false);
-        (self.area_id, self.area_len) = (None, 0);
+        (self.area_id, self.area_len, self.area_wrap) = (None, 0, false);
     }
 
     /// In a column, the widgets added until [`Ui::end_row`] go on one line,

@@ -1257,20 +1257,25 @@ holds the rest):
   character and line (Up and Down keep the column as far as the line
   reaches), Home and End to the line's ends, Page Up and Down by the lines
   shown; a press puts the cursor at the nearest gap, the wheel scrolls, and
-  the area scrolls down and sideways to keep the cursor shown. Text is
+  the area scrolls down and sideways to keep the cursor shown. With wrapping
+  on (`Ui::set_area_wrap`) each line takes as many rows as it needs to fit
+  the area's width, broken after the last space that fits (or where a word
+  longer than a row fills it), and Up, Down, Home, End and the pages go by
+  rows. Text is
   selected across lines as in a field: dragging (scrolling past the lines
   shown), Shift with the keys that move the cursor or with a press, and
   Control-A; typing, Enter, Backspace and Delete replace it, Control-C and
   Control-X copy and cut it (newlines kept) and Control-V pastes. A field
   pastes such text on one line, its newlines left out. The Notes app
-  (`user/notes/`) is a text area and a label saying where the cursor is;
-  what it copies goes to the compositor's clipboard. `cargo xtask notes-test`
+  (`user/notes/`) is a text area, its lines wrapped, and a label saying
+  where the cursor is; what it copies goes to the compositor's clipboard. `cargo xtask notes-test`
   boots `boot/notes.manifest` on both ISAs: the host types three lines, joins
   two with Backspace and splits them with Enter, types past the lines shown,
   turns the wheel back and presses past the first line's end, then drags
-  across two lines, cuts them and pastes them after the last; six
-  screenshots must have every pixel as the toolkit draws the window on the
-  host.
+  across two lines, cuts them and pastes them after the last, then types a
+  line of words wider than the area (it wraps) and goes up a row within it;
+  seven screenshots must have every pixel as the toolkit draws the window on
+  the host.
 - The mixer (`user/mixer/`), the sound server. It is the sound driver's one
   client and serves the same `audio` interface to every component that plays
   sound: it adds their streams together, sample by sample and saturating, into a
@@ -1405,7 +1410,7 @@ holds the rest):
   notifications, a 256-slot CNode pool) so filling them stays quick; normal kernels have
   32 of each, 32 address spaces and a 4096-slot pool.
 
-Not yet: in the desktop shell icons as image files and more time zones than its table; in the toolkit wrapped lines in text areas and a clipboard larger than 32 bytes; a hardware cursor plane, keyboard
+Not yet: in the desktop shell icons as image files and more time zones than its table; in the toolkit a clipboard larger than 32 bytes; a hardware cursor plane, keyboard
 layouts beyond US, UK, Dvorak and French and characters beyond ASCII, a key
 repeat rate apps can set, and surviving a client
 that dies at the very moment its window is read (the compositor then faults and
@@ -1520,7 +1525,7 @@ cargo xtask desktop-test   # the compositor: two clients' windows through restar
 cargo xtask panel-test     # the desktop shell: apps launched from its menu, activated, minimised and restored, closed and launched again, its clock, its keyboard layout menu, ten screenshots checked
 cargo xtask resize-test    # a resizable window: its frame dragged out and in past its least size, a long name scrolled in its field, its top-left corner dragged out, seven screenshots checked
 cargo xtask widgets-test   # the List app: a list chosen in, scrolled by keys, wheel and scroll bar, text selected, cut and pasted, seven screenshots checked
-cargo xtask notes-test     # the Notes app: lines typed, joined, split and scrolled in a text area, two cut and pasted, six screenshots checked
+cargo xtask notes-test     # the Notes app: lines typed, joined, split and scrolled in a text area, two cut and pasted, a line wrapped, seven screenshots checked
 cargo xtask toolkit-test   # the greeter on the toolkit: a field typed in and edited at its cursor, a button clicked, closed, five screenshots checked against the toolkit drawn on the host
 cargo xtask windows-test   # translucent and decorated windows: a blend, a drag by the title bar, a close box, three screenshots checked, a window moved under a still pointer
 cargo xtask input-test     # the compositor's pointer, focus, keys and wheel from a USB mouse, tablet and keyboard, seven screenshots checked
