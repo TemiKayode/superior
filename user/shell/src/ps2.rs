@@ -10,11 +10,15 @@
 //!
 //! The controller translates the keyboard's codes to scancode set 1 (the
 //! driver makes sure of that), read here with a US layout: letters,
-//! digits and punctuation, Shift and Caps Lock, Enter and Backspace.
+//! digits and punctuation, Shift and Caps Lock, Enter, Backspace and Tab,
+//! the arrows, Home, End and Delete, and Control with L, C, U, A and E.
 //! Bytes from the mouse port (a touchpad) are dropped.
+
+use superior_console::editor::Key;
 
 #[cfg(target_arch = "x86_64")]
 mod imp {
+    use super::Key;
     use superior_objects::abi::Syscall;
     use superior_sys::syscall;
 
@@ -39,6 +43,7 @@ mod imp {
         status: u64,
         shift: bool,
         caps: bool,
+        control: bool,
         /// The last byte was 0xe0: an extended key's code follows.
         extended: bool,
     }
@@ -83,6 +88,7 @@ mod imp {
                 status,
                 shift: false,
                 caps: false,
+                control: false,
                 extended: false,
             };
             k.read(data, DATA)?;
@@ -114,8 +120,8 @@ mod imp {
             Some(k)
         }
 
-        /// The next character typed, if one is waiting.
-        pub fn poll(&mut self) -> Option<u8> {
+        /// The next key pressed, if one is waiting.
+        pub fn poll(&mut self) -> Option<Key> {
             loop {
                 let s = self.status();
                 if s & OUTPUT_FULL == 0 || s == 0xff {
@@ -131,8 +137,8 @@ mod imp {
             }
         }
 
-        /// What scancode `code` types, keeping track of the modifiers.
-        fn key(&mut self, code: u8) -> Option<u8> {
+        /// What scancode `code` presses, keeping track of the modifiers.
+        fn key(&mut self, code: u8) -> Option<Key> {
             if code == 0xe0 {
                 self.extended = true;
                 return None;
@@ -150,16 +156,42 @@ mod imp {
                     self.caps = !self.caps;
                     None
                 }
-                // The keypad's Enter.
-                0x1c if extended && !released => Some(b'\r'),
-                _ if released || extended => None,
+                // Left and right Control (the right one is extended).
+                0x1d => {
+                    self.control = !released;
+                    None
+                }
+                _ if released => None,
+                // The keypad's Enter, the arrows, Home, End and Delete.
+                0x1c if extended => Some(Key::Enter),
+                0x48 if extended => Some(Key::Up),
+                0x50 if extended => Some(Key::Down),
+                0x4b if extended => Some(Key::Left),
+                0x4d if extended => Some(Key::Right),
+                0x47 if extended => Some(Key::Home),
+                0x4f if extended => Some(Key::End),
+                0x53 if extended => Some(Key::Delete),
+                _ if extended => None,
                 m if (m as usize) < PLAIN.len() => {
                     let letter = PLAIN[m as usize].is_ascii_lowercase();
                     let shifted = self.shift ^ (self.caps && letter);
                     let c = if shifted { SHIFTED[m as usize] } else { PLAIN[m as usize] };
+                    if self.control {
+                        return match PLAIN[m as usize] {
+                            b'l' => Some(Key::Clear),
+                            b'c' => Some(Key::Cancel),
+                            b'u' => Some(Key::KillLine),
+                            b'a' => Some(Key::Home),
+                            b'e' => Some(Key::End),
+                            _ => None,
+                        };
+                    }
                     match c {
-                        0 | 0x1b | b'\t' => None,
-                        c => Some(c),
+                        0 | 0x1b => None,
+                        b'\t' => Some(Key::Tab),
+                        b'\r' => Some(Key::Enter),
+                        0x08 => Some(Key::Backspace),
+                        c => Some(Key::Char(c)),
                     }
                 }
                 _ => None,
@@ -177,6 +209,8 @@ mod imp {
 
 #[cfg(not(target_arch = "x86_64"))]
 mod imp {
+    use super::Key;
+
     /// No PS/2 controller on this architecture.
     pub struct Keyboard;
 
@@ -185,7 +219,7 @@ mod imp {
             None
         }
 
-        pub fn poll(&mut self) -> Option<u8> {
+        pub fn poll(&mut self) -> Option<Key> {
             None
         }
 

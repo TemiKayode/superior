@@ -1,0 +1,11 @@
+[package]
+name = "superior-console"
+description = "The shell's console on a machine's own screen: how it looks (a status bar, indented output, a prompt, a blinking cursor) and how a line is edited (history, completion, suggestions). No I/O of its own, so it is tested on the host."
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+edition = "2024"
+publish = false
+
+[dependencies]
+superior-toolkit = { path = "../toolkit" }

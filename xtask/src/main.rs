@@ -378,6 +378,8 @@ fn host_tests() -> Result<(), String> {
         "-p",
         "superior-toolkit",
         "-p",
+        "superior-console",
+        "-p",
         "superior-wifi",
     ]))?;
     println!("== model check and long simulation (release)");
@@ -6442,6 +6444,70 @@ fn read_ppm(path: &Path) -> Result<(usize, usize, Vec<u8>), String> {
     }
 }
 
+/// A picture in memory for `superior_console` to draw into, RGB.
+struct Picture {
+    w: usize,
+    h: usize,
+    px: Vec<[u8; 3]>,
+}
+
+impl superior_console::Canvas for Picture {
+    fn fill(&mut self, x: usize, y: usize, w: usize, h: usize, rgb: [u8; 3]) {
+        for yy in y..(y + h).min(self.h) {
+            for xx in x..(x + w).min(self.w) {
+                self.px[yy * self.w + xx] = rgb;
+            }
+        }
+    }
+}
+
+/// Checks a screenshot of the screen console after `echo Hi PS/2!` was
+/// typed on the PS/2 keyboard: below the bar, every pixel must be as the
+/// console draws the same session on the host, but for the cursor's cell
+/// (it blinks).
+fn check_screen_console(path: &Path) -> Result<String, String> {
+    use superior_console::{BAR_H, HINT, Ink, OUTPUT_COL, PROMPT_COL, Term, WELCOME};
+    let (w, h, px) = read_ppm(path)?;
+    let mut p = Picture { w, h, px: vec![[0; 3]; w * h] };
+    let mut t = Box::new(Term::new());
+    t.init(&mut p, w, h);
+    t.style(Ink::Text, PROMPT_COL);
+    t.write(&mut p, WELCOME);
+    t.ink(Ink::Muted);
+    t.write(&mut p, HINT);
+    t.style(Ink::Text, OUTPUT_COL);
+    t.prompt(&mut p);
+    t.edit(&mut p, b"echo Hi PS/2!", 13);
+    t.submit(&mut p);
+    t.write(&mut p, b"Hi PS/2!\n");
+    t.prompt(&mut p);
+    let (cx, cy, cw, ch) = t.cursor_cell().map(|(c, r)| t.cell_rect(c, r)).ok_or("no cursor")?;
+    let mut wrong = 0;
+    let mut first = None;
+    let mut checked = 0;
+    for y in BAR_H..h {
+        for x in 0..w {
+            if (cx..cx + cw).contains(&x) && (cy..cy + ch).contains(&y) {
+                continue;
+            }
+            let i = y * w + x;
+            let have = [px[i * 3], px[i * 3 + 1], px[i * 3 + 2]];
+            checked += 1;
+            if have != p.px[i] {
+                wrong += 1;
+                first.get_or_insert((x, y, have, p.px[i]));
+            }
+        }
+    }
+    match first {
+        None => Ok(format!("{w}x{h}, all {checked} pixels below the bar right")),
+        Some((x, y, have, want)) => Err(format!(
+            "{}: {wrong} pixels wrong below the bar, the first at ({x}, {y}): {have:?}, not {want:?}",
+            path.display()
+        )),
+    }
+}
+
 /// Checks the screenshot at `path`: the top of the screen must be the
 /// kernel's first log lines (`lines`), laid out as the kernel does
 /// (wrapped at the screen's width), every pixel light grey or black.
@@ -6563,26 +6629,26 @@ fn qmp_type(text: &str) -> Result<(), String> {
 
 /// The shell as a console on the screen and the PS/2 keyboard
 /// (boot/console.manifest): a command typed on QEMU's PS/2 keyboard must
-/// be answered, and the screen must show the session, every pixel as the
-/// kernel's log would draw those lines; the serial console must still
-/// work beside them.
+/// be answered, and the screen must show the session every pixel as
+/// `superior_console` draws it on the host (the bar, whose clock moves,
+/// and the blinking cursor's cell left out); the serial console must
+/// still work beside it, its line editing and suggestions too.
 fn console_shell_test() -> Result<(), String> {
     let img = image_with(false, Arch::X86_64, "console")?;
     println!("== screen console test on {}", img.path.display());
     let qmp_arg = format!("tcp:127.0.0.1:{QMP_PORT},server=on,wait=off");
     let path = root().join("target").join("console-shell.ppm");
     let checked = std::cell::RefCell::new(String::new());
-    let lines = |w: usize, h: usize| {
-        vec![
-            String::new(),
-            "Superior shell. Type 'help' for commands.".to_string(),
-            format!("Console on the screen ({w}x{h}), the PS/2 keyboard, and COM1."),
-            "superior> echo Hi PS/2!".to_string(),
-            "Hi PS/2!".to_string(),
-            "superior> ".to_string(),
-        ]
-    };
-    let script = [("help", "reboot          restart the machine")];
+    let script = [
+        ("help", "reboot          restart the machine"),
+        // A typo gets a suggestion; Tab completes a command.
+        ("ech hi", "unknown command: ech (did you mean 'echo'?)"),
+        ("ec\tthere", "\nthere"),
+        // The arrows: Left twice, then a letter goes in the middle.
+        ("echo ac\x1b[D\x1b[Db", "\nbac"),
+        // Up recalls the last line.
+        ("\x1b[A", "\nbac"),
+    ];
     let out = drive_shell_at(&img, &["-qmp", &qmp_arg], &script, &|| {
         qmp_type("echo Hi PS/2!\n")?;
         // The shell reads the keyboard every tick: look until the screen
@@ -6591,7 +6657,7 @@ fn console_shell_test() -> Result<(), String> {
         loop {
             let _ = std::fs::remove_file(&path);
             screendump(&path)?;
-            match check_console(&path, &lines) {
+            match check_screen_console(&path) {
                 Ok(s) => {
                     *checked.borrow_mut() = s;
                     return Ok(());
