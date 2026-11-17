@@ -1129,7 +1129,11 @@ holds the rest):
   and types "jo", presses End, clicks the button and presses the close box;
   five screenshots must have
   every pixel as the toolkit, run on the host after the same events, draws the
-  window, in its frame with its title.
+  window, in its frame with its title. Key repeat (`window` version 11): a key
+  held (not a modifier) is pressed again for the focused window every 50 ms
+  once held 500 ms (`KEY` with `b` 3), until let go, another key is pressed or
+  the focus moves; `toolkit-test` holds Backspace for a second at the end of
+  the field, and the repeats take all six letters out.
 - The desktop shell's panel (`user/panel/`), a strip along the bottom of the
   screen drawn with the toolkit (now with row layouts and selected buttons). It
   has a launcher button for each `start launch` component in the manifest, which
@@ -1366,7 +1370,7 @@ holds the rest):
 
 Not yet: in the desktop shell icons as image files and more time zones than its table; in the toolkit multi-line text and a clipboard larger than 32 bytes; a hardware cursor plane,
 pointer events when a window moves or appears under a still pointer, keyboard
-layouts and key repeat (keys are USB usages), and surviving a client
+layouts (keys are USB usages) and a key repeat rate apps can set, and surviving a client
 that dies at the very moment its window is read (the compositor then faults and
 is restarted, which its clients survive); in the mixer resampling (every stream
 plays at the driver's rate), volume, formats other than 16-bit stereo and

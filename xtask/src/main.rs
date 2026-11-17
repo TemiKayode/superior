@@ -3250,6 +3250,8 @@ enum Act {
     /// or of keys joined by '+' ("shift+home"), held down in order and let
     /// go in reverse.
     Key(&'static str),
+    /// Holds the key with this QEMU name down for this many milliseconds.
+    Hold(&'static str, u64),
     /// Puts the tablet where it puts the pointer at this pixel.
     Tablet(usize, usize),
     /// Turns the wheel one step up (1) or down (-1).
@@ -3357,6 +3359,14 @@ fn input_act(act: &Act, arch: Arch) -> Result<Option<String>, String> {
                     "{{\"type\":\"key\",\"data\":{{\"down\":{down},\"key\":{{\"type\":\"qcode\",\"data\":\"{k}\"}}}}}}"
                 ))])?;
                 std::thread::sleep(Duration::from_millis(KEY_GAP_MS));
+            }
+        }
+        Act::Hold(k, ms) => {
+            for down in [true, false] {
+                qmp(&[send(format!(
+                    "{{\"type\":\"key\",\"data\":{{\"down\":{down},\"key\":{{\"type\":\"qcode\",\"data\":\"{k}\"}}}}}}"
+                ))])?;
+                std::thread::sleep(Duration::from_millis(if down { *ms } else { KEY_GAP_MS }));
             }
         }
         Act::Type(keys) => {
@@ -3840,7 +3850,8 @@ fn toolkit_act(act: &Act, arch: Arch) -> Result<Option<String>, String> {
 /// decorated window the compositor titles. The host clicks its field,
 /// types "ada", edits it to "anna" with the arrows and Delete, clicks
 /// before the text and types "jo" there, presses End, clicks its button
-/// (it greets the name) and presses its close box (it closes). Five
+/// (it greets the name), holds Backspace at the field's end until key
+/// repeat empties it, and presses its close box (it closes). Five
 /// screenshots must have every pixel as the
 /// toolkit draws the window after the same events, in its frame with its
 /// title.
@@ -3876,7 +3887,13 @@ fn toolkit_test(arch: Arch) -> Result<(), String> {
         ),
         (
             vec!["greeter: said \"Hello, joanna!\""],
-            vec![Shot(4), rel(TOOLKIT_BUTTON, TOOLKIT_CLOSE), Button(true), Button(false)],
+            // Back to the field's end, and Backspace held: key repeat
+            // takes all six letters out.
+            vec![Shot(4), rel(TOOLKIT_BUTTON, TOOLKIT_FIELD), Button(true), Button(false), Key("end"), Hold("backspace", 1000)],
+        ),
+        (
+            vec!["greeter: the field holds \"\", the cursor at 0", "compositor: window 0: key 42 held, repeated"],
+            vec![rel(TOOLKIT_FIELD, TOOLKIT_CLOSE), Button(true), Button(false)],
         ),
         (vec!["toolkit: the greeter's window is gone"], vec![Shot(5)]),
     ];
@@ -3898,6 +3915,11 @@ fn toolkit_test(arch: Arch) -> Result<(), String> {
         "greeter: the field holds \"joanna\", the cursor at 2",
         "greeter: the field holds \"joanna\", the cursor at 6",
         "greeter: said \"Hello, joanna!\"",
+        "greeter: the field holds \"joann\", the cursor at 5",
+        "greeter: the field holds \"joan\", the cursor at 4",
+        "greeter: the field holds \"j\", the cursor at 1",
+        "greeter: the field holds \"\", the cursor at 0",
+        "compositor: window 0: key 42 held, repeated",
         "compositor: window 0: its close box was pressed",
         "greeter: closed",
         "toolkit: the greeter's window is gone",

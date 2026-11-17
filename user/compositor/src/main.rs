@@ -55,7 +55,7 @@
 #![no_std]
 #![no_main]
 
-use superior_objects::abi::{CapTransfer, Error, ObjectType, Syscall};
+use superior_objects::abi::{CapTransfer, Error, ObjectType, Syscall, TICK_HZ};
 use superior_objects::idl::{display, window};
 use superior_objects::interfaces::{Status, input};
 use superior_objects::manifest::MANAGER_BADGE;
@@ -93,6 +93,22 @@ const SCREEN_PAGES: u64 = display::SURFACE_PAGES;
 const _: () = assert!(SCREEN + SCREEN_PAGES <= WINDOW_SLOTS);
 /// Rights for a copy of a lent page.
 const ALL: u64 = 0x1f;
+/// Key repeat's delay and interval in ticks.
+const REPEAT_DELAY_TICKS: u64 = window::REPEAT_DELAY * TICK_HZ / 1000;
+const REPEAT_TICKS: u64 = window::REPEAT_INTERVAL * TICK_HZ / 1000;
+
+/// A key held for the window with the focus: its usage, the `KEY` event's
+/// `b` (the modifier byte as it last was), when it next repeats and how
+/// many times it has.
+#[derive(Clone, Copy)]
+struct Repeat {
+    window: usize,
+    usage: u64,
+    b: u64,
+    next: u64,
+    count: u64,
+}
+
 /// Ticks between checks that every window's client is still there.
 const CHECK_TICKS: u64 = 20;
 /// Ticks without a flush after which the driver is asked whether it still
@@ -460,6 +476,8 @@ struct Compositor {
     hover: Option<usize>,
     grab: Option<usize>,
     focus: Option<usize>,
+    /// The key held, repeating.
+    repeat: Option<Repeat>,
     /// The clipboard's text, a zero byte ending it early.
     clipboard: [u8; window::CLIPBOARD_BYTES as usize],
     /// The window dragged by its title bar, and where the pointer is on it
@@ -773,6 +791,7 @@ impl Compositor {
         if to == self.focus {
             return;
         }
+        self.stop_repeat();
         if let Some(o) = self.focus {
             self.post(o, window::FOCUS, 0, 0);
             self.repaint_title(o);
@@ -842,6 +861,16 @@ impl Compositor {
             input::KEY => {
                 if let Some(f) = self.focus {
                     self.post(f, window::KEY, a, b);
+                }
+                let modifier = (0xe0..=0xe7).contains(&a);
+                if b & 1 == 1 && !modifier {
+                    self.stop_repeat();
+                    self.repeat = self.focus.map(|f| Repeat { window: f, usage: a, b, next: ticks() + REPEAT_DELAY_TICKS, count: 0 });
+                } else if b & 1 == 0 && self.repeat.is_some_and(|r| r.usage == a) {
+                    self.stop_repeat();
+                } else if let Some(r) = self.repeat.as_mut() {
+                    // Shift or Control pressed or let go meanwhile.
+                    r.b = r.b & !0xff00 | b & 0xff00;
                 }
                 NONE
             }
@@ -1513,6 +1542,29 @@ impl Compositor {
         }
     }
 
+    /// The held key stops repeating.
+    fn stop_repeat(&mut self) {
+        if let Some(r) = self.repeat.take().filter(|r| r.count > 0) {
+            say!("window {}: key {} held, repeated {} times", r.window, r.usage, r.count);
+        }
+    }
+
+    /// The held key pressed again, if it is time: when next to look.
+    fn repeat_key(&mut self, now: u64) -> Option<u64> {
+        let mut r = self.repeat?;
+        if self.focus != Some(r.window) {
+            self.stop_repeat();
+            return None;
+        }
+        if now >= r.next {
+            self.post(r.window, window::KEY, r.usage, r.b | 2);
+            // One at a time: a late wakeup does not flood the window.
+            (r.next, r.count) = (now + REPEAT_TICKS, r.count + 1);
+            self.repeat = Some(r);
+        }
+        Some(r.next)
+    }
+
     /// `CLIP_PUT` or `CLIP_GET` for window `i`: only while it has the
     /// keyboard focus.
     fn clip(&mut self, op: u64, i: usize, part: u64, bytes: u64) -> [u64; 4] {
@@ -1582,6 +1634,7 @@ pub extern "C" fn _start(_: u64) -> ! {
         grab: None,
         focus: None,
         clipboard: [0; window::CLIPBOARD_BYTES as usize],
+        repeat: None,
         drag: None,
         dragged: false,
         resize: None,
@@ -1614,7 +1667,8 @@ pub extern "C" fn _start(_: u64) -> ! {
             c.tick();
             next_check = ticks() + CHECK_TICKS;
         }
-        syscall(Syscall::TimerSignal, NOTIFY, [next_check.saturating_sub(ticks()).max(1), 0, 0, 0]);
+        let wake = c.repeat_key(now).map_or(next_check, |r| r.min(next_check));
+        syscall(Syscall::TimerSignal, NOTIFY, [wake.saturating_sub(ticks()).max(1), 0, 0, 0]);
         let r = match reply.take() {
             Some(m) => syscall_x(Syscall::ReplyRecv, SERVICE, m, accept),
             None => syscall_x(Syscall::Recv, SERVICE, [0; 4], accept),

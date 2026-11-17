@@ -63,7 +63,12 @@
 # focus may put text there or read it, so an app in the background can
 # neither read what the user copied nor change it. A restarted
 # compositor's clipboard is empty.
-interface window version 10
+#
+# Key repeat: a key held (not a modifier) is pressed again for the window
+# with the focus every `REPEAT_INTERVAL` ms once it has been held
+# `REPEAT_DELAY` ms, until it is let go, another key is pressed or the
+# focus moves.
+interface window version 11
 
 # The most windows on the screen, all clients together.
 const MAX_WINDOWS = 8
@@ -104,8 +109,8 @@ op DESTROY = 7 (window)
 
 # The kinds of event `NEXT` gives, and what `a` and `b` say.
 # A key went down or up while the window had the focus: `a` is its USB
-# HID usage, `b` is 1 if pressed and 0 if released, with the modifier
-# byte in bits 8 to 15.
+# HID usage, `b` is 1 if pressed and 0 if released (3 if pressed again
+# by key repeat), with the modifier byte in bits 8 to 15.
 const KEY = 1
 # The pointer moved over the window (or anywhere, while it is held to the
 # window), or a button went down or up: `a` is where it is in the window
@@ -229,3 +234,8 @@ op CLIP_PUT = 19 (window, part, bytes)
 # how long its text is. `Denied` unless the window has the keyboard focus;
 # `Invalid` past `CLIPBOARD_BYTES`.
 op CLIP_GET = 20 (window, part) -> (bytes, len)
+
+# How long a key is held before it repeats, and how often it does then,
+# in milliseconds.
+const REPEAT_DELAY = 500
+const REPEAT_INTERVAL = 50

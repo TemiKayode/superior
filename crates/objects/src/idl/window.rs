@@ -66,10 +66,15 @@
 /// focus may put text there or read it, so an app in the background can
 /// neither read what the user copied nor change it. A restarted
 /// compositor's clipboard is empty.
+///
+/// Key repeat: a key held (not a modifier) is pressed again for the window
+/// with the focus every `REPEAT_INTERVAL` ms once it has been held
+/// `REPEAT_DELAY` ms, until it is let go, another key is pressed or the
+/// focus moves.
 pub mod window {
     use crate::interfaces::Status;
 
-    pub const VERSION: u64 = 10;
+    pub const VERSION: u64 = 11;
 
     /// The most windows on the screen, all clients together.
     pub const MAX_WINDOWS: u64 = 8;
@@ -79,8 +84,8 @@ pub mod window {
 
     /// The kinds of event `NEXT` gives, and what `a` and `b` say.
     /// A key went down or up while the window had the focus: `a` is its USB
-    /// HID usage, `b` is 1 if pressed and 0 if released, with the modifier
-    /// byte in bits 8 to 15.
+    /// HID usage, `b` is 1 if pressed and 0 if released (3 if pressed again
+    /// by key repeat), with the modifier byte in bits 8 to 15.
     pub const KEY: u64 = 1;
 
     /// The pointer moved over the window (or anywhere, while it is held to the
@@ -156,6 +161,12 @@ pub mod window {
 
     /// The most bytes the clipboard holds.
     pub const CLIPBOARD_BYTES: u64 = 32;
+
+    /// How long a key is held before it repeats, and how often it does then,
+    /// in milliseconds.
+    pub const REPEAT_DELAY: u64 = 500;
+
+    pub const REPEAT_INTERVAL: u64 = 50;
 
     /// The screen's size, and how many windows are shown on it (every
     /// client's).
