@@ -15,6 +15,7 @@ bench = false
 [dependencies]
 superior-objects = { path = "../../crates/objects" }
 superior-sys = { path = "../../crates/sys" }
+superior-console = { path = "../../crates/console" }
 superior-toolkit = { path = "../../crates/toolkit" }
 
 [features]

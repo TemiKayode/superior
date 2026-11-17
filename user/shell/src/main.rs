@@ -23,7 +23,11 @@
 //! console on the machine's own screen and keyboard ([`screen`], [`ps2`]),
 //! for PCs with no serial port: what it prints goes to both, and it reads
 //! from both. Where COM1 is missing (its status port reads as all ones),
-//! the shell leaves it alone.
+//! the shell leaves it alone. The screen has a look of its own (a status
+//! bar, a quiet prompt, inks; `superior_console`), while COM1 keeps the
+//! plain transcript the tests read. Both edit the line the same way: the
+//! arrows, Home, End and Delete, a history on Up and Down, Tab completion
+//! of the command, and a suggestion for a mistyped one.
 
 #![no_std]
 #![no_main]
@@ -32,6 +36,8 @@ mod ps2;
 mod screen;
 
 use core::fmt::{self, Write};
+use superior_console::editor::{Action, Editor, Key, LINE_MAX, suggest};
+use superior_console::{DOT, DOWN, Ink, OUTPUT_COL, PROMPT_COL, UP};
 use superior_objects::abi::{ObjectType, Syscall};
 use superior_sys::{USER_BASE, cycles, syscall};
 
@@ -59,7 +65,9 @@ const RIGHT_READ: u64 = 1 << 0;
 const RIGHT_WRITE: u64 = 1 << 1;
 
 const PROMPT: &str = "superior> ";
-const LINE_MAX: usize = 120;
+
+/// What Tab completes and what a typo is matched against.
+const COMMANDS: &[&str] = &["help", "about", "echo", "sleep", "ipc", "clear", "log", "reboot", "shutdown"];
 
 // ---- the serial driver -------------------------------------------------
 
@@ -172,11 +180,17 @@ mod uart {
 struct Devices {
     uart: bool,
     keyboard: Option<ps2::Keyboard>,
+    /// How far into a terminal's escape sequence (an arrow, Home, ...)
+    /// the UART is, and the number in it so far.
+    escape: u8,
+    number: u8,
 }
 
 static mut DEVICES: Devices = Devices {
     uart: true,
     keyboard: None,
+    escape: 0,
+    number: 0,
 };
 
 fn devices() -> &'static mut Devices {
@@ -189,7 +203,7 @@ fn put_byte(b: u8) {
     if devices().uart {
         uart::write(b);
     }
-    screen::put(b);
+    screen::write(&[b]);
 }
 
 /// The console: output goes to the UART, and to the screen if there is one.
@@ -207,27 +221,131 @@ impl Write for Console {
     }
 }
 
-macro_rules! out {
-    ($($arg:tt)*) => {{ let _ = write!(Console, $($arg)*); }};
+/// The serial console alone: what the screen shows its own way.
+struct Serial;
+
+impl Write for Serial {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        serial_bytes(s.as_bytes());
+        Ok(())
+    }
 }
+
+fn serial_bytes(text: &[u8]) {
+    if !devices().uart {
+        return;
+    }
+    for &b in text {
+        if b == b'\n' {
+            uart::write(b'\r');
+        }
+        uart::write(b);
+    }
+}
+
+/// `s` as the screen's bytes: ASCII as it is, and the console's own
+/// characters (`DOT`, `UP`, ... written as `char`s, U+0080 to U+0083) as
+/// their single bytes.
+fn glyphs(s: &str, mut f: impl FnMut(u8)) {
+    for c in s.chars() {
+        let c = c as u32;
+        f(if c <= u32::from(DOWN) { c as u8 } else { b'?' });
+    }
+}
+
+/// The screen alone, in ink `0`.
+struct Screen(Ink);
+
+impl Write for Screen {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        screen::ink(self.0);
+        glyphs(s, |b| screen::write(&[b]));
+        screen::ink(Ink::Text);
+        Ok(())
+    }
+}
+
 macro_rules! outln {
     ($($arg:tt)*) => {{ let _ = writeln!(Console, $($arg)*); }};
 }
+/// To the serial console only.
+macro_rules! sout {
+    ($($arg:tt)*) => {{ let _ = write!(Serial, $($arg)*); }};
+}
+/// To the screen only, in an ink.
+macro_rules! scr {
+    ($ink:expr, $($arg:tt)*) => {{ let _ = write!(Screen($ink), $($arg)*); }};
+}
 
-/// Next byte typed: read whatever the UART or the keyboard holds, else
-/// sleep until the UART's interrupt, or with a keyboard until the next
-/// tick at the latest (the keyboard is polled), on the same notification.
-fn get_byte() -> u8 {
-    loop {
-        if devices().uart {
-            if let Some(b) = uart::try_read() {
-                return b;
+/// What byte `b` from a serial terminal presses, following its escape
+/// sequences for the arrows, Home, End and Delete.
+fn serial_key(b: u8) -> Option<Key> {
+    let d = devices();
+    match d.escape {
+        1 => {
+            d.escape = if b == b'[' || b == b'O' { 2 } else { 0 };
+            d.number = 0;
+            None
+        }
+        2 => {
+            if b.is_ascii_digit() {
+                d.number = d.number.saturating_mul(10).saturating_add(b - b'0');
+                return None;
+            }
+            d.escape = 0;
+            match b {
+                b'A' => Some(Key::Up),
+                b'B' => Some(Key::Down),
+                b'C' => Some(Key::Right),
+                b'D' => Some(Key::Left),
+                b'H' => Some(Key::Home),
+                b'F' => Some(Key::End),
+                b'~' => match d.number {
+                    1 | 7 => Some(Key::Home),
+                    4 | 8 => Some(Key::End),
+                    3 => Some(Key::Delete),
+                    _ => None,
+                },
+                _ => None,
             }
         }
-        if let Some(k) = devices().keyboard.as_mut() {
-            if let Some(b) = k.poll() {
-                return b;
+        _ => match b {
+            0x1b => {
+                d.escape = 1;
+                None
             }
+            b'\r' | b'\n' => Some(Key::Enter),
+            0x08 | 0x7f => Some(Key::Backspace),
+            b'\t' => Some(Key::Tab),
+            0x0c => Some(Key::Clear),
+            0x03 => Some(Key::Cancel),
+            0x15 => Some(Key::KillLine),
+            0x01 => Some(Key::Home),
+            0x05 => Some(Key::End),
+            0x20..=0x7e => Some(Key::Char(b)),
+            _ => None,
+        },
+    }
+}
+
+/// Next key pressed: whatever the UART or the keyboard holds, else sleep
+/// until the UART's interrupt, or with a keyboard or a screen until the
+/// next tick at the latest (the keyboard is polled, the cursor blinks and
+/// the bar's clock moves), on the same notification.
+fn get_key() -> Key {
+    loop {
+        if devices().uart {
+            while let Some(b) = uart::try_read() {
+                if let Some(k) = serial_key(b) {
+                    return k;
+                }
+            }
+        }
+        if let Some(k) = devices().keyboard.as_mut().and_then(|k| k.poll()) {
+            return k;
+        }
+        let ticking = devices().keyboard.is_some() || screen::present();
+        if ticking {
             syscall(Syscall::TimerSignal, UART_NTFN, [1, 0, 0, 0]);
         }
         syscall(Syscall::Wait, UART_NTFN, [0; 4]);
@@ -235,47 +353,261 @@ fn get_byte() -> u8 {
             uart::clear_interrupt();
             syscall(Syscall::IrqAck, UART_IRQ, [0; 4]);
         }
+        if ticking {
+            status::tick();
+        }
     }
 }
 
-/// Reads a line with echo and backspace. Returns its length.
-fn read_line(buf: &mut [u8; LINE_MAX]) -> usize {
-    let mut len = 0;
+static mut EDITOR: Editor = Editor::new();
+
+fn editor() -> &'static mut Editor {
+    // SAFETY: only the shell's main thread edits, and nothing holds it
+    // past a call.
+    unsafe { &mut *core::ptr::addr_of_mut!(EDITOR) }
+}
+
+/// What the serial terminal shows of the line, to update it with as few
+/// bytes as can be: typing and Backspace at the end of the line send what
+/// they always did, anything else redraws the line.
+struct Shown {
+    line: [u8; LINE_MAX],
+    len: usize,
+    cursor: usize,
+}
+
+impl Shown {
+    const fn new() -> Shown {
+        Shown { line: [0; LINE_MAX], len: 0, cursor: 0 }
+    }
+
+    fn update(&mut self, line: &[u8], cursor: usize) {
+        let (len, old) = (line.len(), &self.line[..self.len]);
+        let at_end = self.cursor == self.len && cursor == len;
+        if at_end && len == old.len() + 1 && line.starts_with(old) {
+            serial_bytes(&line[len - 1..]);
+        } else if at_end && len + 1 == old.len() && old.starts_with(line) {
+            serial_bytes(b"\x08 \x08");
+        } else if line != old || cursor != self.cursor {
+            serial_bytes(b"\r");
+            serial_bytes(PROMPT.as_bytes());
+            serial_bytes(line);
+            let extra = old.len().saturating_sub(len);
+            for _ in 0..extra {
+                serial_bytes(b" ");
+            }
+            for _ in 0..extra + len - cursor {
+                serial_bytes(b"\x08");
+            }
+        }
+        self.line[..len].copy_from_slice(line);
+        self.len = len;
+        self.cursor = cursor;
+    }
+}
+
+/// Shows a new prompt on both consoles.
+fn prompt() {
+    sout!("{PROMPT}");
+    screen::prompt();
+}
+
+/// Reads a line into the editor, showing it as it is edited. False if it
+/// was dropped (Control-C).
+fn read_line() -> bool {
+    let e = editor();
+    let mut shown = Shown::new();
     loop {
-        match get_byte() {
-            b'\r' | b'\n' => {
-                out!("\n");
-                return len;
+        match e.key(get_key(), COMMANDS) {
+            Action::Nothing => {}
+            Action::Edited => {
+                shown.update(e.line(), e.cursor());
+                screen::edit(e.line(), e.cursor());
             }
-            0x08 | 0x7f => {
-                if len > 0 {
-                    len -= 1;
-                    out!("\x08 \x08");
+            Action::Submit => {
+                sout!("\n");
+                screen::submit();
+                return true;
+            }
+            Action::Cancel => {
+                sout!("^C\n");
+                screen::submit();
+                return false;
+            }
+            Action::Clear => {
+                sout!("\x1b[2J\x1b[H");
+                screen::clear();
+                prompt();
+                shown = Shown::new();
+                shown.update(e.line(), e.cursor());
+                screen::edit(e.line(), e.cursor());
+            }
+            Action::Candidates => {
+                sout!("\n");
+                screen::submit();
+                for (i, c) in e.candidates(COMMANDS).enumerate() {
+                    let gap = if i == 0 { "" } else { "  " };
+                    sout!("{gap}{c}");
+                    scr!(Ink::Muted, "{gap}{c}");
                 }
+                sout!("\n");
+                scr!(Ink::Muted, "\n");
+                prompt();
+                shown = Shown::new();
+                shown.update(e.line(), e.cursor());
+                screen::edit(e.line(), e.cursor());
             }
-            b @ 0x20..=0x7e if len < LINE_MAX => {
-                buf[len] = b;
-                len += 1;
-                put_byte(b);
-            }
-            _ => {}
+        }
+    }
+}
+
+// ---- the status bar ----------------------------------------------------
+
+/// A line built without a heap.
+struct Buf<const N: usize> {
+    bytes: [u8; N],
+    len: usize,
+}
+
+impl<const N: usize> Buf<N> {
+    const fn new() -> Self {
+        Buf { bytes: [0; N], len: 0 }
+    }
+
+    fn push(&mut self, b: &[u8]) {
+        let n = b.len().min(N - self.len);
+        self.bytes[self.len..self.len + n].copy_from_slice(&b[..n]);
+        self.len += n;
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        &self.bytes[..self.len]
+    }
+}
+
+impl<const N: usize> Write for Buf<N> {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        glyphs(s, |b| self.push(&[b]));
+        Ok(())
+    }
+}
+
+/// The bar along the top of the screen: the machine on the left (what the
+/// boot log said of it), how long it has been up and the time on the
+/// right, once a second.
+mod status {
+    use super::*;
+
+    struct Status {
+        machine: Buf<64>,
+        /// The real-time clock at boot, if there is one.
+        boot: Option<u64>,
+        ticks: u64,
+        right: Buf<32>,
+    }
+
+    static mut STATUS: Status = Status {
+        machine: Buf::new(),
+        boot: None,
+        ticks: 0,
+        right: Buf::new(),
+    };
+
+    fn status() -> &'static mut Status {
+        // SAFETY: only the shell's main thread draws.
+        unsafe { &mut *core::ptr::addr_of_mut!(STATUS) }
+    }
+
+    fn time() -> Option<u64> {
+        let r = syscall(Syscall::Time, 0, [0; 4]);
+        (r.status == 0).then_some(r.msg[0])
+    }
+
+    /// The number just after `[ok] ` on the boot log's line with `needle`.
+    fn from_log(needle: &[u8]) -> Option<u64> {
+        let line = screen::log_line_with(needle)?;
+        let rest = line.strip_prefix(b"[ok] ")?;
+        let digits = rest.iter().take_while(|b| b.is_ascii_digit()).count();
+        core::str::from_utf8(&rest[..digits]).ok()?.parse().ok()
+    }
+
+    pub fn init() {
+        let s = status();
+        s.boot = time();
+        for b in superior_sys::ARCH.bytes() {
+            s.machine.push(&[if b == b'_' { b'-' } else { b }]);
+        }
+        if let Some(n) = from_log(b" CPUs online") {
+            let _ = write!(s.machine, " {} {n} CPU{}", DOT as char, if n == 1 { "" } else { "s" });
+        }
+        if let Some(n) = from_log(b" MiB of spare RAM") {
+            let _ = write!(s.machine, " {} {n} MiB free", DOT as char);
+        }
+        draw();
+    }
+
+    fn draw() {
+        let s = status();
+        let up = match (s.boot, time()) {
+            (Some(boot), Some(now)) => now.saturating_sub(boot),
+            _ => s.ticks / 100,
+        };
+        let mut right = Buf::<32>::new();
+        let _ = write!(right, "up {}:{:02}:{:02}", up / 3600, up / 60 % 60, up % 60);
+        let clock = time().map(|t| t % 86_400);
+        if right.as_bytes() == s.right.as_bytes() && s.ticks > 0 {
+            return;
+        }
+        s.right = right;
+        let mut hm = Buf::<8>::new();
+        if let Some(t) = clock {
+            let _ = write!(hm, "   {:02}:{:02}", t / 3600, t / 60 % 60);
+        }
+        screen::bar(
+            &[(b"SUPERIOR", Ink::Accent), (b"   ", Ink::Muted), (s.machine.as_bytes(), Ink::Muted)],
+            &[(s.right.as_bytes(), Ink::Muted), (hm.as_bytes(), Ink::Text)],
+        );
+    }
+
+    /// One tick (about): the cursor blinks, and each second the bar.
+    pub fn tick() {
+        let s = status();
+        s.ticks += 1;
+        screen::tick();
+        if s.ticks.is_multiple_of(100) {
+            draw();
         }
     }
 }
 
 // ---- commands ----------------------------------------------------------
 
+/// The commands: their line in the serial `help` (the screen shows its
+/// first 16 characters as the usage), and the screen's shorter line.
+const HELP: &[(&str, &str)] = &[
+    ("help            this list", "this list"),
+    ("about           what is running", "what is running"),
+    ("echo <text>     print <text>", "print the text"),
+    ("sleep <ticks>   sleep on the timer notification (100 ticks a second)", "wait, in ticks of 10 ms"),
+    ("ipc [rounds]    time call/reply round trips to a thread this shell starts", "time IPC round trips"),
+    ("clear           clear the screen (Control-L)", "clear the screen (Ctrl-L)"),
+    ("log             the kernel's boot log, as the screen showed it", "the kernel's boot log"),
+    ("shutdown        power off (exits QEMU)", "power off"),
+    ("reboot          restart the machine (through the keyboard controller)", "restart the machine"),
+];
+
 fn help() {
-    outln!("commands:");
-    outln!("  help            this list");
-    outln!("  about           what is running");
-    outln!("  echo <text>     print <text>");
-    outln!("  sleep <ticks>   sleep on the timer notification (100 ticks a second)");
-    outln!("  ipc [rounds]    time call/reply round trips to a thread this shell starts");
-    outln!("  shutdown        power off (exits QEMU)");
-    if devices().keyboard.is_some() {
-        outln!("  reboot          restart the machine (through the keyboard controller)");
+    sout!("commands:\n");
+    for &(line, short) in HELP {
+        if line.starts_with("reboot") && devices().keyboard.is_none() {
+            continue;
+        }
+        sout!("  {line}\n");
+        let usage = line[..16].trim_end();
+        scr!(Ink::Strong, "{usage:<16}");
+        scr!(Ink::Muted, "{short}\n");
     }
+    scr!(Ink::Muted, "\nTab completes {} {}{} history {} Ctrl-U clears the line\n", DOT as char, UP as char, DOWN as char, DOT as char);
 }
 
 fn about() {
@@ -289,6 +621,46 @@ fn about() {
     if devices().keyboard.is_some() {
         outln!("It also reads the PS/2 keyboard and draws on the boot framebuffer,");
         outln!("given to it as an I/O-port capability and as device memory.");
+    }
+}
+
+/// A command that is not one: say so, and suggest the likeliest.
+fn unknown(word: &str) {
+    match suggest(word, COMMANDS) {
+        Some(s) => {
+            sout!("unknown command: {word} (did you mean '{s}'?)\n");
+            scr!(Ink::Error, "no command '{word}'.");
+            scr!(Ink::Muted, " did you mean ");
+            scr!(Ink::Strong, "{s}");
+            scr!(Ink::Muted, "?\n");
+        }
+        None => {
+            sout!("unknown command: {word} (try 'help')\n");
+            scr!(Ink::Error, "no command '{word}'.");
+            scr!(Ink::Muted, " type 'help' to see them all.\n");
+        }
+    }
+}
+
+fn clear() {
+    sout!("\x1b[2J\x1b[H");
+    screen::clear();
+}
+
+/// The kernel's boot log, as it was on the screen when the shell started.
+fn log() {
+    let mut any = false;
+    screen::style(Ink::Muted, PROMPT_COL);
+    for line in screen::log_lines() {
+        any = true;
+        serial_bytes(line);
+        serial_bytes(b"\n");
+        screen::write(line);
+        screen::write(b"\n");
+    }
+    screen::style(Ink::Text, OUTPUT_COL);
+    if !any {
+        outln!("no boot log on the screen to show (the serial port has it)");
     }
 }
 
@@ -475,24 +847,35 @@ pub extern "C" fn _start(_: u64) -> ! {
     devices().uart = uart::present();
     let screen = screen::init(FB_MEMORY, FB_FRAME);
     devices().keyboard = ps2::Keyboard::new(PS2_DATA, PS2_STATUS);
-    outln!();
-    outln!("Superior shell. Type 'help' for commands.");
+    sout!("\nSuperior shell. Type 'help' for commands.\n");
     if devices().uart && (mapped != 0 || bound.status != 0) {
-        outln!(
-            "(serial interrupt not set up: map {mapped}, bind {})",
+        sout!(
+            "(serial interrupt not set up: map {mapped}, bind {})\n",
             bound.status
         );
     }
     if let Some((w, h)) = screen {
         let keyboard = if devices().keyboard.is_some() { "the PS/2 keyboard" } else { "no keyboard" };
         let serial = if devices().uart { "and COM1" } else { "no serial port" };
-        outln!("Console on the screen ({w}x{h}), {keyboard}, {serial}.");
+        sout!("Console on the screen ({w}x{h}), {keyboard}, {serial}.\n");
+        status::init();
+        screen::style(Ink::Text, PROMPT_COL);
+        screen::write(superior_console::WELCOME);
+        screen::ink(Ink::Muted);
+        screen::write(superior_console::HINT);
+        screen::style(Ink::Text, OUTPUT_COL);
     }
     let mut echo_started = false;
-    let mut buf = [0u8; LINE_MAX];
     loop {
-        out!("{PROMPT}");
-        let len = read_line(&mut buf);
+        prompt();
+        if !read_line() {
+            editor().finish();
+            continue;
+        }
+        let mut buf = [0u8; LINE_MAX];
+        let len = editor().line().len();
+        buf[..len].copy_from_slice(editor().line());
+        editor().finish();
         let line = core::str::from_utf8(&buf[..len]).unwrap_or("").trim();
         let (cmd, arg) = line.split_once(' ').unwrap_or((line, ""));
         match cmd {
@@ -502,9 +885,11 @@ pub extern "C" fn _start(_: u64) -> ! {
             "echo" => outln!("{arg}"),
             "sleep" => sleep(arg),
             "ipc" => ipc(arg, &mut echo_started),
+            "clear" => clear(),
+            "log" => log(),
             "shutdown" | "exit" => shutdown(),
             "reboot" => reboot(),
-            other => outln!("unknown command: {other} (try 'help')"),
+            other => unknown(other),
         }
     }
 }

@@ -16,6 +16,8 @@ getrandom = "0.2"
 superior-objects = { path = "../crates/objects" }
 # Draws the toolkit test's app as it must look, to check screenshots.
 superior-toolkit = { path = "../crates/toolkit" }
+# Draws the screen console as the shell must, to check screenshots.
+superior-console = { path = "../crates/console" }
 # Plays the access point at the far end of the Wi-Fi test's simulated radio.
 superior-wifi = { path = "../crates/wifi" }
 # The AArch64 UEFI disk: a GPT disk whose EFI system partition holds the
