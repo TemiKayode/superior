@@ -5932,6 +5932,7 @@ pub extern "C" fn _start(role: u64) -> ! {
         40 => panel_watcher(),
         41 => wifi_client(),
         42 => window_watcher("widgets", "the List window"),
+        43 => window_watcher("notes", "the Notes window"),
         _ => probe(),
     }
 }

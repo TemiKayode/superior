@@ -1,0 +1,18 @@
+[package]
+name = "superior-notes"
+description = "A toolkit app for notes: lines of text in a text area."
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "superior-notes"
+test = false
+bench = false
+
+[dependencies]
+superior-objects = { path = "../../crates/objects" }
+superior-sys = { path = "../../crates/sys" }
+superior-toolkit = { path = "../../crates/toolkit" }

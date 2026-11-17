@@ -780,6 +780,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "superior-notes"
+version = "0.1.0"
+dependencies = [
+ "superior-objects",
+ "superior-sys",
+ "superior-toolkit",
+]
+
+[[package]]
 name = "superior-nvme"
 version = "0.1.0"
 dependencies = [

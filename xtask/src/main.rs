@@ -220,6 +220,7 @@ fn main() -> ExitCode {
                         .and_then(|_| panel_test(a))
                         .and_then(|_| resize_test(a))
                         .and_then(|_| widgets_test(a))
+                        .and_then(|_| notes_test(a))
                         .and_then(|_| input_test(a))
                         .and_then(|_| audio_test(a))
                         .and_then(|_| tcp_test(a))
@@ -269,6 +270,7 @@ fn main() -> ExitCode {
         Some("panel-test") => panel_test(arch),
         Some("resize-test") => resize_test(arch),
         Some("widgets-test") => widgets_test(arch),
+        Some("notes-test") => notes_test(arch),
         Some("input-test") => input_test(arch),
         Some("audio-test") => audio_test(arch),
         Some("tcp-test") => tcp_test(arch),
@@ -286,7 +288,7 @@ fn main() -> ExitCode {
         }
         Some("bench") => image(false, Arch::X86_64).and_then(|img| bench(&img)),
         _ => Err(
-            "usage: cargo xtask <idl | image | run | test | boot-test | shell-test | cm-test | supervise-test | drivers-test | memory-test | reboot-test | fs-test | nvme-test | ahci-test | net-test | lde-test | lde-e100-test | wifi-test | display-test | desktop-test | windows-test | toolkit-test | panel-test | resize-test | uefi-test | console-test | input-test | audio-test | tcp-test | keyboard-test | hotplug-test | suspend-test | verified-boot-test | ab-test | packages-test | bench | sel4-test> [x86_64 | aarch64]"
+            "usage: cargo xtask <idl | image | run | test | boot-test | shell-test | cm-test | supervise-test | drivers-test | memory-test | reboot-test | fs-test | nvme-test | ahci-test | net-test | lde-test | lde-e100-test | wifi-test | display-test | desktop-test | windows-test | toolkit-test | panel-test | resize-test | widgets-test | notes-test | uefi-test | console-test | input-test | audio-test | tcp-test | keyboard-test | hotplug-test | suspend-test | verified-boot-test | ab-test | packages-test | bench | sel4-test> [x86_64 | aarch64]"
                 .into(),
         ),
     });
@@ -428,7 +430,7 @@ const LINUX_SOURCES: [(&str, &str, &str); 5] = [
 /// a network test's, the display tests', or the audio test's.
 fn linux_driver(manifest: &str) -> Option<&'static str> {
     match manifest {
-        "display" | "desktop" | "input" | "windows" | "toolkit" | "panel" | "resize" | "widgets" => Some("bochs"),
+        "display" | "desktop" | "input" | "windows" | "toolkit" | "panel" | "resize" | "widgets" | "notes" => Some("bochs"),
         "audio" => Some("es1370"),
         _ => linux_nic(manifest).map(|l| l.0),
     }
@@ -633,6 +635,7 @@ fn bundle(arch: Arch, manifest: &str, driver: &str) -> Result<PathBuf, String> {
         ("compositor", "superior-compositor"),
         ("greeter", "superior-greeter"),
         ("list", "superior-list"),
+        ("notes", "superior-notes"),
         ("panel", "superior-panel"),
         ("mixer", "superior-mixer"),
         // Need Linux's source and the build container: only where used.
@@ -886,12 +889,12 @@ fn image_sealed(
         net: matches!(manifest, "net" | "tcp") || linux_nic(manifest).is_some(),
         linux_nic: linux_nic(manifest).map(|l| l.1),
         radio: manifest == "wifi",
-        keyboard: matches!(manifest, "keyboard" | "input" | "windows" | "toolkit" | "panel" | "resize" | "widgets"),
+        keyboard: matches!(manifest, "keyboard" | "input" | "windows" | "toolkit" | "panel" | "resize" | "widgets" | "notes"),
         xhci: false,
-        mouse: matches!(manifest, "input" | "windows" | "toolkit" | "panel" | "resize" | "widgets"),
+        mouse: matches!(manifest, "input" | "windows" | "toolkit" | "panel" | "resize" | "widgets" | "notes"),
         hotplug: manifest == "hotplug",
         monitor: manifest == "suspend",
-        display: matches!(manifest, "display" | "desktop" | "input" | "windows" | "toolkit" | "panel" | "resize" | "widgets"),
+        display: matches!(manifest, "display" | "desktop" | "input" | "windows" | "toolkit" | "panel" | "resize" | "widgets" | "notes"),
         audio: (manifest == "audio").then(|| audio_wav(arch)),
         uefi: false,
         acpi: false,
@@ -4733,6 +4736,229 @@ fn widgets_test(arch: Arch) -> Result<(), String> {
         return Err(format!("widgets test: {shots} screenshots taken, want {}", widgets_pictures().len()));
     }
     println!("== widgets test passed ({})", arch.name());
+    Ok(())
+}
+
+/// The Notes app's window: its size and place, and its widgets as
+/// `user/notes` lays them out (`layout` there): the text area of six
+/// lines and the label under it.
+const NOTES_SIZE: (usize, usize) = (320, 200);
+const NOTES_AT: (usize, usize) = (240, 150);
+
+struct NotesUi {
+    ui: superior_toolkit::Ui,
+    status: usize,
+}
+
+fn notes_ui() -> NotesUi {
+    let mut ui = superior_toolkit::Ui::new(NOTES_SIZE.0 as u32, NOTES_SIZE.1 as u32);
+    ui.area(6);
+    let status = ui.label("");
+    let mut n = NotesUi { ui, status };
+    n.status();
+    n
+}
+
+impl NotesUi {
+    /// The label as the app sets it: where the cursor is, from 1.
+    fn status(&mut self) {
+        let (l, c) = self.ui.area_cursor();
+        self.ui.set_text(self.status, &format!("Line {}, column {}", l + 1, c + 1));
+    }
+
+    fn event(&mut self, e: superior_toolkit::Event) {
+        self.ui.event(e);
+        self.status();
+    }
+
+    /// The pointer at `at` on the screen, the button held or not.
+    fn pointer(&mut self, at: (usize, usize), held: bool) {
+        let (x, y) = ((at.0 - NOTES_AT.0) as i32, (at.1 - NOTES_AT.1) as i32);
+        self.event(superior_toolkit::Event::Pointer { x, y, buttons: held as u64 });
+    }
+
+    fn click(&mut self, at: (usize, usize)) {
+        self.pointer(at, false);
+        self.pointer(at, true);
+        self.pointer(at, false);
+    }
+
+    fn key(&mut self, usage: u64) {
+        use superior_toolkit::Event;
+        self.event(Event::us_key(usage, true, 0));
+        self.event(Event::us_key(usage, false, 0));
+    }
+
+    /// Lower-case letters typed.
+    fn type_letters(&mut self, s: &str) {
+        for c in s.bytes() {
+            self.key(4 + (c - b'a') as u64);
+        }
+    }
+
+    fn layer(&self) -> Layer {
+        let size = NOTES_SIZE;
+        let mut pixels = vec![0u32; size.0 * size.1];
+        self.ui.draw(&mut superior_toolkit::Surface { px: &mut pixels, w: size.0 as u32, h: size.1 as u32 });
+        let at = NOTES_AT;
+        Layer {
+            at,
+            size,
+            frame: Some(StyledWindow { id: 0, at, size, alpha: false, decorated: true, resizable: false, focused: true, title: b"Notes" }),
+            pixels,
+        }
+    }
+}
+
+/// Where the notes test's pointer goes: into the area's first line, far
+/// past its end on that line; the close box.
+const NOTES_LINE: (usize, usize) = (300, 171);
+const NOTES_LINE_END: (usize, usize) = (500, 171);
+const NOTES_CLOSE: (usize, usize) = (550, 140);
+
+/// The usages the notes test presses.
+const RET: u64 = 40;
+const UP_KEY: u64 = 82;
+const DOWN_KEY: u64 = 81;
+const HOME_KEY: u64 = 74;
+const END_KEY: u64 = 77;
+const BACKSPACE_KEY: u64 = 42;
+
+/// What each of the notes test's screenshots must show: the Notes window
+/// after the same events, and the pointer.
+fn notes_pictures() -> Vec<(Layer, Option<(usize, usize)>)> {
+    use superior_toolkit::Event;
+    let mut n = notes_ui();
+    let mut shots = Vec::new();
+    n.event(Event::Focus(true));
+    shots.push((n.layer(), None));
+    // The area pressed; three lines typed.
+    n.click(NOTES_LINE);
+    for (k, w) in ["milk", "eggs", "bread"].into_iter().enumerate() {
+        if k > 0 {
+            n.key(RET);
+        }
+        n.type_letters(w);
+    }
+    assert_eq!((n.ui.area_text(), n.ui.area_cursor()), ("milk\neggs\nbread", (2, 5)));
+    shots.push((n.layer(), Some(NOTES_LINE)));
+    // Up, Home, Backspace (the first two lines joined), Enter (split
+    // again), Down, End; four more lines: seven, scrolled by one.
+    for u in [UP_KEY, HOME_KEY, BACKSPACE_KEY, RET, DOWN_KEY, END_KEY] {
+        n.key(u);
+    }
+    for w in ["jam", "tea", "rice", "salt"] {
+        n.key(RET);
+        n.type_letters(w);
+    }
+    assert_eq!(n.ui.area_text(), "milk\neggs\nbread\njam\ntea\nrice\nsalt");
+    assert_eq!((n.ui.area_cursor(), n.ui.widget(0).scroll), ((6, 4), 1));
+    shots.push((n.layer(), Some(NOTES_LINE)));
+    // The wheel up a step: the first line shown again; a press past its
+    // end puts the cursor there.
+    let (x, y) = ((NOTES_LINE.0 - NOTES_AT.0) as i32, (NOTES_LINE.1 - NOTES_AT.1) as i32);
+    n.event(Event::Wheel { x, y, up: 1 });
+    n.click(NOTES_LINE_END);
+    assert_eq!((n.ui.area_cursor(), n.ui.widget(0).scroll), ((0, 4), 0));
+    shots.push((n.layer(), Some(NOTES_LINE_END)));
+    shots
+}
+
+fn notes_act(act: &Act, arch: Arch) -> Result<Option<String>, String> {
+    let Act::Shot(k) = act else { return input_act(act, arch) };
+    let path = root().join("target").join(format!("notes-{}-{k}.ppm", arch.name()));
+    let _ = std::fs::remove_file(&path);
+    screendump(&path)?;
+    let (layer, pointer) = &notes_pictures()[*k - 1];
+    check_layers(&path, *k, std::slice::from_ref(layer), None, *pointer)
+        .map(|()| Some(format!("screenshot {k}: all {} pixels right: the Notes window, the pointer at {pointer:?}", SCREEN.0 * SCREEN.1)))
+}
+
+/// The notes test's log lines for the text area's state: lines, cursor,
+/// first line shown, text (with `\n` for newlines, as the app's `{:?}`).
+fn notes_line(lines: usize, cursor: (usize, usize), top: usize, text: &str) -> &'static str {
+    let t = format!("{text:?}");
+    format!("notes: {lines} lines, the cursor at line {}, column {}, line {top} at the top: {t}", cursor.0, cursor.1).leak()
+}
+
+/// Boots `boot/notes.manifest`: the Notes app, on the toolkit's text area.
+/// Through QEMU's monitor the host presses the area and types three lines;
+/// goes up, to the line's start, joins it to the line above with Backspace
+/// and splits them again with Enter; goes down to the last line's end and
+/// types four more, past the lines shown (the area scrolls); turns the
+/// wheel up a step, presses past the first line's end (the cursor goes
+/// there) and closes the window. Four screenshots must have every pixel as
+/// the toolkit draws the window after the same events.
+fn notes_test(arch: Arch) -> Result<(), String> {
+    use Act::*;
+    let img = image_with(false, arch, "notes")?;
+    println!("== notes test on {}", img.path.display());
+    let to = |from: (usize, usize), to: (usize, usize)| Move(to.0 as i64 - from.0 as i64, to.1 as i64 - from.1 as i64);
+    let all = "milk\neggs\nbread\njam\ntea\nrice\nsalt";
+    let three = notes_line(3, (2, 5), 0, "milk\neggs\nbread");
+    let seven = notes_line(7, (6, 4), 1, all);
+    let back = notes_line(7, (0, 4), 0, all);
+    let script = vec![
+        (
+            vec!["relative X and Y", "absolute X and Y", "compositor: input subscribed", "notes: ready", "notes: the Notes window is on the screen"],
+            vec![
+                Shot(1),
+                to((400, 300), NOTES_LINE),
+                Button(true),
+                Button(false),
+                Type("milk"),
+                Key("ret"),
+                Type("eggs"),
+                Key("ret"),
+                Type("bread"),
+            ],
+        ),
+        (
+            vec![three],
+            vec![
+                Shot(2),
+                Key("up"),
+                Key("home"),
+                Key("backspace"),
+                Key("ret"),
+                Key("down"),
+                Key("end"),
+                Key("ret"),
+                Type("jam"),
+                Key("ret"),
+                Type("tea"),
+                Key("ret"),
+                Type("rice"),
+                Key("ret"),
+                Type("salt"),
+            ],
+        ),
+        (vec![seven], vec![Shot(3), Wheel(1), to(NOTES_LINE, NOTES_LINE_END), Button(true), Button(false)]),
+        (vec![back], vec![Shot(4), to(NOTES_LINE_END, NOTES_CLOSE), Button(true), Button(false)]),
+        (vec!["notes: the Notes window is gone"], vec![]),
+    ];
+    let (out, shots) = run_script(&img, arch, "notes test", script, notes_act)?;
+    let log = [
+        "notes: ready: window 0, decorated, titled \"Notes\"",
+        notes_line(1, (0, 1), 0, "m"),
+        three,
+        notes_line(3, (1, 4), 0, "milk\neggs\nbread"),
+        notes_line(2, (0, 4), 0, "milkeggs\nbread"),
+        notes_line(3, (1, 0), 0, "milk\neggs\nbread"),
+        notes_line(7, (6, 1), 1, "milk\neggs\nbread\njam\ntea\nrice\ns"),
+        seven,
+        notes_line(7, (6, 4), 0, all),
+        back,
+        "compositor: window 0: its close box was pressed",
+        "notes: closed",
+        "notes: the Notes window is gone",
+        "[cm] watcher asked to shut down (pass)",
+    ];
+    check_log("notes test", &out, &log)?;
+    if shots != notes_pictures().len() {
+        return Err(format!("notes test: {shots} screenshots taken, want {}", notes_pictures().len()));
+    }
+    println!("== notes test passed ({})", arch.name());
     Ok(())
 }
 

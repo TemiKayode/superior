@@ -1241,6 +1241,19 @@ holds the rest):
   characters, cuts and pastes them, adds the text, removes it and closes the
   window; seven screenshots must have every pixel as the toolkit draws the
   window on the host after the same events.
+- Multi-line text: the toolkit's text area (`Ui::area`, `crates/toolkit/src/area.rs`),
+  lines of up to 512 bytes in all edited at a cursor. Enter starts a line,
+  Backspace and Delete join lines at their ends, the arrows move by
+  character and line (Up and Down keep the column as far as the line
+  reaches), Home and End to the line's ends, Page Up and Down by the lines
+  shown; a press puts the cursor at the nearest gap, the wheel scrolls, and
+  the area scrolls down and sideways to keep the cursor shown. The Notes app
+  (`user/notes/`) is a text area and a label saying where the cursor is.
+  `cargo xtask notes-test` boots `boot/notes.manifest` on both ISAs: the host
+  types three lines, joins two with Backspace and splits them with Enter,
+  types past the lines shown, turns the wheel back and presses past the
+  first line's end; four screenshots must have every pixel as the toolkit
+  draws the window on the host.
 - The mixer (`user/mixer/`), the sound server. It is the sound driver's one
   client and serves the same `audio` interface to every component that plays
   sound: it adds their streams together, sample by sample and saturating, into a
@@ -1375,7 +1388,7 @@ holds the rest):
   notifications, a 256-slot CNode pool) so filling them stays quick; normal kernels have
   32 of each, 32 address spaces and a 4096-slot pool.
 
-Not yet: in the desktop shell icons as image files and more time zones than its table; in the toolkit multi-line text and a clipboard larger than 32 bytes; a hardware cursor plane,
+Not yet: in the desktop shell icons as image files and more time zones than its table; in the toolkit selection and copying in text areas, wrapped lines and a clipboard larger than 32 bytes; a hardware cursor plane,
 pointer events when a window moves or appears under a still pointer, keyboard
 layouts beyond US, UK, Dvorak and French and characters beyond ASCII, a key
 repeat rate apps can set, and surviving a client
@@ -1450,6 +1463,7 @@ https://claude.ai/artifact/QKJS8qH5Dfbjzn58RStq1j
 | `crates/toolkit/` | The UI toolkit: a bitmap font, drawing, labels, buttons, text fields (with selection) and scrolling lists, in a column of lines or a row |
 | `user/greeter/` | The first toolkit app: asks for a name and greets it |
 | `user/list/` | A toolkit app that keeps a list: lines, a scrolling list and text selection |
+| `user/notes/` | A toolkit app for notes: lines of text in a text area |
 | `user/panel/` | The desktop shell's panel: launchers and a button for each window |
 | `user/mixer/` | The sound server: every client's stream mixed through the sound driver |
 | `user/pcibus/` | The PCI bus server |
@@ -1464,7 +1478,7 @@ https://claude.ai/artifact/QKJS8qH5Dfbjzn58RStq1j
 | `user/xhci/` | The xHCI (USB) host controller driver |
 | `user/hid/` | The USB HID keyboard, mouse and tablet driver |
 | `user/echo/`, `user/counter/`, `user/testclient/` | Test components for the Component Manager, supervision and drivers |
-| `boot/` | Component manifests: `shell.manifest` (normal boot), `test.manifest` (`cm-test`), `supervise.manifest` (`supervise-test`) , `drivers.manifest` (`drivers-test`) , `memory.manifest` (`memory-test`), `reboot.manifest` (`reboot-test`), `fs.manifest` and `fs-verify.manifest` (`fs-test`), `net.manifest` (`net-test`), `tcp.manifest` (`tcp-test`), `keyboard.manifest` (`keyboard-test`), `display.manifest` (`display-test`), `desktop.manifest` (`desktop-test`), `input.manifest` (`input-test`), `windows.manifest` (`windows-test`), `toolkit.manifest` (`toolkit-test`), `panel.manifest` (`panel-test`), `resize.manifest` (`resize-test`), `widgets.manifest` (`widgets-test`), `audio.manifest` (`audio-test`), `suspend.manifest` (`suspend-test`) |
+| `boot/` | Component manifests: `shell.manifest` (normal boot), `test.manifest` (`cm-test`), `supervise.manifest` (`supervise-test`) , `drivers.manifest` (`drivers-test`) , `memory.manifest` (`memory-test`), `reboot.manifest` (`reboot-test`), `fs.manifest` and `fs-verify.manifest` (`fs-test`), `net.manifest` (`net-test`), `tcp.manifest` (`tcp-test`), `keyboard.manifest` (`keyboard-test`), `display.manifest` (`display-test`), `desktop.manifest` (`desktop-test`), `input.manifest` (`input-test`), `windows.manifest` (`windows-test`), `toolkit.manifest` (`toolkit-test`), `panel.manifest` (`panel-test`), `resize.manifest` (`resize-test`), `widgets.manifest` (`widgets-test`), `notes.manifest` (`notes-test`), `audio.manifest` (`audio-test`), `suspend.manifest` (`suspend-test`) |
 | `sel4/` | Docker build of seL4 and rust-sel4's kernel loader, for running the shell on seL4 |
 | `xtask/` | Build driver: user program, kernel, disk image, QEMU boot |
 
@@ -1490,6 +1504,7 @@ cargo xtask desktop-test   # the compositor: two clients' windows through restar
 cargo xtask panel-test     # the desktop shell: apps launched from its menu, activated, minimised and restored, closed and launched again, its clock, six screenshots checked
 cargo xtask resize-test    # a resizable window: its frame dragged out and in past its least size, a long name scrolled in its field, its top-left corner dragged out, seven screenshots checked
 cargo xtask widgets-test   # the List app: a list chosen in, scrolled by keys, wheel and scroll bar, text selected, cut and pasted, seven screenshots checked
+cargo xtask notes-test     # the Notes app: lines typed, joined, split and scrolled in a text area, four screenshots checked
 cargo xtask toolkit-test   # the greeter on the toolkit: a field typed in and edited at its cursor, a button clicked, closed, five screenshots checked against the toolkit drawn on the host
 cargo xtask windows-test   # translucent and decorated windows: a blend, a drag by the title bar, a close box, three screenshots checked
 cargo xtask input-test     # the compositor's pointer, focus, keys and wheel from a USB mouse, tablet and keyboard, seven screenshots checked

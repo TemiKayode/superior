@@ -31,8 +31,11 @@
 
 #![no_std]
 
+mod area;
 pub mod font;
 pub mod keymap;
+
+pub use area::{AREA_TEXT, LINE_H};
 
 pub const MAX_WIDGETS: usize = 16;
 pub const MAX_TEXT: usize = 32;
@@ -258,6 +261,8 @@ pub enum Kind {
     /// Items in rows, one of them chosen at most, scrolled to show as many
     /// as fit.
     List,
+    /// Lines of text edited at a cursor (see [`Ui::area`]).
+    Area,
 }
 
 /// A list's chosen item when none is.
@@ -288,6 +293,9 @@ pub struct Widget {
     stretch: bool,
     /// A button's icon (see [`ICONS`]), 0 if none.
     pub icon: u8,
+    /// A text area's first column shown, when a line is wider than it (its
+    /// first line shown is `scroll`).
+    pub hscroll: usize,
 }
 
 impl Widget {
@@ -311,6 +319,10 @@ impl Widget {
     /// its text as fits; a list as little as keeps its chosen item shown,
     /// and as many items as fit.
     fn keep_cursor_shown(&mut self) {
+        if self.kind == Kind::Area {
+            // Its text is its `Ui`'s: see `Ui::keep_area_cursor_shown`.
+            return;
+        }
         let n = self.shown();
         if self.kind == Kind::List {
             if self.cursor != NO_ITEM {
@@ -490,6 +502,10 @@ pub struct Ui {
     selecting: bool,
     /// What was last copied or cut.
     clipboard: Text,
+    /// The text area, if any, and its text.
+    area_id: Option<Id>,
+    area: [u8; AREA_TEXT],
+    area_len: usize,
 }
 
 impl Ui {
@@ -508,6 +524,7 @@ impl Ui {
             line: 0,
             stretch: false,
             icon: 0,
+            hscroll: 0,
         };
         Ui {
             w,
@@ -529,6 +546,9 @@ impl Ui {
             dragging: None,
             selecting: false,
             clipboard: Text::EMPTY,
+            area_id: None,
+            area: [0; AREA_TEXT],
+            area_len: 0,
         }
     }
 
@@ -545,6 +565,7 @@ impl Ui {
         (self.next_x, self.next_y) = (PAD, PAD);
         (self.field, self.hover, self.pressed) = (None, None, None);
         (self.dragging, self.selecting) = (None, false);
+        (self.area_id, self.area_len) = (None, 0);
     }
 
     /// In a column, the widgets added until [`Ui::end_row`] go on one line,
@@ -613,7 +634,7 @@ impl Ui {
             self.next_x += w + PAD;
             (r, id, false)
         } else if let Some((start, y)) = self.line {
-            (Rect { x: 0, y, w, h }, start, matches!(kind, Kind::Field | Kind::List))
+            (Rect { x: 0, y, w, h }, start, matches!(kind, Kind::Field | Kind::List | Kind::Area))
         } else {
             let r = Rect { x: PAD, y: self.next_y, w, h };
             self.next_y += h + PAD;
@@ -634,6 +655,7 @@ impl Ui {
             line,
             stretch,
             icon: 0,
+            hscroll: 0,
         };
         self.len += 1;
         if !self.row {
@@ -922,6 +944,7 @@ impl Ui {
                     s.fill(Rect { x: cx, y: ty - 1, w: SCALE, h: th + 2 }, INK);
                 }
             }
+            Kind::Area => self.draw_area(s, id),
             Kind::List => {
                 s.fill(r, FIELD);
                 s.outline(r, if keyboard { FOCUS_EDGE } else { EDGE });
@@ -999,8 +1022,10 @@ impl Ui {
         match e {
             Event::Pointer { x, y, buttons } => self.pointer(x, y, buttons, &mut r),
             Event::Wheel { x, y, up } => {
-                if let Some(l) = self.at(x, y).filter(|&id| self.widgets[id].kind == Kind::List) {
-                    r.damage = self.scroll_list(l, -(up as i64));
+                match self.at(x, y) {
+                    Some(l) if self.widgets[l].kind == Kind::List => r.damage = self.scroll_list(l, -(up as i64)),
+                    Some(a) if self.widgets[a].kind == Kind::Area => r.damage = self.area_wheel(a, up),
+                    _ => {}
                 }
             }
             Event::Leave => {
@@ -1018,6 +1043,9 @@ impl Ui {
                 match self.keyboard() {
                     Some(id) if down && self.widgets[id].kind == Kind::Field => self.field_key(id, usage, modifiers, ch, &mut r),
                     Some(id) if down && self.widgets[id].kind == Kind::List => self.list_key(id, usage, &mut r),
+                    Some(id) if down && self.widgets[id].kind == Kind::Area => {
+                        self.area_key(id, usage, modifiers & CONTROL != 0, ch, &mut r)
+                    }
                     _ => {}
                 }
             }
@@ -1039,7 +1067,7 @@ impl Ui {
             self.pressed = button;
             r.damage = r.damage.union(self.rect(button));
             let kind = under.map(|id| self.widgets[id].kind);
-            if let (Some(id), Some(Kind::Field | Kind::List)) = (under, kind) {
+            if let (Some(id), Some(Kind::Field | Kind::List | Kind::Area)) = (under, kind) {
                 // It takes the keyboard.
                 if self.field != Some(id) {
                     r.damage = r.damage.union(self.rect(self.field)).union(self.rect(Some(id)));
@@ -1059,6 +1087,8 @@ impl Ui {
                     }
                     f.keep_cursor_shown();
                     self.selecting = true;
+                } else if kind == Some(Kind::Area) {
+                    self.area_press(id, x, y);
                 } else if w.has_bar() && w.bar().contains(x, y) {
                     // On the bar: the thumb is taken, or the list goes a
                     // page up or down.
@@ -1078,7 +1108,7 @@ impl Ui {
                     }
                 }
                 let after = self.widgets[id];
-                if (after.cursor, after.anchor, after.scroll) != (w.cursor, w.anchor, w.scroll) {
+                if (after.cursor, after.anchor, after.scroll, after.hscroll) != (w.cursor, w.anchor, w.scroll, w.hscroll) {
                     r.damage = r.damage.union(after.rect);
                 }
             }
