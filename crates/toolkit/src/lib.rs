@@ -310,10 +310,10 @@ impl Widget {
         }
     }
 
-    /// A field's selection, if any: from the first byte selected to the
-    /// byte after the last.
+    /// A field's or text area's selection, if any: from the first byte
+    /// selected to the byte after the last.
     pub fn selection(&self) -> Option<(usize, usize)> {
-        (self.kind == Kind::Field && self.anchor != self.cursor)
+        (matches!(self.kind, Kind::Field | Kind::Area) && self.anchor != self.cursor)
             .then(|| (self.anchor.min(self.cursor), self.anchor.max(self.cursor)))
     }
 
@@ -1054,7 +1054,7 @@ impl Ui {
                     Some(id) if down && self.widgets[id].kind == Kind::Field => self.field_key(id, usage, modifiers, ch, &mut r),
                     Some(id) if down && self.widgets[id].kind == Kind::List => self.list_key(id, usage, &mut r),
                     Some(id) if down && self.widgets[id].kind == Kind::Area => {
-                        self.area_key(id, usage, modifiers & CONTROL != 0, ch, &mut r)
+                        self.area_key(id, usage, modifiers, ch, &mut r)
                     }
                     _ => {}
                 }
@@ -1098,7 +1098,9 @@ impl Ui {
                     f.keep_cursor_shown();
                     self.selecting = true;
                 } else if kind == Some(Kind::Area) {
-                    self.area_press(id, x, y);
+                    let keep = self.modifiers & SHIFT != 0 && was == Some(id);
+                    self.area_press(id, x, y, keep);
+                    self.selecting = true;
                 } else if w.has_bar() && w.bar().contains(x, y) {
                     // On the bar: the thumb is taken, or the list goes a
                     // page up or down.
@@ -1134,6 +1136,9 @@ impl Ui {
                     let to = (at * over + travel / 2) / travel;
                     r.damage = r.damage.union(self.scroll_list(l, to - w.scroll as i64));
                 }
+            } else if let Some(f) = self.field.filter(|&f| self.selecting && self.widgets[f].kind == Kind::Area) {
+                // Dragged across the text area: the selection follows.
+                r.damage = r.damage.union(self.area_drag(f, x, y));
             } else if let Some(f) = self.field.filter(|_| self.selecting) {
                 // Dragged across the field: the selection follows.
                 let gap = self.gap_at(f, x);
@@ -1193,7 +1198,8 @@ impl Ui {
             }
             KEY_V if control => {
                 w.cut();
-                for &c in self.clipboard.as_bytes() {
+                // A field is one line: a text area's newlines are left out.
+                for &c in self.clipboard.as_bytes().iter().filter(|&&c| c != b'\n') {
                     if !w.text.insert(w.cursor, c) {
                         break;
                     }

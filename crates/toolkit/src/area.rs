@@ -10,10 +10,17 @@
 //! and the wheel scrolls. Lines wider than the area scroll sideways with
 //! the cursor; the area scrolls down and up to keep the cursor's line
 //! shown.
+//!
+//! Text is selected as in a field: by dragging across it (down past its
+//! last line shown, or up past its first, it scrolls), by Shift with any
+//! of the keys that move the cursor or with a press, and by Control-A.
+//! Typing, Enter, Backspace and Delete replace the selection; Control-C
+//! copies it and Control-X cuts it (the first [`crate::MAX_TEXT`] bytes,
+//! newlines kept), and Control-V pastes at the cursor.
 
 use crate::{
-    EDGE, FIELD, FIELD_INSET, FOCUS_EDGE, INK, Id, Kind, Rect, Response, STEP, SCALE, Surface, Ui,
-    font,
+    CONTROL, EDGE, FIELD, FIELD_INSET, FOCUS_EDGE, INK, Id, KEY_A, KEY_C, KEY_V, KEY_X, Kind, MAX_TEXT, Rect,
+    Response, SCALE, SELECTION, SHIFT, STEP, Surface, Text, Ui, font,
 };
 
 /// The most bytes of text an area holds, newlines included.
@@ -55,9 +62,24 @@ impl Ui {
             self.area[self.area_len] = c;
             self.area_len += 1;
         }
-        self.widgets[id].cursor = self.area_len;
+        (self.widgets[id].cursor, self.widgets[id].anchor) = (self.area_len, self.area_len);
         self.keep_area_cursor_shown(id);
         self.widgets[id].rect
+    }
+
+    /// The text area's selection, if any: from the first byte selected to
+    /// the byte after the last.
+    pub fn area_selection(&self) -> Option<(usize, usize)> {
+        self.area_id.and_then(|id| self.widgets[id].selection())
+    }
+
+    /// Takes the selection out of the text: whether there was one.
+    fn area_cut(&mut self, id: Id) -> bool {
+        let Some((a, b)) = self.widgets[id].selection() else { return false };
+        self.area.copy_within(b..self.area_len, a);
+        self.area_len -= b - a;
+        (self.widgets[id].cursor, self.widgets[id].anchor) = (a, a);
+        true
     }
 
     /// The text area's cursor as its line and column (both from 0).
@@ -137,13 +159,23 @@ impl Ui {
     }
 
     /// A key down for the text area.
-    pub(crate) fn area_key(&mut self, id: Id, usage: u64, control: bool, ch: Option<u8>, r: &mut Response) {
+    pub(crate) fn area_key(&mut self, id: Id, usage: u64, modifiers: u8, ch: Option<u8>, r: &mut Response) {
         use crate::{BACKSPACE, DELETE, DOWN, END, ENTER, HOME, LEFT, PAGE_DOWN, PAGE_UP, RIGHT, UP};
-        let before = (self.area_len, self.widgets[id].cursor, self.widgets[id].scroll, self.widgets[id].hscroll);
-        let c = self.widgets[id].cursor;
+        let (shift, control) = (modifiers & SHIFT != 0, modifiers & CONTROL != 0);
+        let w = self.widgets[id];
+        let before = (self.area_len, w.cursor, w.anchor, w.scroll, w.hscroll);
+        let c = w.cursor;
+        let sel = w.selection();
         let (line, col) = self.area_cursor();
         let rows = self.area_shown(id).0;
+        // Moved with Shift (the selection stretched), or a key that leaves
+        // the selection be: the anchor stays.
+        let moves = matches!(usage, LEFT | RIGHT | HOME | END | UP | DOWN | PAGE_UP | PAGE_DOWN);
+        let mut keep = moves && shift;
         let to = match usage {
+            // Moved off a selection, the cursor goes to its end that way.
+            LEFT if !shift && sel.is_some() => sel.map_or(c, |s| s.0),
+            RIGHT if !shift && sel.is_some() => sel.map_or(c, |s| s.1),
             LEFT => c.saturating_sub(1),
             RIGHT => (c + 1).min(self.area_len),
             HOME => self.line_start(c),
@@ -154,6 +186,33 @@ impl Ui {
             DOWN => self.area_len,
             PAGE_UP => self.at_line_col(line.saturating_sub(rows), col),
             PAGE_DOWN => self.at_line_col(line + rows, col),
+            KEY_A if control => {
+                self.widgets[id].anchor = 0;
+                keep = true;
+                self.area_len
+            }
+            KEY_C | KEY_X if control => match sel {
+                Some((a, b)) => {
+                    self.clipboard = Text::new(&self.area[a..b.min(a + MAX_TEXT)]);
+                    r.copied = true;
+                    keep = usage == KEY_C;
+                    if usage == KEY_X {
+                        self.area_cut(id);
+                    }
+                    self.widgets[id].cursor
+                }
+                None => c,
+            },
+            KEY_V if control => {
+                self.area_cut(id);
+                let mut at = self.widgets[id].cursor;
+                let clip = self.clipboard;
+                for &k in clip.as_bytes().iter().filter(|&&k| k == b'\n' || (b' '..=b'~').contains(&k)) {
+                    at = self.insert(at, k);
+                }
+                at
+            }
+            BACKSPACE | DELETE if self.area_cut(id) => self.widgets[id].cursor,
             BACKSPACE if c > 0 => {
                 self.remove(c - 1);
                 c - 1
@@ -162,16 +221,29 @@ impl Ui {
                 self.remove(c);
                 c
             }
-            ENTER => self.insert(c, b'\n'),
+            ENTER => {
+                self.area_cut(id);
+                self.insert(self.widgets[id].cursor, b'\n')
+            }
             _ => match ch.filter(|_| !control) {
-                Some(k) => self.insert(c, k),
-                None => c,
+                Some(k) => {
+                    self.area_cut(id);
+                    self.insert(self.widgets[id].cursor, k)
+                }
+                // Shift itself, say.
+                None => {
+                    keep = true;
+                    c
+                }
             },
         };
         self.widgets[id].cursor = to;
+        if !keep {
+            self.widgets[id].anchor = to;
+        }
         self.keep_area_cursor_shown(id);
         let w = self.widgets[id];
-        if (self.area_len, w.cursor, w.scroll, w.hscroll) != before {
+        if (self.area_len, w.cursor, w.anchor, w.scroll, w.hscroll) != before {
             r.damage = w.rect;
         }
     }
@@ -192,14 +264,39 @@ impl Ui {
         self.area_len -= 1;
     }
 
-    /// A press at (x, y) in the text area: the cursor to the gap nearest it.
-    pub(crate) fn area_press(&mut self, id: Id, x: i32, y: i32) {
+    /// The gap in the text nearest (x, y): on the line there (the first or
+    /// last line shown's neighbour above or below the area).
+    fn area_gap_at(&self, id: Id, x: i32, y: i32) -> usize {
         let w = self.widgets[id];
-        let row = ((y - (w.rect.y + TOP) as i32).max(0) as u32 / LINE_H) as usize;
+        let dy = y - (w.rect.y + TOP) as i32;
+        let row = dy.div_euclid(LINE_H as i32).clamp(-1, self.area_shown(id).0 as i32);
         let from = x - (w.rect.x + FIELD_INSET) as i32 + STEP as i32 / 2;
         let col = w.hscroll + (from.max(0) as u32 / STEP) as usize;
-        self.widgets[id].cursor = self.at_line_col(w.scroll + row, col);
+        self.at_line_col((w.scroll as i64 + row as i64).max(0) as usize, col)
+    }
+
+    /// A press at (x, y) in the text area: the cursor to the gap nearest
+    /// it, and the selection from there unless it is to stretch (`keep`,
+    /// Shift held).
+    pub(crate) fn area_press(&mut self, id: Id, x: i32, y: i32, keep: bool) {
+        let gap = self.area_gap_at(id, x, y);
+        let w = &mut self.widgets[id];
+        w.cursor = gap;
+        if !keep {
+            w.anchor = gap;
+        }
         self.keep_area_cursor_shown(id);
+    }
+
+    /// Dragged to (x, y) with the button held after a press in the text
+    /// area: the selection reaches the gap nearest it. The part of the
+    /// window to show again.
+    pub(crate) fn area_drag(&mut self, id: Id, x: i32, y: i32) -> Rect {
+        let before = (self.widgets[id].cursor, self.widgets[id].scroll, self.widgets[id].hscroll);
+        self.widgets[id].cursor = self.area_gap_at(id, x, y);
+        self.keep_area_cursor_shown(id);
+        let w = self.widgets[id];
+        if (w.cursor, w.scroll, w.hscroll) == before { Rect::NONE } else { w.rect }
     }
 
     /// The wheel turned `up` steps over the text area: the part of the
@@ -228,6 +325,7 @@ impl Ui {
         let th = font::HEIGHT * SCALE;
         let tx = r.x + FIELD_INSET;
         let (cl, cc) = self.area_cursor();
+        let sel = w.selection().filter(|_| keyboard);
         for row in 0..rows {
             let n = w.scroll + row;
             if n >= self.area_lines() {
@@ -236,6 +334,17 @@ impl Ui {
             let ty = r.y + TOP + row as u32 * LINE_H + (LINE_H - th) / 2;
             let s0 = self.start_of_line(n);
             let line = &self.area_bytes()[s0..self.line_end(s0)];
+            if let Some((a, b)) = sel {
+                // The selected characters' cells behind them, and the
+                // line's end's if its newline is selected.
+                let e0 = s0 + line.len();
+                let from = a.max(s0) - s0;
+                let to = (b.min(e0 + 1)).max(s0) - s0;
+                for k in from.max(w.hscroll)..to.min(w.hscroll + cols) {
+                    let x = tx + (k - w.hscroll) as u32 * STEP - SCALE / 2;
+                    s.fill(Rect { x, y: ty - 2, w: STEP, h: th + 4 }, SELECTION);
+                }
+            }
             let shown = &line[w.hscroll.min(line.len())..(w.hscroll + cols).min(line.len())];
             s.text(tx, ty, shown, SCALE, INK);
             if keyboard && n == cl && cc >= w.hscroll {
@@ -344,6 +453,60 @@ mod tests {
         assert!(shown > 0, "scrolled sideways");
         key(&mut ui, HOME);
         assert_eq!(ui.widget(a).hscroll, 0);
+    }
+
+    fn shift_key(ui: &mut Ui, usage: u64, modifiers: u8) {
+        ui.event(Event::us_key(225, true, modifiers));
+        ui.event(Event::us_key(usage, true, modifiers));
+        ui.event(Event::us_key(usage, false, modifiers));
+        ui.event(Event::us_key(225, false, 0));
+    }
+
+    #[test]
+    fn text_is_selected_copied_cut_and_pasted_across_lines() {
+        use crate::{FIELD_INSET, STEP};
+        let (mut ui, a) = notes();
+        typ(&mut ui, "milk\neggs\nbread");
+        // Shift-Up then Shift-Home from the end: "eggs\nbread" selected.
+        shift_key(&mut ui, UP, 0x02);
+        shift_key(&mut ui, HOME, 0x02);
+        assert_eq!(ui.area_selection(), Some((5, 15)));
+        // Copied, newlines kept.
+        ui.event(Event::us_key(6, true, 0x01));
+        assert_eq!(ui.clipboard(), "eggs\nbread");
+        // Typing replaces it.
+        typ(&mut ui, "x");
+        assert_eq!((ui.area_text(), ui.area_selection()), ("milk\nx", None));
+        // Pasted at the cursor: lines again.
+        ui.event(Event::us_key(25, true, 0x01));
+        assert_eq!((ui.area_text(), ui.area_cursor()), ("milk\nxeggs\nbread", (2, 5)));
+        // Control-A and Control-X: all of it cut.
+        ui.event(Event::us_key(4, true, 0x01));
+        assert_eq!(ui.area_selection(), Some((0, 16)));
+        ui.event(Event::us_key(27, true, 0x01));
+        assert_eq!((ui.area_text(), ui.clipboard()), ("", "milk\nxeggs\nbread"));
+        // A drag from the first line's gap 1 to the second line's gap 2
+        // selects across the newline; Backspace takes it out.
+        typ(&mut ui, "abc\ndef");
+        let r = ui.widget(a).rect;
+        let (x0, y0) = ((r.x + FIELD_INSET + STEP) as i32, (r.y + super::TOP + super::LINE_H / 2) as i32);
+        let (x1, y1) = (x0 + STEP as i32, y0 + super::LINE_H as i32);
+        ui.event(Event::Pointer { x: x0, y: y0, buttons: 1 });
+        ui.event(Event::Pointer { x: x1, y: y1, buttons: 1 });
+        ui.event(Event::Pointer { x: x1, y: y1, buttons: 0 });
+        assert_eq!(ui.area_selection(), Some((1, 6)));
+        key(&mut ui, BACKSPACE);
+        assert_eq!((ui.area_text(), ui.area_cursor()), ("af", (0, 1)));
+        // Shift with a press stretches the selection; Right without Shift
+        // goes to its end.
+        key(&mut ui, HOME);
+        ui.event(Event::us_key(225, true, 0x02));
+        ui.event(Event::Pointer { x: x1, y: y0, buttons: 1 });
+        ui.event(Event::Pointer { x: x1, y: y0, buttons: 0 });
+        ui.event(Event::us_key(225, false, 0));
+        assert_eq!(ui.area_selection(), Some((0, 2)));
+        key(&mut ui, RIGHT);
+        assert_eq!((ui.area_selection(), ui.area_cursor()), (None, (0, 2)));
     }
 
     #[test]

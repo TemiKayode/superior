@@ -1,7 +1,9 @@
 //! Notes: a toolkit app for lines of text, to show the toolkit's text
 //! area. A decorated window titled "Notes": a text area of six lines, and
 //! a label saying where the cursor is. The close box closes it, and it
-//! exits.
+//! exits. Text copied or cut in it goes to the compositor's clipboard,
+//! and it takes the clipboard when it gets the focus, so text is pasted
+//! between it and other apps.
 //!
 //! Crash-only like every window client: when the compositor restarts, the
 //! next call fails and it makes its window again, its text kept.
@@ -160,14 +162,14 @@ impl App {
         }
     }
 
-    /// What the log tells of the text: its lines, the cursor and the first
-    /// line shown.
-    fn state(&self) -> (usize, (usize, usize), usize) {
-        (self.ui.area_lines(), self.ui.area_cursor(), self.ui.widget(self.area).scroll)
+    /// What the log tells of the text: its lines, the cursor, the first
+    /// line shown and the selection.
+    fn state(&self) -> (usize, (usize, usize), usize, Option<(usize, usize)>) {
+        (self.ui.area_lines(), self.ui.area_cursor(), self.ui.widget(self.area).scroll, self.ui.area_selection())
     }
 
     fn say_state(&self) {
-        let (lines, (l, c), top) = self.state();
+        let (lines, (l, c), top, sel) = self.state();
         // The text quoted, its newlines as `\n` (core's `{:?}` for `str`
         // drags in tables that do not link position-independent here).
         let mut quoted = [0u8; 2 * superior_toolkit::AREA_TEXT];
@@ -183,7 +185,38 @@ impl App {
             n += esc.len();
         }
         let text = core::str::from_utf8(&quoted[..n]).unwrap_or("?");
-        say!("{lines} lines, the cursor at line {l}, column {c}, line {top} at the top: \"{text}\"");
+        match sel {
+            Some((a, b)) => say!(
+                "{lines} lines, the cursor at line {l}, column {c}, line {top} at the top: \"{text}\" ({} bytes selected)",
+                b - a
+            ),
+            None => say!("{lines} lines, the cursor at line {l}, column {c}, line {top} at the top: \"{text}\""),
+        }
+    }
+
+    /// Puts what was copied or cut in the compositor's clipboard.
+    fn give_clipboard(&mut self) {
+        let Some(n) = self.window else { return };
+        let (words, used) = self.ui.clipboard_words();
+        let put = (0..used).all(|p| ok(call(window::clip_put(n, p as u64, words[p]), None)));
+        say!("copied {} bytes to the clipboard{}", self.ui.clipboard().len(), if put { "" } else { " (refused)" });
+    }
+
+    /// Takes the compositor's clipboard (on getting the focus): what
+    /// Control-V pastes, whichever app it was copied in.
+    fn take_clipboard(&mut self) {
+        let Some(n) = self.window else { return };
+        let mut b = [0u8; window::CLIPBOARD_BYTES as usize];
+        let mut len = 0;
+        for p in 0..b.len() / 8 {
+            let Some(m) = call(window::clip_get(n, p as u64), None).filter(|m| m[0] == 0) else { return };
+            b[p * 8..p * 8 + 8].copy_from_slice(&m[1].to_le_bytes());
+            len = (m[2] as usize).min(b.len());
+            if len < p * 8 + 8 {
+                break;
+            }
+        }
+        self.ui.set_clipboard(b.get(..len).unwrap_or(&[]));
     }
 
     /// One event from the compositor; false once the window is closed.
@@ -205,8 +238,14 @@ impl App {
             }
             _ => return true,
         };
+        if e == Event::Focus(true) {
+            self.take_clipboard();
+        }
         let before = (self.state(), self.ui.area_text().len());
         let r = self.ui.event(e);
+        if r.copied {
+            self.give_clipboard();
+        }
         let mut damage = r.damage;
         if (self.state(), self.ui.area_text().len()) != before {
             damage = damage.union(status_text(&mut self.ui, self.status));

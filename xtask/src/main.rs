@@ -4884,9 +4884,12 @@ impl NotesUi {
 }
 
 /// Where the notes test's pointer goes: into the area's first line, far
-/// past its end on that line; the close box.
+/// past its end on that line; the first and third lines' starts (left of
+/// their first characters); the close box.
 const NOTES_LINE: (usize, usize) = (300, 171);
 const NOTES_LINE_END: (usize, usize) = (500, 171);
+const NOTES_START: (usize, usize) = (252, 171);
+const NOTES_THIRD: (usize, usize) = (252, 171 + 2 * superior_toolkit::LINE_H as usize);
 const NOTES_CLOSE: (usize, usize) = (550, 140);
 
 /// The usages the notes test presses.
@@ -4934,6 +4937,31 @@ fn notes_pictures() -> Vec<(Layer, Option<(usize, usize)>)> {
     n.click(NOTES_LINE_END);
     assert_eq!((n.ui.area_cursor(), n.ui.widget(0).scroll), ((0, 4), 0));
     shots.push((n.layer(), Some(NOTES_LINE_END)));
+    // Dragged from the first line's start to the third's: two lines
+    // selected.
+    n.pointer(NOTES_START, false);
+    n.pointer(NOTES_START, true);
+    n.pointer(NOTES_THIRD, true);
+    n.pointer(NOTES_THIRD, false);
+    assert_eq!((n.ui.area_selection(), n.ui.area_cursor()), (Some((0, 10)), (2, 0)));
+    shots.push((n.layer(), Some(NOTES_THIRD)));
+    // Control-X cuts them; down to the last line's end, Enter and
+    // Control-V paste them there (scrolled to show the cursor).
+    let control = |n: &mut NotesUi, usage: u64| {
+        n.event(Event::us_key(224, true, 0x01));
+        n.event(Event::us_key(usage, true, 0x01));
+        n.event(Event::us_key(usage, false, 0x01));
+        n.event(Event::us_key(224, false, 0));
+    };
+    control(&mut n, 27);
+    assert_eq!((n.ui.area_text(), n.ui.clipboard()), ("bread\njam\ntea\nrice\nsalt", "milk\neggs\n"));
+    for u in [DOWN_KEY, DOWN_KEY, DOWN_KEY, DOWN_KEY, END_KEY, RET] {
+        n.key(u);
+    }
+    control(&mut n, 25);
+    assert_eq!(n.ui.area_text(), "bread\njam\ntea\nrice\nsalt\nmilk\neggs\n");
+    assert_eq!((n.ui.area_cursor(), n.ui.widget(0).scroll), ((7, 0), 2));
+    shots.push((n.layer(), Some(NOTES_THIRD)));
     shots
 }
 
@@ -4954,14 +4982,21 @@ fn notes_line(lines: usize, cursor: (usize, usize), top: usize, text: &str) -> &
     format!("notes: {lines} lines, the cursor at line {}, column {}, line {top} at the top: {t}", cursor.0, cursor.1).leak()
 }
 
+/// The same, with `selected` bytes selected.
+fn notes_line_selected(lines: usize, cursor: (usize, usize), top: usize, text: &str, selected: usize) -> &'static str {
+    format!("{} ({selected} bytes selected)", notes_line(lines, cursor, top, text)).leak()
+}
+
 /// Boots `boot/notes.manifest`: the Notes app, on the toolkit's text area.
 /// Through QEMU's monitor the host presses the area and types three lines;
 /// goes up, to the line's start, joins it to the line above with Backspace
 /// and splits them again with Enter; goes down to the last line's end and
 /// types four more, past the lines shown (the area scrolls); turns the
 /// wheel up a step, presses past the first line's end (the cursor goes
-/// there) and closes the window. Four screenshots must have every pixel as
-/// the toolkit draws the window after the same events.
+/// there); drags from the first line's start to the third's (two lines
+/// selected), cuts them with Control-X and pastes them after the last line
+/// with Control-V; and closes the window. Six screenshots must have every
+/// pixel as the toolkit draws the window after the same events.
 fn notes_test(arch: Arch) -> Result<(), String> {
     use Act::*;
     let img = image_with(false, arch, "notes")?;
@@ -4971,6 +5006,9 @@ fn notes_test(arch: Arch) -> Result<(), String> {
     let three = notes_line(3, (2, 5), 0, "milk\neggs\nbread");
     let seven = notes_line(7, (6, 4), 1, all);
     let back = notes_line(7, (0, 4), 0, all);
+    let selected = notes_line_selected(7, (2, 0), 0, all, 10);
+    let cut = notes_line(5, (0, 0), 0, "bread\njam\ntea\nrice\nsalt");
+    let pasted = notes_line(8, (7, 0), 2, "bread\njam\ntea\nrice\nsalt\nmilk\neggs\n");
     let script = vec![
         (
             vec!["relative X and Y", "absolute X and Y", "compositor: input subscribed", "notes: ready", "notes: the Notes window is on the screen"],
@@ -5007,7 +5045,16 @@ fn notes_test(arch: Arch) -> Result<(), String> {
             ],
         ),
         (vec![seven], vec![Shot(3), Wheel(1), to(NOTES_LINE, NOTES_LINE_END), Button(true), Button(false)]),
-        (vec![back], vec![Shot(4), to(NOTES_LINE_END, NOTES_CLOSE), Button(true), Button(false)]),
+        (
+            vec![back],
+            vec![Shot(4), to(NOTES_LINE_END, NOTES_START), Button(true), to(NOTES_START, NOTES_THIRD), Button(false)],
+        ),
+        (vec![selected], vec![Shot(5), Key("ctrl+x")]),
+        (
+            vec![cut, "notes: copied 10 bytes to the clipboard"],
+            vec![Key("down"), Key("down"), Key("down"), Key("down"), Key("end"), Key("ret"), Key("ctrl+v")],
+        ),
+        (vec![pasted], vec![Shot(6), to(NOTES_THIRD, NOTES_CLOSE), Button(true), Button(false)]),
         (vec!["notes: the Notes window is gone"], vec![]),
     ];
     let (out, shots) = run_script(&img, arch, "notes test", script, notes_act)?;
@@ -5022,6 +5069,11 @@ fn notes_test(arch: Arch) -> Result<(), String> {
         seven,
         notes_line(7, (6, 4), 0, all),
         back,
+        selected,
+        "compositor: window 0 copied 10 bytes to the clipboard",
+        "notes: copied 10 bytes to the clipboard",
+        cut,
+        pasted,
         "compositor: window 0: its close box was pressed",
         "notes: closed",
         "notes: the Notes window is gone",
