@@ -1519,7 +1519,7 @@ impl Compositor {
                     return [Status::Ok as u64, word(0), word(1), flags];
                 }
                 if m[0] == window::ICON {
-                    return [Status::Ok as u64, w.icon, 0, 0];
+                    return [Status::Ok as u64, w.icon, w.owner & !MANAGER_BADGE, 0];
                 }
                 if self.manager(i) {
                     return status(Status::Invalid);

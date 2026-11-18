@@ -3998,7 +3998,8 @@ enum ShellMenu {
     Layouts,
 }
 
-/// The icon each test app's window has (its client's `SET_ICON`).
+/// The icon each test app's window has (its client's `SET_ICON`), where
+/// its launcher's manifest names no image file.
 fn task_icon(title: &str) -> u8 {
     superior_toolkit::icon_by_name(match title {
         "Greeter" => b"person",
@@ -4010,10 +4011,18 @@ fn task_icon(title: &str) -> u8 {
 fn panel_ui(tasks: &[(&str, bool, bool)], menu: ShellMenu, clock: &str, kb: u64) -> superior_toolkit::Ui {
     use superior_toolkit::keymap;
     let mut ui = superior_toolkit::Ui::row(SCREEN.0 as u32, PANEL_H as u32);
+    // A launcher's icon from an image file goes on its windows' task
+    // buttons (each window's title is its launcher's name, capitalised).
+    let pictures: Vec<(String, u8)> = PANEL_LAUNCHERS
+        .iter()
+        .filter(|(_, icon)| superior_toolkit::icon_by_name(icon.as_bytes()) == 0)
+        .map(|(l, icon)| (l.to_string(), ui.picture(&icon_file_pixels(icon))))
+        .collect();
     let apps = ui.button("Apps");
     ui.select(apps, menu == ShellMenu::Apps);
     for (title, focused, _) in tasks {
-        let id = ui.icon_button(task_icon(title), title);
+        let picture = pictures.iter().find(|(l, _)| l.eq_ignore_ascii_case(title)).map(|p| p.1);
+        let id = ui.icon_button(picture.unwrap_or_else(|| task_icon(title)), title);
         ui.select(id, *focused);
     }
     let k = ui.icon_button(superior_toolkit::icon_by_name(b"keyboard"), keymap::NAMES[kb as usize]);

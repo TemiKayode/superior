@@ -59,7 +59,10 @@
 /// the window goes back where it was.
 ///
 /// Icons: a client may say what its window is (`SET_ICON`), a number the
-/// desktop shell draws a picture for, and a manager may ask (`ICON`).
+/// desktop shell draws a picture for, and a manager may ask (`ICON`), which
+/// also says whose the window is (the client's badge as the Component
+/// Manager gave it: its component's number plus one), for the shell to
+/// find the icon the client's manifest names.
 ///
 /// The clipboard (`CLIP_PUT`, `CLIP_GET`): text copied in one app to be
 /// pasted in any other. Only the client of the window with the keyboard
@@ -78,7 +81,7 @@
 pub mod window {
     use crate::interfaces::Status;
 
-    pub const VERSION: u64 = 12;
+    pub const VERSION: u64 = 13;
 
     /// The most windows on the screen, all clients together.
     pub const MAX_WINDOWS: u64 = 8;
@@ -432,7 +435,8 @@ pub mod window {
         [SET_ICON, window, icon, 0]
     }
 
-    /// A manager's: what window `window`'s client says it is (`SET_ICON`).
+    /// A manager's: what window `window`'s client says it is (`SET_ICON`), and
+    /// the client's badge (`client`, the manager's mark left out).
     pub const ICON: u64 = 18;
     /// The message of a `ICON` call.
     pub const fn icon(window: u64) -> [u64; 4] {
@@ -442,12 +446,14 @@ pub mod window {
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct IconReply {
         pub icon: u64,
+        pub client: u64,
     }
     /// Reads a `ICON` reply: its results, or the status it failed with.
     pub fn icon_reply(m: [u64; 4]) -> Result<IconReply, Status> {
         match Status::from_u64(m[0]) {
             Status::Ok => Ok(IconReply {
                 icon: m[1],
+                client: m[2],
             }),
             s => Err(s),
         }

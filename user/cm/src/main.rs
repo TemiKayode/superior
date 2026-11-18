@@ -1708,9 +1708,16 @@ pub extern "C" fn _start(arg: u64) -> ! {
             BADGE_REPORT
                 if i < MAX_COMPONENTS
                     && m.component(i).launch_control
-                    && (launch::OP_LAUNCHERS..=launch::OP_ICON_PIXELS).contains(&msg.msg[0]) =>
+                    && ((launch::OP_LAUNCHERS..=launch::OP_ICON_PIXELS).contains(&msg.msg[0])
+                        || msg.msg[0] == launch::OP_LAUNCHER_OF) =>
             {
-                Some(if msg.msg[0] == launch::OP_ICON_PIXELS {
+                Some(if msg.msg[0] == launch::OP_LAUNCHER_OF {
+                    let i = (msg.msg[1] as usize).wrapping_sub(1);
+                    match (0..MAX_COMPONENTS).find(|&k| m.launcher(k) == Some(i)) {
+                        Some(k) => [Reply::Ok as u64, k as u64, 0, 0],
+                        None => [Reply::NotFound as u64, 0, 0, 0],
+                    }
+                } else if msg.msg[0] == launch::OP_ICON_PIXELS {
                     m.icon_pixels(msg.msg[1] as usize, msg.msg[2] as usize)
                 } else if msg.msg[0] != launch::OP_LAUNCH {
                     match m.launcher(msg.msg[1] as usize) {

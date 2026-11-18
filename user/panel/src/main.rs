@@ -285,6 +285,9 @@ struct Panel {
     open: Option<Menu>,
     launchers: [Name; MAX_LAUNCHERS],
     icons: [u8; MAX_LAUNCHERS],
+    /// Each launcher's icon from an image file as the bar's picture (0
+    /// none): its windows' task buttons show it.
+    task_pictures: [u8; MAX_LAUNCHERS],
     nlaunchers: usize,
     tasks: [Task; MAX_TASKS],
     ntasks: usize,
@@ -406,7 +409,17 @@ impl Panel {
             title.bytes = bytes;
             title.len = len.min(window::TITLE_BYTES as usize);
             let minimised = list[3] & 1 << w != 0;
-            let icon = call(window::icon(w), None).filter(|m| m[0] == 0).map_or(0, |m| m[1] as u8);
+            // The icon its launcher's manifest gives as an image file, or
+            // else the one the client says.
+            let (icon, client) = call(window::icon(w), None).filter(|m| m[0] == 0).map_or((0, 0), |m| (m[1] as u8, m[2]));
+            let picture = if client == 0 {
+                0
+            } else {
+                let r = syscall(Syscall::Call, MANAGER, [launch::OP_LAUNCHER_OF, client, 0, 0]);
+                let k = (r.status == 0 && r.msg[0] == 0).then_some(r.msg[1] as usize);
+                k.and_then(|k| self.task_pictures.get(k).copied()).unwrap_or(0)
+            };
+            let icon = if picture != 0 { picture } else { icon };
             tasks[n] = Task { window: w, title, focused: list[2] == w, minimised, icon };
             n += 1;
         }
@@ -596,8 +609,10 @@ pub extern "C" fn _start(_: u64) -> ! {
     let mut launchers = [Name::EMPTY; MAX_LAUNCHERS];
     let mut icons = [0; MAX_LAUNCHERS];
     let mut nlaunchers = 0;
-    // The menu, holding the launchers' icons from image files.
+    // The menu and the bar, holding the launchers' icons from image files.
     let mut menu = Ui::new(MENU_W, menu_height(1));
+    let mut bar = Ui::row(width, HEIGHT);
+    let mut task_pictures = [0; MAX_LAUNCHERS];
     while nlaunchers < MAX_LAUNCHERS {
         let r = syscall(Syscall::Call, MANAGER, [launch::OP_LAUNCHERS, nlaunchers as u64, 0, 0]);
         if r.status != 0 || r.msg[0] != 0 {
@@ -612,6 +627,7 @@ pub extern "C" fn _start(_: u64) -> ! {
             if icons[nlaunchers] == 0 && len > 0 {
                 if let Some(px) = icon_picture(nlaunchers) {
                     icons[nlaunchers] = menu.picture(&px);
+                    task_pictures[nlaunchers] = bar.picture(&px);
                     say!("{}: its icon from {}", launchers[nlaunchers].as_str(), text(&bytes[..len]));
                 }
             }
@@ -619,11 +635,12 @@ pub extern "C" fn _start(_: u64) -> ! {
         nlaunchers += 1;
     }
     let mut p = Panel {
-        bar: Own { ui: Ui::row(width, HEIGHT), window: None, va: VA },
+        bar: Own { ui: bar, window: None, va: VA },
         menu: Own { ui: menu, window: None, va: MENU_VA },
         open: None,
         launchers,
         icons,
+        task_pictures,
         nlaunchers,
         tasks: [NO_TASK; MAX_TASKS],
         ntasks: 0,

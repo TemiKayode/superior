@@ -1206,8 +1206,11 @@ holds the rest):
   `boot/icons/`): Netpbm PPM or PAM with alpha, 16 pixels square, read by
   `superior_objects::image`. The Component Manager hands its pixels to the
   panel (`launch::OP_ICON_PIXELS`), which gives them to the toolkit as a
-  picture (`Ui::picture`), drawn blended over the button; `panel-test`'s
-  launcher menu shows Hello's (`boot/icons/hello.pam`). The panel's clock is now a button showing the date and time
+  picture (`Ui::picture`), drawn blended over the button; it shows on the
+  launcher and on the task buttons of that app's windows, the compositor's
+  `ICON` saying whose a window is (`window` version 13) and the manager
+  which launcher that is (`launch::OP_LAUNCHER_OF`). `panel-test`'s launcher
+  menu and Hello's task button show Hello's (`boot/icons/hello.pam`). The panel's clock is now a button showing the date and time
   ("Sat 14 Nov 09:41"), from the new `superior_objects::time` (civil dates,
   weekdays, and sixteen zones from Los Angeles to Auckland, some half an
   hour off the hour, with the EU's, the US's, Australia's and New Zealand's
@@ -1441,7 +1444,7 @@ holds the rest):
   notifications, a 256-slot CNode pool) so filling them stays quick; normal kernels have
   32 of each, 32 address spaces and a 4096-slot pool.
 
-Not yet: in the desktop shell icons from image files on task buttons (an app's window has a built-in one) and zones beyond its built-in table; in the toolkit a clipboard larger than 32 bytes; a hardware cursor plane, keyboard
+Not yet: in the desktop shell zones beyond its built-in table; in the toolkit a clipboard larger than 32 bytes; a hardware cursor plane, keyboard
 layouts beyond US, UK, Dvorak and French and characters beyond ASCII, a key
 repeat rate apps can set, and surviving a client
 that dies at the very moment its window is read (the compositor then faults and

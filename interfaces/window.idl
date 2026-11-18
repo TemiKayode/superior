@@ -56,7 +56,10 @@
 # the window goes back where it was.
 #
 # Icons: a client may say what its window is (`SET_ICON`), a number the
-# desktop shell draws a picture for, and a manager may ask (`ICON`).
+# desktop shell draws a picture for, and a manager may ask (`ICON`), which
+# also says whose the window is (the client's badge as the Component
+# Manager gave it: its component's number plus one), for the shell to
+# find the icon the client's manifest names.
 #
 # The clipboard (`CLIP_PUT`, `CLIP_GET`): text copied in one app to be
 # pasted in any other. Only the client of the window with the keyboard
@@ -72,7 +75,7 @@
 # Keyboard layouts: each `KEY` event carries the character the key types
 # under the system's layout, which a manager sets (`SET_LAYOUT`); apps
 # type that, and take shortcuts (Control and a letter) by the key's place.
-interface window version 12
+interface window version 13
 
 # The most windows on the screen, all clients together.
 const MAX_WINDOWS = 8
@@ -223,8 +226,9 @@ op MINIMISE = 16 (window)
 # (the toolkit's icons; 0 none).
 op SET_ICON = 17 (window, icon)
 
-# A manager's: what window `window`'s client says it is (`SET_ICON`).
-op ICON = 18 (window) -> (icon)
+# A manager's: what window `window`'s client says it is (`SET_ICON`), and
+# the client's badge (`client`, the manager's mark left out).
+op ICON = 18 (window) -> (icon, client)
 
 # The most bytes the clipboard holds.
 const CLIPBOARD_BYTES = 32

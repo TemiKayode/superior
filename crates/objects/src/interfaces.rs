@@ -799,6 +799,11 @@ pub mod launch {
     /// `k`th component with `start launch` (`icon`), none if it gives
     /// none. Reply `[status, name words...]`, `NotFound` past the last.
     pub const OP_ICON: u64 = 18;
+    /// `[OP_LAUNCHER_OF, client]`: which launcher the component whose
+    /// window clients are badged `client` is (its number plus one, as the
+    /// compositor's `ICON` says it). Reply `[status, k]`, `NotFound` if
+    /// it is not `start launch`.
+    pub const OP_LAUNCHER_OF: u64 = 22;
     /// `[OP_ICON_PIXELS, k, from]`: when the `k`th launcher's icon names an
     /// image file in its bundle (`superior_objects::image`), `ICON_SIDE`
     /// pixels square, its pixels `from` to `from + ICON_PIXELS_PER_CALL - 1`
