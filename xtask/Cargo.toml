@@ -24,3 +24,6 @@ superior-wifi = { path = "../crates/wifi" }
 # loader (the same versions the bootloader crate uses for x86-64's).
 fatfs = { version = "0.3.4", default-features = false, features = ["std", "alloc"] }
 gpt = "3.0.0"
+# The update test's server speaks TLS 1.3, with an Ed25519 certificate.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rcgen = { version = "0.13", default-features = false, features = ["ring", "crypto"] }

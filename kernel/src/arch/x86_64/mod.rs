@@ -428,6 +428,13 @@ pub fn io_out(port: u16, width: u64, value: u64) {
 
 #[cfg_attr(not(feature = "selftest"), allow(dead_code))]
 /// Ends a self-test run with QEMU's exit status.
+/// The TPM's TIS registers (the PC Client profile puts them at
+/// 0xFED40000, locality 0), mapped: whether a TPM answers there is for
+/// `tpm` to find out.
+pub fn tpm_base() -> Option<u64> {
+    vm::map_mmio(x86_64::PhysAddr::new(0xfed4_0000)).ok().map(|va| va.as_u64())
+}
+
 pub fn qemu_exit(pass: bool) -> ! {
     qemu::exit(if pass {
         qemu::ExitCode::Success

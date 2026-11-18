@@ -13,18 +13,18 @@ use super::sha2::Sha512;
 const MASK: u64 = (1 << 51) - 1;
 
 #[derive(Clone, Copy, Debug)]
-struct Fe([u64; 5]);
+pub(super) struct Fe(pub(super) [u64; 5]);
 
 impl Fe {
     const ZERO: Fe = Fe([0; 5]);
     const ONE: Fe = Fe([1, 0, 0, 0, 0]);
 
-    fn small(n: u64) -> Fe {
+    pub(super) fn small(n: u64) -> Fe {
         Fe([n, 0, 0, 0, 0])
     }
 
     /// The low 255 bits of `b`, little-endian (bit 255 is ignored).
-    fn from_bytes(b: &[u8; 32]) -> Fe {
+    pub(super) fn from_bytes(b: &[u8; 32]) -> Fe {
         let load = |i: usize| u64::from_le_bytes(b[i..i + 8].try_into().unwrap());
         Fe([
             load(0) & MASK,
@@ -47,7 +47,7 @@ impl Fe {
     }
 
     /// The canonical encoding: fully reduced, little-endian.
-    fn to_bytes(self) -> [u8; 32] {
+    pub(super) fn to_bytes(self) -> [u8; 32] {
         let mut h = Fe::carry(Fe::carry(self.0).0).0;
         // h < 2^255 + small: subtract p once if h >= p.
         let mut q = (h[0] + 19) >> 51;
@@ -76,13 +76,13 @@ impl Fe {
         out
     }
 
-    fn add(self, b: Fe) -> Fe {
+    pub(super) fn add(self, b: Fe) -> Fe {
         let a = self.0;
         let b = b.0;
         Fe::carry([a[0] + b[0], a[1] + b[1], a[2] + b[2], a[3] + b[3], a[4] + b[4]])
     }
 
-    fn sub(self, b: Fe) -> Fe {
+    pub(super) fn sub(self, b: Fe) -> Fe {
         // Add 4p first so no limb goes below zero (both are carried).
         let a = self.0;
         let b = b.0;
@@ -101,7 +101,7 @@ impl Fe {
         Fe::ZERO.sub(self)
     }
 
-    fn mul(self, b: Fe) -> Fe {
+    pub(super) fn mul(self, b: Fe) -> Fe {
         let a = self.0;
         let b = b.0;
         let m = |x: u64, y: u64| x as u128 * y as u128;
@@ -127,7 +127,7 @@ impl Fe {
         ])
     }
 
-    fn square(self) -> Fe {
+    pub(super) fn square(self) -> Fe {
         self.mul(self)
     }
 
@@ -160,7 +160,7 @@ impl Fe {
     }
 
     /// self^(p - 2) = 1/self (0 for 0).
-    fn invert(self) -> Fe {
+    pub(super) fn invert(self) -> Fe {
         let (t19, t3) = self.pow22501();
         t19.pow2k(5).mul(t3)
     }

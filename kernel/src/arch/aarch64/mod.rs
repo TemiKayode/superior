@@ -636,6 +636,25 @@ pub fn rtc_seconds() -> Option<u64> {
     Some(unsafe { core::ptr::read_volatile(base as *const u32) } as u64)
 }
 
+/// The TPM's TIS registers, if the device tree has one (QEMU's
+/// `tpm-tis-device`, on its platform bus: the node's address is then an
+/// offset into the bus's window).
+pub fn tpm_base() -> Option<u64> {
+    let dtb = DTB.load(core::sync::atomic::Ordering::Relaxed);
+    let (mut base, _) = fdt::find_device(dtb, b"tcg,tpm-tis-mmio")?;
+    // The bus's `ranges`: (its address, the parent's, size), one cell,
+    // then the parent's address cells, then its own size cells.
+    if let Some(r) = fdt::prop(dtb, b"qemu,platform", b"ranges") {
+        let (child, size) = r.own_cells;
+        let parent = r.parent_cells.0;
+        let window = r.cells(child as u64 + parent as u64, size).unwrap_or(0);
+        if let Some(bus) = r.cells(child as u64, parent).filter(|_| base < window) {
+            base += bus;
+        }
+    }
+    vm::map_device(base).then_some(base)
+}
+
 /// RNDR, if the CPU has it (FEAT_RNG: ID_AA64ISAR0_EL1 bits 63:60).
 pub fn random_source() -> Option<&'static str> {
     let isar0: u64;

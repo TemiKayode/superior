@@ -5,7 +5,12 @@
 //! server has an address, it confirms the system came up (`OP_BOOT_OK`:
 //! the network working is its health check), then asks an update server
 //! for a newer system: `GET /system?have=<version>` from port `arg & 0xffff`
-//! of the gateway, over HTTP/1.1 (`superior_objects::http`). 204 means
+//! of the gateway, over HTTP/1.1 (`superior_objects::http`) inside TLS 1.3
+//! (`superior_objects::tls`). The server must hold the Ed25519 key built
+//! into the updater (`SUPERIOR_UPDATE_KEY` when it is built): its
+//! certificate carries it and it signs the handshake, so nobody else can
+//! answer, and the connection is encrypted. (The system's own signature is
+//! still what the manager checks before booting it.) 204 means
 //! there is none. 200 with a `Content-Length` that fits the slot is the
 //! signed system bundle: it is written to the free slot as it arrives,
 //! then the slot's header last, so a download cut short never looks like
@@ -29,6 +34,7 @@ use superior_objects::abi::{CapTransfer, ObjectType, Syscall};
 use superior_objects::ab;
 use superior_objects::http;
 use superior_objects::interfaces::{Status, block, net, update};
+use superior_objects::tls::{self, Client, Step, TlsError};
 use superior_sys::{USER_BASE, print_line, syscall, syscall_x, ticks};
 
 const BLOCK: u64 = 0;
@@ -40,6 +46,56 @@ const NET_PAGE: u64 = 5;
 const DISK_PAGE: u64 = 6;
 const NET_VA: u64 = USER_BASE + 0x4000_0000;
 const DISK_VA: u64 = NET_VA + 0x1000;
+
+/// The update server's Ed25519 public key, from `SUPERIOR_UPDATE_KEY`
+/// (64 hex digits) when the updater was built; zeros (no server holds it)
+/// otherwise.
+const SERVER_KEY: [u8; 32] = {
+    const fn digit(c: u8) -> u8 {
+        match c {
+            b'0'..=b'9' => c - b'0',
+            b'a'..=b'f' => c - b'a' + 10,
+            _ => panic!("SUPERIOR_UPDATE_KEY: not lower-case hex"),
+        }
+    }
+    let mut key = [0u8; 32];
+    if let Some(hex) = option_env!("SUPERIOR_UPDATE_KEY") {
+        let h = hex.as_bytes();
+        assert!(h.len() == 64, "SUPERIOR_UPDATE_KEY: not 32 bytes");
+        let mut i = 0;
+        while i < 32 {
+            key[i] = digit(h[2 * i]) << 4 | digit(h[2 * i + 1]);
+            i += 1;
+        }
+    }
+    key
+};
+
+/// The connection's TLS client, and where its application data goes.
+static mut TLS: Client = Client::new([0; 32], [0; 32], [0; 32]);
+static mut APP: [u8; tls::MAX_DATA] = [0; tls::MAX_DATA];
+
+fn tls_client() -> &'static mut Client {
+    // SAFETY: one thread, one connection at a time.
+    unsafe { &mut *(&raw mut TLS) }
+}
+
+fn app() -> &'static mut [u8; tls::MAX_DATA] {
+    // SAFETY: as for `tls_client`.
+    unsafe { &mut *(&raw mut APP) }
+}
+
+/// What a TLS error says, for the log.
+fn tls_failure(e: TlsError) -> &'static str {
+    match e {
+        TlsError::WrongKey => "TLS: the server does not hold the update server's key",
+        TlsError::BadSignature => "TLS: the server's handshake signature does not verify",
+        TlsError::BadFinished | TlsError::Decrypt => "TLS: the connection was tampered with",
+        TlsError::Alert(_) => "TLS: the server sent an alert",
+        TlsError::Unsupported => "TLS: the server chose what was not offered",
+        _ => "TLS: the server's answer does not parse",
+    }
+}
 
 /// How many downloads it tries before giving up.
 const TRIES: u32 = 5;
@@ -153,6 +209,71 @@ impl Conn {
         net_call([net::CLOSE, self.0, 0, 0]);
         syscall(Syscall::CapDelete, NTFN, [0; 4]);
     }
+
+    /// Sends `bytes` (a page at most).
+    fn send(&self, bytes: &[u8]) -> bool {
+        page(NET_VA)[..bytes.len()].copy_from_slice(bytes);
+        self.send_all(bytes.len())
+    }
+
+    /// The TLS handshake, with fresh secrets from the kernel's entropy.
+    fn handshake(&self) -> Result<(), &'static str> {
+        let (Some(random), Some(secret)) = (superior_sys::random(), superior_sys::random()) else {
+            return Err("no randomness for TLS");
+        };
+        let t = tls_client();
+        t.reset(random, secret, SERVER_KEY);
+        let mut out = [0u8; 256];
+        let n = t.hello(&mut out);
+        if !self.send(&out[..n]) {
+            return Err("the TLS hello was not sent");
+        }
+        while !t.connected() {
+            match self.tls_step(&mut out)? {
+                Some(0) => return Err("the server closed the connection during the TLS handshake"),
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Seals `data` and sends it.
+    fn send_sealed(&self, data: &[u8]) -> bool {
+        let mut rec = [0u8; 512];
+        tls_client().seal(data, &mut rec).is_ok_and(|n| self.send(&rec[..n]))
+    }
+
+    /// One step of the TLS client: `Some(n)` application bytes in `APP`
+    /// (`Some(0)` at the end), `None` for nothing yet.
+    fn tls_step(&self, out: &mut [u8; 256]) -> Result<Option<usize>, &'static str> {
+        let t = tls_client();
+        let last = ticks();
+        loop {
+            match t.process(out, app()).map_err(tls_failure)? {
+                Step::Again => continue,
+                Step::Send(n) => {
+                    if !self.send(&out[..n]) {
+                        return Err("the TLS finish was not sent");
+                    }
+                    return Ok(None);
+                }
+                Step::Data(n) => return Ok(Some(n).filter(|&n| n > 0).or(None)),
+                Step::Closed => return Ok(Some(0)),
+                Step::More => {}
+            }
+            match self.recv() {
+                Ok(Some(0)) => return Ok(Some(0)),
+                Ok(Some(n)) => {
+                    if t.receive(&page(NET_VA)[..n]) < n {
+                        return Err("a TLS record too big");
+                    }
+                }
+                Ok(None) if ticks() > last + STALL => return Err("the server went quiet"),
+                Ok(None) => self.wait(10),
+                Err(()) => return Err("the connection failed"),
+            }
+        }
+    }
 }
 
 /// The bytes of a body, written to the slot a page at a time after its
@@ -223,28 +344,25 @@ fn download(server: u64, have: u64) -> Got {
 /// Sends the request and writes the body to the slot at `first` (`room`
 /// bytes at most): its length.
 fn fetch(c: &Conn, server: u64, have: u64, first: u64, room: usize) -> Result<usize, Got> {
+    c.handshake().map_err(Got::Failed)?;
     let host = format_args!("{}:{}", Dotted(server), server & 0xffff);
-    let n = http::get(page(NET_VA), host, format_args!("/system?have={have}")).ok_or(Got::Failed("request"))?;
-    if !c.send_all(n) {
+    let mut request = [0u8; 256];
+    let n = http::get(&mut request, host, format_args!("/system?have={have}")).ok_or(Got::Failed("request"))?;
+    if !c.send_sealed(&request[..n]) {
         return Err(Got::Failed("the request was not sent"));
     }
-    let mut head = [0u8; http::MAX_HEAD + 4096];
+    let mut head = [0u8; http::MAX_HEAD + tls::MAX_DATA];
     let mut held = 0;
     let mut body: Option<(http::Head, Writer, usize)> = None;
-    let mut last = ticks();
+    let mut out = [0u8; 256];
     loop {
-        let n = match c.recv() {
+        let n = match c.tls_step(&mut out) {
             Ok(Some(0)) => break,
             Ok(Some(n)) => n,
-            Ok(None) if ticks() > last + STALL => return Err(Got::Failed("the server went quiet")),
-            Ok(None) => {
-                c.wait(10);
-                continue;
-            }
-            Err(()) => return Err(Got::Failed("the connection failed")),
+            Ok(None) => continue,
+            Err(why) => return Err(Got::Failed(why)),
         };
-        last = ticks();
-        let bytes = &page(NET_VA)[..n];
+        let bytes = &app()[..n];
         match &mut body {
             Some((h, w, got)) => {
                 let take = n.min(h.length - *got);
@@ -254,6 +372,9 @@ fn fetch(c: &Conn, server: u64, have: u64, first: u64, room: usize) -> Result<us
                 }
             }
             None => {
+                if held + n > head.len() {
+                    return Err(Got::Failed("a response head too long"));
+                }
                 head[held..held + n].copy_from_slice(bytes);
                 held += n;
                 let h = match http::head(&head[..held]) {
@@ -328,7 +449,15 @@ pub extern "C" fn _start(arg: u64) -> ! {
     }
     say!("the network is up ({}): version {version} confirmed", Dotted(net_info[1]));
     let server = net_info[3] | (arg & 0xffff);
-    say!("asking http://{}:{}/system?have={version}", Dotted(server), server & 0xffff);
+    say!(
+        "asking https://{}:{}/system?have={version} (TLS 1.3, the server's key {:02x}{:02x}{:02x}{:02x}...)",
+        Dotted(server),
+        server & 0xffff,
+        SERVER_KEY[0],
+        SERVER_KEY[1],
+        SERVER_KEY[2],
+        SERVER_KEY[3]
+    );
     for k in 1..=TRIES {
         match download(server, version) {
             Got::Nothing => {

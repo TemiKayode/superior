@@ -86,6 +86,30 @@ struct BootServices {
     locate_protocol: extern "efiapi" fn(*const [u8; 16], *mut c_void, *mut *mut c_void) -> Status,
 }
 
+/// The runtime services, as far as GetVariable.
+#[repr(C)]
+struct RuntimeServices {
+    header: [u8; 24],
+    // GetTime .. ConvertPointer.
+    other: [usize; 6],
+    get_variable: extern "efiapi" fn(*const u16, *const [u8; 16], *mut u32, *mut usize, *mut u8) -> Status,
+}
+
+/// EFI_GLOBAL_VARIABLE (8be4df61-93ca-11d2-aa0d-00e098032b8c), whose
+/// `SecureBoot` byte says whether the firmware checks what it starts.
+const GLOBAL_VARIABLE: [u8; 16] = guid(0x8be4_df61, 0x93ca, 0x11d2, [0xaa, 0x0d, 0x00, 0xe0, 0x98, 0x03, 0x2b, 0x8c]);
+
+/// Whether UEFI Secure Boot is on: if so the firmware started this loader
+/// only because its signature verified against the `db` keys, and the
+/// kernel (inside it) was checked with it.
+fn secure_boot(st: &SystemTable) -> bool {
+    let name: [u16; 11] = [b'S', b'e', b'c', b'u', b'r', b'e', b'B', b'o', b'o', b't', 0].map(u16::from);
+    let (mut attributes, mut size, mut value) = (0u32, 1usize, 0u8);
+    // SAFETY: the firmware's runtime services; a one-byte buffer.
+    let rt = unsafe { &*(st.runtime_services as *const RuntimeServices) };
+    (rt.get_variable)(name.as_ptr(), &GLOBAL_VARIABLE, &mut attributes, &mut size, &mut value) == SUCCESS && size == 1 && value == 1
+}
+
 /// EFI_ACPI_TABLE_PROTOCOL (ffe06bdd-6107-46a6-7bb2-5a9c7ec5275c):
 /// installs a table in the firmware's, checksum and XSDT entry included.
 #[repr(C)]
@@ -400,6 +424,11 @@ extern "efiapi" fn efi_main(image: Handle, st: *const SystemTable) -> Status {
     // SAFETY: as above.
     let bs = unsafe { &*st.boot_services };
     con.say("Superior UEFI loader (AArch64)\n");
+    if secure_boot(st) {
+        con.say("loader: Secure Boot is on: the firmware verified this loader, the kernel inside it\n");
+    } else {
+        con.say("loader: Secure Boot is off\n");
+    }
 
     let el: u64;
     // SAFETY: reads the current exception level.

@@ -68,7 +68,7 @@ impl Default for Sha256 {
 }
 
 impl Sha256 {
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Sha256 { h: H256, block: [0; 64], fill: 0, len: 0 }
     }
 

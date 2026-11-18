@@ -1388,6 +1388,35 @@ holds the rest):
   verified-boot-test` boots a properly signed bundle on both ISAs, checking the
   kernel's measurement against one computed on the host, then the four bad ones,
   each of which must be refused.
+- Measured boot and a rollback counter in the TPM (`kernel/src/tpm.rs`). The
+  kernel finds a TPM 2.0 on its TIS interface (0xFED40000 on x86, from the
+  device tree on AArch64, inside QEMU's platform bus) and talks to it at
+  locality 0 with the empty password session: `Startup`, `PCR_Extend` and
+  `PCR_Read`, and an NV counter (`NV_DefineSpace`, `NV_Read`,
+  `NV_Increment`). A verified bundle's measurement is extended into PCR 9, and
+  the counter at NV index 0x01800001 is the machine's rollback floor: a bundle
+  older than it is refused like one older than the kernel's own floor, and an
+  accepted one raises it to its version. The counter only goes up and lives in
+  the TPM, so neither the disk nor an older signed kernel can put it back.
+  QEMU's Windows build has no TPM backend, so `cargo xtask tpm-test` boots in a
+  Linux container (`tpm/Dockerfile`: QEMU with swtpm) three times on one TPM,
+  on both ISAs: version 2 (PCR 9 must equal SHA-256 of zeros and the
+  measurement, computed on the host; counter 2), version 3 (counter 3), then
+  version 2 again, refused as older than the counter though signed and no
+  older than the kernel's floor, with nothing from it run.
+- UEFI Secure Boot over the AArch64 loader, which carries the kernel (and with
+  it the trusted key and its floor): the firmware checks the loader against its
+  `db` before starting it, and the loader says whether Secure Boot is on (the
+  `SecureBoot` variable). `cargo xtask secure-boot-test` makes, in the
+  container, a development PK, KEK and db (in `target/keys/secure-boot`) and
+  another key, signs the loader with db (sbsign) and with the other key, and
+  enrolls PK, KEK and db in edk2's variable store (virt-fw-vars); then QEMU
+  boots Debian's edk2 with Secure Boot (QEMU's own AArch64 build has none) with
+  that store: the db-signed loader boots, says Secure Boot is on and the boot
+  test runs; the loader signed with the other key, changed after signing, or
+  unsigned, the firmware refuses (Access Denied) and nothing of Superior runs.
+  x86-64 is not covered: its UEFI loader is the `bootloader` crate's, which
+  loads the kernel from a file Secure Boot does not check.
 - A/B system updates (`superior_objects::ab`). With `system <service>` in its
   manifest, the boot bundle (the one the kernel verifies) holds only the drivers
   that reach the system disk, and its `trust.key`. The Component Manager then
@@ -1411,16 +1440,23 @@ holds the rest):
   network server has an address, then asks an update server (the gateway's port
   its argument names) for `GET /system?have=<version>` over HTTP/1.1
   (`superior_objects::http`, which reads a response's head in place and wants a
-  `Content-Length`). 204 means nothing newer. 200 is the signed system bundle,
+  `Content-Length`) inside TLS 1.3 (`superior_objects::tls`: a client with one
+  of everything, `TLS_AES_128_GCM_SHA256`, X25519 and Ed25519, on X25519,
+  HKDF and AES-128-GCM written in `superior_objects::crypto` and checked
+  against RFC 7748, 5869 and 4231 and the GCM specification's vectors; host
+  tests run whole connections with rustls). The server must hold the Ed25519
+  key the updater is built with: its certificate carries it and it signs the
+  handshake. 204 means nothing newer. 200 is the signed system bundle,
   written to the free slot as it arrives and its header sector last, so a
   download cut short never looks like a slot; the manager checks it
   (`OP_UPDATE_READY`) and the updater restarts the machine into it
   (`update::OP_RESTART`, a fast reboot). A download refused, cut short or failed
   is tried again, five times at most. `cargo xtask update-test` runs it on both
-  ISAs from a disk whose slot A holds version 2: the host's first answer
-  (changed after signing) is refused by the manager, its second cut off half way,
-  its third staged; the machine restarts into version 3 from slot B, which
-  confirms and is told nothing is newer.
+  ISAs from a disk whose slot A holds version 2, against a rustls server on the
+  host: the first server it reaches holds another key and is refused in the
+  handshake, the next answer (changed after signing) is refused by the manager,
+  the one after cut off half way, the fourth staged; the machine restarts into
+  version 3 from slot B, which confirms and is told nothing is newer.
 - Signed app packages (`superior_objects::package`). A package is a bundle
   signed like the system, but with the publisher key (`packages.key` in the
   system or boot bundle), holding its components' manifest and images. With
@@ -1510,13 +1546,14 @@ firmware's resume path the kernel has not met, power
 handling in the drivers and servers beyond storage and the network (the
 display, input, audio), and a
 timeout on a component that never answers `SUSPEND`; in verified boot the
-firmware's part (the bootloader and kernel checked by UEFI Secure Boot, or on
-AArch64 by the firmware), measurements extended into a TPM and attestation,
+firmware's part on x86-64 (a loader of its own that Secure Boot covers with the
+kernel) and on real firmware, attestation (a quote over PCR 9 for a server to
+check),
 the boot bundle itself in A/B slots (it is built into the kernel image), a
-rollback counter kept in tamper-resistant storage (the floor is on the system
-disk, and the kernel's oldest version built into it), a boot record written
-atomically (two copies), downloads over TLS (the updater trusts the signature,
-not the connection), apps that provide services, a package store on a
+system bundle's rollback floor in the TPM too (the boot bundle's is; the
+system's is on the system disk), a boot record written atomically (two
+copies), certificate chains and revocation for the update server (the updater
+pins one key), apps that provide services, a package store on a
 filesystem rather than fixed disk slots, an app's right to the control
 capability (today any component holding one may shut the machine down), and release keys kept off the build machine; the IDL describing interfaces other than the bus server's; escalating a component
 given up on to a supervisor above it (today the
@@ -1573,6 +1610,7 @@ https://claude.ai/artifact/QKJS8qH5Dfbjzn58RStq1j
 | `user/echo/`, `user/counter/`, `user/testclient/` | Test components for the Component Manager, supervision and drivers |
 | `boot/` | Component manifests: `shell.manifest` (normal boot), `test.manifest` (`cm-test`), `supervise.manifest` (`supervise-test`) , `drivers.manifest` (`drivers-test`) , `memory.manifest` (`memory-test`), `reboot.manifest` (`reboot-test`), `fs.manifest` and `fs-verify.manifest` (`fs-test`), `net.manifest` (`net-test`), `tcp.manifest` (`tcp-test`), `keyboard.manifest` (`keyboard-test`), `display.manifest` (`display-test`), `desktop.manifest` (`desktop-test`), `input.manifest` (`input-test`), `windows.manifest` (`windows-test`), `toolkit.manifest` (`toolkit-test`), `panel.manifest` (`panel-test`), `resize.manifest` (`resize-test`), `widgets.manifest` (`widgets-test`), `notes.manifest` (`notes-test`), `audio.manifest` (`audio-test`), `suspend.manifest` (`suspend-test`) |
 | `sel4/` | Docker build of seL4 and rust-sel4's kernel loader, for running the shell on seL4 |
+| `tpm/` | Docker image with QEMU, swtpm and Secure Boot tools, for the TPM and Secure Boot tests |
 | `xtask/` | Build driver: user program, kernel, disk image, QEMU boot |
 
 ## Building
@@ -1607,6 +1645,8 @@ cargo xtask keyboard-test  # just the USB keyboard test (add aarch64 for that IS
 cargo xtask hotplug-test   # just the PCI hot-plug test (add aarch64 for that ISA)
 cargo xtask suspend-test   # suspend to RAM (S3) twice around the virtio-blk driver, woken by the RTC alarm then a key, reading the disk after each (aarch64: to idle)
 cargo xtask verified-boot-test  # a signed boot bundle verified and measured; changed, foreign-key, unsigned and old ones refused
+cargo xtask tpm-test       # in Docker (QEMU + swtpm): PCR 9 measured, the TPM's rollback counter raised, then an older bundle refused
+cargo xtask secure-boot-test aarch64  # in Docker and QEMU: the db-signed loader boots under Secure Boot; foreign, changed, unsigned ones refused
 cargo xtask ab-test        # A/B system slots: an update staged, tried, fallen back from, confirmed; rollbacks refused
 cargo xtask packages-test  # signed app packages: bad ones refused, the app installed, kept across boots, uninstalled
 cargo xtask run            # boot the shell in QEMU (x86-64), its console on this terminal

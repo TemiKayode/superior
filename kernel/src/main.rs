@@ -31,6 +31,7 @@ mod iommu;
 mod memory;
 mod smp;
 mod task;
+mod tpm;
 
 pub use arch::serial;
 
@@ -74,12 +75,32 @@ fn verified_bundle() -> Result<&'static [u8], &'static str> {
         kprintln!("[boot] bundle version {} is older than {}", s.version, min_version());
         return Err("it is older than this kernel accepts (a rollback)");
     }
-    let m = s.measure();
-    let mut hex = [0u8; 64];
-    for (i, b) in m.iter().enumerate() {
-        hex[2 * i] = b"0123456789abcdef"[(b >> 4) as usize];
-        hex[2 * i + 1] = b"0123456789abcdef"[(b & 15) as usize];
+    // The TPM's rollback counter: the oldest version this machine boots
+    // again, whatever kernel it runs.
+    let tpm = tpm::get();
+    if let Some(t) = tpm {
+        match t.counter(tpm::COUNTER_INDEX) {
+            Ok(Some(floor)) if s.version < floor => {
+                kprintln!("[tpm] bundle version {} is older than the TPM's rollback counter ({floor})", s.version);
+                return Err("it is older than the TPM's rollback counter (a rollback)");
+            }
+            Ok(_) => {}
+            Err(e) => {
+                kprintln!("[tpm] reading the rollback counter: {e}");
+                return Err("the TPM's rollback counter cannot be read");
+            }
+        }
     }
+    let m = s.measure();
+    let hex = |m: &[u8; 32]| {
+        let mut hex = [0u8; 64];
+        for (i, b) in m.iter().enumerate() {
+            hex[2 * i] = b"0123456789abcdef"[(b >> 4) as usize];
+            hex[2 * i + 1] = b"0123456789abcdef"[(b & 15) as usize];
+        }
+        hex
+    };
+    let mhex = hex(&m);
     kprintln!(
         "[boot] bundle verified: version {}, signed by key {:02x}{:02x}{:02x}{:02x}..., measurement sha256:{}",
         s.version,
@@ -87,8 +108,33 @@ fn verified_bundle() -> Result<&'static [u8], &'static str> {
         key[1],
         key[2],
         key[3],
-        core::str::from_utf8(&hex).unwrap_or("?")
+        core::str::from_utf8(&mhex).unwrap_or("?")
     );
+    if let Some(t) = tpm {
+        // Measured boot: the bundle's measurement into its PCR, and the
+        // counter up to this version (it never comes down).
+        let pcr = t.extend(tpm::BUNDLE_PCR, &m).and_then(|_| t.read_pcr(tpm::BUNDLE_PCR));
+        let pcr = match pcr {
+            Ok(v) => v,
+            Err(e) => {
+                kprintln!("[tpm] measuring the bundle: {e}");
+                return Err("the TPM would not take the bundle's measurement");
+            }
+        };
+        let phex = hex(&pcr);
+        kprintln!(
+            "[tpm] PCR {} extended with the bundle's measurement: now sha256:{}",
+            tpm::BUNDLE_PCR,
+            core::str::from_utf8(&phex).unwrap_or("?")
+        );
+        match t.raise(tpm::COUNTER_INDEX, s.version) {
+            Ok(v) => kprintln!("[tpm] rollback counter: {v} (nothing older boots)"),
+            Err(e) => {
+                kprintln!("[tpm] raising the rollback counter: {e}");
+                return Err("the TPM's rollback counter cannot be raised");
+            }
+        }
+    }
     Ok(s.payload)
 }
 

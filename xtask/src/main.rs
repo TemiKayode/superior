@@ -105,6 +105,7 @@ impl Arch {
 }
 
 /// A bootable kernel for one architecture.
+#[derive(Clone)]
 struct Image {
     path: PathBuf,
     arch: Arch,
@@ -163,6 +164,12 @@ struct Image {
     highmem: bool,
     /// QEMU's `-smp` in place of the usual CPU count (a CPU topology).
     smp: Option<&'static str>,
+    /// UEFI: the firmware's variable store (a writable copy), for Secure
+    /// Boot's enrolled keys.
+    vars: Option<PathBuf>,
+    /// AArch64 UEFI: firmware in place of QEMU's edk2 (one built with
+    /// Secure Boot).
+    firmware: Option<PathBuf>,
 }
 
 /// The disk drivers, each with the PCI function its test disk appears as
@@ -232,6 +239,8 @@ fn main() -> ExitCode {
                         .and_then(|_| hotplug_test(a))
                         .and_then(|_| suspend_test(a))
                         .and_then(|_| verified_boot_test(a))
+                        .and_then(|_| tpm_test(a))
+                        .and_then(|_| secure_boot_test(a))
                         .and_then(|_| ab_test(a))
                         .and_then(|_| update_test(a))
                         .and_then(|_| packages_test(a))
@@ -284,6 +293,8 @@ fn main() -> ExitCode {
         Some("hotplug-test") => hotplug_test(arch),
         Some("suspend-test") => suspend_test(arch),
         Some("verified-boot-test") => verified_boot_test(arch),
+        Some("tpm-test") => tpm_test(arch),
+        Some("secure-boot-test") => secure_boot_test(arch),
         Some("ab-test") => ab_test(arch),
         Some("update-test") => update_test(arch),
         Some("packages-test") => packages_test(arch),
@@ -295,7 +306,7 @@ fn main() -> ExitCode {
         }
         Some("bench") => image(false, Arch::X86_64).and_then(|img| bench(&img)),
         _ => Err(
-            "usage: cargo xtask <idl | image | run | test | boot-test | shell-test | cm-test | supervise-test | drivers-test | memory-test | reboot-test | fs-test | nvme-test | ahci-test | net-test | lde-test | lde-e100-test | wifi-test | display-test | desktop-test | windows-test | cursor-test | toolkit-test | panel-test | resize-test | widgets-test | notes-test | uefi-test | console-test | input-test | audio-test | tcp-test | keyboard-test | hotplug-test | suspend-test | verified-boot-test | ab-test | update-test | packages-test | bench | sel4-test> [x86_64 | aarch64]"
+            "usage: cargo xtask <idl | image | run | test | boot-test | shell-test | cm-test | supervise-test | drivers-test | memory-test | reboot-test | fs-test | nvme-test | ahci-test | net-test | lde-test | lde-e100-test | wifi-test | display-test | desktop-test | windows-test | cursor-test | toolkit-test | panel-test | resize-test | widgets-test | notes-test | uefi-test | console-test | input-test | audio-test | tcp-test | keyboard-test | hotplug-test | suspend-test | verified-boot-test | tpm-test | secure-boot-test | ab-test | update-test | packages-test | bench | sel4-test> [x86_64 | aarch64]"
                 .into(),
         ),
     });
@@ -569,6 +580,8 @@ fn lde_objects(arch: Arch, driver: &str) -> Result<(), String> {
 fn user_program(package: &str, arch: Arch) -> Result<PathBuf, String> {
     println!("== building {package} ({})", arch.name());
     let mut build = cargo();
+    // The updater pins the update server's TLS key.
+    build.env("SUPERIOR_UPDATE_KEY", update_key()?.1);
     // Loaders read only program headers: leave debug information out, so
     // the boot bundle stays small.
     build.env("CARGO_PROFILE_RELEASE_STRIP", "debuginfo");
@@ -761,6 +774,9 @@ enum Seal {
     Unsigned,
     /// Properly signed, but an older version than the kernel accepts.
     Old,
+    /// Properly signed, one version newer than the kernel's oldest (the
+    /// TPM test's update).
+    Newer,
 }
 
 /// The development signing key: made from the OS's random source the
@@ -809,7 +825,11 @@ fn seal_bundle(path: &Path, seal: Seal) -> Result<(PathBuf, PathBuf), String> {
         } else {
             key
         };
-        let version = if seal == Seal::Old { BUNDLE_VERSION - 1 } else { BUNDLE_VERSION };
+        let version = match seal {
+            Seal::Old => BUNDLE_VERSION - 1,
+            Seal::Newer => BUNDLE_VERSION + 1,
+            _ => BUNDLE_VERSION,
+        };
         out = sign(out, version, &signer);
     }
     if seal == Seal::Tampered {
@@ -927,6 +947,8 @@ fn image_sealed(
         el2: false,
         highmem: false,
         smp: None,
+        vars: None,
+        firmware: None,
     })
 }
 
@@ -1034,6 +1056,8 @@ fn sel4_image() -> Result<Image, String> {
         el2: false,
         highmem: false,
         smp: None,
+        vars: None,
+        firmware: None,
     })
 }
 
@@ -1415,8 +1439,14 @@ fn qemu_command(img: &Image) -> Command {
                 let acpi = if img.acpi { "on" } else { "off" };
                 q.args(["-machine", &format!("{machine},acpi={acpi}"), "-cpu", cpu])
                     .arg("-drive")
-                    .arg(format!("if=pflash,format=raw,readonly=on,file={}", aavmf().display()))
-                    .arg("-drive")
+                    .arg(format!(
+                        "if=pflash,format=raw,readonly=on,file={}",
+                        img.firmware.clone().unwrap_or_else(aavmf).display()
+                    ));
+                if let Some(vars) = &img.vars {
+                    q.arg("-drive").arg(format!("if=pflash,format=raw,file={}", vars.display()));
+                }
+                q.arg("-drive")
                     .arg(format!("if=none,id=boot,format=raw,file={}", img.path.display()))
                     // On NVMe, so a virtio disk image's driver finds only
                     // its test disk.
@@ -5682,10 +5712,40 @@ fn update_bundle(arch: Arch, version: u64) -> Result<Vec<u8>, String> {
 /// gateway's port of this number).
 const UPDATE_PORT: u16 = 47080;
 
-/// Serves `GET /system?have=N` on `UPDATE_PORT` until `stop`, answering
-/// the requests in turn: `v3` changed after signing, `v3` cut off half way
-/// (the connection closed early), `v3`, then 204 (nothing newer). The
-/// request lines, in order.
+/// The update server's TLS key (a development key in `target/keys`, made
+/// the first time): its seed, and its public key in hex, which the updater
+/// is built with.
+fn update_key() -> Result<([u8; 32], String), String> {
+    let key = dev_key("update-server.seed")?;
+    let public: String = key.verifying_key().to_bytes().iter().map(|b| format!("{b:02x}")).collect();
+    Ok((key.to_bytes(), public))
+}
+
+/// A TLS 1.3 server configuration with a self-signed certificate for the
+/// Ed25519 key of `seed`.
+fn tls_server_config(seed: &[u8; 32]) -> Result<std::sync::Arc<rustls::ServerConfig>, String> {
+    // PKCS #8 for an Ed25519 private key (RFC 8410), the seed last.
+    let mut pkcs8 = vec![0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04, 0x20];
+    pkcs8.extend_from_slice(seed);
+    let key = rcgen::KeyPair::try_from(&pkcs8[..]).map_err(|e| format!("the update server's key: {e}"))?;
+    let cert = rcgen::CertificateParams::new(vec!["updates.superior.test".to_string()])
+        .and_then(|p| p.self_signed(&key))
+        .map_err(|e| format!("the update server's certificate: {e}"))?;
+    let private = rustls::pki_types::PrivateKeyDer::Pkcs8(pkcs8.into());
+    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+    let config = rustls::ServerConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .and_then(|b| b.with_no_client_auth().with_single_cert(vec![cert.der().clone()], private))
+        .map_err(|e| format!("the update server's TLS configuration: {e}"))?;
+    Ok(std::sync::Arc::new(config))
+}
+
+/// Serves `GET /system?have=N` over TLS 1.3 on `UPDATE_PORT` until `stop`.
+/// The first connection is an impostor's (a certificate for another key,
+/// which the updater must refuse before it asks anything); then the
+/// requests are answered in turn: `v3` changed after signing, `v3` cut off
+/// half way (the connection closed early, with no close_notify), `v3`, then
+/// 204 (nothing newer). The request lines, in order.
 fn update_server(
     v3: Vec<u8>,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -5696,8 +5756,11 @@ fn update_server(
     let l = TcpListener::bind(("127.0.0.1", UPDATE_PORT))
         .map_err(|e| format!("binding the update port {UPDATE_PORT}: {e}"))?;
     l.set_nonblocking(true).map_err(|e| e.to_string())?;
+    let real = tls_server_config(&update_key()?.0)?;
+    let impostor = tls_server_config(&[0x77; 32])?;
     Ok(std::thread::spawn(move || {
         let mut asked = Vec::new();
+        let mut connections = 0;
         while !stop.load(Ordering::Relaxed) {
             let Ok((s, _)) = l.accept() else {
                 std::thread::sleep(Duration::from_millis(20));
@@ -5705,7 +5768,10 @@ fn update_server(
             };
             let _ = s.set_nonblocking(false);
             let _ = s.set_read_timeout(Some(Duration::from_secs(10)));
-            let mut r = BufReader::new(s);
+            connections += 1;
+            let config = if connections == 1 { impostor.clone() } else { real.clone() };
+            let Ok(conn) = rustls::ServerConnection::new(config) else { continue };
+            let mut r = BufReader::new(rustls::StreamOwned::new(conn, s));
             let mut line = String::new();
             if r.read_line(&mut line).is_err() {
                 continue;
@@ -5729,8 +5795,12 @@ fn update_server(
                 3 => s.write_all(ok(v3.len()).as_bytes()).and_then(|_| s.write_all(&v3)),
                 _ => s.write_all(b"HTTP/1.1 204 No Content\r\n\r\n"),
             };
+            // Cut short: the connection just ends. Otherwise close_notify.
+            if asked.len() != 2 {
+                s.conn.send_close_notify();
+            }
             let _ = s.flush();
-            let _ = s.shutdown(std::net::Shutdown::Both);
+            let _ = s.sock.shutdown(std::net::Shutdown::Both);
         }
         asked
     }))
@@ -5739,10 +5809,12 @@ fn update_server(
 /// The downloading updater (`user/updater`), in one run of
 /// `boot/update.manifest` on a disk whose slot A holds the system at
 /// version 2: the updater confirms it once the network is up and asks the
-/// host for a newer system; the first download (changed after signing) is
-/// refused by the manager and the second cut short, both tried again; the
-/// third is staged, and the updater restarts the machine into it; version
-/// 3 boots from slot B, confirms, and finds nothing newer.
+/// host for a newer system, over TLS 1.3 to the key it was built with. The
+/// first server it reaches holds another key and is refused in the
+/// handshake; the next download (changed after signing) is refused by the
+/// manager and the one after cut short, each tried again; the fourth is
+/// staged, and the updater restarts the machine into it; version 3 boots
+/// from slot B, confirms, and finds nothing newer.
 fn update_test(arch: Arch) -> Result<(), String> {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -5763,8 +5835,10 @@ fn update_test(arch: Arch) -> Result<(), String> {
     stop.store(true, Ordering::Relaxed);
     let asked = server.join().unwrap_or_default();
     let out = out?;
-    let staged = format!("updater: download 3: {} bytes written to the free slot and staged; restarting into it", v3.len());
-    let cut = format!("updater: download 2: cut short, {} of {} bytes; trying again", v3.len() / 2, v3.len());
+    let staged = format!("updater: download 4: {} bytes written to the free slot and staged; restarting into it", v3.len());
+    let cut = format!("updater: download 3: cut short, {} of {} bytes; trying again", v3.len() / 2, v3.len());
+    let key = &update_key()?.1[..8];
+    let asking = |have: u32| format!("updater: asking https://10.0.3.2:47080/system?have={have} (TLS 1.3, the server's key {key}...)");
     check_log(
         "update test",
         &out,
@@ -5773,9 +5847,10 @@ fn update_test(arch: Arch) -> Result<(), String> {
             "updater: running version 2 from slot A",
             "[cm] system slot A confirmed: active, rollback floor 2",
             "updater: the network is up (10.0.3.30): version 2 confirmed",
-            "updater: asking http://10.0.3.2:47080/system?have=2",
+            &asking(2),
+            "updater: download 1 failed: TLS: the server does not hold the update server's key; trying again",
             "[cm] update in slot B refused: its signature does not verify",
-            "updater: download 1: refused by the manager (status 3); trying again",
+            "updater: download 2: refused by the manager (status 3); trying again",
             &cut,
             "[cm] update staged in slot B (version 3): the next boot tries it once",
             &staged,
@@ -5784,7 +5859,7 @@ fn update_test(arch: Arch) -> Result<(), String> {
             "updater: running version 3 from slot B",
             "[cm] system slot B confirmed: active, rollback floor 3",
             "updater: the network is up (10.0.3.30): version 3 confirmed",
-            "updater: asking http://10.0.3.2:47080/system?have=3",
+            &asking(3),
             "updater: no system newer than version 3",
             "[cm] updater asked to shut down (pass)",
         ],
@@ -6100,6 +6175,218 @@ fn verified_boot_test(arch: Arch) -> Result<(), String> {
         println!("refused ({seal:?}): {why}");
     }
     println!("verified boot test passed");
+    Ok(())
+}
+
+/// The container with QEMU and swtpm (`tpm/Dockerfile`), built the first
+/// time it is wanted.
+fn tpm_container() -> Result<(), String> {
+    let have = Command::new("docker")
+        .args(["image", "inspect", "superior-tpm"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|e| format!("could not run docker: {e}"))?;
+    if !have.success() {
+        println!("== building the TPM test container");
+        run(Command::new("docker").args(["build", "-t", "superior-tpm"]).arg(root().join("tpm")))?;
+    }
+    Ok(())
+}
+
+/// Measured boot and the TPM's rollback counter. QEMU's Windows build has
+/// no TPM backend, so the three boots run in a Linux container (QEMU with
+/// swtpm, `tpm/`), on one TPM whose state lasts across them: version 2 of
+/// the boot bundle, then version 3, then version 2 again. Each accepted
+/// boot must extend PCR 9 with the bundle's measurement (the PCR's value
+/// as computed here from a fresh one) and raise the counter to its
+/// version; the last, though signed and no older than the kernel's own
+/// floor, must be refused as older than the counter, with nothing from it
+/// run.
+fn tpm_test(arch: Arch) -> Result<(), String> {
+    use superior_objects::crypto::sha2::sha256;
+    tpm_container()?;
+    let dir = root().join("target").join("tpm");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let hex = |b: &[u8]| b.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    let mut boots = vec![];
+    for (k, seal, version) in [(1, Seal::Good, BUNDLE_VERSION), (2, Seal::Newer, BUNDLE_VERSION + 1), (3, Seal::Good, BUNDLE_VERSION)] {
+        let img = image_sealed(false, arch, "test", "virtio-blk", seal)?;
+        let signed = root().join("target").join(format!("bundle-{}-test.signed", arch.name()));
+        let bundle = std::fs::read(&signed).map_err(|e| format!("reading {}: {e}", signed.display()))?;
+        let m = sha256(&bundle);
+        // The PCR from zero, extended once.
+        let mut both = [0u8; 64];
+        both[32..].copy_from_slice(&m);
+        let name = format!("boot-{}-{k}", arch.name());
+        std::fs::copy(&img.path, dir.join(&name)).map_err(|e| format!("copying {}: {e}", img.path.display()))?;
+        boots.push((name, version, hex(&m), hex(&sha256(&both))));
+    }
+    let tpm = "-chardev socket,id=chrtpm,path=/tmp/tpm/sock -tpmdev emulator,id=tpm0,chardev=chrtpm";
+    let qemu = match arch {
+        Arch::X86_64 => format!(
+            "qemu-system-x86_64 -m 512M -smp 1 -drive format=raw,file=/work/target/tpm/$IMG -device isa-debug-exit,iobase=0xf4,iosize=0x04 {tpm} -device tpm-tis,tpmdev=tpm0"
+        ),
+        Arch::Aarch64 => format!(
+            "qemu-system-aarch64 -machine virt,highmem=off,gic-version=3 -cpu cortex-a72 -m 512M -smp 1 -kernel /work/target/tpm/$IMG -semihosting-config enable=on,target=native {tpm} -device tpm-tis-device,tpmdev=tpm0"
+        ),
+    };
+    let mut script = String::from("rm -rf /tmp/tpm && mkdir -p /tmp/tpm\n");
+    for (k, (name, ..)) in boots.iter().enumerate() {
+        script += &format!(
+            "IMG={name}\nswtpm socket --tpm2 --tpmstate dir=/tmp/tpm --ctrl type=unixio,path=/tmp/tpm/sock --terminate --daemon\n\
+             timeout 90 {qemu} -serial stdio -display none -no-reboot -monitor none </dev/null\n\
+             echo \"== tpm boot {} exit $?\"\nsleep 1\n",
+            k + 1
+        );
+    }
+    println!("== TPM test ({}): three boots on one software TPM", arch.name());
+    let out = Command::new("docker")
+        .args(["run", "--rm", "-v"])
+        .arg(format!("{}:/work", root().display()))
+        .args(["superior-tpm", "sh", "-c", &script])
+        .output()
+        .map_err(|e| format!("could not run docker: {e}"))?;
+    let all = String::from_utf8_lossy(&out.stdout).replace('\r', "");
+    let log = root().join("target").join(format!("tpm-{}.log", arch.name()));
+    let _ = std::fs::write(&log, format!("{all}\n{}", String::from_utf8_lossy(&out.stderr)));
+    let mut rest = all.as_str();
+    for (k, (_, version, m, pcr)) in boots.iter().enumerate() {
+        let marker = format!("== tpm boot {} exit ", k + 1);
+        let at = rest.find(&marker).ok_or_else(|| format!("tpm: boot {} did not finish (see {})", k + 1, log.display()))?;
+        let (this, after) = rest.split_at(at);
+        let code: i32 = after[marker.len()..].lines().next().unwrap_or("").trim().parse().unwrap_or(-1);
+        rest = &after[marker.len()..];
+        let what = format!("tpm boot {} (version {version})", k + 1);
+        if k < 2 {
+            let lines = [
+                "[ok] TPM 2.0 over TIS".to_string(),
+                format!("[boot] bundle verified: version {version}, signed by key "),
+                format!("[tpm] PCR 9 extended with the bundle's measurement: now sha256:{pcr}"),
+                format!("[tpm] rollback counter: {version} (nothing older boots)"),
+                "[ok] Component Manager loaded".to_string(),
+                "[cm] manifest:".to_string(),
+            ];
+            let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
+            check_log(&what, this, &lines)?;
+            if !this.contains(&format!("measurement sha256:{m}")) {
+                return Err(format!("{what}: the kernel's measurement is not sha256:{m}"));
+            }
+            println!("{what}: PCR 9 = sha256:{pcr} as computed here; the counter raised to {version}");
+        } else {
+            let lines = [
+                format!("[tpm] bundle version {version} is older than the TPM's rollback counter ({})", version + 1),
+                "[boot] boot bundle REFUSED: it is older than the TPM's rollback counter (a rollback)".to_string(),
+            ];
+            let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
+            check_log(&what, this, &lines)?;
+            if this.contains("Component Manager loaded") || this.contains("[cm]") {
+                return Err(format!("{what}: something from the bundle ran"));
+            }
+            if code == QEMU_PASS || code == 124 {
+                return Err(format!("{what}: exit {code}, not the failure code"));
+            }
+            println!("{what}: refused, though signed and no older than the kernel's own floor ({BUNDLE_VERSION})");
+        }
+    }
+    println!("== TPM test passed ({})", arch.name());
+    Ok(())
+}
+
+/// UEFI Secure Boot over the AArch64 loader, which carries the kernel and
+/// with it the boot bundle's key: the firmware checks the loader against
+/// its `db`, the kernel checks the bundle. In the TPM container (which has
+/// openssl, sbsign and virt-fw-vars) the test makes a Secure Boot PK, KEK
+/// and db (kept in `target/keys/secure-boot`, never in the repository) and
+/// another key, signs the loader with db and with the other key, and makes
+/// edk2's variable store with PK, KEK and db enrolled. Then QEMU's edk2,
+/// with that store: the loader signed with db boots, says Secure Boot is
+/// on and the kernel's boot test runs; signed with the other key, changed
+/// after signing, or unsigned, the firmware refuses it and nothing of
+/// Superior runs. The firmware is Debian's AArch64 edk2 (AAVMF), from the
+/// container: QEMU's own build has no Secure Boot.
+///
+/// x86-64 is not covered: its UEFI loader is the `bootloader` crate's,
+/// which loads the kernel from a file of its own that Secure Boot would
+/// not check.
+fn secure_boot_test(arch: Arch) -> Result<(), String> {
+    if arch != Arch::Aarch64 {
+        println!("== Secure Boot test: AArch64 only (x86-64's loader leaves the kernel unchecked)");
+        return Ok(());
+    }
+    tpm_container()?;
+    let img = uefi_image(Arch::Aarch64, "test")?;
+    let dir = root().join("target").join("sb");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let efi = root().join("target").join("aarch64-unknown-uefi").join("release").join("superior-uefi-loader.efi");
+    std::fs::copy(&efi, dir.join("loader.efi")).map_err(|e| format!("copying {}: {e}", efi.display()))?;
+    // The variable store's template: QEMU's (the same layout as Debian's,
+    // which virt-fw-vars misreads).
+    let template = aavmf().with_file_name("edk2-arm-vars.fd");
+    std::fs::copy(&template, dir.join("template-vars.fd")).map_err(|e| format!("copying {}: {e}", template.display()))?;
+    let script = r#"set -e
+# Debian's AArch64 edk2, which has Secure Boot.
+cp /usr/share/AAVMF/AAVMF_CODE.fd /work/target/sb/code.fd
+cd /work/target
+mkdir -p keys/secure-boot && cd keys/secure-boot
+for k in PK KEK db other; do
+  [ -f $k.crt ] || openssl req -quiet -new -x509 -newkey rsa:2048 -nodes -days 3650 -sha256      -subj "/CN=Superior development $k/" -keyout $k.key -out $k.crt 2>/dev/null
+done
+cd /work/target/sb
+sbsign --key ../keys/secure-boot/db.key --cert ../keys/secure-boot/db.crt --output signed.efi loader.efi
+sbsign --key ../keys/secure-boot/other.key --cert ../keys/secure-boot/other.crt --output foreign.efi loader.efi
+python3 -c "import sys; b=bytearray(open('signed.efi','rb').read()); b[len(b)//3]^=0x40; open('tampered.efi','wb').write(b)"
+G=6f8c0a2e-2a3c-4d25-9b1f-5e5d0c1b7a01
+virt-fw-vars --input template-vars.fd --output /tmp/vars.fd --set-pk $G ../keys/secure-boot/PK.crt --add-kek $G ../keys/secure-boot/KEK.crt   --add-db $G ../keys/secure-boot/db.crt --secure-boot
+cp /tmp/vars.fd vars.fd
+echo signed and enrolled"#;
+    println!("== Secure Boot: keys, signatures and the firmware's variables (in the container)");
+    run(Command::new("docker")
+        .args(["run", "--rm", "-v"])
+        .arg(format!("{}:/work", root().display()))
+        .args(["superior-tpm", "sh", "-c", script]))?;
+    for (file, good, what) in [
+        ("signed.efi", true, "signed with db"),
+        ("foreign.efi", false, "signed with a key not in db"),
+        ("tampered.efi", false, "changed after signing"),
+        ("loader.efi", false, "unsigned"),
+    ] {
+        let disk = dir.join(format!("disk-{file}.img"));
+        esp_disk(&[("EFI/BOOT/BOOTAA64.EFI", &dir.join(file))], &disk)?;
+        let vars = dir.join("run-vars.fd");
+        std::fs::copy(dir.join("vars.fd"), &vars).map_err(|e| format!("copying the variable store: {e}"))?;
+        let mut run_img = img.clone();
+        run_img.path = disk;
+        run_img.vars = Some(vars);
+        run_img.firmware = Some(dir.join("code.fd"));
+        println!("== Secure Boot: the loader {what}");
+        if good {
+            let out = run_to_exit(&run_img, Duration::from_secs(120))?;
+            let out = out.find("Superior UEFI loader").map_or("", |at| &out[at..]);
+            check_log(
+                &format!("secure boot ({what})"),
+                out,
+                &[
+                    "Superior UEFI loader (AArch64)",
+                    "loader: Secure Boot is on: the firmware verified this loader, the kernel inside it",
+                    "Superior microkernel",
+                    "[boot] bundle verified: version",
+                    "[cm] manifest:",
+                ],
+            )?;
+            println!("booted: Secure Boot on, the loader and the kernel in it verified by the firmware");
+        } else {
+            let (_, out) = run_capture(&run_img, Duration::from_secs(25), |_| {})?;
+            if out.contains("Superior UEFI loader") || out.contains("Superior microkernel") {
+                return Err(format!("secure boot ({what}): the firmware started it"));
+            }
+            if !out.contains("Access Denied") {
+                return Err(format!("secure boot ({what}): the firmware did not say Access Denied"));
+            }
+            println!("refused by the firmware (Access Denied)");
+        }
+    }
+    println!("== Secure Boot test passed (aarch64)");
     Ok(())
 }
 
