@@ -5803,7 +5803,7 @@ fn ab_client(role: u64) -> ! {
 /// package store, each laid out as a store slot: 0 the app signed by
 /// another key, 1 the app changed after signing, 2 an app that uses the
 /// disk, 3 one that asks for a device, 4 one that asks to install
-/// packages itself, 5 the app.
+/// packages itself, 5 the app (version 1), 6 and 7 its versions 2 and 3.
 const PACKAGE_DOWNLOADS: u64 =
     superior_objects::package::FIRST + superior_objects::package::COUNT as u64 * superior_objects::package::SECTORS;
 /// The installer's `report` service, which the app calls.
@@ -5815,47 +5815,74 @@ const APP_HELLO: u64 = 0xa99;
 /// it had downloaded it, and asks the manager to install it: the
 /// manager's answer.
 fn install_download(k: u64) -> u64 {
+    match write_download(k) {
+        Ok(slot) => manager([install::OP_INSTALL, slot, 0, 0])[0],
+        Err(e) => e,
+    }
+}
+
+/// Copies download `k` into a free store slot, and asks the manager to
+/// put it in place of the version installed: the manager's answer.
+fn upgrade_download(k: u64) -> [u64; 4] {
+    match write_download(k) {
+        Ok(slot) => manager([install::OP_UPGRADE, slot, 0, 0]),
+        Err(e) => [e, 0, 0, 0],
+    }
+}
+
+/// Copies download `k` into a free store slot: the slot, or the status
+/// that stopped it.
+fn write_download(k: u64) -> Result<u64, u64> {
     use superior_objects::package;
     let r = manager([install::OP_PACKAGE_SLOT, 0, 0, 0]);
     if r[0] != Status::Ok as u64 {
-        return r[0];
+        return Err(r[0]);
     }
     let (from, to) = (PACKAGE_DOWNLOADS + k * package::SECTORS, r[2]);
     if !disk(block::READ, from, 1) {
-        return Status::DeviceError as u64;
+        return Err(Status::DeviceError as u64);
     }
     // SAFETY: the buffer is mapped; its first sector is the header.
     let header: [u8; 512] = unsafe { *(BUFFER_VA as *const [u8; 512]) };
     let Some(len) = package::length(&header) else {
-        return Status::NotFound as u64;
+        return Err(Status::NotFound as u64);
     };
     let sectors = 1 + len.div_ceil(512) as u64;
     let mut done = 0;
     while done < sectors {
         let n = (sectors - done).min(8);
         if !disk(block::READ, from + done, n) || !disk(block::WRITE, to + done, n) {
-            return Status::DeviceError as u64;
+            return Err(Status::DeviceError as u64);
         }
         done += n;
     }
     if syscall(Syscall::Call, BLOCK, [block::FLUSH, 0, 0, 0]).msg[0] != Status::Ok as u64 {
-        return Status::DeviceError as u64;
+        return Err(Status::DeviceError as u64);
     }
-    manager([install::OP_INSTALL, r[1], 0, 0])[0]
+    Ok(r[1])
 }
 
 /// Waits for the app to call `report`, and answers it: whether it said
 /// hello.
 fn app_calls() -> bool {
+    app_version() == Some(1)
+}
+
+/// Waits for the app to call `report`, and answers it: the version it
+/// says it is, if it said hello.
+fn app_version() -> Option<u64> {
     let call = syscall(Syscall::Recv, REPORT, [0; 4]);
     syscall(Syscall::Reply, 0, [0; 4]);
-    call.status == 0 && call.msg[0] == APP_HELLO
+    (call.status == 0 && call.msg[0] == APP_HELLO).then_some(call.msg[1])
 }
 
 /// The package test's installer (role 35): it counts its boots in sector
-/// 1 of the disk. Boot 1 has five bad packages refused and installs the
-/// app; boot 2 finds it installed from the store, and uninstalls it; boot
-/// 3 finds nothing installed.
+/// 1 of the disk. Boot 1 has five bad packages refused, installs the app,
+/// upgrades it to version 2, has version 1 refused in its place, and
+/// leaves version 3 written to the store but not installed, as an
+/// upgrade cut short would; boot 2 finds version 3 installed from the
+/// store in place of version 2, and uninstalls it; boot 3 finds nothing
+/// installed.
 fn install_client() -> ! {
     let mut t = Checks(0, "packages");
     let ok = Status::Ok as u64;
@@ -5894,10 +5921,31 @@ fn install_client() -> ! {
             t.check(r == Status::InUse as u64, format_args!("installing it twice is refused (status {r})"));
             let now = manager([install::OP_PACKAGES, 0, 0, 0])[1];
             t.check(now == 1, format_args!("the store holds the app alone"));
+            // Version 2 in place of version 1.
+            let r = upgrade_download(6);
+            t.check(
+                r[0] == ok && r[2] == 0,
+                format_args!("version 2 replaces version 1 (status {}, slot {} replaced)", r[0], r[2] as i64),
+            );
+            let v = app_version();
+            t.check(v == Some(2), format_args!("the app runs as version 2 ({})", v.unwrap_or(0)));
+            let now = manager([install::OP_PACKAGES, 0, 0, 0])[1];
+            t.check(now == 0b10, format_args!("the store holds version 2 alone ({now:#b})"));
+            // Back to version 1: refused.
+            let r = upgrade_download(5)[0];
+            let now = manager([install::OP_PACKAGES, 0, 0, 0])[1];
+            t.check(
+                r == Status::Denied as u64 && now == 0b10,
+                format_args!("an older version is refused in its place (status {r})"),
+            );
+            // Version 3 written, the machine stopped before asking.
+            let w = write_download(7);
+            t.check(w == Ok(0), format_args!("version 3 is written to the store and left there"));
         }
         1 => {
             t.check(installed[1] == 1, format_args!("the app was installed at boot from the store"));
-            t.check(app_calls(), format_args!("it runs, and calls the installer"));
+            let v = app_version();
+            t.check(v == Some(3), format_args!("it runs as version 3, the newer left in the store ({})", v.unwrap_or(0)));
             let r = manager([install::OP_UNINSTALL, 0, 0, 0])[0];
             let now = manager([install::OP_PACKAGES, 0, 0, 0])[1];
             t.check(r == ok && now == 0, format_args!("the app is uninstalled (status {r})"));
@@ -5910,11 +5958,11 @@ fn install_client() -> ! {
     superior_sys::park()
 }
 
-/// The package test's app (role 36), installed from a package: it calls
-/// the installer's `report` service (slot 0), then waits to be
-/// uninstalled.
-fn app_client() -> ! {
-    syscall(Syscall::Call, 0, [APP_HELLO, 0, 0, 0]);
+/// The package test's app (version 1 as role 36, 2 and 3 as roles 44
+/// and 45), installed from a package: it calls the installer's `report`
+/// service (slot 0) with its version, then waits to be uninstalled.
+fn app_client(version: u64) -> ! {
+    syscall(Syscall::Call, 0, [APP_HELLO, version, 0, 0]);
     superior_sys::park()
 }
 
@@ -5957,7 +6005,9 @@ pub extern "C" fn _start(role: u64) -> ! {
         31 => suspend_client(),
         32..=34 => ab_client(role),
         35 => install_client(),
-        36 => app_client(),
+        36 => app_client(1),
+        44 => app_client(2),
+        45 => app_client(3),
         37 => styled_first(),
         38 => styled_second(),
         39 => window_watcher("toolkit", "the greeter's window"),

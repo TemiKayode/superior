@@ -5627,19 +5627,25 @@ fn packages_disk(arch: Arch) -> PathBuf {
 const APP_MANIFEST: &str = "component app\n  image app\n  arg 36\n  uses report 0\n";
 
 /// A package holding `manifest` and the test client as `app`, signed with
-/// `key`.
+/// `key` as version 1.
 fn app_package(arch: Arch, manifest: &str, key: &ed25519_dalek::SigningKey) -> Result<Vec<u8>, String> {
+    app_package_version(arch, manifest, key, 1)
+}
+
+/// [`app_package`] signed as `version`.
+fn app_package_version(arch: Arch, manifest: &str, key: &ed25519_dalek::SigningKey, version: u64) -> Result<Vec<u8>, String> {
     let client = user_program("superior-testclient", arch)?;
     let image = std::fs::read(&client).map_err(|e| format!("reading {}: {e}", client.display()))?;
     let files = vec![("manifest".to_string(), manifest.as_bytes().to_vec()), ("app".to_string(), image)];
-    Ok(sign(pack(&files), 1, key))
+    Ok(sign(pack(&files), version, key))
 }
 
 /// Writes a fresh package test disk: an empty store, and after it the
 /// packages the installer downloads (see the test client's
 /// `PACKAGE_DOWNLOADS`): the app signed by another key, the app changed
 /// after signing, apps asking for the disk, a device and the right to
-/// install, and the app.
+/// install, the app, and its versions 2 and 3 (the test client in roles 44
+/// and 45, saying so).
 fn write_packages_disk(arch: Arch) -> Result<(), String> {
     use superior_objects::ab::SECTOR;
     use superior_objects::package::{COUNT, FIRST, SECTORS, header};
@@ -5654,6 +5660,8 @@ fn write_packages_disk(arch: Arch) -> Result<(), String> {
         app_package(arch, &format!("{APP_MANIFEST}  device pci-config 1\n"), &key)?,
         app_package(arch, &format!("{APP_MANIFEST}  install-control\n"), &key)?,
         app_package(arch, APP_MANIFEST, &key)?,
+        app_package_version(arch, &APP_MANIFEST.replace("arg 36", "arg 44"), &key, 2)?,
+        app_package_version(arch, &APP_MANIFEST.replace("arg 36", "arg 45"), &key, 3)?,
     ];
     let first = FIRST + COUNT as u64 * SECTORS;
     let mut disk = vec![0u8; ((first + downloads.len() as u64 * SECTORS) as usize) * SECTOR];
@@ -5671,8 +5679,11 @@ fn write_packages_disk(arch: Arch) -> Result<(), String> {
 /// 1. the installer has five bad packages refused (another key, changed
 ///    after signing, asking for the disk, a device, the right to
 ///    install) and cleared from the store, then installs the app, which
-///    runs and calls it; a second copy is refused;
-/// 2. the app is installed at boot from the store, calls in, and is
+///    runs and calls it; a second copy is refused; version 2 replaces it
+///    and calls in, version 1 is refused in its place, and version 3 is
+///    written to the store and left, as by an upgrade cut short;
+/// 2. version 3 is installed at boot from the store and version 2
+///    refused and cleared, the app calls in as version 3, and is
 ///    uninstalled;
 /// 3. nothing is installed.
 fn packages_test(arch: Arch) -> Result<(), String> {
@@ -5702,16 +5713,26 @@ fn packages_test(arch: Arch) -> Result<(), String> {
                 "[cm] package in store slot 1 refused: a component of that name is installed (app)",
                 "[pass] packages: installing it twice is refused",
                 "[pass] packages: the store holds the app alone",
+                "[cm] package in store slot 1 (version 2) replaces slot 0's (version 1)",
+                "[cm] uninstalled package in store slot 0: app",
+                "[cm] installed package in store slot 1 (version 2): app",
+                "[pass] packages: version 2 replaces version 1 (status 0, slot 0 replaced)",
+                "[pass] packages: the app runs as version 2 (2)",
+                "[pass] packages: the store holds version 2 alone (0b10)",
+                "[cm] package in store slot 0 refused: no newer than the installed one",
+                "[pass] packages: an older version is refused in its place (status",
+                "[pass] packages: version 3 is written to the store and left there",
                 "[cm] installer asked to shut down (pass)",
             ],
         ),
         (
             "installed from the store",
             &[
-                "[cm] installed package in store slot 0 (version 1): app",
+                "[cm] installed package in store slot 0 (version 3): app",
+                "[cm] package in store slot 1 refused: no newer than the installed one",
                 "[cm] package store: 1 installed",
                 "[pass] packages: the app was installed at boot from the store",
-                "[pass] packages: it runs, and calls the installer",
+                "[pass] packages: it runs as version 3, the newer left in the store (3)",
                 "[cm] uninstalled package in store slot 0: app",
                 "[pass] packages: the app is uninstalled",
                 "[cm] installer asked to shut down (pass)",

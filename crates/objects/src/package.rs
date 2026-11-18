@@ -15,7 +15,9 @@
 //! (magic [`MAGIC`], the bundle's length), then the signed bundle. The
 //! manager installs every package in the store at boot; an installer
 //! writes one into a free slot and asks the manager to install it, which
-//! clears the slot if it refuses.
+//! clears the slot if it refuses, or to put it in place of an older
+//! version of the same package ([`admit_replacing`]); of two versions
+//! found in the store at boot, the newer is kept.
 
 use crate::ab::{SECTOR, SLOT_FIRST, SLOT_SECTORS};
 use crate::manifest::{CapKind, Manifest, Start};
@@ -74,6 +76,16 @@ pub struct Refusal<'a> {
 /// Checks a package's manifest `pkg` against the running system's
 /// `host`: what an app may ask for.
 pub fn admit<'a>(pkg: &Manifest<'a>, host: &Manifest<'_>) -> Result<(), Refusal<'a>> {
+    admit_replacing(pkg, host, |_| false)
+}
+
+/// [`admit`], for a package that replaces the components of `host` that
+/// `replaced` picks (by index): their names are not taken.
+pub fn admit_replacing<'a>(
+    pkg: &Manifest<'a>,
+    host: &Manifest<'_>,
+    replaced: impl Fn(usize) -> bool,
+) -> Result<(), Refusal<'a>> {
     let no = |why, word| Err(Refusal { why, word, taken: false });
     if pkg.configures_system() {
         return no("a package may not configure the system", "");
@@ -83,7 +95,7 @@ pub fn admit<'a>(pkg: &Manifest<'a>, host: &Manifest<'_>) -> Result<(), Refusal<
     }
     for (_, c) in pkg.iter() {
         let name = c.name;
-        if host.iter().any(|(_, h)| h.name == name) {
+        if host.iter().any(|(i, h)| h.name == name && !replaced(i)) {
             return Err(Refusal { why: "a component of that name is installed", word: name, taken: true });
         }
         if c.start != Start::Boot {
@@ -162,6 +174,18 @@ component installer
         assert_eq!(why(""), "it has no components");
         let taken = check("component installer\n image app\n").unwrap_err();
         assert!(taken.taken && taken.word == "installer");
+    }
+
+    #[test]
+    fn a_replacement_may_take_the_names_it_replaces() {
+        let host = Manifest::parse(HOST).unwrap();
+        let pkg = Manifest::parse_unchecked("component installer\n image app\n").unwrap();
+        let installer = host.iter().find(|(_, c)| c.name == "installer").unwrap().0;
+        assert_eq!(admit_replacing(&pkg, &host, |i| i == installer), Ok(()));
+        assert!(admit_replacing(&pkg, &host, |i| i != installer).unwrap_err().taken);
+        // What it asks for is checked all the same.
+        let pkg = Manifest::parse_unchecked("component installer\n image app\n device pci-config 1\n").unwrap();
+        assert_eq!(admit_replacing(&pkg, &host, |_| true).unwrap_err().why, "asks for a device");
     }
 
     #[test]

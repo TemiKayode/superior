@@ -954,7 +954,6 @@ impl<'a> Manager<'a> {
             shutdown(false);
         }
         self.open_disk(service);
-        let mut count = 0;
         for k in 0..package::COUNT {
             match disk_read(package::first(k), 1) {
                 Ok(h) if package::length(h[..ab::SECTOR].try_into().unwrap()).is_none() => continue,
@@ -964,24 +963,32 @@ impl<'a> Manager<'a> {
                     continue;
                 }
             }
-            if self.install(k).is_ok() {
-                count += 1;
-            }
+            // An upgrade cut short leaves two versions: the newer stays.
+            let _ = self.install(k, Mode::Boot);
         }
+        let count = self.installed().count_ones();
         say!("package store: {count} installed");
     }
 
-    /// Checks the package in store slot `k` and starts its components;
-    /// clears the slot if it refuses it. The number of components.
-    fn install(&mut self, k: usize) -> Result<usize, Reply> {
+    /// Checks the package in store slot `k` and starts its components,
+    /// replacing an older version as `mode` allows; clears the slot if it
+    /// refuses it. The number of components and the slot replaced.
+    fn install(&mut self, k: usize, mode: Mode) -> Result<(usize, Option<usize>), Reply> {
         if k >= package::COUNT {
             return Err(Reply::Invalid);
         }
         if self.packages[k].is_some() {
             return Err(Reply::InUse);
         }
-        match self.admit(k) {
-            Ok((bundle, version, pkg)) => {
+        match self.admit(k, mode) {
+            Ok((bundle, version, pkg, replaced)) => {
+                if let Some(j) = replaced {
+                    let old = self.packages[j].map_or(0, |(_, v)| v);
+                    say!("package in store slot {k} (version {version}) replaces slot {j}'s (version {old})");
+                    if self.uninstall(j) != Reply::Ok {
+                        say!("could not clear package store slot {j}");
+                    }
+                }
                 let from = self.next_component;
                 let mut names = [""; MAX_COMPONENTS];
                 let mut n = 0;
@@ -995,7 +1002,7 @@ impl<'a> Manager<'a> {
                 self.packages[k] = Some((bundle, version));
                 say!("installed package in store slot {k} (version {version}): {}", Names(&names[..n]));
                 self.wire(from);
-                Ok(n)
+                Ok((n, replaced))
             }
             Err((why, word, status)) => {
                 if word.is_empty() {
@@ -1012,9 +1019,15 @@ impl<'a> Manager<'a> {
     }
 
     /// Reads store slot `k`'s package into its pages and checks it: the
-    /// publisher's signature, then what it asks for.
+    /// publisher's signature, then what it asks for, then (as `mode`
+    /// allows) whether it replaces an installed package, which it must be
+    /// newer than. The package, its version, and the slot it replaces.
     #[allow(clippy::type_complexity)]
-    fn admit(&mut self, k: usize) -> Result<(Bundle<'a>, u64, Manifest<'a>), (&'static str, &'a str, Reply)> {
+    fn admit(
+        &mut self,
+        k: usize,
+        mode: Mode,
+    ) -> Result<(Bundle<'a>, u64, Manifest<'a>, Option<usize>), (&'static str, &'a str, Reply)> {
         let denied = |why| (why, "", Reply::Denied);
         let invalid = |why| (why, "", Reply::Invalid);
         let key = self.publisher_key().ok_or(denied("no publisher key to check it with"))?;
@@ -1031,8 +1044,31 @@ impl<'a> Manager<'a> {
         let bundle = Bundle::parse(signed.payload).map_err(|e| invalid(bundle_error(e)))?;
         let text = bundle.get("manifest").and_then(|m| core::str::from_utf8(m).ok()).ok_or(invalid("no manifest"))?;
         let pkg = Manifest::parse_unchecked(text).map_err(|e| (e.what, e.word, Reply::Invalid))?;
-        package::admit(&pkg, &self.manifest)
+        // The installed package whose components it names, if they are
+        // all one package's.
+        let mut replaced = None;
+        let mut one = true;
+        for (_, c) in pkg.iter() {
+            for (i, h) in self.manifest.iter() {
+                if h.name == c.name {
+                    match self.origin[i] {
+                        Some(j) if replaced.is_none_or(|r| r == j) => replaced = Some(j),
+                        _ => one = false,
+                    }
+                }
+            }
+        }
+        let replaced = replaced.filter(|_| one && mode != Mode::Install);
+        if mode == Mode::Upgrade && replaced.is_none() && one {
+            return Err(("no installed package for it to replace", "", Reply::NotFound));
+        }
+        package::admit_replacing(&pkg, &self.manifest, |i| replaced.is_some() && self.origin[i] == replaced)
             .map_err(|r| (r.why, r.word, if r.taken { Reply::InUse } else { Reply::Invalid }))?;
+        if let Some((_, old)) = replaced.and_then(|j| self.packages[j]) {
+            if signed.version <= old {
+                return Err(("no newer than the installed one", "", Reply::Denied));
+            }
+        }
         for (_, c) in pkg.iter() {
             if bundle.get(c.image).is_none() {
                 return Err(("its image is not in it", c.image, Reply::Invalid));
@@ -1041,7 +1077,7 @@ impl<'a> Manager<'a> {
         if self.next_component + pkg.len() > MAX_COMPONENTS {
             return Err(("no room for more components", "", Reply::InUse));
         }
-        Ok((bundle, signed.version, pkg))
+        Ok((bundle, signed.version, pkg, replaced))
     }
 
     /// `[OP_UNINSTALL, k]`: stops store slot `k`'s components, forgets
@@ -1094,6 +1130,16 @@ impl<'a> Manager<'a> {
             }
         }
     }
+}
+
+/// How a package may be installed: beside the others only (`OP_INSTALL`),
+/// only in place of an older version (`OP_UPGRADE`), or either (from the
+/// store at boot).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Install,
+    Upgrade,
+    Boot,
 }
 
 /// The two manifests together, once the system's is loaded.
@@ -1637,15 +1683,19 @@ pub extern "C" fn _start(arg: u64) -> ! {
             BADGE_REPORT
                 if i < MAX_COMPONENTS
                     && m.component(i).install_control
-                    && (install::OP_PACKAGES..=install::OP_UNINSTALL).contains(&msg.msg[0]) =>
+                    && ((install::OP_PACKAGES..=install::OP_UNINSTALL).contains(&msg.msg[0])
+                        || msg.msg[0] == install::OP_UPGRADE) =>
             {
                 Some(match msg.msg[0] {
                     install::OP_PACKAGES => [Reply::Ok as u64, m.installed(), 0, 0],
                     install::OP_PACKAGE_SLOT => m.package_slot(),
-                    install::OP_INSTALL => match m.install(msg.msg[1] as usize) {
-                        Ok(n) => [Reply::Ok as u64, n as u64, 0, 0],
-                        Err(e) => [e as u64, 0, 0, 0],
-                    },
+                    install::OP_INSTALL | install::OP_UPGRADE => {
+                        let mode = if msg.msg[0] == install::OP_INSTALL { Mode::Install } else { Mode::Upgrade };
+                        match m.install(msg.msg[1] as usize, mode) {
+                            Ok((n, j)) => [Reply::Ok as u64, n as u64, j.map_or(u64::MAX, |j| j as u64), 0],
+                            Err(e) => [e as u64, 0, 0, 0],
+                        }
+                    }
                     _ => [m.uninstall(msg.msg[1] as usize) as u64, 0, 0, 0],
                 })
             }

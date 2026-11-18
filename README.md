@@ -1378,11 +1378,20 @@ holds the rest):
   capability, state, `install-control` and the like), no heap, no more than 1 MiB
   of memory, 64 KiB untyped blocks or priority 10, and only the services the
   system names with `app-service`. A refused package is cleared from the store.
-  `cargo xtask packages-test` boots one disk three times on both ISAs: five bad
-  packages refused (another key, changed after signing, asking for the disk, a
-  device, the right to install), the app installed, running and calling the
-  installer, and a second copy refused; the app installed again at boot from the
-  store, then uninstalled; and nothing installed after that. The root task's
+  A package upgrades in place (`install::OP_UPGRADE`): signed with a higher
+  version than the installed package whose components it names (and no other
+  package's or the system's), it is checked as an install is, then the old
+  package's components are stopped and forgotten, its slot cleared, and the new
+  one's started; one no newer is refused. The store is installed at boot the
+  same way, so an upgrade cut short between writing the new package and
+  clearing the old leaves the newer. `cargo xtask packages-test` boots one disk
+  three times on both ISAs: five bad packages refused (another key, changed
+  after signing, asking for the disk, a device, the right to install), the app
+  installed, running and calling the installer, a second copy refused, version
+  2 put in its place (it calls in as version 2), version 1 refused in its place,
+  and version 3 written to the store and left; at the next boot version 3
+  installed and version 2 refused and cleared, then uninstalled; and nothing
+  installed after that. The root task's
   stack is 128 KiB, as the manager's state and manifests outgrew 64 KiB.
 - Interrupt and exception entries clear the direction flag. User code may be
   interrupted mid-way through a backward copy, with the flag set; the kernel's own
@@ -1451,8 +1460,7 @@ AArch64 by the firmware), measurements extended into a TPM and attestation,
 the boot bundle itself in A/B slots (it is built into the kernel image), a
 rollback counter kept in tamper-resistant storage (the floor is on the system
 disk, and the kernel's oldest version built into it), a boot record written
-atomically (two copies), an updater that downloads, package versions and
-upgrades in place, apps that provide services, a package store on a
+atomically (two copies), an updater that downloads, apps that provide services, a package store on a
 filesystem rather than fixed disk slots, an app's right to the control
 capability (today any component holding one may shut the machine down), and release keys kept off the build machine; the IDL describing interfaces other than the bus server's; escalating a component
 given up on to a supervisor above it (today the

@@ -765,6 +765,17 @@ pub mod install {
     /// `[OP_UNINSTALL, slot]`: stops the package's components and clears
     /// its slot. Reply `[status]`.
     pub const OP_UNINSTALL: u64 = 15;
+    /// `[OP_UPGRADE, slot]`: the package written there replaces the
+    /// installed package whose components it names (a component of the
+    /// same name in no other package or the system): signed with a higher
+    /// version, it is checked as `OP_INSTALL` checks, the old package's
+    /// components are stopped and forgotten and its slot cleared, and the
+    /// new one's started. Reply `[status, components, slot replaced]`:
+    /// `Denied` also if it is no newer than the installed one, `NotFound`
+    /// if no installed package has a component it names. A refused
+    /// package is cleared from the store. At boot the store is installed
+    /// the same way, so of two versions left there the newer stays.
+    pub const OP_UPGRADE: u64 = 20;
 }
 
 /// Launching apps: calls to the Component Manager from a component with
