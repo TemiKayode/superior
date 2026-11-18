@@ -535,9 +535,107 @@ fn alpine_files(arch: Arch) -> Result<(Vec<u8>, Vec<u8>), String> {
 /// `echo`, `uname` (a system call answered with a structure), the shell
 /// with arithmetic and an exit status, and `awk` with floating point (the
 /// FPU's registers are the program's own).
+/// What the Linux test types into the shell on the terminal, after the
+/// batch runs: each step's bytes, what must then appear, and whether the
+/// prompt must come back after it.
+const LINUX_SESSION: &[(&str, &str, bool)] = &[
+    ("", "", true),
+    ("echo $((6 * 7))\n", "\n42", true),
+    ("[ -t 0 ] && echo stdin is a terminal\n", "\nstdin is a terminal", true),
+    ("stty size\n", "\n24 80", true),
+    ("trap 'echo caught USR1' USR1; kill -USR1 $$\n", "\ncaught USR1", true),
+    // A foreground job interrupted from the keyboard: ^C sends SIGINT to
+    // its process group, and the shell reports 128 + 2.
+    ("sh -c 'echo started; sleep 100'\n", "\nstarted", false),
+    ("\x03", "", true),
+    ("echo status $?\n", "\nstatus 130", true),
+    ("exit\n", "", false),
+];
+const LINUX_PROMPT: &str = "linux$ ";
+
+/// Boots `img` and types `script` into the Linux personality's terminal
+/// (see [`LINUX_SESSION`]); all the output once QEMU exits with the pass
+/// code.
+fn drive_linux(img: &Image, script: &[(&str, &str, bool)]) -> Result<String, String> {
+    let mut child = qemu_command(img)
+        .args(["-display", "none"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("could not start QEMU ({}): {e}", qemu(img.arch).display()))?;
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+    let seen = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let sink = Arc::clone(&seen);
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 256];
+        while let Ok(n) = stdout.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            let _ = std::io::stdout().write_all(&buf[..n]);
+            let _ = std::io::stdout().flush();
+            sink.lock().unwrap().extend_from_slice(&buf[..n]);
+        }
+    });
+    // The batch runs come first: the first prompt may take a while.
+    let expect = |want: &str, from: usize| -> Result<usize, String> {
+        let deadline = Instant::now() + scaled(Duration::from_secs(120));
+        loop {
+            {
+                let out = seen.lock().unwrap();
+                let text = String::from_utf8_lossy(&out[from.min(out.len())..]).into_owned();
+                if let Some(i) = text.find(want) {
+                    return Ok(from + text[..i].len() + want.len());
+                }
+            }
+            if Instant::now() > deadline {
+                return Err(format!("Linux session: timed out waiting for {want:?}"));
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    let mut at = 0;
+    let mut result = Ok(());
+    for (typed, want, prompt) in script {
+        // A byte at a time, as from a keyboard.
+        for b in typed.bytes() {
+            stdin.write_all(&[b]).map_err(|e| e.to_string())?;
+            stdin.flush().map_err(|e| e.to_string())?;
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let step = expect(want, at).and_then(|p| if *prompt { expect(LINUX_PROMPT, p) } else { Ok(p) });
+        match step {
+            Ok(p) => at = p,
+            Err(e) => {
+                result = Err(e);
+                break;
+            }
+        }
+    }
+    let deadline = Instant::now() + scaled(Duration::from_secs(60));
+    let status = loop {
+        if let Some(s) = child.try_wait().map_err(|e| e.to_string())? {
+            break Some(s);
+        }
+        if Instant::now() > deadline || result.is_err() {
+            let _ = child.kill();
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    println!();
+    result?;
+    let out = String::from_utf8_lossy(&seen.lock().unwrap()).into_owned();
+    match status.and_then(|s| s.code()) {
+        Some(QEMU_PASS) => Ok(out),
+        code => Err(format!("QEMU did not exit with the pass code (exit {code:?})")),
+    }
+}
+
 fn linux_test(img: &Image) -> Result<(), String> {
     println!("== Linux personality test on {}", img.path.display());
-    let out = run_to_exit(img, Duration::from_secs(60))?;
+    let out = drive_linux(img, LINUX_SESSION)?;
     let isa = if img.arch == Arch::X86_64 { "x86_64" } else { "aarch64" };
     let interp = format!("interpreter /lib/ld-musl-{isa}.so.1)");
     let machine = format!("linux: > Linux {isa}");
@@ -575,6 +673,15 @@ fn linux_test(img: &Image) -> Result<(), String> {
         "linux: > second line",
         "linux: cat /tmp/notes/c exited with status 0",
         "linux: > cat said 1",
+        // Signals.
+        "linux: > trapped USR1",
+        "linux: > after the trap",
+        "linux: > status after kill 143",
+        "linux: sh -c yes | head -n 3 | wc -l exited with status 0",
+        "linux: > slept",
+        // The terminal session (its steps were checked as it ran).
+        "linux: running sh (pid ",
+        "linux: sh exited with status 0",
         "[cm] linux asked to shut down (pass)",
     ];
     if let Err(step) = find_in_order(&out, &steps) {

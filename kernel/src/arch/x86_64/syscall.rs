@@ -142,6 +142,69 @@ impl UserFrame {
         self.rax = value;
     }
 
+    /// Register `i` in Linux's `sigcontext` order (`r8`-`r15`, `rdi`,
+    /// `rsi`, `rbp`, `rbx`, `rdx`, `rax`, `rcx`, `rsp`, `rip`, `eflags`).
+    pub fn linux_reg(&self, i: u64) -> Option<u64> {
+        Some(match i {
+            0 => self.r8,
+            1 => self.r9,
+            2 => self.r10,
+            3 => self.r11,
+            4 => self.r12,
+            5 => self.r13,
+            6 => self.r14,
+            7 => self.r15,
+            8 => self.rdi,
+            9 => self.rsi,
+            10 => self.rbp,
+            11 => self.rbx,
+            12 => self.rdx,
+            13 => self.rax,
+            14 => self.rcx,
+            15 => self.rsp,
+            16 => self.rip,
+            17 => self.rflags,
+            _ => return None,
+        })
+    }
+
+    /// Sets register `i` as [`UserFrame::linux_reg`] numbers them. The
+    /// instruction and stack pointers must be in `user` (an `iretq` to a
+    /// non-canonical address would fault in the kernel); of the flags only
+    /// the arithmetic ones and the direction flag are taken (not the trap
+    /// flag, the interrupt flag or the I/O privilege level). False if `v`
+    /// is refused.
+    pub fn set_linux_reg(&mut self, i: u64, v: u64, user: core::ops::Range<u64>) -> bool {
+        const TAKEN: u64 = 0x1 | 0x4 | 0x10 | 0x40 | 0x80 | 0x400 | 0x800;
+        let r = match i {
+            0 => &mut self.r8,
+            1 => &mut self.r9,
+            2 => &mut self.r10,
+            3 => &mut self.r11,
+            4 => &mut self.r12,
+            5 => &mut self.r13,
+            6 => &mut self.r14,
+            7 => &mut self.r15,
+            8 => &mut self.rdi,
+            9 => &mut self.rsi,
+            10 => &mut self.rbp,
+            11 => &mut self.rbx,
+            12 => &mut self.rdx,
+            13 => &mut self.rax,
+            14 => &mut self.rcx,
+            15 | 16 if !user.contains(&v) => return false,
+            15 => &mut self.rsp,
+            16 => &mut self.rip,
+            17 => {
+                self.rflags = self.rflags & !TAKEN | v & TAKEN;
+                return true;
+            }
+            _ => return true,
+        };
+        *r = v;
+        true
+    }
+
     /// A system call made Linux's way: its number, six arguments and the
     /// stack pointer.
     pub fn foreign_syscall(&self) -> [u64; 8] {

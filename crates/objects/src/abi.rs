@@ -508,6 +508,19 @@ pub const REGS_FOREIGN: u64 = 4;
 /// (`rax`, `x0`). The thread must be configured and not yet started; it
 /// starts where the other will resume.
 pub const REGS_FORK_FROM: u64 = 5;
+/// Four of the thread's registers from index `rdx`, in Linux's
+/// `sigcontext` order (x86-64: `r8`-`r15`, `rdi`, `rsi`, `rbp`, `rbx`,
+/// `rdx`, `rax`, `rcx`, `rsp`, `rip`, `eflags`; AArch64: `x0`-`x30`, `sp`,
+/// `pc`, `pstate`); past the last, 0. For a signal handler's frame.
+pub const REGS_GET: u64 = 6;
+/// Sets registers `rdx` and `rdx + 1` (in [`REGS_GET`]'s order) to `r8`
+/// and `r9`, of a thread stopped in a fault (waiting for its handler) or
+/// not started. The program counter and stack pointer must lie in user
+/// space; of the flags only the arithmetic ones (and on x86-64 the
+/// direction flag) are taken. An index past the last is ignored.
+pub const REGS_SET: u64 = 7;
+/// How many registers [`REGS_GET`] numbers.
+pub const REGS_COUNT: u64 = if cfg!(target_arch = "x86_64") { 18 } else { 34 };
 
 /// [`Syscall::FrameMapInto`] flags.
 pub const MAP_WRITE: u64 = 1;

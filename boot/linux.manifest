@@ -25,3 +25,6 @@ component linux
   file busybox 200
   untyped 23 0
   control 1
+  # The terminal: the serial console's UART and its interrupt.
+  device uart 3
+  device uart-irq 4

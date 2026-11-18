@@ -36,18 +36,28 @@
 //! `PROC_SLOTS + i * PROC_SPAN`: its address space, thread, badged fault
 //! endpoint, then its pages.
 //!
-//! Not yet: signals, threads (`clone` with `CLONE_VM`), terminals, the
-//! filesystem server underneath, fixed-address (non-PIE) executables.
+//! Signals ([`signal`]): actions, masks, `kill`, handlers run on the
+//! process's stack and returned from. The terminal ([`tty`]): the serial
+//! console with Linux's line discipline, settings and foreground process
+//! group, so `^C` interrupts a job; `poll` and `nanosleep` wait on it and
+//! on the timer.
+//!
+//! Not yet: threads (`clone` with `CLONE_VM`), stopping and continuing
+//! jobs (`^Z`), the filesystem server underneath, fixed-address (non-PIE)
+//! executables.
 
 #![no_std]
 #![no_main]
 
 mod fs;
+mod signal;
+mod tty;
 
 use fs::{FileKind, Fs, Kind, Open, Pipe, MAX_FILES, MAX_PIPES, PIPE_BUF, ROOT};
+use signal::{Action, Next, SA_RESTART, SIGCHLD, SIGPIPE, SIGSEGV, SYSCALL_LEN, TRAMPOLINE, TRAMPOLINE_CODE};
 use superior_objects::abi::{
-    FaultKind, FaultReply, MAP_EXEC, MAP_WRITE, ObjectType, REGS_FOREIGN, REGS_FORK_FROM, REGS_SET_TLS,
-    REGS_SYSCALL, REGS_SYSCALL_MORE, REGS_TLS, Syscall, TICK_HZ,
+    Error, FaultKind, FaultReply, MAP_EXEC, MAP_WRITE, ObjectType, REGS_COUNT, REGS_FOREIGN, REGS_FORK_FROM, REGS_GET,
+    REGS_SET, REGS_SET_TLS, REGS_SYSCALL, REGS_SYSCALL_MORE, REGS_TLS, Syscall, TICK_HZ,
 };
 use superior_objects::elf::{Elf, Machine};
 use superior_sys::{USER_BASE, print_line, syscall};
@@ -59,6 +69,12 @@ macro_rules! say {
 const UNTYPED: u64 = 0;
 const CONTROL: u64 = 1;
 const EP: u64 = 2;
+/// The notification this server's thread is bound to (so `Recv` also
+/// returns when it is signalled), and two badged copies of it: the UART's
+/// interrupt (bit 0) and the timer for sleepers (bit 1).
+const NTFN: u64 = 5;
+const NTFN_UART: u64 = 6;
+const NTFN_TIMER: u64 = 7;
 const BLOCKS: u64 = 8;
 const BLOCK_BITS: u64 = 20;
 const INTERP_FILE: u64 = 16;
@@ -66,6 +82,8 @@ const PROGRAM_FILE: u64 = 200;
 const STATE_SLOTS: u64 = 512;
 const STATE_PAGES: u64 = 24;
 const POOL_SLOTS: u64 = STATE_SLOTS + STATE_PAGES;
+/// The signal restorer's page ([`signal::TRAMPOLINE`]).
+const TRAMPOLINE_SLOT: u64 = 1000;
 const PROC_SLOTS: u64 = 1024;
 const PROC_SPAN: u64 = 1024;
 const MAX_PROCS: usize = 7;
@@ -81,6 +99,7 @@ const INTERP_VA: u64 = USER_BASE + 0x1_0000_0000;
 const PROGRAM_VA: u64 = USER_BASE + 0x1_1000_0000;
 const STATE_VA: u64 = USER_BASE + 0x1_2000_0000;
 const POOL_VA: u64 = USER_BASE + 0x1_3000_0000;
+const TRAMPOLINE_VA: u64 = USER_BASE + 0x1_4000_0000;
 
 /// A process's address space: everything inside [`CHILD`, `CHILD_END`).
 const CHILD: u64 = USER_BASE + 0x40_0000_0000;
@@ -101,6 +120,9 @@ const PLATFORM: &str = if cfg!(target_arch = "x86_64") { "x86_64" } else { "aarc
 
 // Linux error numbers (and those in `fs`).
 use fs::{EBADF, EEXIST, EINVAL, EISDIR, ENFILE, ENOENT, ENOTDIR, EPIPE};
+const EPERM: u64 = 1;
+const ESRCH: u64 = 3;
+const EINTR: u64 = 4;
 const ENOEXEC: u64 = 8;
 const ECHILD: u64 = 10;
 const EAGAIN: u64 = 11;
@@ -138,7 +160,7 @@ const fn err(e: u64) -> u64 {
 
 /// The system calls answered, Linux's names; [`decode`] maps each ISA's
 /// numbers and turns the old x86-64 path calls into their `*at` forms.
-// Some exist only in x86-64's table (`fork`, `dup2`, `arch_prctl`).
+// Some exist only in x86-64's table (`fork`, `dup2`, `arch_prctl`, `pause`).
 #[cfg_attr(target_arch = "aarch64", allow(dead_code))]
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Sys {
@@ -193,11 +215,31 @@ enum Sys {
     Quiet,
     /// `EINVAL`: callers copy by reading and writing instead.
     Sendfile,
+    Sigaction,
+    Sigprocmask,
+    Sigpending,
+    Sigsuspend,
+    Sigreturn,
+    Pause,
+    Kill,
+    /// `tkill` and `tgkill`, the thread id first: a process's one thread
+    /// is the process.
+    Tkill,
+    /// `clock_nanosleep`'s arguments; `nanosleep` becomes one.
+    Nanosleep,
+    Getsid,
+    Setsid,
+    /// `poll`'s arguments, the timeout in milliseconds.
+    Poll,
+    /// `ppoll`'s, the timeout a `timespec`.
+    Ppoll,
     Unsupported(u64),
 }
 
 /// The call and its arguments, normalized.
 fn decode(nr: u64, a: [u64; 6]) -> (Sys, [u64; 6]) {
+    // x86-64's old path calls become their `*at` forms.
+    #[cfg(target_arch = "x86_64")]
     let cwd = AT_FDCWD as i64 as u64;
     #[cfg(target_arch = "x86_64")]
     let s = match nr {
@@ -210,7 +252,20 @@ fn decode(nr: u64, a: [u64; 6]) -> (Sys, [u64; 6]) {
         6 => return (Sys::Fstatat, [cwd, a[0], a[1], AT_SYMLINK_NOFOLLOW, 0, 0]),
         8 => Sys::Lseek,
         9 => Sys::Mmap,
-        10 | 28 | 13 | 14 | 131 | 273 | 90..=94 | 268 | 260 | 280 | 105 | 106 | 62 | 234 | 24 | 35 | 230 => Sys::Zero,
+        10 | 28 | 131 | 273 | 90..=94 | 268 | 260 | 280 | 105 | 106 | 24 => Sys::Zero,
+        7 => Sys::Poll,
+        271 => Sys::Ppoll,
+        13 => Sys::Sigaction,
+        14 => Sys::Sigprocmask,
+        15 => Sys::Sigreturn,
+        34 => Sys::Pause,
+        35 => return (Sys::Nanosleep, [0, 0, a[0], a[1], 0, 0]),
+        62 => Sys::Kill,
+        127 => Sys::Sigpending,
+        130 => Sys::Sigsuspend,
+        200 => Sys::Tkill,
+        230 => Sys::Nanosleep,
+        234 => return (Sys::Tkill, [a[1], a[2], 0, 0, 0, 0]),
         11 => Sys::Munmap,
         12 => Sys::Brk,
         16 => Sys::Ioctl,
@@ -246,7 +301,10 @@ fn decode(nr: u64, a: [u64; 6]) -> (Sys, [u64; 6]) {
         102 | 104 | 107 | 108 => Sys::Zero,
         109 => Sys::Setpgid,
         110 => Sys::Getppid,
-        111 | 112 | 121 | 124 => Sys::Getpgid,
+        111 => return (Sys::Getpgid, [0; 6]),
+        112 => Sys::Setsid,
+        121 => Sys::Getpgid,
+        124 => Sys::Getsid,
         158 => Sys::ArchPrctl,
         217 => Sys::Getdents64,
         228 => Sys::ClockGettime,
@@ -297,15 +355,26 @@ fn decode(nr: u64, a: [u64; 6]) -> (Sys, [u64; 6]) {
         113 => Sys::ClockGettime,
         153 => Sys::Times,
         154 => Sys::Setpgid,
-        155..=157 => Sys::Getpgid,
+        155 => Sys::Getpgid,
+        156 => Sys::Getsid,
+        157 => Sys::Setsid,
         160 => Sys::Uname,
         163 => Sys::Getrlimit,
         166 => Sys::Umask,
         169 => Sys::Gettimeofday,
         173 => Sys::Getppid,
-        174..=177 | 99 | 101 | 115 | 124 | 129 | 131 | 132 | 134 | 135 | 144 | 146 | 52..=55 | 88 | 226 | 233 => {
-            Sys::Zero
-        }
+        174..=177 | 99 | 124 | 132 | 144 | 146 | 52..=55 | 88 | 226 | 233 => Sys::Zero,
+        101 => return (Sys::Nanosleep, [0, 0, a[0], a[1], 0, 0]),
+        115 => Sys::Nanosleep,
+        73 => Sys::Ppoll,
+        129 => Sys::Kill,
+        130 => Sys::Tkill,
+        131 => return (Sys::Tkill, [a[1], a[2], 0, 0, 0, 0]),
+        133 => Sys::Sigsuspend,
+        134 => Sys::Sigaction,
+        135 => Sys::Sigprocmask,
+        136 => Sys::Sigpending,
+        139 => Sys::Sigreturn,
         214 => Sys::Brk,
         215 => Sys::Munmap,
         216 => return (Sys::Mmap, [0; 6]),
@@ -346,11 +415,20 @@ enum Blocked {
     Write { fd: u64, buf: u64, len: u64 },
     Writev { fd: u64, iov: u64, cnt: u64 },
     Wait { pid: i64, status: u64, options: u64 },
+    /// `nanosleep`, until this tick.
+    Sleep { until: u64 },
+    /// `sigsuspend` or `pause`: until a signal is taken.
+    Suspend,
+    /// `poll`: until a descriptor is ready, or the tick `until`.
+    Poll { fds: u64, n: u64, until: u64 },
 }
 
 /// What a system call comes to.
 enum Out {
     Ret(u64),
+    /// Resume elsewhere (`rt_sigreturn`): at `pc`, with `value` in the
+    /// result register.
+    Resume { pc: u64, value: u64 },
     Block(Blocked),
     /// The thread that asked is gone (it exited or became another
     /// program): no answer.
@@ -362,6 +440,16 @@ struct Proc {
     zombie: bool,
     pid: u32,
     ppid: u32,
+    /// Its process group and session.
+    pgid: u32,
+    sid: u32,
+    /// Signals sent and not yet taken; held back; the mask to restore
+    /// after a `sigsuspend` (`suspended`); what each signal does.
+    pending: u64,
+    mask: u64,
+    saved_mask: u64,
+    suspended: bool,
+    actions: [Action; 64],
     /// Its wait status once a zombie.
     status: u32,
     /// Slots used of its span.
@@ -398,7 +486,7 @@ struct State {
     pipes: [Pipe; MAX_PIPES],
     procs: [Proc; MAX_PROCS],
     next_pid: u32,
-    shared: [Shared; 8],
+    shared: [Shared; 12],
     nshared: usize,
     /// Console output not yet printed: the line being written.
     line: [u8; 160],
@@ -407,6 +495,8 @@ struct State {
     top_status: Option<u32>,
     program: &'static [u8],
     interp: &'static [u8],
+    /// The terminal (the serial console).
+    tty: tty::Tty,
 }
 
 const _: () = assert!(core::mem::size_of::<State>() as u64 <= STATE_PAGES * PAGE);
@@ -653,6 +743,9 @@ impl State {
         p.cloexec = 0;
         p.blocked = Blocked::None;
         p.present = [0; CHILD_PAGES / 64];
+        (p.pgid, p.sid) = (pid, pid);
+        (p.pending, p.mask, p.saved_mask, p.suspended) = (0, 0, 0, false);
+        p.actions = [Action { handler: 0, flags: 0, restorer: 0, mask: 0 }; 64];
         Some(i)
     }
 
@@ -799,9 +892,14 @@ impl State {
                 }
             }
         }
+        let ppid = self.procs[i].ppid;
+        if let Some(parent) = self.procs.iter().position(|q| q.used && !q.zombie && q.pid == ppid) {
+            self.post(parent, SIGCHLD);
+        }
         let p = &mut self.procs[i];
         p.zombie = true;
         p.status = status;
+        p.blocked = Blocked::None;
         if p.ppid == 0 {
             p.used = false;
             if self.top_status.is_none() && pid == self.first_pid() {
@@ -921,6 +1019,7 @@ fn mode_of(kind: Kind) -> u32 {
         Kind::Symlink => 0o120777,
         Kind::Program | Kind::Interp => 0o100755,
         Kind::Null => 0o20666,
+        Kind::Tty => 0o20620,
         Kind::Free => 0,
     }
 }
@@ -949,7 +1048,52 @@ fn answer(st: &mut State, i: usize, call: Sys, a: [u64; 6]) -> Out {
         Sys::Fstatat => r(fstatat(st, i, a)),
         Sys::Lseek => r(lseek(st, i, a[0], a[1] as i64, a[2])),
         Sys::Getdents64 => r(getdents(st, i, a[0], a[1], a[2])),
-        Sys::Ioctl => Ret(err(ENOTTY)),
+        Sys::Ioctl => r(ioctl(st, i, a[0], a[1], a[2])),
+        Sys::Sigaction => r(st.sigaction(i, a[0], a[1], a[2])),
+        Sys::Sigprocmask => r(st.sigprocmask(i, a[0], a[1], a[2])),
+        Sys::Sigpending => {
+            let p = &st.procs[i];
+            let pending = p.pending & p.mask;
+            r(st.put(i, a[0], &pending.to_le_bytes()))
+        }
+        Sys::Sigsuspend => st.sigsuspend(i, Some(a[0])),
+        Sys::Pause => st.sigsuspend(i, None),
+        Sys::Sigreturn => match st.sigreturn(i) {
+            Some((pc, value)) => Out::Resume { pc, value },
+            None => {
+                st.exit(i, SIGSEGV);
+                Out::Gone
+            }
+        },
+        Sys::Kill => r(st.kill(i, a[0] as i32 as i64, a[1])),
+        Sys::Tkill if (a[0] as i32) <= 0 => Ret(err(EINVAL)),
+        Sys::Tkill => r(st.kill(i, a[0] as i32 as i64, a[1])),
+        Sys::Nanosleep => nanosleep(st, i, a[1], a[2]),
+        Sys::Poll => {
+            let ms = a[2] as i32;
+            let until = if ms < 0 { u64::MAX } else { superior_sys::ticks() + (ms as u64 * TICK_HZ).div_ceil(1000) };
+            poll(st, i, a[0], a[1], until)
+        }
+        Sys::Ppoll => {
+            let until = if a[2] == 0 {
+                u64::MAX
+            } else {
+                match (st.word(i, a[2]), st.word(i, a[2] + 8)) {
+                    (Some(sec), Some(ns)) => superior_sys::ticks() + sec * TICK_HZ + (ns * TICK_HZ).div_ceil(1_000_000_000),
+                    _ => return Ret(err(EFAULT)),
+                }
+            };
+            poll(st, i, a[0], a[1], until)
+        }
+        Sys::Getsid => r(group_of(st, i, a[0]).map(|k| st.procs[k].sid as u64)),
+        Sys::Setsid => {
+            let p = &mut st.procs[i];
+            if p.pgid == p.pid {
+                return Ret(err(EPERM));
+            }
+            (p.sid, p.pgid) = (p.pid, p.pid);
+            Ret(p.pid as u64)
+        }
         Sys::Faccessat => r(st.dir_of(i, a[0]).and_then(|d| {
             let mut path = [0u8; 256];
             let n = st.cstr(i, a[1], &mut path)?;
@@ -1015,9 +1159,11 @@ fn answer(st: &mut State, i: usize, call: Sys, a: [u64; 6]) -> Out {
         Sys::Renameat => r(renameat(st, i, a)),
         Sys::Readlinkat => r(readlinkat(st, i, a)),
         Sys::Umask => Ret(0o22),
-        Sys::Getpid | Sys::Getpgid => Ret(st.procs[i].pid as u64),
+        Sys::Getpid => Ret(st.procs[i].pid as u64),
+        Sys::Getpgid => r(group_of(st, i, a[0]).map(|k| st.procs[k].pgid as u64)),
         Sys::Getppid => Ret(st.procs[i].ppid as u64),
-        Sys::Setpgid | Sys::Zero => Ret(0),
+        Sys::Setpgid => r(setpgid(st, i, a[0], a[1])),
+        Sys::Zero => Ret(0),
         Sys::Brk => Ret(brk(st, i, a[0])),
         Sys::Mmap => r(mmap(st, i, a)),
         Sys::Munmap => Ret(0),
@@ -1120,7 +1266,8 @@ fn openat(st: &mut State, i: usize, a: [u64; 6]) -> Result<u64, u64> {
     if flags & O_TRUNC != 0 && writing && kind == Kind::File {
         st.fs.truncate(ino, 0)?;
     }
-    let f = st.new_file(FileKind::Node, ino, 0, flags).ok_or(ENFILE)?;
+    let fk = if kind == Kind::Tty { FileKind::Tty } else { FileKind::Node };
+    let f = st.new_file(fk, ino, 0, flags).ok_or(ENFILE)?;
     st.new_fd(i, f, 0, flags & O_CLOEXEC != 0).inspect_err(|_| st.files[f].kind = FileKind::Closed)
 }
 
@@ -1129,7 +1276,7 @@ fn fstat(st: &mut State, i: usize, fd: u64, buf: u64) -> Result<u64, u64> {
     let o = st.files[f];
     let s = match o.kind {
         FileKind::Node => stat_bytes(mode_of(st.fs.kind(o.ino)), o.ino as u64, st.fs.size(o.ino)),
-        FileKind::Console => stat_bytes(0o20620, 0, 0),
+        FileKind::Console | FileKind::Tty => stat_bytes(0o20620, 0, 0),
         _ => stat_bytes(0o10600, 0, st.pipes[o.pipe as usize].len as u64),
     };
     st.put(i, buf, &s[..STAT_LEN])
@@ -1266,6 +1413,13 @@ fn read(st: &mut State, i: usize, fd: u64, buf: u64, len: u64) -> Out {
     let want = len.min(tmp.len() as u64) as usize;
     let n = match o.kind {
         FileKind::Console => 0,
+        FileKind::Tty if !st.tty.readable() => {
+            if o.flags & O_NONBLOCK != 0 {
+                return Out::Ret(err(EAGAIN));
+            }
+            return Out::Block(Blocked::Read { fd, buf, len });
+        }
+        FileKind::Tty => st.tty.read(&mut tmp[..want]),
         FileKind::Node => match st.fs.kind(o.ino) {
             Kind::Dir => return Out::Ret(err(EISDIR)),
             _ if o.flags & O_ACCMODE == O_WRONLY => return Out::Ret(err(EBADF)),
@@ -1301,6 +1455,7 @@ fn write(st: &mut State, i: usize, fd: u64, buf: u64, len: u64) -> Out {
         FileKind::PipeWrite => {
             let pipe = &st.pipes[o.pipe as usize];
             if pipe.readers == 0 {
+                st.post(i, SIGPIPE);
                 return Out::Ret(err(EPIPE));
             }
             let room = PIPE_BUF - pipe.len as usize;
@@ -1313,7 +1468,7 @@ fn write(st: &mut State, i: usize, fd: u64, buf: u64, len: u64) -> Out {
             room.min(len as usize)
         }
         FileKind::Node if o.flags & O_ACCMODE == 0 => return Out::Ret(err(EBADF)),
-        FileKind::Console | FileKind::Node => len.min(tmp.len() as u64) as usize,
+        FileKind::Console | FileKind::Tty | FileKind::Node => len.min(tmp.len() as u64) as usize,
         _ => return Out::Ret(err(EBADF)),
     };
     if !st.copy_in(i, buf, &mut tmp[..n]) {
@@ -1322,6 +1477,10 @@ fn write(st: &mut State, i: usize, fd: u64, buf: u64, len: u64) -> Out {
     Out::Ret(match o.kind {
         FileKind::Console => {
             st.output(&tmp[..n]);
+            n as u64
+        }
+        FileKind::Tty => {
+            st.tty.write(&tmp[..n]);
             n as u64
         }
         FileKind::PipeWrite => st.pipes[o.pipe as usize].put(&tmp[..n]) as u64,
@@ -1495,8 +1654,10 @@ fn fork(st: &mut State, i: usize) -> Result<u64, u64> {
     for &f in fds.iter().filter(|&&f| f != 0) {
         st.files[f as usize - 1].refs += 1;
     }
+    let (pgid, sid, mask, actions) = (st.procs[i].pgid, st.procs[i].sid, st.procs[i].mask, st.procs[i].actions);
     let p = &mut st.procs[c];
     (p.fds, p.cloexec, p.cwd, p.brk_start, p.brk, p.mmap_next) = (fds, cloexec, cwd, b0, b1, m);
+    (p.pgid, p.sid, p.mask, p.actions) = (pgid, sid, mask, actions);
     if st.start(c, CHILD + PAGE, CHILD + 2 * PAGE, Some(i)).is_err() {
         for fd in 0..MAX_FDS {
             st.close(c, fd);
@@ -1541,6 +1702,7 @@ fn execve(st: &mut State, i: usize, path: u64, argv: u64, envp: u64) -> Result<(
             st.close(i, fd);
         }
     }
+    st.reset_handlers(i);
     if let Err(why) = st.exec(i, &args, &env, &name[..n]) {
         say!("linux: pid {}: exec failed after the old program was gone: {why}", st.procs[i].pid);
         st.exit(i, 127 << 8);
@@ -1568,8 +1730,35 @@ fn wait4(st: &mut State, i: usize, pid: i64, status: u64, options: u64) -> Out {
     Out::Ret(cpid as u64)
 }
 
-/// Tries every waiting call again, answering those that can go on, until
-/// none can.
+/// Answers process `i`'s call with `value`, resuming at `pc` (the call
+/// just received if `place` is `None`, else the one set aside there),
+/// unless a signal it must take comes first: then it ends, or starts in
+/// the handler with that answer saved for after.
+fn finish(st: &mut State, i: usize, pc: u64, value: u64, place: Option<u64>) {
+    let (pc, value) = match st.next_signal(i) {
+        Next::None => (pc, value),
+        Next::Kill(sig) => {
+            st.exit(i, sig);
+            return;
+        }
+        Next::Handle(sig) => match st.enter_handler(i, sig, pc, Some(value)) {
+            Some(at) => at,
+            None => {
+                st.exit(i, SIGSEGV);
+                return;
+            }
+        },
+    };
+    let msg = [FaultReply::ResumeAt as u64, pc, value, 0];
+    match place {
+        None => syscall(Syscall::Reply, 0, msg),
+        Some(place) => syscall(Syscall::ReplyTo, place, msg),
+    };
+}
+
+/// Tries every waiting call again, answering those that can go on, and
+/// acts on signals: a process waiting in a call is interrupted for a
+/// handler, and any process a signal ends is ended. Until nothing moves.
 fn wake(st: &mut State) {
     loop {
         let mut moved = false;
@@ -1578,36 +1767,107 @@ fn wake(st: &mut State) {
             if !p.used || p.zombie {
                 continue;
             }
-            let out = match p.blocked {
-                Blocked::None => continue,
+            let blocked = p.blocked;
+            let out = match blocked {
+                Blocked::None => {
+                    // Running: only a signal that ends it acts now.
+                    if let Next::Kill(sig) = st.next_signal(i) {
+                        st.exit(i, sig);
+                        moved = true;
+                    }
+                    continue;
+                }
                 Blocked::Read { fd, buf, len } => read(st, i, fd, buf, len),
                 Blocked::Write { fd, buf, len } => write(st, i, fd, buf, len),
                 Blocked::Writev { fd, iov, cnt } => writev(st, i, fd, iov, cnt),
                 Blocked::Wait { pid, status, options } => wait4(st, i, pid, status, options),
+                Blocked::Sleep { until } if superior_sys::ticks() >= until => Out::Ret(0),
+                Blocked::Poll { fds, n, until } => poll(st, i, fds, n, until),
+                Blocked::Sleep { .. } | Blocked::Suspend => Out::Block(blocked),
             };
+            let (place, pc) = (st.procs[i].place, st.procs[i].pc);
             if let Out::Ret(v) = out {
-                let p = &mut st.procs[i];
-                p.blocked = Blocked::None;
-                syscall(Syscall::ReplyTo, p.place, [FaultReply::ResumeAt as u64, p.pc, v, 0]);
+                st.procs[i].blocked = Blocked::None;
+                finish(st, i, pc, v, Some(place));
                 moved = true;
+                continue;
+            }
+            match st.next_signal(i) {
+                Next::None => {}
+                Next::Kill(sig) => {
+                    st.exit(i, sig);
+                    moved = true;
+                }
+                Next::Handle(sig) => {
+                    // Interrupted: EINTR after the handler, or with
+                    // SA_RESTART the call made again.
+                    let restart = st.procs[i].actions[sig as usize - 1].flags & SA_RESTART != 0
+                        && matches!(blocked, Blocked::Read { .. } | Blocked::Write { .. } | Blocked::Writev { .. } | Blocked::Wait { .. });
+                    st.procs[i].blocked = Blocked::None;
+                    let entered = if restart {
+                        st.enter_handler(i, sig, pc - SYSCALL_LEN, None)
+                    } else {
+                        st.enter_handler(i, sig, pc, Some(err(EINTR)))
+                    };
+                    match entered {
+                        Some((at, v)) => {
+                            syscall(Syscall::ReplyTo, place, [FaultReply::ResumeAt as u64, at, v, 0]);
+                        }
+                        None => st.exit(i, SIGSEGV),
+                    }
+                    moved = true;
+                }
             }
         }
         if !moved {
-            return;
+            break;
         }
     }
+    // The timer for the next sleeper to wake, if any.
+    let next = st
+        .procs
+        .iter()
+        .filter(|p| p.used && !p.zombie)
+        .filter_map(|p| match p.blocked {
+            Blocked::Sleep { until } => Some(until),
+            Blocked::Poll { until, .. } if until != u64::MAX => Some(until),
+            _ => None,
+        })
+        .min();
+    let ticks = next.map_or(0, |until| until.saturating_sub(superior_sys::ticks()).max(1));
+    syscall(Syscall::TimerSignal, NTFN_TIMER, [ticks, 0, 0, 0]);
+}
+
+/// Typed bytes from the UART: into the terminal, signals to its
+/// foreground group.
+fn uart_input(st: &mut State) {
+    while let Some(b) = tty::uart::try_read() {
+        if let Some(sig) = st.tty.input(b) {
+            let fg = st.tty.fg;
+            st.post_group(fg, sig);
+        }
+    }
+    tty::uart::clear_interrupt();
+    syscall(Syscall::IrqAck, tty::UART_IRQ, [0; 4]);
 }
 
 /// Runs `argv` as a new process (pid 1 in the first run, then counting
-/// on) with the console as its standard input and output, until it and
-/// every process it made are gone. Its wait status.
-fn run(st: &mut State, argv: &[&str], env: &[&str]) -> Result<u32, &'static str> {
+/// on) until it and every process it made are gone. Its standard input
+/// and output are the console log (output a line at a time, input empty),
+/// or, `interactive`, the terminal, with the process leading its session
+/// and in the foreground. Its wait status.
+fn run(st: &mut State, argv: &[&str], env: &[&str], interactive: bool) -> Result<u32, &'static str> {
     let i = st.new_proc(0).ok_or("no process slot")?;
-    RUN_PID.store(st.procs[i].pid, core::sync::atomic::Ordering::Relaxed);
+    let pid = st.procs[i].pid;
+    RUN_PID.store(pid, core::sync::atomic::Ordering::Relaxed);
     st.top_status = None;
-    let console = st.new_file(FileKind::Console, 0, 0, O_RDWR).ok_or("no open file")?;
+    let kind = if interactive { FileKind::Tty } else { FileKind::Console };
+    let console = st.new_file(kind, 0, 0, O_RDWR).ok_or("no open file")?;
     st.files[console].refs = 3;
     st.procs[i].fds[..3].fill(console as u8 + 1);
+    if interactive {
+        st.tty.reset(pid);
+    }
     let (mut args, mut envs) = (Strs::new(), Strs::new());
     argv.iter().for_each(|a| _ = args.push(a.as_bytes()));
     env.iter().for_each(|e| _ = envs.push(e.as_bytes()));
@@ -1617,10 +1877,17 @@ fn run(st: &mut State, argv: &[&str], env: &[&str]) -> Result<u32, &'static str>
         return Err(why);
     }
     let interp = Elf::parse(st.program).ok().and_then(|e| e.interpreter()).unwrap_or(b"?");
-    let interp = core::str::from_utf8(interp).unwrap_or("?").trim_end_matches(' ');
-    say!("linux: running {} (pid {}, interpreter {interp})", Joined(argv), st.procs[i].pid);
+    let interp = core::str::from_utf8(interp).unwrap_or("?").trim_end_matches(char::from(0));
+    say!("linux: running {} (pid {pid}, interpreter {interp})", Joined(argv));
     while st.procs.iter().any(|p| p.used && !p.zombie) {
         let r = syscall(Syscall::Recv, EP, [0; 4]);
+        if r.status == Error::Notified as u64 {
+            if r.badge & 1 != 0 {
+                uart_input(st);
+            }
+            wake(st);
+            continue;
+        }
         let [kind, nr, pc, _] = r.msg;
         let Some(i) = (r.badge as usize).checked_sub(1).filter(|&i| i < MAX_PROCS && st.procs[i].used) else {
             continue;
@@ -1643,9 +1910,8 @@ fn run(st: &mut State, argv: &[&str], env: &[&str]) -> Result<u32, &'static str>
         let y = sys(Syscall::ThreadRegisters, t, [REGS_SYSCALL_MORE, 0, 0, 0]).unwrap_or([0; 4]);
         let (call, args) = decode(nr, [x[1], x[2], x[3], y[0], y[1], y[2]]);
         match answer(st, i, call, args) {
-            Out::Ret(v) => {
-                syscall(Syscall::Reply, 0, [FaultReply::ResumeAt as u64, pc, v, 0]);
-            }
+            Out::Ret(v) => finish(st, i, pc, v, None),
+            Out::Resume { pc, value } => finish(st, i, pc, value, None),
             Out::Block(b) => {
                 let saved = syscall(Syscall::ReplySave, 0, [0; 4]);
                 let p = &mut st.procs[i];
@@ -1659,6 +1925,183 @@ fn run(st: &mut State, argv: &[&str], env: &[&str]) -> Result<u32, &'static str>
     }
     st.flush();
     st.top_status.ok_or("lost track of the first process")
+}
+
+/// `poll`: which of the `n` descriptors in the `pollfd`s at `fds` are
+/// ready to read (`POLLIN`) or write (`POLLOUT`), or hung up; waits for
+/// one until tick `until` (`u64::MAX`: no limit).
+fn poll(st: &mut State, i: usize, fds: u64, n: u64, until: u64) -> Out {
+    const POLLIN: u16 = 1;
+    const POLLOUT: u16 = 4;
+    const POLLERR: u16 = 8;
+    const POLLHUP: u16 = 0x10;
+    const POLLNVAL: u16 = 0x20;
+    if n > 64 {
+        return Out::Ret(err(EINVAL));
+    }
+    let mut ready = 0;
+    for k in 0..n {
+        let at = fds + 8 * k;
+        let mut e = [0u8; 8];
+        if !st.copy_in(i, at, &mut e) {
+            return Out::Ret(err(EFAULT));
+        }
+        let fd = i32::from_le_bytes([e[0], e[1], e[2], e[3]]);
+        let events = u16::from_le_bytes([e[4], e[5]]);
+        let revents = if fd < 0 {
+            0
+        } else {
+            match st.file(i, fd as u64).map(|f| st.files[f]) {
+                None => POLLNVAL,
+                Some(o) => match o.kind {
+                    FileKind::Tty => (if st.tty.readable() { POLLIN } else { 0 }) | POLLOUT,
+                    FileKind::PipeRead => {
+                        let pipe = &st.pipes[o.pipe as usize];
+                        (if pipe.len > 0 { POLLIN } else { 0 }) | if pipe.writers == 0 { POLLHUP } else { 0 }
+                    }
+                    FileKind::PipeWrite => {
+                        let pipe = &st.pipes[o.pipe as usize];
+                        if pipe.readers == 0 {
+                            POLLERR
+                        } else if (pipe.len as usize) < PIPE_BUF {
+                            POLLOUT
+                        } else {
+                            0
+                        }
+                    }
+                    _ => POLLIN | POLLOUT,
+                },
+            }
+        } & (events | POLLERR | POLLHUP | POLLNVAL);
+        ready += (revents != 0) as u64;
+        if !st.copy_out(i, at + 6, &revents.to_le_bytes()) {
+            return Out::Ret(err(EFAULT));
+        }
+    }
+    if ready > 0 || superior_sys::ticks() >= until {
+        return Out::Ret(ready);
+    }
+    Out::Block(Blocked::Poll { fds, n, until })
+}
+
+/// The process `pid` names for `getpgid` and `getsid` (0: the caller).
+fn group_of(st: &State, i: usize, pid: u64) -> Result<usize, u64> {
+    if pid == 0 {
+        return Ok(i);
+    }
+    st.procs.iter().position(|p| p.used && p.pid as u64 == pid).ok_or(ESRCH)
+}
+
+/// `setpgid`: the caller or a child of its into group `pgid` (0: its own
+/// pid), within its session.
+fn setpgid(st: &mut State, i: usize, pid: u64, pgid: u64) -> Result<u64, u64> {
+    let me = st.procs[i].pid;
+    let k = if pid == 0 { i } else { group_of(st, i, pid)? };
+    let p = &st.procs[k];
+    if k != i && p.ppid != me {
+        return Err(ESRCH);
+    }
+    if p.sid != st.procs[i].sid || p.pid == p.sid {
+        return Err(EPERM);
+    }
+    let pgid = if pgid == 0 { p.pid } else { pgid as u32 };
+    if pgid != p.pid && !st.procs.iter().any(|q| q.used && q.pgid == pgid && q.sid == p.sid) {
+        return Err(EPERM);
+    }
+    st.procs[k].pgid = pgid;
+    Ok(0)
+}
+
+/// `clock_nanosleep` (`nanosleep` with clock 0 and no flags): sleeps
+/// until the time in `req`, relative or (`TIMER_ABSTIME`) absolute, to
+/// the tick.
+fn nanosleep(st: &mut State, i: usize, flags: u64, req: u64) -> Out {
+    let (Some(sec), Some(nsec)) = (st.word(i, req), st.word(i, req + 8)) else { return Out::Ret(err(EFAULT)) };
+    if nsec >= 1_000_000_000 {
+        return Out::Ret(err(EINVAL));
+    }
+    let ticks = sec.saturating_mul(TICK_HZ).saturating_add((nsec * TICK_HZ).div_ceil(1_000_000_000));
+    let until = if flags & 1 != 0 { ticks } else { superior_sys::ticks().saturating_add(ticks) };
+    if until <= superior_sys::ticks() {
+        return Out::Ret(0);
+    }
+    Out::Block(Blocked::Sleep { until })
+}
+
+/// The terminal's `ioctl`s: its settings, window size and foreground
+/// group. Anything else is not a terminal.
+fn ioctl(st: &mut State, i: usize, fd: u64, cmd: u64, arg: u64) -> Result<u64, u64> {
+    const TCGETS: u64 = 0x5401;
+    const TCSETS: u64 = 0x5402;
+    const TCSETSW: u64 = 0x5403;
+    const TCSETSF: u64 = 0x5404;
+    const TIOCSCTTY: u64 = 0x540e;
+    const TIOCGPGRP: u64 = 0x540f;
+    const TIOCSPGRP: u64 = 0x5410;
+    const TIOCGWINSZ: u64 = 0x5413;
+    const TIOCSWINSZ: u64 = 0x5414;
+    const FIONREAD: u64 = 0x541b;
+    const TIOCNOTTY: u64 = 0x5422;
+    const TIOCGSID: u64 = 0x5429;
+    let f = st.file(i, fd).ok_or(EBADF)?;
+    if st.files[f].kind != FileKind::Tty {
+        return Err(ENOTTY);
+    }
+    match cmd {
+        TCGETS => {
+            let t = st.tty.termios;
+            st.put(i, arg, &t)
+        }
+        TCSETS | TCSETSW | TCSETSF => {
+            let mut t = [0u8; tty::TERMIOS_LEN];
+            if !st.copy_in(i, arg, &mut t) {
+                return Err(EFAULT);
+            }
+            st.tty.set(t, cmd == TCSETSF);
+            Ok(0)
+        }
+        TIOCGPGRP => {
+            let fg = st.tty.fg;
+            st.put(i, arg, &fg.to_le_bytes())
+        }
+        TIOCSPGRP => {
+            let mut b = [0u8; 4];
+            if !st.copy_in(i, arg, &mut b) {
+                return Err(EFAULT);
+            }
+            let pgid = u32::from_le_bytes(b);
+            if !st.procs.iter().any(|p| p.used && !p.zombie && p.pgid == pgid) {
+                return Err(EPERM);
+            }
+            st.tty.fg = pgid;
+            Ok(0)
+        }
+        TIOCGWINSZ => {
+            let mut w = [0u8; 8];
+            w[..2].copy_from_slice(&st.tty.rows.to_le_bytes());
+            w[2..4].copy_from_slice(&st.tty.cols.to_le_bytes());
+            st.put(i, arg, &w)
+        }
+        TIOCSWINSZ => {
+            let mut w = [0u8; 8];
+            if !st.copy_in(i, arg, &mut w) {
+                return Err(EFAULT);
+            }
+            st.tty.rows = u16::from_le_bytes([w[0], w[1]]);
+            st.tty.cols = u16::from_le_bytes([w[2], w[3]]);
+            Ok(0)
+        }
+        FIONREAD => {
+            let n = st.tty.available() as u32;
+            st.put(i, arg, &n.to_le_bytes())
+        }
+        TIOCGSID => {
+            let sid = st.procs[i].sid;
+            st.put(i, arg, &sid.to_le_bytes())
+        }
+        TIOCSCTTY | TIOCNOTTY => Ok(0),
+        _ => Err(EINVAL),
+    }
 }
 
 /// Bytes joined into a fixed buffer.
@@ -1708,7 +2151,8 @@ impl core::fmt::Display for Joined<'_> {
 const APPLETS: &[&str] = &[
     "sh", "ash", "echo", "cat", "ls", "wc", "seq", "mkdir", "rmdir", "rm", "touch", "true", "false", "uname", "awk",
     "sort", "head", "tail", "grep", "tr", "env", "pwd", "test", "[", "basename", "dirname", "cp", "mv", "ln", "printf",
-    "expr", "cut", "uniq", "sed", "xargs", "find", "stat", "readlink", "sleep", "yes", "tee", "od",
+    "expr", "cut", "uniq", "sed", "xargs", "find", "stat", "readlink", "sleep", "yes", "tee", "od", "stty",
+    "kill",
 ];
 
 /// What the test runs, and the exit status each must end with. They share
@@ -1730,7 +2174,18 @@ const RUNS: &[(&[&str], u32)] = &[
     // What the last run left is still there.
     (&["cat", "/tmp/notes/c"], 0),
     (&["sh", "-c", "cat /tmp/missing; echo cat said $?"], 0),
+    // Signals: a handler (the shell's trap) run and returned from; a
+    // sleeping child ended by one, its status 128 + 15; a writer ended by
+    // SIGPIPE when its reader is gone; a timed sleep.
+    (&["sh", "-c", "trap 'echo trapped USR1' USR1; kill -USR1 $$; echo after the trap"], 0),
+    (&["sh", "-c", "sleep 30 & kill $!; wait $!; echo status after kill $?"], 0),
+    (&["sh", "-c", "yes | head -n 3 | wc -l"], 0),
+    (&["sh", "-c", "sleep 1 && echo slept"], 0),
 ];
+
+/// Then a shell on the terminal, until it exits (the test types into it).
+const SESSION: &[&str] = &["sh"];
+const SESSION_ENV: &[&str] = &["PATH=/bin", "HOME=/home", "PS1=linux$ "];
 
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(_: u64) -> ! {
@@ -1741,9 +2196,11 @@ pub extern "C" fn _start(_: u64) -> ! {
         },
         |st| {
             let mut failures = 0;
-            for &(argv, want) in RUNS {
+            let runs = RUNS.iter().map(|&(argv, want)| (argv, want, false)).chain([(SESSION, 0, true)]);
+            for (argv, want, interactive) in runs {
                 let line = Joined(argv);
-                match run(st, argv, &["PATH=/bin", "HOME=/home"]) {
+                let env: &[&str] = if interactive { SESSION_ENV } else { &["PATH=/bin", "HOME=/home"] };
+                match run(st, argv, env, interactive) {
                     Ok(status) if status & 0x7f == 0 => {
                         let code = status >> 8;
                         say!("linux: {line} exited with status {code}");
@@ -1773,6 +2230,14 @@ fn setup() -> Result<&'static mut State, &'static str> {
         sys(Syscall::Retype, UNTYPED, [ObjectType::Untyped as u64, BLOCK_BITS, BLOCKS + b, 0]).map_err(|_| "no memory")?;
     }
     sys(Syscall::Retype, FS_BLOCK, [ObjectType::Endpoint as u64, 0, EP, 0]).map_err(|_| "no endpoint")?;
+    sys(Syscall::Retype, FS_BLOCK, [ObjectType::Notification as u64, 0, NTFN, 0]).map_err(|_| "no notification")?;
+    sys(Syscall::CapMint, NTFN, [NTFN_UART, ALL, 1, 0]).map_err(|_| "no notification")?;
+    sys(Syscall::CapMint, NTFN, [NTFN_TIMER, ALL, 2, 0]).map_err(|_| "no notification")?;
+    sys(Syscall::NotificationBind, NTFN, [0; 4]).map_err(|_| "could not bind the notification")?;
+    if tty::uart::init() != 0 {
+        return Err("could not map the UART");
+    }
+    sys(Syscall::IrqSetNotification, tty::UART_IRQ, [NTFN_UART, 0, 0, 0]).map_err(|_| "no UART interrupt")?;
     for p in 0..STATE_PAGES + fs::POOL_PAGES as u64 {
         let slot = STATE_SLOTS + p;
         let va = if p < STATE_PAGES { STATE_VA + p * PAGE } else { POOL_VA + (slot - POOL_SLOTS) * PAGE };
@@ -1786,6 +2251,13 @@ fn setup() -> Result<&'static mut State, &'static str> {
     st.interp = map_file(INTERP_FILE, INTERP_VA, PROGRAM_FILE - INTERP_FILE);
     st.program = map_file(PROGRAM_FILE, PROGRAM_VA, STATE_SLOTS - PROGRAM_FILE);
     st.next_pid = 1;
+    // The restorer page, executable in every process.
+    sys(Syscall::Retype, FS_BLOCK, [ObjectType::Frame as u64, 0, TRAMPOLINE_SLOT, 0]).map_err(|_| "no memory")?;
+    sys(Syscall::FrameMap, TRAMPOLINE_SLOT, [TRAMPOLINE_VA, 1, 0, 0]).map_err(|_| "no room")?;
+    // SAFETY: the page was just mapped, writable, at TRAMPOLINE_VA.
+    unsafe { core::ptr::copy_nonoverlapping(TRAMPOLINE_CODE.as_ptr(), TRAMPOLINE_VA as *mut u8, TRAMPOLINE_CODE.len()) };
+    st.shared[0] = Shared { start: TRAMPOLINE, end: TRAMPOLINE + PAGE, ptr: TRAMPOLINE_VA, slot: TRAMPOLINE_SLOT, flags: MAP_EXEC };
+    st.nshared = 1;
     let interp_path = Elf::parse(st.program).ok().and_then(|e| e.interpreter()).ok_or("the program is not dynamically linked")?;
     let (program, interp) = (st.program, st.interp);
     st.fs.init(POOL_VA, program, interp, interp_path, APPLETS);

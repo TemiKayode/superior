@@ -907,7 +907,8 @@ fn raise_fault(k: &mut Kernel, cur: Tid, kind: FaultKind, addr: u64, pc: u64, co
 /// its value. See the `REGS_*` constants.
 fn thread_registers(k: &mut Kernel, cur: Tid, f: &Args) -> Result<(), u64> {
     use superior_objects::abi::{
-        REGS_FOREIGN, REGS_FORK_FROM, REGS_SET_TLS, REGS_SYSCALL, REGS_SYSCALL_MORE, REGS_TLS,
+        REGS_FOREIGN, REGS_FORK_FROM, REGS_GET, REGS_SET, REGS_SET_TLS, REGS_SYSCALL, REGS_SYSCALL_MORE,
+        REGS_TLS,
     };
     let t = thread_cap(k, cur, f.a0)? as usize;
     let r = k.frames[t].foreign_syscall();
@@ -923,6 +924,29 @@ fn thread_registers(k: &mut Kernel, cur: Tid, f: &Args) -> Result<(), u64> {
             [0; 4]
         }
         REGS_TLS => [k.tls[t], 0, 0, 0],
+        REGS_GET => {
+            let fr = &k.frames[t];
+            let at = |n: u64| f.a2.checked_add(n).and_then(|i| fr.linux_reg(i)).unwrap_or(0);
+            [at(0), at(1), at(2), at(3)]
+        }
+        REGS_SET => {
+            // Only a thread that is not running: its frame is what it
+            // resumes with.
+            if !k.in_fault[t] && !thread_inactive(k, t as Tid) {
+                return Err(Error::IllegalOperation.code());
+            }
+            let mut frame = k.frames[t];
+            for (n, v) in [(0, f.a3), (1, f.a4)] {
+                if let Some(i) = f.a2.checked_add(n) {
+                    if !frame.set_linux_reg(i, v, USER_BASE..USER_END) {
+                        return Err(Error::InvalidArgument.code());
+                    }
+                }
+            }
+            k.frames[t] = frame;
+            k.preempted[t] = true;
+            [0; 4]
+        }
         REGS_FORK_FROM => {
             let from = thread_cap(k, cur, f.a2)? as usize;
             if !thread_inactive(k, t as Tid) || k.configured[t].is_none() || from == t {

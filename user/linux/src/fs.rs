@@ -1,5 +1,5 @@
 //! The personality's files: an in-memory tree (directories, files,
-//! symbolic links, the programs from the bundle, `/dev/null`), pipes, and
+//! symbolic links, the programs from the bundle, `/dev/null`, the terminal), pipes, and
 //! the open-file descriptions processes share through their descriptors.
 //!
 //! Everything lives in pages this server maps at start (all zero is a
@@ -44,6 +44,8 @@ pub enum Kind {
     /// Its interpreter (musl's dynamic linker).
     Interp,
     Null,
+    /// The terminal (`/dev/tty`, `/dev/console`).
+    Tty,
 }
 
 #[derive(Clone, Copy)]
@@ -90,6 +92,8 @@ impl Fs {
         let _ = self.create(ROOT, b"home", Kind::Dir);
         if let Ok(dev) = self.create(ROOT, b"dev", Kind::Dir) {
             let _ = self.create(dev, b"null", Kind::Null);
+            let _ = self.create(dev, b"tty", Kind::Tty);
+            let _ = self.create(dev, b"console", Kind::Tty);
         }
     }
 
@@ -414,6 +418,8 @@ pub enum FileKind {
     Node,
     PipeRead,
     PipeWrite,
+    /// The terminal ([`crate::tty`]).
+    Tty,
 }
 
 /// An open-file description, shared by the descriptors `dup` and `fork`

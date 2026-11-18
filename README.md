@@ -1538,6 +1538,31 @@ holds the rest):
   `seq 1 1000 | wc -l`, a three-stage pipeline, `>` and `>>` into a new
   directory, `cp`, `mv`, `ls`, `wc -c <` and `rm`, and a later run reading what
   an earlier one left, on both ISAs.
+- The Linux personality's signals and terminal: BusyBox's shell runs
+  interactively on the serial console. Signals have Linux's actions, masks
+  and senders (`kill`, `tgkill`, a pipe with no reader, a child's exit, the
+  keyboard); one whose action ends a process ends it at once, wherever it is,
+  and one with a handler is taken when the process next comes back from a
+  system call, interrupting one it is waiting in (`EINTR`, or made again with
+  `SA_RESTART`). Taking it is Linux's: the registers it would have resumed
+  with and its mask go in an `rt_sigframe` on its stack, the thread starts in
+  the handler, and `rt_sigreturn` takes the frame back. For that the kernel
+  reads and writes a foreign thread's every register (`ThreadRegisters`,
+  `REGS_GET` and `REGS_SET`, in Linux's `sigcontext` order; a new program
+  counter or stack pointer must be in user space and only the arithmetic
+  flags are taken). Handlers set without `SA_RESTORER` return through a
+  restorer page the personality maps in every process. `sigsuspend`,
+  `pause`, process groups and sessions, `nanosleep` (on a timer
+  notification) and `poll` are there too. The terminal is the UART, driven
+  by the personality: its interrupt and the timer signal one notification
+  its thread is bound to, so its `Recv` wakes for a fault, a keystroke or a
+  sleeper. Typed bytes go through Linux's line discipline as `termios`
+  says (canonical editing, echo, `^D`), `^C`, `^\` and `^Z` signal the
+  foreground process group, and the shell's job control (`TIOCSPGRP`) and
+  line editor (raw mode, `TIOCGWINSZ`) work. `linux-test` now also runs a
+  trap's handler, kills a sleeping child (`143`), ends `yes` with SIGPIPE and
+  sleeps, then types into the shell on the terminal: `[ -t 0 ]`, `stty size`,
+  a trap, and `^C` interrupting a foreground job, `$?` then 130.
 - Interrupt and exception entries clear the direction flag. User code may be
   interrupted mid-way through a backward copy, with the flag set; the kernel's own
   copies need it clear, and without the `cld` they ran backwards, wrecking saved
@@ -1610,8 +1635,9 @@ system's is on the system disk), a boot record written atomically (two
 copies), certificate chains and revocation for the update server (the updater
 pins one key), apps that provide services, a package store on a
 filesystem rather than fixed disk slots, the Linux personality's files on
-the filesystem server (today they are in its memory), signals, terminals
-and threads (`clone` with `CLONE_VM`), and
+the filesystem server (today they are in its memory), threads (`clone` with
+`CLONE_VM`), stopping jobs (`^Z`), and a handled signal reaching a process
+that spins without system calls (it is taken at the next one), and
 fixed-address (non-PIE) Linux executables, which are linked at 4 MiB, where
 the AArch64 kernel's identity map lives (the kernel needs moving to the high
 half first), an app's right to the control
