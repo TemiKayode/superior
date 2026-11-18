@@ -1,0 +1,17 @@
+[package]
+name = "superior-linux"
+description = "The Linux personality: runs unmodified Linux programs, answering their system calls."
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "superior-linux"
+test = false
+bench = false
+
+[dependencies]
+superior-objects = { path = "../../crates/objects" }
+superior-sys = { path = "../../crates/sys" }

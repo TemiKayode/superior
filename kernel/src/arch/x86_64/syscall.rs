@@ -141,6 +141,12 @@ impl UserFrame {
         self.rip = pc;
         self.rax = value;
     }
+
+    /// A system call made Linux's way: its number, six arguments and the
+    /// stack pointer.
+    pub fn foreign_syscall(&self) -> [u64; 8] {
+        [self.rax, self.rdi, self.rsi, self.rdx, self.r10, self.r8, self.r9, self.rsp]
+    }
 }
 
 /// A system call's number and arguments, independent of register names:
@@ -212,6 +218,7 @@ pub fn init(cpu: usize) {
     unsafe {
         Efer::update(|f| *f |= EferFlags::SYSTEM_CALL_EXTENSIONS | EferFlags::NO_EXECUTE_ENABLE)
     };
+    super::fp_cpu_init(cpu);
 }
 
 /// Enters user mode for the first time on this CPU with `frame`'s

@@ -282,6 +282,11 @@ pub enum Syscall {
     /// needs no capability: the wiring is no secret, and the lines
     /// themselves are capabilities.
     IntxLine = 52,
+    /// A foreign-ABI thread's registers, for the personality server that
+    /// is its fault handler: `rdi` = the thread (Write right), `rsi` = one
+    /// of the `REGS_*` operations, `rdx` = its value. Meaningful while the
+    /// thread waits on its handler.
+    ThreadRegisters = 53,
     /// Maps the frame in slot `rdi` at page-aligned `rsi` in the address
     /// space in slot `r8` (Write right). `rdx` = [`MAP_WRITE`] and/or
     /// [`MAP_EXEC`], never both. Needs the frame's Map right, plus Write
@@ -359,6 +364,7 @@ impl Syscall {
             50 => Syscall::Random,
             51 => Syscall::Time,
             52 => Syscall::IntxLine,
+            53 => Syscall::ThreadRegisters,
             42 => Syscall::IoFaults,
             0x100 => Syscall::DebugPutStr,
             0x101 => Syscall::DebugSelftestDone,
@@ -417,6 +423,12 @@ pub enum FaultKind {
     GeneralProtection = 2,
     InvalidOpcode = 3,
     DivideError = 4,
+    /// A system call from a thread running a foreign ABI (see
+    /// [`Syscall::ThreadRegisters`]): `msg[1]` = its number (`rax` on
+    /// x86-64, `x8` on AArch64), `msg[2]` = the address after the
+    /// instruction. The handler reads the arguments with `ThreadRegisters`
+    /// and answers [`FaultReply::ResumeAt`] that address with the result.
+    ForeignSyscall = 5,
 }
 
 impl FaultKind {
@@ -426,6 +438,7 @@ impl FaultKind {
             2 => FaultKind::GeneralProtection,
             3 => FaultKind::InvalidOpcode,
             4 => FaultKind::DivideError,
+            5 => FaultKind::ForeignSyscall,
             _ => return None,
         })
     }
@@ -473,6 +486,23 @@ pub const VSPACE_MAX_BITS: u64 = 20;
 /// it is the 16 whose configuration space QEMU `virt`'s ECAM window
 /// holds below 4 GiB.
 pub const PCI_BUSES: u64 = if cfg!(target_arch = "aarch64") { 16 } else { 256 };
+
+/// [`Syscall::ThreadRegisters`] operations.
+/// The system call it made, Linux's way: number and arguments 0 to 2, in
+/// message words 0 to 3 (`rax`, `rdi`, `rsi`, `rdx`; `x8`, `x0`-`x2`).
+pub const REGS_SYSCALL: u64 = 0;
+/// Arguments 3 to 5 and the stack pointer (`r10`, `r8`, `r9`, `rsp`;
+/// `x3`-`x5`, `sp`).
+pub const REGS_SYSCALL_MORE: u64 = 1;
+/// Sets its thread-pointer register to `rdx` (the FS base on x86-64,
+/// `TPIDR_EL0` on AArch64): a user address, or 0.
+pub const REGS_SET_TLS: u64 = 2;
+/// Its thread pointer, in message word 0.
+pub const REGS_TLS: u64 = 3;
+/// `rdx` = 1: its system calls go to its fault handler as
+/// [`FaultKind::ForeignSyscall`] (and its registers are restored exactly
+/// on return, but for the result); 0: they are Superior's again.
+pub const REGS_FOREIGN: u64 = 4;
 
 /// [`Syscall::FrameMapInto`] flags.
 pub const MAP_WRITE: u64 = 1;

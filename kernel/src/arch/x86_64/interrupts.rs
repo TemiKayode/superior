@@ -27,6 +27,15 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
             .set_handler_addr(addr(syscall::invalid_opcode_entry));
         idt.divide_error
             .set_handler_addr(addr(syscall::divide_error_entry));
+        // FPU use while it is off (CR0.TS: a thread that is not foreign)
+        // is an invalid instruction; a floating-point exception user code
+        // unmasked is an arithmetic one, like dividing by zero.
+        idt.device_not_available
+            .set_handler_addr(addr(syscall::invalid_opcode_entry));
+        idt.x87_floating_point
+            .set_handler_addr(addr(syscall::divide_error_entry));
+        idt.simd_floating_point
+            .set_handler_addr(addr(syscall::divide_error_entry));
     }
     // SAFETY: the IST index refers to a stack set up in gdt::TSS and used
     // by no other handler.

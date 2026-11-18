@@ -553,10 +553,15 @@ impl Table {
     }
 
     /// Deletes the capability in `slot`. Its children are re-parented to
-    /// its own parent, so revoking an ancestor still reaches them.
+    /// its own parent, so revoking an ancestor still reaches them. A copy
+    /// of an original object (one retyped from untyped memory, not itself
+    /// untyped) takes the original's place: it is no copy of its new
+    /// parent's object, so that block can still be retyped. (A copy of an
+    /// untyped block stays a copy: its original's carvings may live on.)
     pub fn delete(&mut self, slot: usize) -> Result<(), CapError> {
-        self.get(slot).ok_or(self.missing(slot))?;
+        let cap = self.get(slot).ok_or(self.missing(slot))?;
         let grandparent = self.slots[slot].parent;
+        let was_copy = self.slots[slot].copy || cap.object.untyped().is_some();
         self.unlink(slot);
         loop {
             let c = self.slots[slot].child;
@@ -564,6 +569,7 @@ impl Table {
                 break;
             }
             self.unlink(c as usize);
+            self.slots[c as usize].copy &= was_copy;
             if let Some(g) = grandparent {
                 self.link(g as usize, c as usize);
             }

@@ -59,6 +59,130 @@ pub(super) fn platform() -> &'static platform::Platform {
 /// machine boots with no framebuffer, so the log is on the PL011 alone.
 pub fn console_hand_over() {}
 
+/// The user thread pointer (`TPIDR_EL0`) as the thread left it: user code
+/// may set it itself.
+pub fn user_tls() -> Option<u64> {
+    let v: u64;
+    // SAFETY: reading TPIDR_EL0 has no side effect.
+    unsafe { core::arch::asm!("mrs {}, tpidr_el0", out(reg) v, options(nostack, nomem)) };
+    Some(v)
+}
+
+/// A thread's floating-point and SIMD registers (only foreign threads
+/// have any: Superior's own code is built without them).
+#[repr(C, align(16))]
+#[derive(Clone, Copy)]
+pub struct FpState {
+    q: [u128; 32],
+    fpsr: u64,
+    fpcr: u64,
+}
+
+impl FpState {
+    /// Linux's initial state: all zero (round to nearest, no traps).
+    pub const INITIAL: FpState = FpState { q: [0; 32], fpsr: 0, fpcr: 0 };
+}
+
+/// Whether each CPU lets user code use the FP/SIMD registers.
+static FP_ON: [core::sync::atomic::AtomicBool; superior_objects::ipc::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicBool::new(false) }; superior_objects::ipc::MAX_CPUS];
+
+/// FP/SIMD for the kernel's own saves (CPACR_EL1.FPEN = 0b01), trapped at
+/// EL0 until a foreign thread runs.
+pub fn fp_cpu_init() {
+    // SAFETY: FPEN only decides which levels trap FP/SIMD instructions.
+    unsafe { core::arch::asm!("msr cpacr_el1, {}", "isb", in(reg) 1u64 << 20, options(nostack)) };
+    FP_ON[cpu_id()].store(false, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Lets user code use the FP/SIMD registers (`on`, for a foreign thread),
+/// or makes them trap.
+pub fn fp_enable(on: bool) {
+    use core::sync::atomic::Ordering::Relaxed;
+    if FP_ON[cpu_id()].swap(on, Relaxed) != on {
+        let fpen: u64 = if on { 3 << 20 } else { 1 << 20 };
+        // SAFETY: as in `fp_cpu_init`.
+        unsafe { core::arch::asm!("msr cpacr_el1, {}", "isb", in(reg) fpen, options(nostack)) };
+    }
+}
+
+/// Saves the FP/SIMD registers into `s`.
+pub fn fp_save(s: &mut FpState) {
+    // SAFETY: `s` is 528 writable bytes, 16-byte aligned; EL1 may use
+    // FP/SIMD (FPEN is never below 0b01).
+    unsafe {
+        core::arch::asm!(
+            ".arch_extension fp",
+            ".arch_extension simd",
+            "stp q0, q1, [{s}, #0]",
+            "stp q2, q3, [{s}, #32]",
+            "stp q4, q5, [{s}, #64]",
+            "stp q6, q7, [{s}, #96]",
+            "stp q8, q9, [{s}, #128]",
+            "stp q10, q11, [{s}, #160]",
+            "stp q12, q13, [{s}, #192]",
+            "stp q14, q15, [{s}, #224]",
+            "stp q16, q17, [{s}, #256]",
+            "stp q18, q19, [{s}, #288]",
+            "stp q20, q21, [{s}, #320]",
+            "stp q22, q23, [{s}, #352]",
+            "stp q24, q25, [{s}, #384]",
+            "stp q26, q27, [{s}, #416]",
+            "stp q28, q29, [{s}, #448]",
+            "stp q30, q31, [{s}, #480]",
+            "mrs {a}, fpsr",
+            "mrs {b}, fpcr",
+            "add {s}, {s}, #512",
+            "stp {a}, {b}, [{s}]",
+            s = inout(reg) s as *mut FpState => _,
+            a = out(reg) _,
+            b = out(reg) _,
+            options(nostack)
+        )
+    };
+}
+
+/// Loads the FP/SIMD registers from `s`.
+pub fn fp_restore(s: &FpState) {
+    // SAFETY: as in `fp_save`, reading.
+    unsafe {
+        core::arch::asm!(
+            ".arch_extension fp",
+            ".arch_extension simd",
+            "ldp q0, q1, [{s}, #0]",
+            "ldp q2, q3, [{s}, #32]",
+            "ldp q4, q5, [{s}, #64]",
+            "ldp q6, q7, [{s}, #96]",
+            "ldp q8, q9, [{s}, #128]",
+            "ldp q10, q11, [{s}, #160]",
+            "ldp q12, q13, [{s}, #192]",
+            "ldp q14, q15, [{s}, #224]",
+            "ldp q16, q17, [{s}, #256]",
+            "ldp q18, q19, [{s}, #288]",
+            "ldp q20, q21, [{s}, #320]",
+            "ldp q22, q23, [{s}, #352]",
+            "ldp q24, q25, [{s}, #384]",
+            "ldp q26, q27, [{s}, #416]",
+            "ldp q28, q29, [{s}, #448]",
+            "ldp q30, q31, [{s}, #480]",
+            "add {s}, {s}, #512",
+            "ldp {a}, {b}, [{s}]",
+            "msr fpsr, {a}",
+            "msr fpcr, {b}",
+            s = inout(reg) s as *const FpState => _,
+            a = out(reg) _,
+            b = out(reg) _,
+            options(nostack)
+        )
+    };
+}
+
+/// Loads a user thread pointer into `TPIDR_EL0`.
+pub fn set_user_tls(v: u64) {
+    // SAFETY: TPIDR_EL0 is a scratch register the kernel does not use.
+    unsafe { core::arch::asm!("msr tpidr_el0, {}", in(reg) v, options(nostack, nomem)) };
+}
+
 /// Finds and turns on the IOMMU, if the machine has one.
 pub fn iommu_init() -> Option<&'static str> {
     let (base, irq) = platform().smmu?;

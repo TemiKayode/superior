@@ -116,7 +116,8 @@ pub fn admit_replacing<'a>(
         for cap in c.caps() {
             match cap.kind {
                 CapKind::Uses(s) if !host.offers(s) => return no("uses a service not offered to apps", s),
-                CapKind::Uses(_) | CapKind::Notification => {}
+                // A file of its own package, paid for from its own memory.
+                CapKind::Uses(_) | CapKind::Notification | CapKind::File(_) => {}
                 CapKind::Untyped(bits) if bits <= MAX_UNTYPED_BITS => {}
                 CapKind::Untyped(_) => return no("more memory than an app may have", name),
                 CapKind::Provides(s) => return no("provides a service", s),

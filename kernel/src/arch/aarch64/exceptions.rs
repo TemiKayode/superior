@@ -110,6 +110,13 @@ impl UserFrame {
         self.elr = pc;
         self.x[0] = value;
     }
+
+    /// A system call made Linux's way: its number, six arguments and the
+    /// stack pointer.
+    pub fn foreign_syscall(&self) -> [u64; 8] {
+        let x = &self.x;
+        [x[8], x[0], x[1], x[2], x[3], x[4], x[5], self.sp]
+    }
 }
 
 extern "C" {
@@ -128,6 +135,7 @@ pub fn init() {
             options(nostack)
         )
     };
+    super::fp_cpu_init();
 }
 
 /// Enters user mode for the first time with `frame`'s registers, from the

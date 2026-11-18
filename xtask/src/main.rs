@@ -244,6 +244,8 @@ fn main() -> ExitCode {
                         .and_then(|_| ab_test(a))
                         .and_then(|_| update_test(a))
                         .and_then(|_| packages_test(a))
+                        .and_then(|_| image_with(false, a, "linux"))
+                        .and_then(|img| linux_test(&img))
                         .and_then(|_| image(false, a))
                         .and_then(|img| shell_session(&img))
                 })
@@ -301,12 +303,13 @@ fn main() -> ExitCode {
         Some("memory-test") => {
             image_with(false, arch, "memory").and_then(|img| memory_test(&img))
         }
+        Some("linux-test") => image_with(false, arch, "linux").and_then(|img| linux_test(&img)),
         Some("reboot-test") => {
             image_with(false, arch, "reboot").and_then(|img| reboot_test(&img))
         }
         Some("bench") => image(false, Arch::X86_64).and_then(|img| bench(&img)),
         _ => Err(
-            "usage: cargo xtask <idl | image | run | test | boot-test | shell-test | cm-test | supervise-test | drivers-test | memory-test | reboot-test | fs-test | nvme-test | ahci-test | net-test | lde-test | lde-e100-test | wifi-test | display-test | desktop-test | windows-test | cursor-test | toolkit-test | panel-test | resize-test | widgets-test | notes-test | uefi-test | console-test | input-test | audio-test | tcp-test | keyboard-test | hotplug-test | suspend-test | verified-boot-test | tpm-test | secure-boot-test | ab-test | update-test | packages-test | bench | sel4-test> [x86_64 | aarch64]"
+            "usage: cargo xtask <idl | image | run | test | boot-test | shell-test | cm-test | supervise-test | drivers-test | memory-test | reboot-test | fs-test | nvme-test | ahci-test | net-test | lde-test | lde-e100-test | wifi-test | display-test | desktop-test | windows-test | cursor-test | toolkit-test | panel-test | resize-test | widgets-test | notes-test | uefi-test | console-test | input-test | audio-test | tcp-test | keyboard-test | hotplug-test | suspend-test | verified-boot-test | tpm-test | secure-boot-test | ab-test | update-test | packages-test | linux-test | bench | sel4-test> [x86_64 | aarch64]"
                 .into(),
         ),
     });
@@ -480,6 +483,88 @@ fn linux_nic(manifest: &str) -> Option<(&'static str, &'static str)> {
         "lde-e100" => Some(("e100", "i82557b,netdev=n0")),
         _ => None,
     }
+}
+
+/// Where the Linux personality's programs come from: Alpine Linux 3.18 (no
+/// longer updated, so its packages stay as they are).
+const ALPINE: &str = "https://dl-cdn.alpinelinux.org/alpine/v3.18/main";
+
+/// The packages, for each ISA: (Alpine's name for the ISA, package, its
+/// SHA-256, the file taken from it).
+const ALPINE_PACKAGES: [(&str, &str, &str, &str); 4] = [
+    ("x86_64", "busybox-1.36.1-r7", "d2cdd10ad7dce8e8ed48e100679b182646344dab8e07c1ea972d9eb6f9d809d7", "bin/busybox"),
+    ("x86_64", "musl-1.2.4-r3", "466e1e985756113655b65f49a4c5fb0013fd4da682fbef3dac91ec44ae986f0a", "lib/ld-musl-x86_64.so.1"),
+    ("aarch64", "busybox-1.36.1-r7", "9ecc170cae8289a86597a057670bbdc8cc4b3db327b4006f04000890711edf1d", "bin/busybox"),
+    ("aarch64", "musl-1.2.4-r3", "d9674ebd60a55330fcca142a02e7e3e5a9ee889d65dc929311f53f735c5c8ac5", "lib/ld-musl-aarch64.so.1"),
+];
+
+/// BusyBox and musl's dynamic linker (which is also its C library), as
+/// Alpine builds them for `arch`, unmodified: each package downloaded once
+/// and checked against its pinned hash every time.
+fn alpine_files(arch: Arch) -> Result<(Vec<u8>, Vec<u8>), String> {
+    let isa = if arch == Arch::X86_64 { "x86_64" } else { "aarch64" };
+    let dir = root().join("target/linux/alpine");
+    let mut out = Vec::new();
+    for &(_, package, sha256, file) in ALPINE_PACKAGES.iter().filter(|p| p.0 == isa) {
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let apk = dir.join(format!("{package}-{isa}.apk"));
+        if !apk.exists() {
+            println!("== fetching Alpine's {package} ({isa})");
+            let url = format!("{ALPINE}/{isa}/{package}.apk");
+            run(Command::new("curl").args(["-sSfL", "-o"]).arg(&apk).arg(&url))?;
+        }
+        let bytes = std::fs::read(&apk).map_err(|e| format!("reading {}: {e}", apk.display()))?;
+        let hash: String = superior_objects::crypto::sha2::sha256(&bytes).iter().map(|b| format!("{b:02x}")).collect();
+        if hash != sha256 {
+            return Err(format!("{} is not Alpine's {package}: delete it to fetch it again", apk.display()));
+        }
+        // An apk is gzipped tar segments one after another.
+        let to = dir.join(isa);
+        std::fs::create_dir_all(&to).map_err(|e| e.to_string())?;
+        run(Command::new("tar").arg("-xzf").arg(&apk).arg("-C").arg(&to).arg(file))?;
+        let path = to.join(file);
+        out.push(std::fs::read(&path).map_err(|e| format!("reading {}: {e}", path.display()))?);
+    }
+    let ld_musl = out.pop().ok_or("no musl")?;
+    let busybox = out.pop().ok_or("no BusyBox")?;
+    Ok((busybox, ld_musl))
+}
+
+/// Boots `boot/linux.manifest`: the Linux personality runs Alpine's
+/// BusyBox, unmodified and dynamically linked against musl, four times:
+/// `echo`, `uname` (a system call answered with a structure), the shell
+/// with arithmetic and an exit status, and `awk` with floating point (the
+/// FPU's registers are the program's own).
+fn linux_test(img: &Image) -> Result<(), String> {
+    println!("== Linux personality test on {}", img.path.display());
+    let out = run_to_exit(img, Duration::from_secs(60))?;
+    let isa = if img.arch == Arch::X86_64 { "x86_64" } else { "aarch64" };
+    let interp = format!("interpreter /lib/ld-musl-{isa}.so.1)");
+    let machine = format!("linux: > Linux {isa}");
+    let steps = [
+        "linux: running busybox echo hello from Linux (",
+        &interp,
+        "linux: > hello from Linux",
+        "linux: busybox echo hello from Linux exited with status 0",
+        "linux: running busybox uname -sm (",
+        &machine,
+        "linux: busybox uname -sm exited with status 0",
+        "linux: > 42 from the shell",
+        "linux: busybox sh -c echo $((6 * 7)) from the shell; exit 3 exited with status 3",
+        "linux: > pi is 3.141593",
+        "linux: busybox awk BEGIN { printf \"pi is %.6f\\n\", atan2(0, -1) } exited with status 0",
+        "[cm] linux asked to shut down (pass)",
+    ];
+    if let Err(step) = find_in_order(&out, &steps) {
+        return Err(format!("Linux personality test: missing (in order) {step:?}"));
+    }
+    for bad in ["[fail]", "could not", "panic", "[fault]"] {
+        if out.contains(bad) {
+            return Err(format!("Linux personality test: log contains {bad:?}"));
+        }
+    }
+    println!("== Linux personality test passed ({})", img.arch.name());
+    Ok(())
 }
 
 /// Linux's `driver` source, unmodified: downloaded once, and checked
@@ -661,6 +746,7 @@ fn bundle(arch: Arch, manifest: &str, driver: &str) -> Result<PathBuf, String> {
         ("notes", "superior-notes"),
         ("panel", "superior-panel"),
         ("mixer", "superior-mixer"),
+        ("linux", "superior-linux"),
         // Need Linux's source and the build container: only where used.
         ("lde-8139cp", "superior-lde-8139cp"),
         ("lde-e100", "superior-lde-e100"),
@@ -676,6 +762,12 @@ fn bundle(arch: Arch, manifest: &str, driver: &str) -> Result<PathBuf, String> {
         let path = user_program(package, arch)?;
         let bytes = std::fs::read(&path).map_err(|e| format!("reading {}: {e}", path.display()))?;
         files.push((name.to_string(), bytes));
+    }
+    // The Linux programs the personality runs (`file` in its manifest).
+    if manifest == "linux" {
+        let (busybox, ld_musl) = alpine_files(arch)?;
+        files.push(("busybox".to_string(), busybox));
+        files.push(("ld-musl".to_string(), ld_musl));
     }
     // Icon images (`icon NAME.pam` in a manifest), by their file names.
     let mut icons: Vec<_> = std::fs::read_dir(root().join("boot/icons"))

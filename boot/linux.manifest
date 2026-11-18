@@ -1,0 +1,23 @@
+# The Linux personality test (cargo xtask linux-test).
+#
+# The personality runs Alpine Linux's BusyBox, unmodified: a dynamically
+# linked, position-independent executable, with musl's dynamic linker
+# (also its C library) as its interpreter. Both come from the bundle as
+# files, copied into the personality's own memory. Each run is a program
+# in an address space and on a thread of its own, made from the untyped
+# block in slot 0 and destroyed when it exits.
+
+component linux
+  image linux
+  priority 10
+  # Its CNode (2^12 slots: two for each page a program has), address space,
+  # image, stack, the two files and the programs' block.
+  memory 23
+  cspace 12
+  vspace 18
+  # The files before the block: memory is handed out in order, and the
+  # block is aligned to its size.
+  file ld-musl 16
+  file busybox 200
+  untyped 22 0
+  control 1

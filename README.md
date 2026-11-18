@@ -1483,6 +1483,40 @@ holds the rest):
   installed and version 2 refused and cleared, then uninstalled; and nothing
   installed after that. The root task's
   stack is 128 KiB, as the manager's state and manifests outgrew 64 KiB.
+- The Linux personality (Phase 3, `user/linux`): unmodified Linux programs run
+  as Superior threads. The kernel can mark a thread foreign
+  (`ThreadRegisters`, `REGS_FOREIGN`): its `syscall` or `svc` then reaches not
+  the kernel's system calls but its fault handler, as a `ForeignSyscall` fault
+  with the number and the address after the instruction, and the handler reads
+  the arguments with `ThreadRegisters` (Linux's registers: `rdi`, `rsi`, `rdx`,
+  `r10`, `r8`, `r9`; `x0`-`x5`) and answers `ResumeAt` with the result. The
+  thread comes back with every register as it was but the result, its thread
+  pointer kept per thread (the FS base, set for it with `REGS_SET_TLS`, as
+  `arch_prctl` asks; `TPIDR_EL0`, which it sets itself), and its FPU and SIMD
+  registers its own: a foreign thread's `fxsave` area (AArch64: Q0-Q31, FPSR
+  and FPCR) is saved on every entry and restored on every return, and for every
+  other thread the FPU stays off (CR0.TS, CPACR_EL1), since Superior's own code
+  uses none. The personality loads a program as Linux does: the
+  position-independent executable and the interpreter it names (musl's dynamic
+  linker, which is also its C library) in an address space of their own, a
+  stack with the arguments, environment and auxiliary vector (`AT_PHDR`,
+  `AT_BASE`, `AT_ENTRY`, `AT_RANDOM`, ...), the thread started at the
+  interpreter, which relocates both and calls `main`. Every page is mapped in
+  the personality too, in a mirror window, so system calls read and write the
+  program's memory in place. It answers what BusyBox needs: `write` and
+  `writev` (printed a line at a time), `brk` and anonymous `mmap`, `uname`,
+  `arch_prctl`, `clock_gettime`, `getrandom`, ids, signal masks as no-ops,
+  `ioctl` as not a terminal, files as absent; anything else is `ENOSYS` and
+  logged. The programs come from the bundle by a new manifest directive,
+  `file <name> <slot>`: the manager copies the file into pages of the
+  component's own memory, in consecutive slots. (Deleting a capability now
+  makes its copy of an object other than untyped memory the original, so the
+  manager can hand the pages over without keeping them, and the untyped block
+  stays retypeable.) `cargo xtask linux-test` runs Alpine Linux 3.18's
+  BusyBox (dynamically linked, against musl), downloaded from Alpine once and
+  checked against pinned hashes, on both ISAs: `echo`, `uname -sm`, the shell
+  doing arithmetic and exiting with status 3, and `awk` printing pi from
+  `atan2`.
 - Interrupt and exception entries clear the direction flag. User code may be
   interrupted mid-way through a backward copy, with the flag set; the kernel's own
   copies need it clear, and without the `cld` they ran backwards, wrecking saved
@@ -1554,7 +1588,11 @@ system bundle's rollback floor in the TPM too (the boot bundle's is; the
 system's is on the system disk), a boot record written atomically (two
 copies), certificate chains and revocation for the update server (the updater
 pins one key), apps that provide services, a package store on a
-filesystem rather than fixed disk slots, an app's right to the control
+filesystem rather than fixed disk slots, the Linux personality's processes
+(`fork`, `clone`, `execve`), files, signals, terminals and threads, and
+fixed-address (non-PIE) Linux executables, which are linked at 4 MiB, where
+the AArch64 kernel's identity map lives (the kernel needs moving to the high
+half first), an app's right to the control
 capability (today any component holding one may shut the machine down), and release keys kept off the build machine; the IDL describing interfaces other than the bus server's; escalating a component
 given up on to a supervisor above it (today the
 manager is the only one), memory budgets from a policy service (Phase 3), sizing the Memory Server's CSpace
@@ -1607,8 +1645,9 @@ https://claude.ai/artifact/QKJS8qH5Dfbjzn58RStq1j
 | `user/dns/` | The DNS resolver |
 | `user/xhci/` | The xHCI (USB) host controller driver |
 | `user/hid/` | The USB HID keyboard, mouse and tablet driver |
+| `user/linux/` | The Linux personality: runs unmodified Linux programs |
 | `user/echo/`, `user/counter/`, `user/testclient/` | Test components for the Component Manager, supervision and drivers |
-| `boot/` | Component manifests: `shell.manifest` (normal boot), `test.manifest` (`cm-test`), `supervise.manifest` (`supervise-test`) , `drivers.manifest` (`drivers-test`) , `memory.manifest` (`memory-test`), `reboot.manifest` (`reboot-test`), `fs.manifest` and `fs-verify.manifest` (`fs-test`), `net.manifest` (`net-test`), `tcp.manifest` (`tcp-test`), `keyboard.manifest` (`keyboard-test`), `display.manifest` (`display-test`), `desktop.manifest` (`desktop-test`), `input.manifest` (`input-test`), `windows.manifest` (`windows-test`), `toolkit.manifest` (`toolkit-test`), `panel.manifest` (`panel-test`), `resize.manifest` (`resize-test`), `widgets.manifest` (`widgets-test`), `notes.manifest` (`notes-test`), `audio.manifest` (`audio-test`), `suspend.manifest` (`suspend-test`) |
+| `boot/` | Component manifests: `shell.manifest` (normal boot), `test.manifest` (`cm-test`), `supervise.manifest` (`supervise-test`) , `drivers.manifest` (`drivers-test`) , `memory.manifest` (`memory-test`), `reboot.manifest` (`reboot-test`), `fs.manifest` and `fs-verify.manifest` (`fs-test`), `net.manifest` (`net-test`), `tcp.manifest` (`tcp-test`), `keyboard.manifest` (`keyboard-test`), `display.manifest` (`display-test`), `desktop.manifest` (`desktop-test`), `input.manifest` (`input-test`), `windows.manifest` (`windows-test`), `toolkit.manifest` (`toolkit-test`), `panel.manifest` (`panel-test`), `resize.manifest` (`resize-test`), `widgets.manifest` (`widgets-test`), `notes.manifest` (`notes-test`), `audio.manifest` (`audio-test`), `suspend.manifest` (`suspend-test`), `linux.manifest` (`linux-test`) |
 | `sel4/` | Docker build of seL4 and rust-sel4's kernel loader, for running the shell on seL4 |
 | `tpm/` | Docker image with QEMU, swtpm and Secure Boot tools, for the TPM and Secure Boot tests |
 | `xtask/` | Build driver: user program, kernel, disk image, QEMU boot |
@@ -1649,6 +1688,7 @@ cargo xtask tpm-test       # in Docker (QEMU + swtpm): PCR 9 measured, the TPM's
 cargo xtask secure-boot-test aarch64  # in Docker and QEMU: the db-signed loader boots under Secure Boot; foreign, changed, unsigned ones refused
 cargo xtask ab-test        # A/B system slots: an update staged, tried, fallen back from, confirmed; rollbacks refused
 cargo xtask packages-test  # signed app packages: bad ones refused, the app installed, kept across boots, uninstalled
+cargo xtask linux-test     # the Linux personality runs Alpine's BusyBox, unmodified: echo, uname, the shell, awk
 cargo xtask run            # boot the shell in QEMU (x86-64), its console on this terminal
 cargo xtask run aarch64    # the same on QEMU's AArch64 virt machine
 cargo xtask console-test   # the kernel's log on the boot framebuffer, from a BIOS and from UEFI, checked by screenshot

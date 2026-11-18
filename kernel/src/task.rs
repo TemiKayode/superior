@@ -225,6 +225,15 @@ struct Kernel {
     fault_ep: [Option<(u16, u64)>; MAX_THREADS],
     /// Blocked in a fault call: the reply says how to resume.
     in_fault: [bool; MAX_THREADS],
+    /// Runs a foreign ABI: its system calls are faults (`REGS_FOREIGN`).
+    foreign: [bool; MAX_THREADS],
+    /// Its thread pointer (`REGS_SET_TLS`; on AArch64 also whatever it
+    /// put in `TPIDR_EL0` itself).
+    tls: [u64; MAX_THREADS],
+    /// A foreign thread's FPU and SIMD registers while it is not running.
+    fp: [arch::FpState; MAX_THREADS],
+    /// The thread whose FPU registers each CPU holds, if any.
+    fp_owner: [Option<Tid>; MAX_CPUS],
     /// Thread table entries in use, by a boot thread or a Thread object.
     thread_used: [bool; MAX_THREADS],
     /// Made by retype (so destroyed with its last capability).
@@ -387,6 +396,10 @@ static KERNEL: Mutex<Kernel> = Mutex::new(Kernel {
     io_mapped: no_slice(),
     fault_ep: [None; MAX_THREADS],
     in_fault: [false; MAX_THREADS],
+    foreign: [false; MAX_THREADS],
+    tls: [0; MAX_THREADS],
+    fp: [arch::FpState::INITIAL; MAX_THREADS],
+    fp_owner: [None; MAX_CPUS],
     thread_used: [false; MAX_THREADS],
     thread_object: [false; MAX_THREADS],
     configured: [None; MAX_THREADS],
@@ -633,6 +646,12 @@ fn save_running(k: &mut Kernel, frame: &UserFrame, syscall: bool) -> Option<Tid>
     if let Some(t) = t {
         k.frames[t as usize] = *frame;
         k.preempted[t as usize] = !syscall;
+        if let Some(tls) = arch::user_tls() {
+            k.tls[t as usize] = tls;
+        }
+        if k.fp_owner[me] == Some(t) {
+            arch::fp_save(&mut k.fp[t as usize]);
+        }
     }
     if let Some(gone) = k.ipc.settle() {
         if Some(gone) == t && syscall {
@@ -661,6 +680,15 @@ pub fn handle_syscall(frame: &mut UserFrame) -> Exit {
         return resume(guard, frame);
     };
 
+    if k.foreign[cur as usize] {
+        // Not a Superior system call: its handler (a personality server)
+        // answers it, and every register comes back as it was but for the
+        // result.
+        k.preempted[cur as usize] = true;
+        let nr = frame.foreign_syscall()[0];
+        raise_fault(k, cur, FaultKind::ForeignSyscall, nr, frame.pc(), 0);
+        return resume(guard, frame);
+    }
     let a = frame.args();
     let msg = [a.a1, a.a2, a.a3, a.a4];
     let mut reboot = false;
@@ -695,6 +723,7 @@ pub fn handle_syscall(frame: &mut UserFrame) -> Exit {
             None => Err(Error::IllegalOperation.code()),
         },
         Some(Syscall::IntxLine) => intx_line(k, cur, &a),
+        Some(Syscall::ThreadRegisters) => thread_registers(k, cur, &a),
         Some(Syscall::IrqMsiMessage) => irq_msi_message(k, cur, &a),
         Some(Syscall::FrameDmaAddress) => frame_dma_address(k, cur, a.a0),
         Some(Syscall::DeviceFrame) => device_frame(k, cur, &a),
@@ -846,16 +875,6 @@ pub fn handle_fault(frame: &mut UserFrame, kind: FaultKind, code: u64, addr: u64
         return resume(guard, frame);
     };
     match k.fault_ep[cur as usize] {
-        Some((ep, badge)) => {
-            k.stats.faults_handled += 1;
-            k.in_fault[cur as usize] = true;
-            k.ipc.set_transfer(CapTransfer::NONE);
-            let msg = [kind as u64, addr, frame.pc(), code];
-            if k.ipc.call(ep, badge, msg).is_err() {
-                k.in_fault[cur as usize] = false;
-                stop_thread(k, cur, kind, addr, frame.pc());
-            }
-        }
         None if cur == ROOT_TID && rebootable() => {
             kprintln!(
                 "[fault] the Component Manager: {kind:?} at pc {:#x}, address {addr:#x}",
@@ -864,9 +883,53 @@ pub fn handle_fault(frame: &mut UserFrame, kind: FaultKind, code: u64, addr: u64
             k.stats.faults_unhandled += 1;
             guard = fast_reboot(guard, "the Component Manager failed");
         }
-        None => stop_thread(k, cur, kind, addr, frame.pc()),
+        _ => raise_fault(k, cur, kind, addr, frame.pc(), code),
     }
     resume(guard, frame)
+}
+
+/// Makes thread `cur`'s fault a `Call` to its fault handler, or stops it
+/// if it has none (or the call fails).
+fn raise_fault(k: &mut Kernel, cur: Tid, kind: FaultKind, addr: u64, pc: u64, code: u64) {
+    let Some((ep, badge)) = k.fault_ep[cur as usize] else {
+        return stop_thread(k, cur, kind, addr, pc);
+    };
+    k.stats.faults_handled += 1;
+    k.in_fault[cur as usize] = true;
+    k.ipc.set_transfer(CapTransfer::NONE);
+    if k.ipc.call(ep, badge, [kind as u64, addr, pc, code]).is_err() {
+        k.in_fault[cur as usize] = false;
+        stop_thread(k, cur, kind, addr, pc);
+    }
+}
+
+/// `ThreadRegisters`: rdi = thread (Write right), rsi = operation, rdx =
+/// its value. See the `REGS_*` constants.
+fn thread_registers(k: &mut Kernel, cur: Tid, f: &Args) -> Result<(), u64> {
+    use superior_objects::abi::{REGS_FOREIGN, REGS_SET_TLS, REGS_SYSCALL, REGS_SYSCALL_MORE, REGS_TLS};
+    let t = thread_cap(k, cur, f.a0)? as usize;
+    let r = k.frames[t].foreign_syscall();
+    let msg = match f.a1 {
+        REGS_SYSCALL => [r[0], r[1], r[2], r[3]],
+        REGS_SYSCALL_MORE => [r[4], r[5], r[6], r[7]],
+        REGS_SET_TLS => {
+            // A non-canonical FS base would fault in the kernel.
+            if f.a2 != 0 && !(USER_BASE..USER_END).contains(&f.a2) {
+                return Err(Error::InvalidArgument.code());
+            }
+            k.tls[t] = f.a2;
+            [0; 4]
+        }
+        REGS_TLS => [k.tls[t], 0, 0, 0],
+        REGS_FOREIGN if f.a2 <= 1 => {
+            k.foreign[t] = f.a2 == 1;
+            k.fp[t] = arch::FpState::INITIAL;
+            [0; 4]
+        }
+        _ => return Err(Error::InvalidArgument.code()),
+    };
+    k.ipc.set_msg_of(cur, msg);
+    Ok(())
 }
 
 /// Rebuilds the root task for a fast reboot (set by `main` once it has
@@ -1628,6 +1691,16 @@ fn resume(mut guard: KernelGuard, frame: &mut UserFrame) -> Exit {
     smp::note_loaded(space.root_pa());
     k.running[arch::cpu_id()] = Some(next);
     k.stats.resumes[arch::cpu_id()] += 1;
+    arch::set_user_tls(k.tls[n]);
+    let cpu = arch::cpu_id();
+    if k.foreign[n] {
+        arch::fp_enable(true);
+        arch::fp_restore(&k.fp[n]);
+        k.fp_owner[cpu] = Some(next);
+    } else {
+        arch::fp_enable(false);
+        k.fp_owner[cpu] = None;
+    }
     *frame = out;
     exit
 }
@@ -2201,6 +2274,8 @@ fn destroy_thread(k: &mut Kernel, t: Tid) {
     k.spaces[i] = None;
     k.fault_ep[i] = None;
     k.in_fault[i] = false;
+    k.foreign[i] = false;
+    k.tls[i] = 0;
     k.sleep_until[i] = None;
     let _ = k.ipc.clear_notification(sleep_ntfn(t));
     let _ = k.ipc.reset_thread(t);
@@ -2253,6 +2328,8 @@ fn thread_configure(k: &mut Kernel, cur: Tid, f: &Args) -> Result<(), u64> {
     k.fresh[i] = true;
     k.preempted[i] = false;
     k.fault_ep[i] = k.fault_ep[cur as usize];
+    k.foreign[i] = false;
+    k.tls[i] = 0;
     // Nor escape its budget: the new thread gets the same parameters.
     let sc = *k.ipc.sched_context(cur);
     if let Some(budget) = sc.budget {

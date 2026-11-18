@@ -173,7 +173,11 @@ impl Model {
         fn go(ns: &mut Vec<Node>, slot: usize) -> bool {
             if let Some(i) = ns.iter().position(|n| n.slot == slot) {
                 let n = ns.remove(i);
-                for (k, c) in n.children.into_iter().enumerate() {
+                // A copy of an original object (not untyped) becomes the
+                // original.
+                let original = !n.copy && n.cap.object.untyped().is_none();
+                for (k, mut c) in n.children.into_iter().enumerate() {
+                    c.copy &= !original;
                     ns.insert(i + k, c);
                 }
                 return true;

@@ -74,6 +74,7 @@ pub struct Elf<'a> {
 
 const PT_LOAD: u32 = 1;
 const PT_DYNAMIC: u32 = 2;
+const PT_INTERP: u32 = 3;
 const DT_NULL: u64 = 0;
 const DT_RELA: u64 = 7;
 const DT_RELASZ: u64 = 8;
@@ -175,6 +176,25 @@ impl<'a> Elf<'a> {
                 Err(ElfError::BadSegment)
             })
         })
+    }
+
+    /// Where the program headers are in the file, and how many there are
+    /// (an ELF loader passes them on: Linux's `AT_PHDR` and `AT_PHNUM`).
+    pub fn program_headers(&self) -> (u64, usize) {
+        (self.phoff as u64, self.phnum)
+    }
+
+    /// The interpreter a dynamically linked executable names (`PT_INTERP`),
+    /// without its terminating NUL.
+    pub fn interpreter(&self) -> Option<&'a [u8]> {
+        let d = self.data;
+        let o = (0..self.phnum)
+            .map(|i| self.phoff + i * self.phentsize)
+            .find(|&o| u32_at(d, o) == Some(PT_INTERP))?;
+        let off = u64_at(d, o + 8)? as usize;
+        let size = u64_at(d, o + 32)? as usize;
+        let s = d.get(off..off.checked_add(size)?)?;
+        Some(s.split(|&b| b == 0).next().unwrap_or(s))
     }
 
     /// The file bytes of a segment returned by [`segments`](Self::segments).

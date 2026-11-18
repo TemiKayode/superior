@@ -137,6 +137,11 @@ pub enum CapKind<'a> {
     /// slots from this one on, as many as there are. For the Memory
     /// Server.
     Spare,
+    /// A file of the bundle, copied into pages of the component's own
+    /// memory, in consecutive slots from this one (the last page padded
+    /// with zeros): data a component reads, like the Linux personality's
+    /// programs.
+    File(&'a str),
 }
 
 /// Most `app-service` lines.
@@ -489,6 +494,10 @@ impl<'a> Manifest<'a> {
                 }
                 "notification" => Some((CapKind::Notification, arg("notification needs a slot")?)),
                 "control" => Some((CapKind::Control, arg("control needs a slot")?)),
+                "file" => {
+                    let f = arg("file needs a bundle entry")?;
+                    Some((CapKind::File(f), arg("file needs a slot")?))
+                }
                 "state" => {
                     if c.caps().any(|x| x.kind == CapKind::State) {
                         return Err(err("only one state page per component", key));

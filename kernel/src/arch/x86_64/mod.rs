@@ -229,7 +229,102 @@ pub fn ram_sleep(seconds: u64) -> Result<&'static str, &'static str> {
 
 /// After [`ram_sleep`]: starts the `before` CPUs that were online again.
 pub fn ram_sleep_restart_cpus(before: usize) -> usize {
+    for f in &FS_LOADED {
+        f.store(u64::MAX, core::sync::atomic::Ordering::Relaxed);
+    }
     sleep::restart_cpus(before)
+}
+
+/// The FS base each CPU last loaded; `u64::MAX` when unknown (at boot and
+/// after sleep).
+static FS_LOADED: [core::sync::atomic::AtomicU64; superior_objects::ipc::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicU64::new(u64::MAX) }; superior_objects::ipc::MAX_CPUS];
+
+/// A thread's x87, MMX and SSE registers in `fxsave` form (only foreign
+/// threads have any: Superior's own code is built without them).
+#[repr(C, align(16))]
+#[derive(Clone, Copy)]
+pub struct FpState([u8; 512]);
+
+impl FpState {
+    /// Linux's initial state: x87 control word 0x37f and MXCSR 0x1f80,
+    /// every exception masked.
+    pub const INITIAL: FpState = {
+        let mut b = [0; 512];
+        b[0] = 0x7f;
+        b[1] = 0x03;
+        b[24] = 0x80;
+        b[25] = 0x1f;
+        FpState(b)
+    };
+}
+
+/// Whether each CPU lets user code use the FPU (CR0.TS clear).
+static FP_ON: [core::sync::atomic::AtomicBool; superior_objects::ipc::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicBool::new(false) }; superior_objects::ipc::MAX_CPUS];
+
+/// SSE on (CR4.OSFXSR, unmasked SIMD exceptions as #XM), but CR0.TS set:
+/// any FPU instruction traps (#NM) until a foreign thread runs.
+pub fn fp_cpu_init(cpu: usize) {
+    use x86_64::registers::control::{Cr0, Cr0Flags, Cr4, Cr4Flags};
+    // SAFETY: these bits only decide whether FPU and SSE instructions work
+    // or trap; the kernel uses none.
+    unsafe {
+        Cr4::update(|f| f.insert(Cr4Flags::OSFXSR | Cr4Flags::OSXMMEXCPT_ENABLE));
+        Cr0::update(|f| {
+            f.remove(Cr0Flags::EMULATE_COPROCESSOR);
+            f.insert(Cr0Flags::MONITOR_COPROCESSOR | Cr0Flags::NUMERIC_ERROR | Cr0Flags::TASK_SWITCHED);
+        });
+    }
+    FP_ON[cpu].store(false, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Lets user code use the FPU (`on`, for a foreign thread), or makes it
+/// trap.
+pub fn fp_enable(on: bool) {
+    use core::sync::atomic::Ordering::Relaxed;
+    if FP_ON[cpu_id()].swap(on, Relaxed) != on {
+        // SAFETY: as in `fp_cpu_init`.
+        unsafe {
+            if on {
+                core::arch::asm!("clts", options(nostack, nomem));
+            } else {
+                x86_64::registers::control::Cr0::update(|f| {
+                    f.insert(x86_64::registers::control::Cr0Flags::TASK_SWITCHED)
+                });
+            }
+        }
+    }
+}
+
+/// Saves the FPU and SSE registers into `s` (the FPU on: `fp_enable`).
+pub fn fp_save(s: &mut FpState) {
+    // SAFETY: `s` is 512 writable bytes, 16-byte aligned.
+    unsafe { core::arch::asm!("fxsave64 [{}]", in(reg) s as *mut FpState, options(nostack)) };
+}
+
+/// Loads the FPU and SSE registers from `s` (the FPU on).
+pub fn fp_restore(s: &FpState) {
+    // SAFETY: as in `fp_save`, reading; a state from `fp_save` or
+    // `INITIAL` has no reserved MXCSR bit set.
+    unsafe { core::arch::asm!("fxrstor64 [{}]", in(reg) s as *const FpState, options(nostack)) };
+}
+
+/// The user thread pointer as the thread left it, if user code can change
+/// it: on x86-64 it cannot (`wrfsbase` is off), so only the kernel sets it.
+pub fn user_tls() -> Option<u64> {
+    None
+}
+
+/// Loads a user thread pointer (a canonical address, checked by the
+/// caller) as the FS base, unless this CPU has it already.
+pub fn set_user_tls(v: u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let loaded = &FS_LOADED[cpu_id()];
+    if loaded.load(Relaxed) != v {
+        x86_64::registers::model_specific::FsBase::write(x86_64::VirtAddr::new_truncate(v));
+        loaded.store(v, Relaxed);
+    }
 }
 
 /// The CMOS real-time clock's date and time: (year, month, day, hour,

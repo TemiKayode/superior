@@ -133,7 +133,9 @@ const SYSTEM_MAX_PAGES: u64 = ab::SLOT_BYTES.div_ceil(4096) as u64;
 /// each store slot.
 const PACKAGE_PAGES: u64 = SYSTEM_PAGES + SYSTEM_MAX_PAGES;
 const PACKAGE_MAX_PAGES: u64 = package::BYTES.div_ceil(4096) as u64;
-const _: () = assert!(PACKAGE_PAGES + PACKAGE_MAX_PAGES * package::COUNT as u64 <= 1 << root::CNODE_BITS);
+/// Where each page of a `file` is made before it goes to the component.
+const FILE_SCRATCH: u64 = (1 << root::CNODE_BITS) - 1;
+const _: () = assert!(PACKAGE_PAGES + PACKAGE_MAX_PAGES * package::COUNT as u64 <= FILE_SCRATCH);
 /// The manager's badge on the system disk (clients' are their numbers).
 const BADGE_SYSTEM_DISK: u64 = 0x1000;
 
@@ -377,6 +379,10 @@ impl<'a> Manager<'a> {
                     cnode_copy(cnode, slot, CONTROL, WRITE, BADGE_REPORT + i as u64)
                 }
                 CapKind::State => cnode_copy(cnode, slot, root::STATE_STORE + i as u64, ALL, 0),
+                CapKind::File(name) => match self.file(i, name) {
+                    Some(bytes) => copy_file(bytes, ut, cnode, slot),
+                    None => return Err(("file not in the bundle", 0)),
+                },
                 CapKind::Shared(n) => (0..n as u64)
                     .try_for_each(|p| cnode_copy(cnode, slot + p, self.shared[i] + p, ALL, 0)),
                 // Each spare block the kernel gave, made over whole as a
@@ -1293,6 +1299,29 @@ fn map_into(frame: u64, va: u64, flags: u64, vspace: u64) -> Result<(), u64> {
     sys(Syscall::FrameMapInto, frame, [va, flags, vspace, 0]).map(drop)
 }
 
+/// Copies `bytes` into pages retyped from `ut` (a `file` directive), placed
+/// in consecutive indexes of the CNode in slot `cnode` from `index`. Each
+/// page is written through the scratch mapping; the component's copy is
+/// the only capability left to it.
+fn copy_file(bytes: &[u8], ut: u64, cnode: u64, index: u64) -> Result<(), u64> {
+    for (p, chunk) in bytes.chunks(PAGE as usize).enumerate() {
+        retype(ut, ObjectType::Frame, 0, FILE_SCRATCH)?;
+        let r = sys(Syscall::FrameMap, FILE_SCRATCH, [SCRATCH_VA, 1, 0, 0])
+            .map(|_| {
+                // SAFETY: the page was just mapped at SCRATCH_VA, writable,
+                // and a chunk is at most a page.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(chunk.as_ptr(), SCRATCH_VA as *mut u8, chunk.len())
+                }
+            })
+            .and_then(|_| sys(Syscall::FrameUnmap, FILE_SCRATCH, [0; 4]))
+            .and_then(|_| cnode_copy(cnode, index + p as u64, FILE_SCRATCH, ALL, 0));
+        let _ = syscall(Syscall::CapDelete, FILE_SCRATCH, [0; 4]);
+        r?;
+    }
+    Ok(())
+}
+
 /// Loads a static position-independent executable into the address space
 /// in slot `vspace`, from frames retyped from `ut` into the image slots of
 /// `block`. Each page is written through a scratch mapping in the
@@ -1466,6 +1495,7 @@ fn fault_name(kind: u64) -> &'static str {
         Some(FaultKind::GeneralProtection) => "general protection fault",
         Some(FaultKind::InvalidOpcode) => "invalid instruction",
         Some(FaultKind::DivideError) => "divide error",
+        Some(FaultKind::ForeignSyscall) => "foreign system call",
         None => "unknown fault",
     }
 }
