@@ -1345,7 +1345,14 @@ holds the rest):
   the same pages. `cargo xtask suspend-test` boots `boot/suspend.manifest` on both
   ISAs: the client reads the disk, suspends the machine twice for 200 ticks,
   each time 2 seconds on the host's clock and almost no ticks on the guest's,
-  and reads it right after each resume.
+  and reads it right after each resume. The network sleeps with it: the
+  network server (`power`, after its driver in the manifest) leaves the driver
+  and DHCP alone, the virtio-net driver resets its card, turns bus mastering
+  off and answers `Unreachable`; on resume the driver programs its MSI-X entry
+  and queues again on the same pages with every buffer free, and the server
+  renews its DHCP lease at once (the machine may have woken on another
+  network). The test checks both through both suspends, and the renewed lease
+  after the second.
 - Suspend to RAM (ACPI S3) on x86. The FADT gives the PM1 event and
   control ports and the FACS, the DSDT's `\_S3_` package the sleep type. The
   kernel parks the other CPUs, saves the PIC masks, every I/O APIC entry and
@@ -1500,7 +1507,8 @@ a second IPv6 router or a DHCPv6 server to test against (QEMU's network has one 
 no equivalent of S3, so it suspends to idle), wake sources beyond the RTC
 alarm and the power button or a key (the network), S3 on real chipsets whose
 firmware's resume path the kernel has not met, power
-handling in drivers other than virtio-blk and in the servers above them, and a
+handling in the drivers and servers beyond storage and the network (the
+display, input, audio), and a
 timeout on a component that never answers `SUSPEND`; in verified boot the
 firmware's part (the bootloader and kernel checked by UEFI Secure Boot, or on
 AArch64 by the firmware), measurements extended into a TPM and attestation,

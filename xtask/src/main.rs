@@ -908,7 +908,7 @@ fn image_sealed(
         disk,
         writable: fs || matches!(manifest, "ab" | "update" | "packages"),
         driver,
-        net: matches!(manifest, "net" | "tcp" | "update") || linux_nic(manifest).is_some(),
+        net: matches!(manifest, "net" | "tcp" | "update" | "suspend") || linux_nic(manifest).is_some(),
         linux_nic: linux_nic(manifest).map(|l| l.1),
         radio: manifest == "wifi",
         keyboard: matches!(manifest, "keyboard" | "input" | "windows" | "cursor" | "toolkit" | "panel" | "resize" | "widgets" | "notes"),
@@ -6152,13 +6152,16 @@ fn suspend_test(arch: Arch) -> Result<(), String> {
         steps.push("[ok] ACPI: S3 (suspend to RAM): SLP_TYP");
     }
     steps.extend([
-        "[cm] manifest: 3 components",
+        "[cm] manifest: 5 components",
         "virtio-blk: ready:",
+        "virtio-net: ready: ",
         "[pass] suspend: read 8 sectors before suspending: every word right",
         "[pass] suspend: the driver refuses SUSPEND from a client",
     ]);
     for k in 0..2 {
         steps.extend([
+            "net: suspended: the driver and DHCP left alone",
+            "virtio-net: suspended: device reset, bus mastering off",
             "virtio-blk: suspended: device reset, bus mastering off",
             "pci: suspended: ",
             "[cm] every power component quiesced; suspending for",
@@ -6173,7 +6176,16 @@ fn suspend_test(arch: Arch) -> Result<(), String> {
             "pci: resumed: ",
             "virtio-blk: ready:",
             "virtio-blk: resumed: device initialized again",
+            "virtio-net: resumed: device initialized again, every buffer free",
         ]);
+        // The first suspend may come before DHCP has answered (the
+        // server then goes on asking after the resume); by the second
+        // there is a lease, renewed at the resume.
+        if k == 0 {
+            steps.push("net: resumed");
+        } else {
+            steps.extend(["net: resumed: renewing the lease on 10.0.3.30", "net: lease renewed: 10.0.3.30 for "]);
+        }
     }
     steps.extend([
         "[pass] suspend: suspend 1: suspended for up to 200 ticks and resumed",
@@ -6185,6 +6197,9 @@ fn suspend_test(arch: Arch) -> Result<(), String> {
         "[cm] client asked to shut down (pass)",
     ]);
     check_log("suspend", &out, &steps)?;
+    if !out.contains("net: leased 10.0.3.30/") {
+        return Err("suspend: the network server got no DHCP lease".into());
+    }
     if ram && out.contains("S3 failed") {
         return Err("suspend: the machine did not suspend to RAM".into());
     }

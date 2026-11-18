@@ -37,6 +37,11 @@
 //! takes a call, as before; the timer's call to the driver is what finds
 //! a restarted one.
 //!
+//! Suspend (`power`, from the Component Manager, before the driver's):
+//! the server leaves the driver and DHCP alone until the resume (after
+//! the driver's), then renews its lease at once, as a machine that wakes
+//! may be on another network, or its lease may have run out meanwhile.
+//!
 //! Slots: 0 the `nic` endpoint, 1 the `net` endpoint (receive), 2 untyped
 //! memory (2 MiB), 17 the state page, 18 to 30 the ring's shared pages.
 //!
@@ -75,7 +80,7 @@ use superior_objects::interfaces::net::ring as cring;
 use superior_objects::interfaces::nic::ring;
 use superior_inet::tcp::{self, Bufs, Tcb};
 use superior_inet::{Key, MAX_REASSEMBLED, Outcome, Reassembler, fold, ipv4, mapped, pseudo, sum};
-use superior_objects::interfaces::{Status, net, nic};
+use superior_objects::interfaces::{Status, net, nic, power};
 use superior_sys::{USER_BASE, print_line, syscall, syscall_x};
 
 const NIC: u64 = 0;
@@ -344,6 +349,8 @@ impl core::fmt::Display for Ip {
 
 struct Net {
     mac: [u8; 6],
+    /// Suspended: nothing goes to the driver until the resume.
+    asleep: bool,
     lease: Option<Lease>,
     phase: Phase,
     /// The current DHCP transaction.
@@ -496,6 +503,7 @@ fn state_number(s: tcp::State) -> u64 {
 
 static mut NET: Net = Net {
     mac: [0; 6],
+    asleep: false,
     lease: None,
     phase: Phase::Selecting,
     xid: 0,
@@ -2377,6 +2385,25 @@ impl Net {
     fn serve(&mut self, badge: u64, m: [u64; 4], lent: bool) -> ([u64; 4], bool) {
         let status = |s: Status| ([s as u64, 0, 0, 0], false);
         match m[0] {
+            // The Component Manager (badge 0).
+            power::SUSPEND if badge == 0 => {
+                self.asleep = true;
+                say!("suspended: the driver and DHCP left alone");
+                status(Status::Ok)
+            }
+            power::RESUME if badge == 0 => {
+                self.asleep = false;
+                match self.lease {
+                    Some(l) if self.phase == Phase::Bound || self.phase == Phase::Renewing => {
+                        say!("resumed: renewing the lease on {}", Ip(l.ip));
+                        self.phase = Phase::Renewing;
+                        self.next_xid();
+                        self.dhcp_send(DHCP_REQUEST);
+                    }
+                    _ => say!("resumed"),
+                }
+                status(Status::Ok)
+            }
             net::RING_STATS if m[1] == net::VERSION => {
                 ([Status::Ok as u64, self.cring_ops, self.cring_bells, 0], false)
             }
@@ -2687,7 +2714,9 @@ pub extern "C" fn _start(arg: u64) -> ! {
         }
         // With a ring, received frames are taken here, whatever woke the
         // server, and never by a call.
-        n.before_sleep();
+        if !n.asleep {
+            n.before_sleep();
+        }
         n.run_loopback();
         let r = syscall_x(Syscall::Recv, SERVICE, [0; 4], accept);
         n.cring_sleeps(false);
@@ -2699,6 +2728,11 @@ pub extern "C" fn _start(arg: u64) -> ! {
             let timer = r.badge & TIMER != 0;
             if timer {
                 syscall(Syscall::TimerSignal, TIMER_CAP, [PERIOD, 0, 0, 0]);
+            }
+            if n.asleep {
+                continue;
+            }
+            if timer {
                 n.tick();
             }
             if timer || !n.ring_up {

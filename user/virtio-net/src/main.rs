@@ -48,6 +48,13 @@
 //! harness adds: the signal it was heard at, in dBm (as a real radio
 //! reports beside the frame).
 //!
+//! Suspend (`power`, from the Component Manager): it resets the device
+//! and turns bus mastering off, answers callers `Unreachable` and leaves
+//! the rings be meanwhile, and on resume runs the device's whole
+//! initialization again on the same pages, every buffer free again (a
+//! frame the device had not sent when it was reset is lost, as on a
+//! wire).
+//!
 //! Slots: 0 the bus server, 1 the `nic` endpoint (receive), 2 a
 //! notification, 3 untyped memory (64 KiB).
 
@@ -64,7 +71,7 @@ use superior_driver::{DmaPage, Failure, Mmio, Pci, dma_barrier};
 
 use superior_objects::abi::{CapTransfer, Error, Syscall, TICK_HZ};
 use superior_objects::interfaces::nic::{link, ring};
-use superior_objects::interfaces::{Status, nic};
+use superior_objects::interfaces::{Status, nic, power};
 use superior_sys::{USER_BASE, print_line, syscall, syscall_x, ticks};
 use superior_wifi::handshake::Akm;
 use superior_wifi::station::{Link, Station};
@@ -148,6 +155,17 @@ macro_rules! say {
 }
 
 struct Nic {
+    pci: Pci,
+    /// The common register block, where queue notifications go (base,
+    /// multiplier), the MSI-X table entry and the message it holds.
+    common: Mmio,
+    device: Mmio,
+    notify_base: u64,
+    multiplier: u64,
+    msix: Mmio,
+    message: (u64, u64),
+    /// Suspended: the device is reset until the resume.
+    suspended: bool,
     rx: Queue,
     tx: Queue,
     rx_notify: u64,
@@ -341,7 +359,81 @@ fn start(radio: bool) -> Result<Nic, Failure> {
     };
     let (common, device) = (Mmio { base: common }, Mmio { base: device });
 
-    // Reset, then the initialization sequence (virtio 1.x, 3.1.1).
+    // One MSI-X vector for both queues.
+    let msix = pci.find_capability(CAP_MSIX, 0)?.ok_or(("no MSI-X", 0))?;
+    let table = pci.config_read(msix + 4)? as u64;
+    let entry = Mmio {
+        base: bars.map(table & 7, table & !7, 16)?,
+    };
+    let (address, data) = pci.msi_vector(0, MSI, NOTIFY, DOMAIN)?;
+    let rx = Queue::new(DmaPage::new(UNTYPED, RX_QUEUE, DMA_VA, DOMAIN)?);
+    let tx = Queue::new(DmaPage::new(UNTYPED, TX_QUEUE, DMA_VA + 0x1000, DOMAIN)?);
+    let mut nic = Nic {
+        pci,
+        common,
+        device,
+        notify_base,
+        multiplier,
+        msix: entry,
+        message: (address, data),
+        suspended: false,
+        rx,
+        tx,
+        rx_notify: 0,
+        tx_notify: 0,
+        rx_buf: buffers(RX_PAGES, DMA_VA + 0x2000)?,
+        tx_buf: buffers(TX_PAGES, DMA_VA + 0x2000 + 4096 * (BUFFERS / 2))?,
+        mac: 0,
+        attached: false,
+        sent: 0,
+        received: 0,
+        ring_pages: 0,
+        ring: false,
+        rx_tail: 0,
+        tx_head: 0,
+        by_ring: 0,
+        station: None,
+        radio,
+        shown: Link::Idle,
+        shown_rekeys: (0, 0),
+        surveying: false,
+        shown_ignored: 0,
+        shown_group_ignored: 0,
+    };
+    if syscall(Syscall::CapMint, NOTIFY, [DOORBELL, WRITE, 2, 0]).status != 0 {
+        return Err(("making the doorbell", 0));
+    }
+    nic.init()?;
+    if radio {
+        let mac = nic.mac.to_be_bytes();
+        nic.station = Some(Station::new(mac[2..].try_into().unwrap()));
+        if syscall(Syscall::CapMint, NOTIFY, [TIMER, WRITE, TIMER_BADGE, 0]).status != 0 {
+            return Err(("making the station's timer", 0));
+        }
+    }
+    let m = nic.mac;
+    say!(
+        "ready{}: {:02x}:{:02x}.{}, MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}, interrupts on MSI-X vector 0 (message data {data:#x})",
+        if radio { " as a Wi-Fi radio" } else { "" },
+        bdf >> 8,
+        bdf >> 3 & 0x1f,
+        bdf & 7,
+        m >> 40 & 0xff,
+        m >> 32 & 0xff,
+        m >> 24 & 0xff,
+        m >> 16 & 0xff,
+        m >> 8 & 0xff,
+        m & 0xff,
+    );
+    Ok(nic)
+}
+
+impl Nic {
+    /// Resets the device and brings it up (virtio 1.x, 3.1.1): at start,
+    /// and again on `power::RESUME`. Every receive buffer goes to the
+    /// device, every transmit buffer is free.
+    fn init(&mut self) -> Result<(), Failure> {
+    let common = self.common;
     common.write8(DEVICE_STATUS, 0);
     while common.read8(DEVICE_STATUS) != 0 {
         syscall(Syscall::Yield, 0, [0; 4]);
@@ -372,23 +464,20 @@ fn start(radio: bool) -> Result<Nic, Failure> {
     // One MSI-X vector for both queues. The transmit queue asks for no
     // interrupts (sent buffers are reaped when the next frame needs one)
     // except while frames in the transmit ring wait for a buffer.
-    let msix = pci.find_capability(CAP_MSIX, 0)?.ok_or(("no MSI-X", 0))?;
-    let table = pci.config_read(msix + 4)? as u64;
-    let entry = Mmio {
-        base: bars.map(table & 7, table & !7, 16)?,
-    };
-    let (address, data) = pci.msi_vector(0, MSI, NOTIFY, DOMAIN)?;
-    entry.write32(0, address as u32);
-    entry.write32(4, (address >> 32) as u32);
-    entry.write32(8, data as u32);
-    entry.write32(12, 0); // unmasked
-    pci.msix(true)?;
+    let (address, data) = self.message;
+    self.msix.write32(12, 1); // masked while it changes
+    self.msix.write32(0, address as u32);
+    self.msix.write32(4, (address >> 32) as u32);
+    self.msix.write32(8, data as u32);
+    self.msix.write32(12, 0); // unmasked
+    self.pci.msix(true)?;
     common.write16(CONFIG_MSIX_VECTOR, NO_VECTOR);
 
-    let rx = Queue::new(DmaPage::new(UNTYPED, RX_QUEUE, DMA_VA, DOMAIN)?);
-    let tx = Queue::new(DmaPage::new(UNTYPED, TX_QUEUE, DMA_VA + 0x1000, DOMAIN)?);
+    self.rx.reset();
+    self.tx.reset();
+    let (notify_base, multiplier) = (self.notify_base, self.multiplier);
     let mut notify_at = [0; 2];
-    for (q, queue, vector) in [(0u16, &rx, 0u16), (1, &tx, 0)] {
+    for (q, queue, vector) in [(0u16, &self.rx, 0u16), (1, &self.tx, 0)] {
         common.write16(QUEUE_SELECT, q);
         if common.read16(QUEUE_SIZE) < virtq::SIZE {
             return Err(("a queue is too small", q as u64));
@@ -405,70 +494,65 @@ fn start(radio: bool) -> Result<Nic, Failure> {
         notify_at[q as usize] = notify_base + common.read16(QUEUE_NOTIFY_OFF) as u64 * multiplier;
         common.write16(QUEUE_ENABLE, 1);
     }
-    let mut nic = Nic {
-        rx,
-        tx,
-        rx_notify: notify_at[0],
-        tx_notify: notify_at[1],
-        rx_buf: buffers(RX_PAGES, DMA_VA + 0x2000)?,
-        tx_buf: buffers(TX_PAGES, DMA_VA + 0x2000 + 4096 * (BUFFERS / 2))?,
-        mac: (0..6).fold(0, |m, i| m << 8 | device.read8(i) as u64),
-        attached: false,
-        sent: 0,
-        received: 0,
-        ring_pages: 0,
-        ring: false,
-        rx_tail: 0,
-        tx_head: 0,
-        by_ring: 0,
-        station: None,
-        radio,
-        shown: Link::Idle,
-        shown_rekeys: (0, 0),
-        surveying: false,
-        shown_ignored: 0,
-        shown_group_ignored: 0,
-    };
-    if radio {
-        let mac = nic.mac.to_be_bytes();
-        nic.station = Some(Station::new(mac[2..].try_into().unwrap()));
-        if syscall(Syscall::CapMint, NOTIFY, [TIMER, WRITE, TIMER_BADGE, 0]).status != 0 {
-            return Err(("making the station's timer", 0));
-        }
-    }
+    (self.rx_notify, self.tx_notify) = (notify_at[0], notify_at[1]);
+    let device = self.device;
+    self.mac = (0..6).fold(0, |m, i| m << 8 | device.read8(i) as u64);
     // Sent frames are reaped when a buffer is wanted: no interrupts for
     // them unless frames wait for one (`Nic::before_sleep`).
-    nic.tx.interrupts(false);
-    if syscall(Syscall::CapMint, NOTIFY, [DOORBELL, WRITE, 2, 0]).status != 0 {
-        return Err(("making the doorbell", 0));
-    }
-    pci.bus_master(true)?;
+    self.tx.interrupts(false);
+    self.pci.bus_master(true)?;
     common.write8(
         DEVICE_STATUS,
         ACKNOWLEDGE | DRIVER | FEATURES_OK | DRIVER_OK,
     );
-    // Every receive buffer to the device.
-    for i in 0..BUFFERS as u16 {
-        nic.offer(i);
+    // Every transmit buffer free, every receive buffer to the device.
+    for i in 0..BUFFERS as usize {
+        self.tx_buf.give(i);
     }
-    let m = nic.mac;
-    say!(
-        "ready{}: {:02x}:{:02x}.{}, MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}, interrupts on MSI-X vector 0 (message data {data:#x})",
-        if radio { " as a Wi-Fi radio" } else { "" },
-        bdf >> 8,
-        bdf >> 3 & 0x1f,
-        bdf & 7,
-        m >> 40 & 0xff,
-        m >> 32 & 0xff,
-        m >> 24 & 0xff,
-        m >> 16 & 0xff,
-        m >> 8 & 0xff,
-        m & 0xff,
-    );
-    Ok(nic)
-}
+    for i in 0..BUFFERS as u16 {
+        self.offer(i);
+    }
+    Ok(())
+    }
 
-impl Nic {
+    /// `power::SUSPEND`: resets the device (it forgets its queues) and
+    /// stops its DMA.
+    fn quiesce(&mut self) -> Result<(), Failure> {
+        self.common.write8(DEVICE_STATUS, 0);
+        while self.common.read8(DEVICE_STATUS) != 0 {
+            syscall(Syscall::Yield, 0, [0; 4]);
+        }
+        self.pci.bus_master(false)?;
+        self.suspended = true;
+        Ok(())
+    }
+
+    /// The Component Manager's `power` calls (badge 0), or `None` for any
+    /// other call.
+    fn power(&mut self, m: [u64; 4], badge: u64) -> Option<[u64; 4]> {
+        let ok = |r: Result<(), Failure>, done: &str| match r {
+            Ok(()) => {
+                say!("{done}");
+                [Status::Ok as u64, 0, 0, 0]
+            }
+            Err((what, code)) => {
+                say!("could not {}: {what} ({code})", if m[0] == power::SUSPEND { "suspend" } else { "resume" });
+                [Status::DeviceError as u64, 0, 0, 0]
+            }
+        };
+        match m[0] {
+            power::SUSPEND if badge == 0 => Some(ok(self.quiesce(), "suspended: device reset, bus mastering off")),
+            power::RESUME if badge == 0 => {
+                let r = self.init();
+                self.suspended = r.is_err();
+                Some(ok(r, "resumed: device initialized again, every buffer free"))
+            }
+            // Asleep: the caller tries again after the resume.
+            _ if self.suspended => Some([Status::Unreachable as u64, 0, 0, 0]),
+            _ => None,
+        }
+    }
+
     /// Gives receive buffer `i` (descriptor `i`) to the device.
     fn offer(&mut self, i: u16) {
         self.rx
@@ -1037,7 +1121,9 @@ impl Nic {
     /// `before_sleep` does the work.
     fn interrupt(&mut self) {
         syscall(Syscall::IrqAck, MSI, [0; 4]);
-        if self.ring {
+        if self.suspended {
+            // The device is reset: nothing of its to look at.
+        } else if self.ring {
             hdr(ring::DRIVER_SLEEPS).store(0, Ordering::SeqCst);
         } else if self.attached && !self.radio && self.rx.has_used() {
             // (A radio's frames go through the station first:
@@ -1074,7 +1160,7 @@ pub extern "C" fn _start(arg: u64) -> ! {
     // ring's doorbell), one serving calls. The call that arrived, and the
     // reply to send with the next wait, pass between them and `idle`.
     let events = Events::new();
-    let call = Cell::new(None);
+    let call: Cell<Option<([u64; 4], Option<u16>, u64)>> = Cell::new(None);
     let reply: Cell<Option<([u64; 4], bool)>> = Cell::new(None);
     let interrupts = pin!(async {
         loop {
@@ -1085,10 +1171,17 @@ pub extern "C" fn _start(arg: u64) -> ! {
     let service = pin!(async {
         loop {
             events.wait(CALL).await;
-            let Some((msg, mut cap)) = call.take() else {
+            let Some((msg, mut cap, badge)) = call.take() else {
                 continue;
             };
             let msg: [u64; 4] = msg;
+            if let Some(m) = nic.borrow_mut().power(msg, badge) {
+                if cap.is_some() {
+                    syscall(Syscall::CapDelete, LENT, [0; 4]);
+                }
+                reply.set(Some((m, false)));
+                continue;
+            }
             if msg[0] == nic::ATTACH && cap == Some(LENT as u16) {
                 // Keep the notification (replacing an earlier one).
                 syscall(Syscall::CapDelete, LISTENER, [0; 4]);
@@ -1108,8 +1201,10 @@ pub extern "C" fn _start(arg: u64) -> ! {
     // Nothing can run: send the reply that is due and wait for the next
     // call or interrupt.
     let idle = || {
-        nic.borrow_mut().radio_poll();
-        nic.borrow_mut().before_sleep();
+        if !nic.borrow().suspended {
+            nic.borrow_mut().radio_poll();
+            nic.borrow_mut().before_sleep();
+        }
         let r = match reply.take() {
             Some((m, doorbell)) => {
                 let x = CapTransfer {
@@ -1125,7 +1220,7 @@ pub extern "C" fn _start(arg: u64) -> ! {
         } else if r.status != 0 {
             0
         } else {
-            call.set(Some((r.msg, r.cap)));
+            call.set(Some((r.msg, r.cap, r.badge)));
             CALL
         }
     };

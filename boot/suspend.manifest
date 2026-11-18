@@ -9,6 +9,11 @@
 # and halts them all until a one-shot alarm. Then the bus server puts the
 # configuration back, the driver brings the disk up again and the client
 # reads it.
+#
+# The network goes to sleep too: the network server first (it leaves the
+# driver and DHCP alone), then the virtio-net driver (it resets its card
+# and stops its DMA). On resume the driver initializes the card again and
+# the server renews its DHCP lease at once.
 
 component pcibus
   image pcibus
@@ -36,6 +41,27 @@ component virtio-blk
   provides block 1
   notification 2
   untyped 17 3
+  power
+
+component virtio-net
+  image virtio-net
+  priority 11
+  uses pci 0
+  provides nic 1
+  notification 2
+  untyped 16 3
+  power
+
+component net
+  image net
+  priority 10
+  uses nic 0
+  provides net 1
+  memory 22
+  untyped 21 2
+  state 17
+  shared 13 18
+  cspace 9
   power
 
 component client
