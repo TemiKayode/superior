@@ -888,6 +888,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "superior-virtio-gpu"
+version = "0.1.0"
+dependencies = [
+ "superior-driver",
+ "superior-objects",
+ "superior-sys",
+]
+
+[[package]]
 name = "superior-virtio-net"
 version = "0.1.0"
 dependencies = [

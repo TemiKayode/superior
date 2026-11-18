@@ -1,0 +1,18 @@
+[package]
+name = "superior-virtio-gpu"
+description = "A virtio GPU driver (virtio 1.x over PCI, 2D), serving the display interface with a cursor plane."
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "superior-virtio-gpu"
+test = false
+bench = false
+
+[dependencies]
+superior-objects = { path = "../../crates/objects" }
+superior-sys = { path = "../../crates/sys" }
+superior-driver = { path = "../../crates/driver" }

@@ -1163,6 +1163,23 @@ holds the rest):
   keyboard menu and types the keys under "2790" on a US keyboard into the
   greeter: its field holds "pearéèçà" (12 bytes, 8 characters), and an
   eleventh screenshot has every pixel of the glyphs as the toolkit draws them.
+- A hardware cursor plane, on a native virtio GPU driver (`user/virtio-gpu`,
+  virtio 1.x over PCI, 2D). It serves `display` (version 2) with no copying:
+  the caller's surface pages, mapped read-only into the device's IOMMU domain,
+  back the scanout's host resource, and a flush has the device take the
+  rectangle and show it (`TRANSFER_TO_HOST_2D`, `RESOURCE_FLUSH`). Its cursor
+  queue is the plane: `CURSOR` lends a page with a 32x32 ARGB picture (copied
+  into the device's 64x64 cursor resource) and `MOVE_CURSOR` moves it or hides
+  it, with no flush. A display without a plane (Linux's bochs driver) answers
+  `CURSOR` with `Invalid`. The compositor offers the pointer's picture when it
+  sets up the display; if taken, it leaves the pointer out of the screen and
+  only moves the cursor as the pointer moves. `cargo xtask cursor-test` runs
+  the window style test on QEMU's virtio GPU (virtio-vga on x86-64, for the
+  bootloader's BIOS; virtio-gpu-pci on AArch64), both ISAs: the driver shows
+  the 800x600 scanout from the compositor's 469 pages, the cursor follows the
+  pointer to (150, 110), (350, 260) and (610, 210), and three screenshots
+  (the scanout alone, which the host draws the cursor over) have every pixel
+  right with no pointer in them.
 - The desktop shell's panel (`user/panel/`), a strip along the bottom of the
   screen drawn with the toolkit (now with row layouts and selected buttons). It
   has a launcher button for each `start launch` component in the manifest, which
@@ -1456,7 +1473,7 @@ holds the rest):
   notifications, a 256-slot CNode pool) so filling them stays quick; normal kernels have
   32 of each, 32 address spaces and a 4096-slot pool.
 
-Not yet: in the desktop shell zones beyond its built-in table; in the toolkit a clipboard larger than 32 bytes; a hardware cursor plane, keyboard
+Not yet: in the desktop shell zones beyond its built-in table; in the toolkit a clipboard larger than 32 bytes; a cursor plane on real GPUs, keyboard
 layouts beyond US, UK, Dvorak and French, characters beyond Latin-1, dead keys and AltGr, a key
 repeat rate apps can set, and surviving a client
 that dies at the very moment its window is read (the compositor then faults and
@@ -1537,6 +1554,7 @@ https://claude.ai/artifact/QKJS8qH5Dfbjzn58RStq1j
 | `user/memserver/` | The Memory Server |
 | `user/fs/` | The filesystem server |
 | `user/virtio-blk/` | The virtio block driver |
+| `user/virtio-gpu/` | The virtio GPU driver (2D, with a cursor plane) |
 | `user/nvme/` | The NVMe class driver |
 | `user/ahci/` | The AHCI (SATA) class driver |
 | `user/virtio-net/` | The virtio network driver |

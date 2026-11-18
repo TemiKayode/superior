@@ -7,14 +7,23 @@
 /// framebuffer it is not showing and flips to it, so the screen changes
 /// whole. Pixels are XRGB8888, 32 bits each (blue in the low byte), rows
 /// `pitch` bytes apart, in the surface as on the screen.
+///
+/// A display may have a cursor plane (version 2): a small picture it shows
+/// over the screen, moved without the caller drawing it into the surface
+/// or flushing anything. One without answers `CURSOR` with `Invalid`, and
+/// the caller draws its pointer itself.
 pub mod display {
     use crate::interfaces::Status;
 
-    pub const VERSION: u64 = 1;
+    pub const VERSION: u64 = 2;
 
     /// The most surface pages a caller may attach (4 MiB: 1024x768 at 32
     /// bits).
     pub const SURFACE_PAGES: u64 = 1024;
+
+    /// A cursor's picture: CURSOR_SIDE pixels square, ARGB8888 (the top byte
+    /// its opacity), rows CURSOR_SIDE * 4 bytes apart: one page.
+    pub const CURSOR_SIDE: u64 = 32;
 
     /// What the display offers: how many modes (`MODE` lists them, preferred
     /// first), which of them is preferred, and whether the display's EDID was
@@ -124,6 +133,38 @@ pub mod display {
             Status::Ok => Ok(FlushReply {
                 front: m[1],
                 flips: m[2],
+            }),
+            s => Err(s),
+        }
+    }
+
+    /// Takes the cursor's picture from the page the call lends (kept no longer
+    /// than the call), its point `hot` (x | y << 16, in the picture): shown
+    /// there once `MOVE_CURSOR` shows it. `Invalid` if the display has no
+    /// cursor plane.
+    pub const CURSOR: u64 = 6;
+    /// The message of a `CURSOR` call.
+    pub const fn cursor(hot: u64) -> [u64; 4] {
+        [CURSOR, hot, 0, 0]
+    }
+
+    /// Puts the cursor's point at (`x`, `y`) on the screen, shown if `shown` is
+    /// 1 and hidden if 0. Returns how many moves there have been.
+    pub const MOVE_CURSOR: u64 = 7;
+    /// The message of a `MOVE_CURSOR` call.
+    pub const fn move_cursor(x: u64, y: u64, shown: u64) -> [u64; 4] {
+        [MOVE_CURSOR, x, y, shown]
+    }
+    /// What a `MOVE_CURSOR` call answers.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct MoveCursorReply {
+        pub moves: u64,
+    }
+    /// Reads a `MOVE_CURSOR` reply: its results, or the status it failed with.
+    pub fn move_cursor_reply(m: [u64; 4]) -> Result<MoveCursorReply, Status> {
+        match Status::from_u64(m[0]) {
+            Status::Ok => Ok(MoveCursorReply {
+                moves: m[1],
             }),
             s => Err(s),
         }

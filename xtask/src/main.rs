@@ -144,6 +144,9 @@ struct Image {
     /// QEMU's bochs-display as the only display, and its monitor to take
     /// screenshots through (the display test).
     display: bool,
+    /// With `display`: a virtio GPU in its place (virtio-vga on x86, for
+    /// the bootloader's BIOS), which has a cursor plane (the cursor test).
+    gpu: bool,
     /// QEMU's ENSONIQ AudioPCI, recording what it plays to this WAV file
     /// (the audio test).
     audio: Option<PathBuf>,
@@ -216,6 +219,7 @@ fn main() -> ExitCode {
                         .and_then(|_| display_test(a))
                         .and_then(|_| desktop_test(a))
                         .and_then(|_| windows_test(a))
+                        .and_then(|_| cursor_test(a))
                         .and_then(|_| toolkit_test(a))
                         .and_then(|_| panel_test(a))
                         .and_then(|_| resize_test(a))
@@ -267,6 +271,7 @@ fn main() -> ExitCode {
         Some("display-test") => display_test(arch),
         Some("desktop-test") => desktop_test(arch),
         Some("windows-test") => windows_test(arch),
+        Some("cursor-test") => cursor_test(arch),
         Some("toolkit-test") => toolkit_test(arch),
         Some("panel-test") => panel_test(arch),
         Some("resize-test") => resize_test(arch),
@@ -290,7 +295,7 @@ fn main() -> ExitCode {
         }
         Some("bench") => image(false, Arch::X86_64).and_then(|img| bench(&img)),
         _ => Err(
-            "usage: cargo xtask <idl | image | run | test | boot-test | shell-test | cm-test | supervise-test | drivers-test | memory-test | reboot-test | fs-test | nvme-test | ahci-test | net-test | lde-test | lde-e100-test | wifi-test | display-test | desktop-test | windows-test | toolkit-test | panel-test | resize-test | widgets-test | notes-test | uefi-test | console-test | input-test | audio-test | tcp-test | keyboard-test | hotplug-test | suspend-test | verified-boot-test | ab-test | update-test | packages-test | bench | sel4-test> [x86_64 | aarch64]"
+            "usage: cargo xtask <idl | image | run | test | boot-test | shell-test | cm-test | supervise-test | drivers-test | memory-test | reboot-test | fs-test | nvme-test | ahci-test | net-test | lde-test | lde-e100-test | wifi-test | display-test | desktop-test | windows-test | cursor-test | toolkit-test | panel-test | resize-test | widgets-test | notes-test | uefi-test | console-test | input-test | audio-test | tcp-test | keyboard-test | hotplug-test | suspend-test | verified-boot-test | ab-test | update-test | packages-test | bench | sel4-test> [x86_64 | aarch64]"
                 .into(),
         ),
     });
@@ -626,6 +631,7 @@ fn bundle(arch: Arch, manifest: &str, driver: &str) -> Result<PathBuf, String> {
         ("counter", "superior-counter"),
         ("pcibus", "superior-pcibus"),
         ("virtio-blk", "superior-virtio-blk"),
+        ("virtio-gpu", "superior-virtio-gpu"),
         ("nvme", "superior-nvme"),
         ("ahci", "superior-ahci"),
         ("virtio-net", "superior-virtio-net"),
@@ -905,12 +911,16 @@ fn image_sealed(
         net: matches!(manifest, "net" | "tcp" | "update") || linux_nic(manifest).is_some(),
         linux_nic: linux_nic(manifest).map(|l| l.1),
         radio: manifest == "wifi",
-        keyboard: matches!(manifest, "keyboard" | "input" | "windows" | "toolkit" | "panel" | "resize" | "widgets" | "notes"),
+        keyboard: matches!(manifest, "keyboard" | "input" | "windows" | "cursor" | "toolkit" | "panel" | "resize" | "widgets" | "notes"),
         xhci: false,
-        mouse: matches!(manifest, "input" | "windows" | "toolkit" | "panel" | "resize" | "widgets" | "notes"),
+        mouse: matches!(manifest, "input" | "windows" | "cursor" | "toolkit" | "panel" | "resize" | "widgets" | "notes"),
         hotplug: manifest == "hotplug",
         monitor: manifest == "suspend",
-        display: matches!(manifest, "display" | "desktop" | "input" | "windows" | "toolkit" | "panel" | "resize" | "widgets" | "notes"),
+        display: matches!(
+            manifest,
+            "display" | "desktop" | "input" | "windows" | "cursor" | "toolkit" | "panel" | "resize" | "widgets" | "notes"
+        ),
+        gpu: manifest == "cursor",
         audio: (manifest == "audio").then(|| audio_wav(arch)),
         uefi: false,
         acpi: false,
@@ -1017,6 +1027,7 @@ fn sel4_image() -> Result<Image, String> {
         hotplug: false,
         monitor: false,
         display: false,
+        gpu: false,
         audio: None,
         uefi: false,
         acpi: false,
@@ -1613,15 +1624,20 @@ fn qemu_command(img: &Image) -> Command {
         // VGA in place of the default one (the bootloader needs its BIOS),
         // on AArch64 bochs-display (no BIOS there; the same registers in
         // MMIO).
-        let card = match img.arch {
-            Arch::X86_64 => "VGA",
-            Arch::Aarch64 => "bochs-display",
+        let card = match (img.arch, img.gpu) {
+            (Arch::X86_64, false) => "VGA",
+            (Arch::Aarch64, false) => "bochs-display",
+            // The virtio GPU, modern only, its DMA through the IOMMU; on
+            // x86 with the VGA registers and BIOS too.
+            (Arch::X86_64, true) => "virtio-vga,disable-legacy=on,iommu_platform=on",
+            (Arch::Aarch64, true) => "virtio-gpu-pci,disable-legacy=on,iommu_platform=on",
         };
         if img.arch == Arch::X86_64 {
             q.args(["-vga", "none"]);
         }
+        let edid = if img.gpu { "off" } else { "on" };
         q.arg("-device")
-            .arg(format!("{card},xres={},yres={},edid=on", SCREEN.0, SCREEN.1));
+            .arg(format!("{card},xres={},yres={},edid={edid}", SCREEN.0, SCREEN.1));
     }
     if let Some(wav) = &img.audio {
         // The card Linux's ES1370 driver is for, its DMA through the
@@ -3607,7 +3623,15 @@ fn windows_pictures() -> Vec<(Vec<StyledWindow>, Option<(usize, usize)>)> {
 
 /// Checks the window style test's screenshot `k` (from 1) pixel by pixel.
 fn check_styled(path: &Path, k: usize) -> Result<String, String> {
+    check_styled_on(path, k, false)
+}
+
+/// Checks the window style test's screenshot `k` (from 1) pixel by pixel,
+/// the pointer left out if the display has a cursor plane (`plane`: the
+/// host draws it over the scanout, and a screenshot is the scanout alone).
+fn check_styled_on(path: &Path, k: usize, plane: bool) -> Result<String, String> {
     let (windows, pointer) = &windows_pictures()[k - 1];
+    let pointer = if plane { &None } else { pointer };
     let pixels = read_screenshot(path)?;
     let mut wrong = 0;
     let mut first = None;
@@ -3656,6 +3680,69 @@ fn check_styled(path: &Path, k: usize) -> Result<String, String> {
             "screenshot {k}: {wrong} pixels wrong, the first at ({x}, {y}): {have:?}, not {want:?}"
         )),
     }
+}
+
+/// Does one act of the cursor test's script: screenshots are checked as
+/// the window style test's pictures without the pointer.
+fn cursor_act(act: &Act, arch: Arch) -> Result<Option<String>, String> {
+    let Act::Shot(k) = act else { return input_act(act, arch) };
+    let path = root().join("target").join(format!("cursor-{}-{k}.ppm", arch.name()));
+    let _ = std::fs::remove_file(&path);
+    screendump(&path)?;
+    check_styled_on(&path, *k, true).map(|s| Some(format!("{s} (the pointer on the cursor plane)")))
+}
+
+/// Boots `boot/cursor.manifest`: the window style test's desktop on QEMU's
+/// virtio GPU (`user/virtio-gpu`), whose cursor plane draws the pointer.
+/// The compositor finds the plane and gives it the pointer's picture,
+/// then moves the cursor there at each move instead of drawing the
+/// pointer and flushing. The host does the window style test's drag and
+/// close; its three screenshots must have every pixel right with no
+/// pointer in them, and the driver must have moved the cursor where the
+/// pointer went.
+fn cursor_test(arch: Arch) -> Result<(), String> {
+    use Act::*;
+    let img = image_with(false, arch, "cursor")?;
+    println!("== cursor plane test on {}", img.path.display());
+    let script = vec![
+        (
+            vec![
+                "relative X and Y",
+                "absolute X and Y",
+                "compositor: input subscribed",
+                "picture 1 on the screen",
+            ],
+            vec![Shot(1), Move(-250, -190), Button(true), Move(200, 150), Button(false)],
+        ),
+        (vec!["picture 2 on the screen"], vec![Shot(2), Move(260, -50), Button(true), Button(false)]),
+        (vec!["picture 3 on the screen"], vec![Shot(3)]),
+    ];
+    let (out, shots) = run_script(&img, arch, "cursor plane test", script, cursor_act)?;
+    let log = [
+        "virtio-gpu: ready: ",
+        ", scanout 0 is 800x600, a 64x64 cursor plane",
+        "virtio-gpu: 800x600 shown on scanout 0 from the caller's 469 pages, pitch 3200",
+        "virtio-gpu: cursor picture set: 32x32, its point at (0, 0)",
+        "compositor: the display has a cursor plane: the pointer is drawn there",
+        "compositor: ready: the desktop on a 800x600 screen",
+        "compositor: input subscribed: keys and the pointer",
+        "[pass] windows: picture 1 on the screen: window B shown over window A, translucent and decorated",
+        "virtio-gpu: cursor at (150, 110)",
+        "compositor: window 0 dragged to (300, 270)",
+        "virtio-gpu: cursor at (350, 260)",
+        "[pass] windows: window A dragged by its title bar to (300, 270), in front, with the focus, and no pointer events of its own (0): picture 2 on the screen",
+        "virtio-gpu: cursor at (610, 210)",
+        "compositor: window 1: its close box was pressed",
+        "[pass] windows: window B closed from its close box: picture 3 on the screen",
+        "windows: done (0 failed)",
+        "[cm] second asked to shut down (pass)",
+    ];
+    check_log("cursor plane test", &out, &log)?;
+    if shots != windows_pictures().len() {
+        return Err(format!("cursor plane test: {shots} screenshots taken, want {}", windows_pictures().len()));
+    }
+    println!("== cursor plane test passed ({})", arch.name());
+    Ok(())
 }
 
 /// Does one act of the window style test's script: screenshots are

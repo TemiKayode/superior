@@ -1,0 +1,84 @@
+# The cursor plane test (cargo xtask cursor-test).
+#
+# The window style test's desktop on QEMU's virtio GPU, driven by
+# user/virtio-gpu in place of Linux's bochs driver: the compositor finds
+# the display's cursor plane and has it draw the pointer. The host drags
+# and closes the windows as in windows-test and checks every pixel of
+# three screenshots, which leave the pointer out (the host draws the
+# cursor over the scanout, not in it).
+
+component pcibus
+  image pcibus
+  priority 12
+  cspace 7
+  provides pci 0
+  device pci-config 1
+  device pci-mmio 2
+  device pci-io 88
+  device msi 3
+  device iommu 11
+  untyped 18 12
+  device intx 80
+
+component xhci
+  image xhci
+  priority 11
+  uses pci 0
+  provides usb 1
+  notification 2
+  untyped 17 3
+
+component hid
+  image hid
+  priority 11
+  uses usb 0
+  provides input 1
+  untyped 14 2
+
+component virtio-gpu
+  image virtio-gpu
+  priority 11
+  # Its slots: the surface's pages (up to 1024) from slot 64.
+  cspace 11
+  uses pci 0
+  provides display 1
+  notification 2
+  # Queues, commands, backing entries and the cursor's picture: 11 pages.
+  untyped 17 3
+
+component compositor
+  image compositor
+  priority 10
+  # Its slots: the screen (up to 1024 pages) and 8 windows of up to 384
+  # pages each.
+  cspace 13
+  # Page tables for the screen and the windows.
+  vspace 17
+  uses display 0
+  provides window 1
+  notification 2
+  # 2 MiB for the screen (800x600 at 32 bits is 469 pages).
+  memory 22
+  untyped 21 3
+  uses input 6
+
+component first
+  image testclient
+  arg 37
+  priority 8
+  uses window 0
+  cspace 8
+  # Its window: 300x200 at 32 bits is 59 pages.
+  memory 21
+  untyped 19 2
+
+component second
+  image testclient
+  arg 38
+  priority 8
+  uses window 0
+  control 1
+  cspace 8
+  # Its window: 320x240 at 32 bits is 75 pages.
+  memory 21
+  untyped 19 2

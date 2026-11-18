@@ -74,6 +74,10 @@ const INPUT: u64 = 6;
 /// driver.
 const INPUT_CAP: u64 = 7;
 const INPUT_BADGE: u64 = 1;
+/// The pointer's picture for a display with a cursor plane, and where it
+/// is mapped.
+const CURSOR_PAGE: u64 = 8;
+const CURSOR_VA: u64 = USER_BASE + 0x3000_0000;
 /// The screen's pages.
 const SCREEN: u64 = 16;
 /// The notification each window's client lent (`LISTEN`).
@@ -139,7 +143,8 @@ fn desktop(x: u32, y: u32) -> u32 {
 
 /// The pointer, its tip at the top left: `#` black, `o` white, a space
 /// what is under it. `cargo xtask input-test` draws the same to check
-/// screenshots.
+/// screenshots. On a display with a cursor plane it is the plane's
+/// picture instead (`#` opaque black, `o` opaque white, the rest clear).
 const CURSOR: [&[u8; 12]; 17] = [
     b"#           ",
     b"##          ",
@@ -478,6 +483,10 @@ struct Compositor {
     /// Where the pointer is, and whether it is drawn (once it has moved).
     pointer: (u32, u32),
     cursor: bool,
+    /// The display draws the pointer on its cursor plane (and the screen
+    /// leaves it out); whether the cursor's page has been made.
+    plane: bool,
+    cursor_page: bool,
     /// The buttons held.
     buttons: u64,
     /// The window under the pointer (or holding it), the one holding it
@@ -568,7 +577,56 @@ impl Compositor {
         }
         (self.width, self.height) = (w, h);
         self.showing = true;
+        self.set_up_cursor();
         true
+    }
+
+    /// Gives the display the pointer's picture for its cursor plane, if it
+    /// has one; the pointer is then drawn there, not on the screen.
+    fn set_up_cursor(&mut self) {
+        let side = display::CURSOR_SIDE as usize;
+        if !self.cursor_page {
+            let made = syscall(Syscall::Retype, MEMORY, [ObjectType::Frame as u64, 0, CURSOR_PAGE, 0]).status == 0
+                && syscall(Syscall::FrameMap, CURSOR_PAGE, [CURSOR_VA, 1, 0, 0]).status == 0;
+            if !made {
+                self.plane = false;
+                return;
+            }
+            let at = CURSOR_VA as *mut u32;
+            for y in 0..side {
+                for x in 0..side {
+                    let p = match CURSOR.get(y).and_then(|r| r.get(x)) {
+                        Some(b'#') => 0xff00_0000,
+                        Some(b'o') => 0xffff_ffff,
+                        _ => 0,
+                    };
+                    // SAFETY: the cursor's page is mapped, writable: one
+                    // picture of `side` squared pixels.
+                    unsafe { at.add(y * side + x).write(p) };
+                }
+            }
+            self.cursor_page = true;
+        }
+        let x = CapTransfer { grant: Some(CURSOR_PAGE as u16), accept: None };
+        // The pointer's tip is its point.
+        let r = syscall_x(Syscall::Call, DISPLAY, display::cursor(0), x);
+        let had = self.plane;
+        self.plane = r.status == 0 && r.msg[0] == Status::Ok as u64;
+        if self.plane && !had {
+            say!("the display has a cursor plane: the pointer is drawn there");
+        }
+        if self.plane && self.cursor {
+            self.move_cursor();
+        }
+    }
+
+    /// Has the display's cursor plane show the pointer where it is.
+    fn move_cursor(&mut self) {
+        let (x, y) = self.pointer;
+        let r = display_call(display::move_cursor(x as u64, y as u64, 1), None);
+        if r.is_none_or(|r| r[0] != 0) {
+            say!("[fail] the display would not move the cursor to ({x}, {y})");
+        }
     }
 
     fn whole(&self) -> Rect {
@@ -685,7 +743,7 @@ impl Compositor {
 
     /// Where the pointer is drawn (nothing before it first moves).
     fn cursor_rect(&self) -> Rect {
-        if !self.cursor {
+        if !self.cursor || self.plane {
             return NONE;
         }
         let (x, y) = self.pointer;
@@ -986,6 +1044,9 @@ impl Compositor {
         let before = self.cursor_rect();
         self.pointer = to;
         self.cursor = true;
+        if self.plane {
+            self.move_cursor();
+        }
         if let Some((i, (ox, oy))) = self.drag {
             return before.union(self.cursor_rect()).union(self.drag_to(i, ox, oy));
         }
@@ -1681,6 +1742,8 @@ pub extern "C" fn _start(_: u64) -> ! {
         queues: [EMPTY_QUEUE; window::MAX_WINDOWS as usize],
         pointer: (0, 0),
         cursor: false,
+        plane: false,
+        cursor_page: false,
         buttons: 0,
         hover: None,
         posted: None,

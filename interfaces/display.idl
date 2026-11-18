@@ -4,7 +4,12 @@
 # framebuffer it is not showing and flips to it, so the screen changes
 # whole. Pixels are XRGB8888, 32 bits each (blue in the low byte), rows
 # `pitch` bytes apart, in the surface as on the screen.
-interface display version 1
+#
+# A display may have a cursor plane (version 2): a small picture it shows
+# over the screen, moved without the caller drawing it into the surface
+# or flushing anything. One without answers `CURSOR` with `Invalid`, and
+# the caller draws its pointer itself.
+interface display version 2
 
 # The most surface pages a caller may attach (4 MiB: 1024x768 at 32
 # bits).
@@ -32,3 +37,17 @@ op SET_MODE = 4 (index) -> (pitch, front_offset, back_offset)
 # then flipped to. Returns which framebuffer is shown now and how many
 # flips there have been.
 op FLUSH = 5 (rect) -> (front, flips)
+
+# A cursor's picture: CURSOR_SIDE pixels square, ARGB8888 (the top byte
+# its opacity), rows CURSOR_SIDE * 4 bytes apart: one page.
+const CURSOR_SIDE = 32
+
+# Takes the cursor's picture from the page the call lends (kept no longer
+# than the call), its point `hot` (x | y << 16, in the picture): shown
+# there once `MOVE_CURSOR` shows it. `Invalid` if the display has no
+# cursor plane.
+op CURSOR = 6 (hot)
+
+# Puts the cursor's point at (`x`, `y`) on the screen, shown if `shown` is
+# 1 and hidden if 0. Returns how many moves there have been.
+op MOVE_CURSOR = 7 (x, y, shown) -> (moves)
