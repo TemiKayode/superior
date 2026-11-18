@@ -410,7 +410,8 @@ impl Window {
         let (m, c) = (window::CLOSE_MARGIN as u32, window::CLOSE_BOX as u32);
         let room = self.at.w.saturating_sub(TITLE_LEFT + TITLE_GAP + self.boxes() * (m + c));
         let fits = (room / TITLE_SCALE + 1) / superior_toolkit::font::ADVANCE;
-        &self.title[..self.title_len.min(fits as usize)]
+        let title = &self.title[..self.title_len];
+        &title[..superior_toolkit::font::ahead(title, 0, fits as usize)]
     }
 
     /// Its decoration's pixel at (x, y) on the screen, a part of its frame

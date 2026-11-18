@@ -1141,7 +1141,7 @@ holds the rest):
   the field, and the repeats take all six letters out. Keyboard layouts
   (`window` version 12): the compositor maps each key by its place to the
   character it types under the system's layout (`crates/toolkit/src/keymap.rs`:
-  US, UK, Dvorak and French AZERTY, ASCII only) and gives it with the `KEY`
+  US, UK, Dvorak and French AZERTY) and gives it with the `KEY`
   event; a manager sets the layout (`SET_LAYOUT`), anyone may ask (`LAYOUT`).
   Apps type the character and take shortcuts by the key's place. The
   panel's keyboard button, left of the clock, names the layout and opens a
@@ -1151,6 +1151,18 @@ holds the rest):
   Dvorak from that menu and types the keys under "rdao" on a US keyboard into
   Hello: its field holds "pear"; two more screenshots check the menu and the
   panel naming Dvorak.
+- Characters beyond ASCII: Latin-1. The font draws 0xA0 to 0xFF too (accented
+  capitals are their letter five rows tall under the accent; `?` past Latin-1),
+  and the layouts type them: French `é è ç à ù`, `² ° £ µ §`, UK `£` and `¬`. A
+  `KEY` event's character is the Latin-1 code (dead keys still type nothing).
+  The toolkit's text is UTF-8 (`&str` as before): fields, labels, lists, the
+  text area and window titles count, scroll, select, move over and take out
+  whole characters, never half of one, and cut text before a character that
+  would not fit whole (`superior_toolkit::font`'s `count`, `ahead` and
+  `back`). `cargo xtask panel-test` then picks French from the panel's
+  keyboard menu and types the keys under "2790" on a US keyboard into the
+  greeter: its field holds "pearéèçà" (12 bytes, 8 characters), and an
+  eleventh screenshot has every pixel of the glyphs as the toolkit draws them.
 - The desktop shell's panel (`user/panel/`), a strip along the bottom of the
   screen drawn with the toolkit (now with row layouts and selected buttons). It
   has a launcher button for each `start launch` component in the manifest, which
@@ -1445,7 +1457,7 @@ holds the rest):
   32 of each, 32 address spaces and a 4096-slot pool.
 
 Not yet: in the desktop shell zones beyond its built-in table; in the toolkit a clipboard larger than 32 bytes; a hardware cursor plane, keyboard
-layouts beyond US, UK, Dvorak and French and characters beyond ASCII, a key
+layouts beyond US, UK, Dvorak and French, characters beyond Latin-1, dead keys and AltGr, a key
 repeat rate apps can set, and surviving a client
 that dies at the very moment its window is read (the compositor then faults and
 is restarted, which its clients survive); in the mixer resampling (every stream

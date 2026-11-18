@@ -1,5 +1,6 @@
 //! A text area: lines of text, edited at a cursor. One per [`Ui`], its
-//! text (up to [`AREA_TEXT`] bytes, lines ended by `\n`) kept by the `Ui`.
+//! text (up to [`AREA_TEXT`] bytes of UTF-8, lines ended by `\n`) kept by
+//! the `Ui`. Columns, rows' widths and moves count characters, not bytes.
 //!
 //! The area shows rows: each line is one, or with wrapping on
 //! ([`Ui::set_area_wrap`]) as many as it takes to fit the area's width,
@@ -48,10 +49,10 @@ struct Row {
 }
 
 impl Row {
-    /// The last gap the cursor may be at in it: a wrapped row's end is the
-    /// next row's start, so the gap before its last character.
-    fn last_gap(self) -> usize {
-        if self.wrapped { self.end - 1 } else { self.end }
+    /// The last gap the cursor may be at in it (of `text`): a wrapped row's
+    /// end is the next row's start, so the gap before its last character.
+    fn last_gap(self, text: &[u8]) -> usize {
+        if self.wrapped { font::back(text, self.end, 1) } else { self.end }
     }
 
     /// Whether the cursor at `at` is shown in it.
@@ -78,7 +79,7 @@ impl Iterator for Rows<'_> {
         }
         let (t, s) = (self.text, self.at);
         let line_end = t[s..].iter().position(|&c| c == b'\n').map_or(t.len(), |k| s + k);
-        if line_end - s <= self.cols {
+        if self.cols == usize::MAX || font::count(&t[s..line_end]) <= self.cols {
             if line_end == t.len() {
                 self.done = true;
             } else {
@@ -87,7 +88,7 @@ impl Iterator for Rows<'_> {
             return Some(Row { start: s, end: line_end, wrapped: false });
         }
         // Broken after the last space that fits, or where the row is full.
-        let full = s + self.cols;
+        let full = font::ahead(t, s, self.cols);
         let end = t[s..full].iter().rposition(|&c| c == b' ').map_or(full, |k| s + k + 1);
         self.at = end;
         Some(Row { start: s, end, wrapped: true })
@@ -122,18 +123,21 @@ impl Ui {
         core::str::from_utf8(&self.area[..self.area_len]).unwrap_or("")
     }
 
-    /// Sets the text area's text (cut at [`AREA_TEXT`] bytes, ASCII and
-    /// newlines kept, the rest left out), the cursor at its end: the part
-    /// of the window to show again.
+    /// Sets the text area's text (cut at [`AREA_TEXT`] bytes, before the
+    /// character that would not fit whole; control characters but newlines
+    /// left out), the cursor at its end: the part of the window to show
+    /// again.
     pub fn set_area_text(&mut self, text: &str) -> Rect {
         let Some(id) = self.area_id else { return Rect::NONE };
         self.area_len = 0;
-        for &c in text.as_bytes().iter().filter(|&&c| c == b'\n' || (b' '..=b'~').contains(&c)) {
-            if self.area_len == AREA_TEXT {
+        for c in text.chars().filter(|&c| c == '\n' || !c.is_control()) {
+            let mut b = [0; 4];
+            let b = c.encode_utf8(&mut b).as_bytes();
+            if self.area_len + b.len() > AREA_TEXT {
                 break;
             }
-            self.area[self.area_len] = c;
-            self.area_len += 1;
+            self.area[self.area_len..self.area_len + b.len()].copy_from_slice(b);
+            self.area_len += b.len();
         }
         (self.widgets[id].cursor, self.widgets[id].anchor) = (self.area_len, self.area_len);
         self.keep_area_cursor_shown(id);
@@ -155,12 +159,13 @@ impl Ui {
         true
     }
 
-    /// The text area's cursor as its line and column (both from 0).
+    /// The text area's cursor as its line and column (both from 0, the
+    /// column in characters).
     pub fn area_cursor(&self) -> (usize, usize) {
         let Some(id) = self.area_id else { return (0, 0) };
         let c = self.widgets[id].cursor;
         let start = self.area_bytes()[..c].iter().rposition(|&b| b == b'\n').map_or(0, |k| k + 1);
-        (self.area_bytes()[..c].iter().filter(|&&b| b == b'\n').count(), c - start)
+        (self.area_bytes()[..c].iter().filter(|&&b| b == b'\n').count(), font::count(&self.area_bytes()[start..c]))
     }
 
     /// How many lines the text area's text has (at least one).
@@ -211,7 +216,8 @@ impl Ui {
     /// The gap `col` characters into row `n`, or its last if shorter.
     fn at_row_col(&self, id: Id, n: usize, col: usize) -> usize {
         let r = self.area_row(id, n);
-        (r.start + col).min(r.last_gap())
+        let t = self.area_bytes();
+        font::ahead(t, r.start, col).min(r.last_gap(t))
     }
 
     /// How many rows, and characters of a row, the area shows (with room
@@ -230,7 +236,7 @@ impl Ui {
         let (rows, cols) = self.area_shown(id);
         let c = self.widgets[id].cursor;
         let (row, r) = self.row_of(id, c);
-        let col = c - r.start;
+        let col = font::count(&self.area_bytes()[r.start..c]);
         let count = self.rows(id).count();
         let wrap = self.area_wrap;
         let w = &mut self.widgets[id];
@@ -258,7 +264,7 @@ impl Ui {
         let c = w.cursor;
         let sel = w.selection();
         let (row, here) = self.row_of(id, c);
-        let col = c - here.start;
+        let col = font::count(&self.area_bytes()[here.start..c]);
         let count = self.rows(id).count();
         let rows = self.area_shown(id).0;
         // Moved with Shift (the selection stretched), or a key that leaves
@@ -269,10 +275,10 @@ impl Ui {
             // Moved off a selection, the cursor goes to its end that way.
             LEFT if !shift && sel.is_some() => sel.map_or(c, |s| s.0),
             RIGHT if !shift && sel.is_some() => sel.map_or(c, |s| s.1),
-            LEFT => c.saturating_sub(1),
-            RIGHT => (c + 1).min(self.area_len),
+            LEFT => font::back(self.area_bytes(), c, 1),
+            RIGHT => font::ahead(self.area_bytes(), c, 1),
             HOME => here.start,
-            END => here.last_gap(),
+            END => here.last_gap(self.area_bytes()),
             UP if row > 0 => self.at_row_col(id, row - 1, col),
             UP => 0,
             DOWN if row + 1 < count => self.at_row_col(id, row + 1, col),
@@ -300,28 +306,36 @@ impl Ui {
                 self.area_cut(id);
                 let mut at = self.widgets[id].cursor;
                 let clip = self.clipboard;
-                for &k in clip.as_bytes().iter().filter(|&&k| k == b'\n' || (b' '..=b'~').contains(&k)) {
-                    at = self.insert(at, k);
+                let t = clip.as_bytes();
+                let mut k = 0;
+                while k < t.len() {
+                    let next = font::ahead(t, k, 1);
+                    if t[k] == b'\n' || t[k] >= b' ' && t[k] != 0x7f {
+                        at = self.insert(at, &t[k..next]);
+                    }
+                    k = next;
                 }
                 at
             }
             BACKSPACE | DELETE if self.area_cut(id) => self.widgets[id].cursor,
             BACKSPACE if c > 0 => {
-                self.remove(c - 1);
-                c - 1
+                let at = font::back(self.area_bytes(), c, 1);
+                self.remove(at, c);
+                at
             }
             DELETE if c < self.area_len => {
-                self.remove(c);
+                self.remove(c, font::ahead(self.area_bytes(), c, 1));
                 c
             }
             ENTER => {
                 self.area_cut(id);
-                self.insert(self.widgets[id].cursor, b'\n')
+                self.insert(self.widgets[id].cursor, b"\n")
             }
             _ => match ch.filter(|_| !control) {
                 Some(k) => {
                     self.area_cut(id);
-                    self.insert(self.widgets[id].cursor, k)
+                    let (bytes, n) = font::encode(k);
+                    self.insert(self.widgets[id].cursor, &bytes[..n])
                 }
                 // Shift itself, say.
                 None => {
@@ -341,20 +355,22 @@ impl Ui {
         }
     }
 
-    /// Inserts `k` at `at` if there is room: where the cursor goes.
-    fn insert(&mut self, at: usize, k: u8) -> usize {
-        if self.area_len == AREA_TEXT {
+    /// Inserts character `k` (its bytes) at `at` if there is room: where
+    /// the cursor goes.
+    fn insert(&mut self, at: usize, k: &[u8]) -> usize {
+        if self.area_len + k.len() > AREA_TEXT {
             return at;
         }
-        self.area.copy_within(at..self.area_len, at + 1);
-        self.area[at] = k;
-        self.area_len += 1;
-        at + 1
+        self.area.copy_within(at..self.area_len, at + k.len());
+        self.area[at..at + k.len()].copy_from_slice(k);
+        self.area_len += k.len();
+        at + k.len()
     }
 
-    fn remove(&mut self, at: usize) {
-        self.area.copy_within(at + 1..self.area_len, at);
-        self.area_len -= 1;
+    /// Takes out bytes `a` to `b`.
+    fn remove(&mut self, a: usize, b: usize) {
+        self.area.copy_within(b..self.area_len, a);
+        self.area_len -= b - a;
     }
 
     /// The gap in the text nearest (x, y): on the row there (the first or
@@ -418,24 +434,28 @@ impl Ui {
         let th = font::HEIGHT * SCALE;
         let tx = r.x + FIELD_INSET;
         let sel = w.selection().filter(|_| keyboard);
+        let t = self.area_bytes();
         for (k, row) in self.rows(id).skip(w.scroll).take(shown).enumerate() {
             let ty = r.y + TOP + k as u32 * LINE_H + (LINE_H - th) / 2;
-            let line = &self.area_bytes()[row.start..row.end];
+            let line = &t[row.start..row.end];
             if let Some((a, b)) = sel {
                 // The selected characters' cells behind them, and the
                 // line's end's if its newline is selected.
-                let past = if row.wrapped { row.end } else { row.end + 1 };
-                let from = a.max(row.start) - row.start;
-                let to = b.min(past).max(row.start) - row.start;
-                for k in from.max(w.hscroll)..to.min(w.hscroll + cols) {
-                    let x = tx + (k - w.hscroll) as u32 * STEP - SCALE / 2;
-                    s.fill(Rect { x, y: ty - 2, w: STEP, h: th + 4 }, SELECTION);
+                let past = if row.wrapped { row.end } else { (row.end + 1).min(t.len()) };
+                let (mut at, mut col) = (row.start, 0);
+                while at < past && col < w.hscroll + cols {
+                    if col >= w.hscroll && (a..b).contains(&at) {
+                        let x = tx + (col - w.hscroll) as u32 * STEP - SCALE / 2;
+                        s.fill(Rect { x, y: ty - 2, w: STEP, h: th + 4 }, SELECTION);
+                    }
+                    (at, col) = (font::ahead(t, at, 1), col + 1);
                 }
             }
-            let text = &line[w.hscroll.min(line.len())..(w.hscroll + cols).min(line.len())];
-            s.text(tx, ty, text, SCALE, INK);
-            if keyboard && row.holds(w.cursor) && w.cursor - row.start >= w.hscroll {
-                let cx = tx + (w.cursor - row.start - w.hscroll) as u32 * STEP - SCALE;
+            let from = font::ahead(line, 0, w.hscroll);
+            s.text(tx, ty, &line[from..font::ahead(line, from, cols)], SCALE, INK);
+            let col = font::count(&t[row.start..w.cursor.clamp(row.start, t.len())]);
+            if keyboard && row.holds(w.cursor) && col >= w.hscroll {
+                let cx = tx + (col - w.hscroll) as u32 * STEP - SCALE;
                 s.fill(Rect { x: cx, y: ty - 1, w: SCALE, h: th + 2 }, INK);
             }
         }
@@ -648,7 +668,7 @@ mod tests {
     }
 
     #[test]
-    fn it_holds_what_fits_and_set_text_keeps_ascii_and_newlines() {
+    fn it_holds_what_fits_and_set_text_leaves_out_control_characters() {
         let (mut ui, _) = notes();
         let long: std::string::String = core::iter::repeat_n('x', 600).collect();
         ui.set_area_text(&long);
@@ -656,6 +676,40 @@ mod tests {
         typ(&mut ui, "y");
         assert_eq!(ui.area_text().len(), super::AREA_TEXT, "full: nothing more typed");
         ui.set_area_text("one\ttwo\nthree\u{e9}");
-        assert_eq!((ui.area_text(), ui.area_cursor()), ("onetwo\nthree", (1, 5)));
+        assert_eq!((ui.area_text(), ui.area_cursor()), ("onetwo\nthree\u{e9}", (1, 6)));
+        // A character that would not fit whole is left out.
+        let long: std::string::String = core::iter::repeat_n('x', super::AREA_TEXT - 1).chain(['\u{e9}']).collect();
+        ui.set_area_text(&long);
+        assert_eq!(ui.area_text().len(), super::AREA_TEXT - 1);
+    }
+
+    #[test]
+    fn characters_past_ascii_are_one_column_each() {
+        let (mut ui, a) = notes();
+        // é and à typed (Latin-1 0xe9 and 0xe0), then moved over and taken
+        // out a character at a time though each is two bytes.
+        for ch in [0xe9, b'l', 0xe0] {
+            ui.event(Event::Key { usage: 4, down: true, modifiers: 0, ch: Some(ch) });
+        }
+        assert_eq!((ui.area_text(), ui.area_cursor(), ui.widget(a).cursor), ("\u{e9}l\u{e0}", (0, 3), 5));
+        key(&mut ui, LEFT);
+        assert_eq!((ui.area_cursor(), ui.widget(a).cursor), ((0, 2), 3));
+        key(&mut ui, LEFT);
+        key(&mut ui, BACKSPACE);
+        assert_eq!((ui.area_text(), ui.area_cursor()), ("l\u{e0}", (0, 0)));
+        key(&mut ui, DELETE);
+        assert_eq!(ui.area_text(), "\u{e0}");
+        key(&mut ui, END);
+        key(&mut ui, ENTER);
+        typ(&mut ui, "x");
+        key(&mut ui, UP);
+        assert_eq!(ui.area_cursor(), (0, 1), "the column in characters");
+        // Wrapped, a row holds as many characters as a row of ASCII.
+        let cols = ui.area_shown(a).1;
+        let wide: std::string::String = core::iter::repeat_n('\u{e9}', cols + 3).collect();
+        ui.set_area_wrap(true);
+        ui.set_area_text(&wide);
+        assert_eq!(ui.area_rows(), 2);
+        assert_eq!(ui.area_row(a, 0).end, 2 * cols);
     }
 }

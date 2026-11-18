@@ -198,7 +198,7 @@ impl Surface<'_> {
     }
 }
 
-/// Up to [`MAX_TEXT`] bytes of text.
+/// Up to [`MAX_TEXT`] bytes of UTF-8 text.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Text {
     bytes: [u8; MAX_TEXT],
@@ -208,10 +208,12 @@ pub struct Text {
 impl Text {
     pub const EMPTY: Text = Text { bytes: [0; MAX_TEXT], len: 0 };
 
-    /// `s`, cut at `MAX_TEXT` bytes.
+    /// `s`, cut at `MAX_TEXT` bytes (before the character that would
+    /// not fit whole).
     pub fn new(s: &[u8]) -> Text {
         let mut t = Text::EMPTY;
-        for &b in s {
+        let n = if s.len() > MAX_TEXT { font::back(s, MAX_TEXT + 1, 1) } else { s.len() };
+        for &b in &s[..n] {
             t.push(b);
         }
         t
@@ -252,6 +254,27 @@ impl Text {
         self.bytes[at] = b;
         self.len += 1;
         true
+    }
+
+    /// Puts `bytes` before byte `at` (at most the length) if they all fit:
+    /// whether they did.
+    pub fn insert_all(&mut self, at: usize, bytes: &[u8]) -> bool {
+        if self.len + bytes.len() > MAX_TEXT || at > self.len {
+            return false;
+        }
+        self.bytes.copy_within(at..self.len, at + bytes.len());
+        self.bytes[at..at + bytes.len()].copy_from_slice(bytes);
+        self.len += bytes.len();
+        true
+    }
+
+    /// Takes out bytes `a` to `b` (those there are).
+    pub fn remove_range(&mut self, a: usize, b: usize) {
+        let b = b.min(self.len);
+        if a < b {
+            self.bytes.copy_within(b..self.len, a);
+            self.len -= b - a;
+        }
     }
 
     /// Takes out byte `at`; false if there is none.
@@ -355,20 +378,21 @@ impl Widget {
             self.scroll = self.scroll.min(self.count.saturating_sub(n));
             return;
         }
+        // In characters: `scroll` and `cursor` are bytes, each at a
+        // character's start.
+        let t = self.text.as_bytes();
         if self.cursor < self.scroll {
             self.scroll = self.cursor;
-        } else if self.cursor > self.scroll + n {
-            self.scroll = self.cursor - n;
+        } else if font::count(&t[self.scroll.min(t.len())..self.cursor.min(t.len())]) > n {
+            self.scroll = font::back(t, self.cursor, n);
         }
-        self.scroll = self.scroll.min(self.text.len().saturating_sub(n));
+        self.scroll = self.scroll.min(font::back(t, t.len(), n));
     }
 
     /// Takes a field's selection out of its text: whether there was one.
     fn cut(&mut self) -> bool {
         let Some((a, b)) = self.selection() else { return false };
-        for _ in a..b {
-            self.text.remove(a);
-        }
+        self.text.remove_range(a, b);
         (self.cursor, self.anchor) = (a, a);
         true
     }
@@ -956,7 +980,7 @@ impl Ui {
             Kind::Label => {
                 s.fill(r, BACKGROUND);
                 let fits = (r.w / STEP + 1) as usize;
-                s.text(r.x, r.y + 1, &t[..t.len().min(fits)], SCALE, INK);
+                s.text(r.x, r.y + 1, &t[..font::ahead(t, 0, fits)], SCALE, INK);
             }
             Kind::Button => {
                 let face = if self.pressed == Some(id) && self.hover == Some(id) {
@@ -995,19 +1019,25 @@ impl Ui {
                 s.outline(r, if keyboard { FOCUS_EDGE } else { EDGE });
                 let (tx, ty) = (r.x + FIELD_INSET, r.y + (r.h - th) / 2);
                 let n = w.shown();
+                let scroll = scroll.min(t.len());
+                let end = font::ahead(t, scroll, n);
                 if let Some((a, b)) = w.selection().filter(|_| keyboard) {
                     // The selected characters' cells, behind them.
-                    for k in a.max(scroll)..b.min(scroll + n) {
-                        let x = tx + (k - scroll) as u32 * STEP - SCALE / 2;
-                        s.fill(Rect { x, y: ty - 2, w: STEP, h: th + 4 }, SELECTION);
+                    let (mut at, mut col) = (scroll, 0);
+                    while at < end {
+                        if (a..b).contains(&at) {
+                            let x = tx + col * STEP - SCALE / 2;
+                            s.fill(Rect { x, y: ty - 2, w: STEP, h: th + 4 }, SELECTION);
+                        }
+                        (at, col) = (font::ahead(t, at, 1), col + 1);
                     }
                 }
-                let shown = &t[scroll.min(t.len())..(scroll + n).min(t.len())];
-                s.text(tx, ty, shown, SCALE, INK);
+                s.text(tx, ty, &t[scroll..end], SCALE, INK);
                 if keyboard {
                     // The cursor, in the gap before the character it is
                     // before (or after the last one).
-                    let cx = tx + (cursor - scroll) as u32 * STEP - SCALE;
+                    let cols = font::count(&t[scroll..cursor.clamp(scroll, t.len())]);
+                    let cx = tx + cols as u32 * STEP - SCALE;
                     s.fill(Rect { x: cx, y: ty - 1, w: SCALE, h: th + 2 }, INK);
                 }
             }
@@ -1028,7 +1058,7 @@ impl Ui {
                         s.fill(Rect { y, h: ITEM_H, ..rows }, colour);
                     }
                     let item = self.items[w.first + k].as_bytes();
-                    s.text(rows.x + FIELD_INSET, y + (ITEM_H - th) / 2, &item[..item.len().min(fits)], SCALE, INK);
+                    s.text(rows.x + FIELD_INSET, y + (ITEM_H - th) / 2, &item[..font::ahead(item, 0, fits)], SCALE, INK);
                 }
                 if w.has_bar() {
                     s.fill(w.bar(), FACE);
@@ -1067,7 +1097,7 @@ impl Ui {
     fn gap_at(&self, f: Id, x: i32) -> usize {
         let w = &self.widgets[f];
         let from = x - (w.rect.x + FIELD_INSET) as i32 + STEP as i32 / 2;
-        (w.scroll + (from.max(0) as u32 / STEP) as usize).min(w.text.len())
+        font::ahead(w.text.as_bytes(), w.scroll, (from.max(0) as u32 / STEP) as usize)
     }
 
     /// Scrolls list `id` by `by` items (back if negative), as far as it
@@ -1219,7 +1249,7 @@ impl Ui {
         }
     }
 
-    /// A key down for field `id`.
+    /// A key down for field `id` (`ch` the Latin-1 character it types).
     fn field_key(&mut self, id: Id, usage: u64, modifiers: u8, ch: Option<u8>, r: &mut Response) {
         let (shift, control) = (modifiers & SHIFT != 0, modifiers & CONTROL != 0);
         let mut w = self.widgets[id];
@@ -1233,8 +1263,8 @@ impl Ui {
                 let to = match (usage, sel.filter(|_| !shift)) {
                     (LEFT, Some((a, _))) => a,
                     (RIGHT, Some((_, b))) => b,
-                    (LEFT, None) => w.cursor.saturating_sub(1),
-                    (RIGHT, None) => (w.cursor + 1).min(len),
+                    (LEFT, None) => font::back(w.text.as_bytes(), w.cursor, 1),
+                    (RIGHT, None) => font::ahead(w.text.as_bytes(), w.cursor, 1),
                     (HOME, _) => 0,
                     _ => len,
                 };
@@ -1256,31 +1286,42 @@ impl Ui {
             KEY_V if control => {
                 w.cut();
                 // A field is one line: a text area's newlines are left out.
-                for &c in self.clipboard.as_bytes().iter().filter(|&&c| c != b'\n') {
-                    if !w.text.insert(w.cursor, c) {
-                        break;
+                // Each character goes in whole or not at all.
+                let clip = self.clipboard;
+                let c = clip.as_bytes();
+                let mut at = 0;
+                while at < c.len() {
+                    let next = font::ahead(c, at, 1);
+                    if c[at] != b'\n' {
+                        if !w.text.insert_all(w.cursor, &c[at..next]) {
+                            break;
+                        }
+                        w.cursor += next - at;
                     }
-                    w.cursor += 1;
+                    at = next;
                 }
                 w.anchor = w.cursor;
             }
             BACKSPACE => {
-                if !w.cut() && w.cursor > 0 && w.text.remove(w.cursor - 1) {
-                    w.cursor -= 1;
+                if !w.cut() && w.cursor > 0 {
+                    let at = font::back(w.text.as_bytes(), w.cursor, 1);
+                    w.text.remove_range(at, w.cursor);
+                    w.cursor = at;
                 }
                 w.anchor = w.cursor;
             }
             DELETE => {
                 if !w.cut() {
-                    w.text.remove(w.cursor);
+                    w.text.remove_range(w.cursor, font::ahead(w.text.as_bytes(), w.cursor, 1));
                 }
             }
             ENTER => r.entered = Some(id),
             _ if !control => {
                 if let Some(c) = ch {
                     w.cut();
-                    if w.text.insert(w.cursor, c) {
-                        w.cursor += 1;
+                    let (bytes, n) = font::encode(c);
+                    if w.text.insert_all(w.cursor, &bytes[..n]) {
+                        w.cursor += n;
                     }
                     w.anchor = w.cursor;
                 }
@@ -1330,6 +1371,7 @@ fn overlaps(a: Rect, b: Rect) -> bool {
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
     use super::*;
 
     const LEFT_BUTTON: u64 = 1;
@@ -1363,9 +1405,82 @@ mod tests {
         assert_eq!(font::width(b"Greet", 2), 58);
         assert_eq!(font::width(b"", 2), 0);
         // Every glyph but the space marks something, in its 5 columns.
-        for c in 33..=126u8 {
+        for c in (33..=126u8).chain(0xa1..=0xff) {
             let g = font::glyph(c);
             assert!(g.iter().any(|&r| r != 0) && g.iter().all(|&r| r < 0x20), "glyph {}", c as char);
+        }
+        assert_eq!(font::glyph(0xa0), font::glyph(b' '), "a no-break space");
+        assert_eq!(font::glyph(0x85), font::glyph(b'?'), "C1 controls");
+        // The accented letters differ from their letters and each other.
+        assert_eq!(font::glyph(0xe9), &[0x02, 0x04, 0x0e, 0x11, 0x1f, 0x10, 0x0e]);
+        let mut all: std::vec::Vec<_> = (0xc0..=0xffu8).filter(|&c| c != 0xd7 && c != 0xf7).map(font::glyph).collect();
+        all.sort();
+        all.dedup();
+        assert_eq!(all.len(), 0x40 - 2);
+    }
+
+    #[test]
+    fn text_is_utf8_counted_by_characters() {
+        let t = "d\u{e9}j\u{e0} \u{20ac}".as_bytes();
+        assert_eq!((t.len(), font::count(t)), (10, 6));
+        assert_eq!(font::width(t, 1), 6 * font::ADVANCE - 1);
+        assert_eq!((font::ahead(t, 0, 2), font::ahead(t, 1, 1), font::ahead(t, 6, 9)), (3, 3, 10));
+        assert_eq!((font::back(t, 3, 1), font::back(t, 10, 1), font::back(t, 3, 9)), (1, 7, 0));
+        assert_eq!(font::encode(0xe9), ([0xc3, 0xa9], 2));
+        assert_eq!(font::encode(b'e'), ([b'e', 0], 1));
+        // A character past Latin-1 (the euro sign) is drawn as `?`.
+        assert_eq!((font::first(&t[1..]), font::first(&t[7..]), font::first(b"")), (Some(0xe9), Some(b'?'), None));
+        for dy in 0..font::HEIGHT {
+            for dx in 0..font::WIDTH {
+                let at = 5 * font::ADVANCE + dx;
+                assert_eq!(font::text_lit(t, 1, at, dy), font::lit(b'?', dx, dy));
+                assert_eq!(font::text_lit(t, 1, font::ADVANCE + dx, dy), font::lit(0xe9, dx, dy));
+            }
+        }
+        // Cut to fit, a character is left whole or out.
+        let mut s = [b'x'; MAX_TEXT + 1];
+        s[MAX_TEXT - 1..].copy_from_slice(&[0xc3, 0xa9]);
+        assert_eq!(Text::new(&s).len(), MAX_TEXT - 1);
+    }
+
+    #[test]
+    fn a_field_edits_accented_characters_whole() {
+        let mut ui = Ui::new(320, 240);
+        let field = ui.field();
+        let r = ui.widget(field).rect;
+        ui.event(Event::Focus(true));
+        ui.event(Event::Pointer { x: r.x as i32 + 4, y: r.y as i32 + 4, buttons: 1 });
+        ui.event(Event::Pointer { x: r.x as i32 + 4, y: r.y as i32 + 4, buttons: 0 });
+        for ch in [b'c', 0xe7, 0xe0] {
+            ui.event(Event::Key { usage: 4, down: true, modifiers: 0, ch: Some(ch) });
+        }
+        assert_eq!((ui.text(field), ui.cursor(field)), ("c\u{e7}\u{e0}", 5));
+        ui.event(Event::us_key(LEFT, true, 0));
+        assert_eq!(ui.cursor(field), 3);
+        ui.event(Event::us_key(BACKSPACE, true, 0));
+        assert_eq!((ui.text(field), ui.cursor(field)), ("c\u{e0}", 1));
+        ui.event(Event::us_key(DELETE, true, 0));
+        assert_eq!((ui.text(field), ui.cursor(field)), ("c", 1));
+        // A press puts the cursor in a gap by characters: after the second.
+        ui.set_text(field, "\u{e9}\u{e9}\u{e9}");
+        let x = (r.x + FIELD_INSET + 2 * STEP) as i32;
+        ui.event(Event::Pointer { x, y: r.y as i32 + 4, buttons: 1 });
+        ui.event(Event::Pointer { x, y: r.y as i32 + 4, buttons: 0 });
+        assert_eq!(ui.cursor(field), 4);
+        // Shift-Left selects one character; Control-C copies its two bytes.
+        ui.event(Event::us_key(LEFT, true, 0x02));
+        ui.event(Event::us_key(KEY_C, true, 0x01));
+        assert_eq!(ui.clipboard(), "\u{e9}");
+        // Drawn as the font's é, the characters' cells one step apart.
+        let mut px = std::vec![0u32; (320 * 240) as usize];
+        let mut s = Surface { px: &mut px, w: 320, h: 240 };
+        ui.draw(&mut s);
+        let (tx, ty) = (r.x + FIELD_INSET + STEP, r.y + (r.h - font::HEIGHT * SCALE) / 2);
+        for dy in 0..font::HEIGHT * SCALE {
+            for dx in 0..font::WIDTH * SCALE {
+                let lit = font::lit(0xe9, dx / SCALE, dy / SCALE);
+                assert_eq!(s.px[((ty + dy) * 320 + tx + dx) as usize] == INK, lit, "({dx}, {dy})");
+            }
         }
     }
 

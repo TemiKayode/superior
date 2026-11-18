@@ -3558,11 +3558,15 @@ impl StyledWindow {
         // The characters wholly before the boxes, less the gap.
         let room = w.saturating_sub(TITLE_LEFT + TITLE_GAP + boxes * (m + c));
         let fits = (room / TITLE_SCALE + 1) / superior_toolkit::font::ADVANCE as usize;
-        let title = &self.title[..self.title.len().min(fits)];
+        let title = &self.title[..superior_toolkit::font::ahead(self.title, 0, fits)];
         if x >= tx && y >= ty {
+            // A character at a time, as the toolkit's font reads UTF-8.
             let (cx, cy) = ((x - tx) / TITLE_SCALE, (y - ty) / TITLE_SCALE);
             let adv = superior_toolkit::font::ADVANCE as usize;
-            if cx / adv < title.len() && superior_toolkit::font::lit(title[cx / adv], (cx % adv) as u32, cy as u32) {
+            let at = superior_toolkit::font::ahead(title, 0, cx / adv);
+            if superior_toolkit::font::first(&title[at..])
+                .is_some_and(|c| superior_toolkit::font::lit(c, (cx % adv) as u32, cy as u32))
+            {
                 return Some(TITLE_TEXT);
             }
         }
@@ -4081,12 +4085,12 @@ fn zones_ui() -> superior_toolkit::Ui {
 }
 
 /// The keyboard layouts' menu (user/panel's `keyboard_layout`): a button
-/// for each layout, `kb` chosen, above the panel's keyboard button (on
-/// the US layout).
+/// for each layout, `kb` chosen, above the panel's keyboard button (which
+/// names layout `kb`, and so is as wide as its name).
 const LAYOUTS_H: usize = 8 + superior_toolkit::keymap::NAMES.len() * 34;
 
-fn layouts_at() -> (usize, usize) {
-    let ui = panel_ui(&[], ShellMenu::Closed, &panel_clock(0, 0), superior_toolkit::keymap::US);
+fn layouts_at(kb: u64) -> (usize, usize) {
+    let ui = panel_ui(&[], ShellMenu::Closed, &panel_clock(0, 0), kb);
     let x = ui.widget(ui.len() - 2).rect.x as usize;
     (x.min(SCREEN.0 - MENU_W), SCREEN.1 - PANEL_H - LAYOUTS_H)
 }
@@ -4181,13 +4185,14 @@ const PANEL_LAUNCHERS: &[(&str, &str)] = &[("greeter", "person"), ("hello", "hel
 /// launchers, the greeter's and Hello's task buttons (with both apps'
 /// windows on the panel), the greeter's minimise and close boxes, the
 /// clock and the time zones' menu's Adelaide, the keyboard button and the
-/// layouts' menu's Dvorak.
+/// layouts' menu's Dvorak and French (opened on Dvorak).
 struct PanelSpots {
     apps: (usize, usize),
     clock: (usize, usize),
     adelaide: (usize, usize),
     keyboard: (usize, usize),
     dvorak: (usize, usize),
+    french: (usize, usize),
     run: [(usize, usize); 2],
     greeter_task: (usize, usize),
     hello_task: (usize, usize),
@@ -4203,7 +4208,8 @@ fn panel_spots() -> PanelSpots {
         clock: panel_spot(&ui, 4),
         adelaide: menu_spot_of(&zones_ui(), ZONES_AT, adelaide_zone()),
         keyboard: panel_spot(&ui, 3),
-        dvorak: menu_spot_of(&layouts_ui(keymap::US), layouts_at(), keymap::DVORAK as usize),
+        dvorak: menu_spot_of(&layouts_ui(keymap::US), layouts_at(keymap::US), keymap::DVORAK as usize),
+        french: menu_spot_of(&layouts_ui(keymap::DVORAK), layouts_at(keymap::DVORAK), keymap::FRENCH as usize),
         run: [menu_spot(0), menu_spot(1)],
         greeter_task: panel_spot(&ui, 1),
         hello_task: panel_spot(&ui, 2),
@@ -4220,7 +4226,7 @@ fn panel_spots() -> PanelSpots {
 /// the windows back to front, and where the pointer is.
 fn panel_pictures(minute: u64) -> Vec<(Vec<Layer>, Option<(usize, usize)>)> {
     use ShellMenu::*;
-    use superior_toolkit::keymap::{DVORAK, US};
+    use superior_toolkit::keymap::{DVORAK, FRENCH, US};
     let s = panel_spots();
     let (utc, adelaide) = (panel_clock(minute, 0), panel_clock(minute, adelaide_zone()));
     let panel = |tasks: &[(&str, bool, bool)], menu: ShellMenu, pointer: (usize, usize)| {
@@ -4257,7 +4263,7 @@ fn panel_pictures(minute: u64) -> Vec<(Vec<Layer>, Option<(usize, usize)>)> {
                 greeter_layer(false, false),
                 greeter_layer(true, true),
                 panel(&both, Layouts, s.keyboard),
-                menu_layer_of(layouts_ui(US), layouts_at(), Some(s.keyboard)),
+                menu_layer_of(layouts_ui(US), layouts_at(US), Some(s.keyboard)),
             ],
             Some(s.keyboard),
         ),
@@ -4265,7 +4271,42 @@ fn panel_pictures(minute: u64) -> Vec<(Vec<Layer>, Option<(usize, usize)>)> {
             vec![greeter_layer(false, false), hello_dvorak(), panel_layer(&both, Closed, &adelaide, DVORAK, None)],
             Some(PANEL_HELLO_FIELD),
         ),
+        (
+            {
+                let [hello, greeter] = greeter_french();
+                let tasks = [("Greeter", true, false), ("Hello", false, false)];
+                vec![hello, greeter, panel_layer(&tasks, Closed, &adelaide, FRENCH, None)]
+            },
+            Some(PANEL_GREETER_FIELD),
+        ),
     ]
+}
+
+/// Hello's window behind, "pear" in its field, and the greeter's in front
+/// with the focus: "pear" pasted in its field, then "éèçà" typed on the
+/// French layout by the keys under "2790" on a US keyboard.
+fn greeter_french() -> [Layer; 2] {
+    use superior_toolkit::{Event, keymap};
+    let mut hello = greeter_layer(true, false);
+    let (mut ui, field, ..) = greeter_ui();
+    ui.set_text(field, "pear");
+    ui.draw(&mut superior_toolkit::Surface { px: &mut hello.pixels, w: hello.size.0 as u32, h: hello.size.1 as u32 });
+    let mut greeter = greeter_layer(false, true);
+    let (mut ui, field, ..) = greeter_ui();
+    ui.event(Event::Focus(true));
+    let (x, y) = ((PANEL_GREETER_FIELD.0 - greeter.at.0) as i32, (PANEL_GREETER_FIELD.1 - greeter.at.1) as i32);
+    for buttons in [0, 1, 0] {
+        ui.event(Event::Pointer { x, y, buttons });
+    }
+    ui.set_text(field, "pear");
+    for usage in [31, 36, 38, 39] {
+        for down in [true, false] {
+            ui.event(Event::Key { usage, down, modifiers: 0, ch: keymap::character(keymap::FRENCH, usage, 0) });
+        }
+    }
+    assert_eq!(ui.text(field), "pear\u{e9}\u{e8}\u{e7}\u{e0}");
+    ui.draw(&mut superior_toolkit::Surface { px: &mut greeter.pixels, w: greeter.size.0 as u32, h: greeter.size.1 as u32 });
+    [hello, greeter]
 }
 
 /// Hello's window with the focus, its field pressed and "pear" typed on
@@ -5196,7 +5237,9 @@ const PANEL_GREETER_FIELD: (usize, usize) = (360, 220);
 /// in front from its task button, closes it from its close box (it exits)
 /// and launches it again; then chooses the Dvorak layout from the panel's
 /// keyboard menu, types "pear" in Hello by the keys that type it there,
-/// copies it and pastes it in the greeter. Ten screenshots must have every
+/// copies it and pastes it in the greeter; then chooses French and types
+/// "éèçà" in the greeter by the keys under "2790". Eleven screenshots must
+/// have every
 /// pixel right:
 /// the panel as the toolkit lays it out on the host, the apps' windows in
 /// their titled frames, the focus and the stacking.
@@ -5257,7 +5300,16 @@ fn panel_test(arch: Arch) -> Result<(), String> {
             v.push(Key("ctrl+v"));
             v
         }),
-        (vec!["greeter: the field holds \"pear\", the cursor at 4"], vec![]),
+        // French chosen, and accented letters typed after it: the keys
+        // under "2790" on a US keyboard.
+        (vec!["greeter: the field holds \"pear\", the cursor at 4"], click(s.keyboard)),
+        (vec!["panel: keyboard layouts open: Dvorak chosen"], click(s.french)),
+        (vec!["panel: keyboard layout French (status 0)"], {
+            let mut v = click(PANEL_GREETER_FIELD);
+            v.extend([Key("end"), Type("2790")]);
+            v
+        }),
+        (vec!["greeter: the field holds \"pear\u{e9}\u{e8}\u{e7}\u{e0}\", the cursor at 12"], with(Some(11), vec![])),
     ];
     let (out, shots) = run_script(&img, arch, "desktop shell test", script, panel_act)?;
     let log = [
@@ -5308,11 +5360,17 @@ fn panel_test(arch: Arch) -> Result<(), String> {
         "panel test: Hello back with the focus (step 4)",
         "panel test: the greeter with the focus again (step 5)",
         "panel test: keyboard layout 2",
+        "panel: keyboard layouts open: Dvorak chosen",
+        "compositor: keyboard layout French",
+        "panel: keyboard layout French (status 0)",
+        "greeter: the field holds \"pear\u{e9}\", the cursor at 6",
+        "greeter: the field holds \"pear\u{e9}\u{e8}\u{e7}\u{e0}\", the cursor at 12",
+        "panel test: keyboard layout 3",
         "[cm] watcher asked to shut down (pass)",
     ];
     check_log("desktop shell test", &out, &log)?;
-    if shots != 10 {
-        return Err(format!("desktop shell test: {shots} screenshots taken, want 10"));
+    if shots != 11 {
+        return Err(format!("desktop shell test: {shots} screenshots taken, want 11"));
     }
     println!("== desktop shell test passed ({})", arch.name());
     Ok(())

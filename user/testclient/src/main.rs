@@ -5286,8 +5286,8 @@ fn window_watcher(test: &str, what: &str) -> ! {
 /// The desktop shell test's watcher (`arg 40`, boot/panel.manifest), a
 /// window manager too, to see what the panel does: both apps minimised,
 /// then the greeter closed (Hello still minimised), then the greeter
-/// launched again with the focus; then it shuts the system down (after
-/// the host's last screenshot).
+/// launched again with the focus; then, once the panel has chosen French,
+/// it shuts the system down (after the host's last screenshot).
 fn panel_watcher() -> ! {
     // The greeter's and Hello's windows: whether each is shown, minimised
     // and has the focus, as the compositor lists them to a manager.
@@ -5332,7 +5332,12 @@ fn panel_watcher() -> ! {
         }
         superior_sys::sleep(5);
     }
-    superior_sys::sleep(SCREENSHOT_TICKS);
+    // Accented letters are typed on French (layout 3) at the end.
+    while window_call(window::layout(), None).map_or(u64::MAX, |m| m[1]) != 3 {
+        superior_sys::sleep(5);
+    }
+    say!("panel test: keyboard layout 3");
+    superior_sys::sleep(2 * SCREENSHOT_TICKS);
     syscall(Syscall::Call, DESKTOP_CONTROL, [OP_SHUTDOWN, 0, 0, 0]);
     superior_sys::park()
 }

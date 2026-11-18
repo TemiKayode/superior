@@ -1,7 +1,7 @@
 //! Keyboard layouts: the character a key types, by its USB HID usage (the
 //! key's place on the keyboard), whether Shift is held, and the layout.
-//! Only ASCII is typed (the font has nothing else): a key whose character
-//! in the layout is outside it, or a dead key, types nothing.
+//! Characters are Latin-1 (the font's): ASCII, and from 0xA0 `£`, `é` and
+//! the like. A dead key (an accent typed before its letter) types nothing.
 //!
 //! The compositor maps keys under the system's layout and gives each
 //! `KEY` event the character; shortcuts (Control with a letter) go by the
@@ -71,14 +71,14 @@ pub fn character(layout: u64, usage: u64, modifiers: u8) -> Option<u8> {
     }
 }
 
-/// UK: as the US layout but for `"` and `@` swapped, `£` and `¬` (which
-/// type nothing here), and the keys beside Enter (`#~`, usage 50) and
-/// left Shift (`\|`, usage 100).
+/// UK: as the US layout but for `"` and `@` swapped, `£` and `¬`, and the
+/// keys beside Enter (`#~`, usage 50) and left Shift (`\|`, usage 100).
 fn uk(usage: u64, shift: bool) -> Option<u8> {
     match (usage, shift) {
         (31, true) => Some(b'"'),
         (52, true) => Some(b'@'),
-        (32, true) | (53, true) => None,
+        (32, true) => Some(0xa3),
+        (53, true) => Some(0xac),
         (50, false) => Some(b'#'),
         (50, true) => Some(b'~'),
         (100, false) => Some(b'\\'),
@@ -99,10 +99,10 @@ fn dvorak(usage: u64, shift: bool) -> Option<u8> {
 }
 
 /// French AZERTY: A and Q, Z and W swapped, M right of L; the digits
-/// shifted, unshifted the row's symbols (accented ones type nothing).
+/// shifted, unshifted the row's symbols and accented letters.
 fn french(usage: u64, shift: bool) -> Option<u8> {
-    // The top row from `1` to `0`, unshifted (0: an accented letter).
-    const TOP: &[u8; 10] = b"&\0\"'(-\0_\0\0";
+    // The top row from `1` to `0`, unshifted: & é " ' ( - è _ ç à.
+    const TOP: &[u8; 10] = &[b'&', 0xe9, b'"', b'\'', b'(', b'-', 0xe8, b'_', 0xe7, 0xe0];
     let pair = |plain: u8, shifted: u8| {
         let c = if shift { shifted } else { plain };
         (c != 0).then_some(c)
@@ -115,17 +115,17 @@ fn french(usage: u64, shift: bool) -> Option<u8> {
         29 => pair(b'w', b'W'),
         51 => pair(b'm', b'M'),
         16 => pair(b',', b'?'),
-        45 => pair(b')', 0),
+        45 => pair(b')', 0xb0),
         46 => pair(b'=', b'+'),
         // `^` and `¨` are dead keys there.
         47 => None,
-        48 => pair(b'$', 0),
-        49 | 50 => pair(b'*', 0),
-        52 => pair(0, b'%'),
-        53 => None,
+        48 => pair(b'$', 0xa3),
+        49 | 50 => pair(b'*', 0xb5),
+        52 => pair(0xf9, b'%'),
+        53 => pair(0xb2, 0),
         54 => pair(b';', b'.'),
         55 => pair(b':', b'/'),
-        56 => pair(b'!', 0),
+        56 => pair(b'!', 0xa7),
         100 => pair(b'<', b'>'),
         _ => us_key(usage).map(|c| if shift { us_shift(c) } else { c }),
     }
@@ -138,6 +138,7 @@ mod tests {
 
     /// What typing `keys` (usage and Shift) gives under `layout`.
     fn typed(layout: u64, keys: &[(u64, bool)]) -> std::string::String {
+        // Latin-1 is Unicode's first 256 code points.
         keys.iter().filter_map(|&(u, s)| character(layout, u, if s { 0x02 } else { 0 })).map(char::from).collect()
     }
 
@@ -183,7 +184,7 @@ mod tests {
     #[test]
     fn uk_differs_from_us_in_a_few_places() {
         assert_eq!(typed(UK, &[(31, true), (52, true), (50, false), (50, true), (100, false), (100, true)]), "\"@#~\\|");
-        assert_eq!(typed(UK, &[(32, true), (53, true), (49, false)]), "", "£, ¬ and the US backslash key");
+        assert_eq!(typed(UK, &[(32, true), (53, true), (49, false)]), "£¬", "the US backslash key types nothing");
         assert_eq!(typed(UK, &us_keys("Pear 42")), "Pear 42");
     }
 
@@ -194,9 +195,12 @@ mod tests {
         assert_eq!(typed(FRENCH, &us_keys("qwerty")), "azerty");
         assert_eq!(typed(FRENCH, &us_keys("q;")), "am");
         // The top row: symbols, digits with Shift.
-        assert_eq!(typed(FRENCH, &us_keys("1234567890")), "&\"'(-_");
+        assert_eq!(typed(FRENCH, &us_keys("1234567890")), "&é\"'(-è_çà");
         assert_eq!(typed(FRENCH, &(30..=39).map(|u| (u, true)).collect::<std::vec::Vec<_>>()), "1234567890");
         assert_eq!(typed(FRENCH, &[(16, false), (54, false), (55, false), (56, false), (100, true)]), ",;:!>");
         assert_eq!(character(FRENCH, 47, 0), None, "a dead key");
+        // The accented letters and symbols beside them.
+        assert_eq!(typed(FRENCH, &[(52, false), (53, false), (45, true), (48, true), (49, true), (56, true)]), "ù²°£µ§");
+        assert_eq!(typed(FRENCH, &[(52, true), (53, true)]), "%");
     }
 }
