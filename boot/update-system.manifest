@@ -1,0 +1,35 @@
+# The downloading updater's test (cargo xtask update-test): the system
+# bundle, signed as version 2 in slot A and served as version 3 by the
+# host. It follows boot/update.manifest, so it uses the PCI bus server
+# and the disk driver there: it adds the network and the updater.
+
+component virtio-net
+  image virtio-net
+  priority 11
+  uses pci 0
+  provides nic 1
+  notification 2
+  untyped 16 3
+
+component net
+  image net
+  priority 10
+  uses nic 0
+  provides net 1
+  memory 22
+  untyped 21 2
+  state 17
+  shared 13 18
+  cspace 9
+
+# Asks the gateway's port 47080, where xtask serves updates over HTTP
+# (port 47080 | 1 << 16: shut the machine down when done, for the test).
+component updater
+  image updater
+  arg 112616
+  priority 8
+  uses block 0
+  uses net 1
+  control 2
+  untyped 14 3
+  update-control

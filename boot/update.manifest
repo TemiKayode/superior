@@ -1,0 +1,31 @@
+# The downloading updater's test (cargo xtask update-test): the boot
+# bundle, as boot/ab.manifest's: the drivers that reach the system disk.
+# `system block` has the Component Manager boot the system in slot A or
+# B (boot/update-system.manifest), which brings up the network and runs
+# the updater.
+
+system block
+
+component pcibus
+  image pcibus
+  priority 12
+  # 2^7 slots: an ECAM page for each of 32 functions, BAR pages, domains.
+  cspace 7
+  provides pci 0
+  device pci-config 1
+  device pci-mmio 2
+  # Ports for I/O BARs.
+  device pci-io 88
+  # MSI vectors: slots 3 to 10.
+  device msi 3
+  device iommu 11
+  # Memory for the IOMMU domains: 64 KiB each, four at once.
+  untyped 18 12
+
+component virtio-blk
+  image virtio-blk
+  priority 11
+  uses pci 0
+  provides block 1
+  notification 2
+  untyped 17 3

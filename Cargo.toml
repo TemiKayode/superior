@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["kernel", "crates/objects", "crates/xdbc", "crates/sys", "crates/toolkit", "crates/console", "crates/inet", "crates/wifi", "user/pingpong", "user/shell", "user/cm", "user/echo", "user/counter", "user/testclient", "user/pcibus", "user/virtio-blk", "user/nvme", "user/ahci", "user/virtio-net", "user/net", "user/dns", "user/xhci", "user/hid", "user/memserver", "user/fs", "crates/driver", "crates/idl", "crates/lde", "user/lde-8139cp", "user/lde-e100", "user/lde-bochs", "user/lde-es1370", "user/compositor", "user/greeter", "user/list", "user/notes", "user/panel", "user/mixer", "loader", "xtask"]
+members = ["kernel", "crates/objects", "crates/xdbc", "crates/sys", "crates/toolkit", "crates/console", "crates/inet", "crates/wifi", "user/pingpong", "user/shell", "user/cm", "user/echo", "user/counter", "user/testclient", "user/pcibus", "user/virtio-blk", "user/nvme", "user/ahci", "user/virtio-net", "user/net", "user/dns", "user/xhci", "user/hid", "user/memserver", "user/fs", "crates/driver", "crates/idl", "crates/lde", "user/lde-8139cp", "user/lde-e100", "user/lde-bochs", "user/lde-es1370", "user/compositor", "user/greeter", "user/list", "user/notes", "user/panel", "user/mixer", "user/updater", "loader", "xtask"]
 # The kernel only builds for x86_64-unknown-none, so plain `cargo build` / `cargo test`
 # on the host covers the host-testable crates. Use `cargo xtask` for the kernel.
 default-members = ["crates/objects", "crates/xdbc", "xtask"]

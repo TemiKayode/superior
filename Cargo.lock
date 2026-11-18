@@ -871,6 +871,14 @@ name = "superior-uefi-loader"
 version = "0.1.0"
 
 [[package]]
+name = "superior-updater"
+version = "0.1.0"
+dependencies = [
+ "superior-objects",
+ "superior-sys",
+]
+
+[[package]]
 name = "superior-virtio-blk"
 version = "0.1.0"
 dependencies = [

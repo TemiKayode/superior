@@ -229,6 +229,7 @@ fn main() -> ExitCode {
                         .and_then(|_| suspend_test(a))
                         .and_then(|_| verified_boot_test(a))
                         .and_then(|_| ab_test(a))
+                        .and_then(|_| update_test(a))
                         .and_then(|_| packages_test(a))
                         .and_then(|_| image(false, a))
                         .and_then(|img| shell_session(&img))
@@ -279,6 +280,7 @@ fn main() -> ExitCode {
         Some("suspend-test") => suspend_test(arch),
         Some("verified-boot-test") => verified_boot_test(arch),
         Some("ab-test") => ab_test(arch),
+        Some("update-test") => update_test(arch),
         Some("packages-test") => packages_test(arch),
         Some("memory-test") => {
             image_with(false, arch, "memory").and_then(|img| memory_test(&img))
@@ -288,7 +290,7 @@ fn main() -> ExitCode {
         }
         Some("bench") => image(false, Arch::X86_64).and_then(|img| bench(&img)),
         _ => Err(
-            "usage: cargo xtask <idl | image | run | test | boot-test | shell-test | cm-test | supervise-test | drivers-test | memory-test | reboot-test | fs-test | nvme-test | ahci-test | net-test | lde-test | lde-e100-test | wifi-test | display-test | desktop-test | windows-test | toolkit-test | panel-test | resize-test | widgets-test | notes-test | uefi-test | console-test | input-test | audio-test | tcp-test | keyboard-test | hotplug-test | suspend-test | verified-boot-test | ab-test | packages-test | bench | sel4-test> [x86_64 | aarch64]"
+            "usage: cargo xtask <idl | image | run | test | boot-test | shell-test | cm-test | supervise-test | drivers-test | memory-test | reboot-test | fs-test | nvme-test | ahci-test | net-test | lde-test | lde-e100-test | wifi-test | display-test | desktop-test | windows-test | toolkit-test | panel-test | resize-test | widgets-test | notes-test | uefi-test | console-test | input-test | audio-test | tcp-test | keyboard-test | hotplug-test | suspend-test | verified-boot-test | ab-test | update-test | packages-test | bench | sel4-test> [x86_64 | aarch64]"
                 .into(),
         ),
     });
@@ -886,6 +888,8 @@ fn image_sealed(
         Some(fs_disk())
     } else if manifest == "ab" {
         Some(ab_disk(arch))
+    } else if manifest == "update" {
+        Some(update_disk(arch))
     } else if manifest == "packages" {
         Some(packages_disk(arch))
     } else {
@@ -896,9 +900,9 @@ fn image_sealed(
         arch,
         sel4: false,
         disk,
-        writable: fs || manifest == "ab" || manifest == "packages",
+        writable: fs || matches!(manifest, "ab" | "update" | "packages"),
         driver,
-        net: matches!(manifest, "net" | "tcp") || linux_nic(manifest).is_some(),
+        net: matches!(manifest, "net" | "tcp" | "update") || linux_nic(manifest).is_some(),
         linux_nic: linux_nic(manifest).map(|l| l.1),
         radio: manifest == "wifi",
         keyboard: matches!(manifest, "keyboard" | "input" | "windows" | "toolkit" | "panel" | "resize" | "widgets" | "notes"),
@@ -5499,6 +5503,145 @@ fn system_bundle(arch: Arch, role: u64, version: u64) -> Result<Vec<u8>, String>
     let image = std::fs::read(&client).map_err(|e| format!("reading {}: {e}", client.display()))?;
     let files = vec![("manifest".to_string(), text.into_bytes()), ("testclient".to_string(), image)];
     Ok(sign(pack(&files), version, &signing_key()?))
+}
+
+/// The update test's system disk.
+fn update_disk(arch: Arch) -> PathBuf {
+    root().join("target").join(format!("update-test-disk-{}.img", arch.name()))
+}
+
+/// The update test's system (`boot/update-system.manifest`: the network
+/// and the updater), signed as `version`.
+fn update_bundle(arch: Arch, version: u64) -> Result<Vec<u8>, String> {
+    let text = std::fs::read_to_string(root().join("boot/update-system.manifest"))
+        .map_err(|e| format!("reading boot/update-system.manifest: {e}"))?
+        .replace("\r\n", "\n");
+    let mut files = vec![("manifest".to_string(), text.into_bytes())];
+    for (name, package) in [("virtio-net", "superior-virtio-net"), ("net", "superior-net"), ("updater", "superior-updater")] {
+        let path = user_program(package, arch)?;
+        files.push((name.to_string(), std::fs::read(&path).map_err(|e| format!("reading {}: {e}", path.display()))?));
+    }
+    Ok(sign(pack(&files), version, &signing_key()?))
+}
+
+/// Where the update test's host serves updates (the guest asks the
+/// gateway's port of this number).
+const UPDATE_PORT: u16 = 47080;
+
+/// Serves `GET /system?have=N` on `UPDATE_PORT` until `stop`, answering
+/// the requests in turn: `v3` changed after signing, `v3` cut off half way
+/// (the connection closed early), `v3`, then 204 (nothing newer). The
+/// request lines, in order.
+fn update_server(
+    v3: Vec<u8>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Result<std::thread::JoinHandle<Vec<String>>, String> {
+    use std::io::{BufRead, BufReader};
+    use std::net::TcpListener;
+    use std::sync::atomic::Ordering;
+    let l = TcpListener::bind(("127.0.0.1", UPDATE_PORT))
+        .map_err(|e| format!("binding the update port {UPDATE_PORT}: {e}"))?;
+    l.set_nonblocking(true).map_err(|e| e.to_string())?;
+    Ok(std::thread::spawn(move || {
+        let mut asked = Vec::new();
+        while !stop.load(Ordering::Relaxed) {
+            let Ok((s, _)) = l.accept() else {
+                std::thread::sleep(Duration::from_millis(20));
+                continue;
+            };
+            let _ = s.set_nonblocking(false);
+            let _ = s.set_read_timeout(Some(Duration::from_secs(10)));
+            let mut r = BufReader::new(s);
+            let mut line = String::new();
+            if r.read_line(&mut line).is_err() {
+                continue;
+            }
+            // The rest of the head.
+            let mut h = String::new();
+            while r.read_line(&mut h).is_ok_and(|n| n > 2) {
+                h.clear();
+            }
+            asked.push(line.trim_end().to_string());
+            let mut s = r.into_inner();
+            let ok = |len: usize| format!("HTTP/1.1 200 OK\r\nContent-Length: {len}\r\nContent-Type: application/octet-stream\r\n\r\n");
+            let _ = match asked.len() {
+                1 => {
+                    let mut changed = v3.clone();
+                    let n = changed.len();
+                    changed[n / 2] ^= 0x10;
+                    s.write_all(ok(n).as_bytes()).and_then(|_| s.write_all(&changed))
+                }
+                2 => s.write_all(ok(v3.len()).as_bytes()).and_then(|_| s.write_all(&v3[..v3.len() / 2])),
+                3 => s.write_all(ok(v3.len()).as_bytes()).and_then(|_| s.write_all(&v3)),
+                _ => s.write_all(b"HTTP/1.1 204 No Content\r\n\r\n"),
+            };
+            let _ = s.flush();
+            let _ = s.shutdown(std::net::Shutdown::Both);
+        }
+        asked
+    }))
+}
+
+/// The downloading updater (`user/updater`), in one run of
+/// `boot/update.manifest` on a disk whose slot A holds the system at
+/// version 2: the updater confirms it once the network is up and asks the
+/// host for a newer system; the first download (changed after signing) is
+/// refused by the manager and the second cut short, both tried again; the
+/// third is staged, and the updater restarts the machine into it; version
+/// 3 boots from slot B, confirms, and finds nothing newer.
+fn update_test(arch: Arch) -> Result<(), String> {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use superior_objects::ab::{SECTOR, SLOT_FIRST, SLOT_SECTORS, slot_header};
+    let img = image_with(false, arch, "update")?;
+    let v2 = update_bundle(arch, 2)?;
+    let v3 = update_bundle(arch, 3)?;
+    let mut disk = vec![0u8; ((SLOT_FIRST[1] + SLOT_SECTORS) as usize) * SECTOR];
+    let at = SLOT_FIRST[0] as usize * SECTOR;
+    disk[at..at + SECTOR].copy_from_slice(&slot_header(v2.len()));
+    disk[at + SECTOR..at + SECTOR + v2.len()].copy_from_slice(&v2);
+    let path = update_disk(arch);
+    std::fs::write(&path, disk).map_err(|e| format!("writing {}: {e}", path.display()))?;
+    let stop = Arc::new(AtomicBool::new(false));
+    let server = update_server(v3.clone(), stop.clone())?;
+    println!("== update test on {} (version 3 is {} bytes)", img.path.display(), v3.len());
+    let out = run_to_exit(&img, Duration::from_secs(240));
+    stop.store(true, Ordering::Relaxed);
+    let asked = server.join().unwrap_or_default();
+    let out = out?;
+    let staged = format!("updater: download 3: {} bytes written to the free slot and staged; restarting into it", v3.len());
+    let cut = format!("updater: download 2: cut short, {} of {} bytes; trying again", v3.len() / 2, v3.len());
+    check_log(
+        "update test",
+        &out,
+        &[
+            "[cm] booting system slot A (version 2)",
+            "updater: running version 2 from slot A",
+            "[cm] system slot A confirmed: active, rollback floor 2",
+            "updater: the network is up (10.0.3.30): version 2 confirmed",
+            "updater: asking http://10.0.3.2:47080/system?have=2",
+            "[cm] update in slot B refused: its signature does not verify",
+            "updater: download 1: refused by the manager (status 3); trying again",
+            &cut,
+            "[cm] update staged in slot B (version 3): the next boot tries it once",
+            &staged,
+            "[cm] updater asked to restart the machine",
+            "[cm] booting system slot B (version 3)",
+            "updater: running version 3 from slot B",
+            "[cm] system slot B confirmed: active, rollback floor 3",
+            "updater: the network is up (10.0.3.30): version 3 confirmed",
+            "updater: asking http://10.0.3.2:47080/system?have=3",
+            "updater: no system newer than version 3",
+            "[cm] updater asked to shut down (pass)",
+        ],
+    )?;
+    let want = ["have=2", "have=2", "have=2", "have=3"].map(|h| format!("GET /system?{h} HTTP/1.1"));
+    if asked != want {
+        return Err(format!("update test: the host was asked {asked:?}, not {want:?}"));
+    }
+    println!("== the host served 4 requests: {}", asked.join(", "));
+    println!("== update test passed ({})", arch.name());
+    Ok(())
 }
 
 /// Writes a fresh A/B disk (`superior_objects::ab`): no boot record, slot

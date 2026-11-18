@@ -1,0 +1,17 @@
+[package]
+name = "superior-updater"
+description = "The updater: fetches the next system over HTTP and stages it in the free A/B slot."
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "superior-updater"
+test = false
+bench = false
+
+[dependencies]
+superior-objects = { path = "../../crates/objects" }
+superior-sys = { path = "../../crates/sys" }

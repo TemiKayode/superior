@@ -1367,6 +1367,21 @@ holds the rest):
   4; version 4 boots and confirms, raising the floor, and version 2 may not be
   staged again; with slot B damaged nothing boots, as slot A is now older than the
   floor.
+- The updater (`user/updater`), which downloads the next system. Run in the
+  system bundle with `update-control`, it confirms the system came up once the
+  network server has an address, then asks an update server (the gateway's port
+  its argument names) for `GET /system?have=<version>` over HTTP/1.1
+  (`superior_objects::http`, which reads a response's head in place and wants a
+  `Content-Length`). 204 means nothing newer. 200 is the signed system bundle,
+  written to the free slot as it arrives and its header sector last, so a
+  download cut short never looks like a slot; the manager checks it
+  (`OP_UPDATE_READY`) and the updater restarts the machine into it
+  (`update::OP_RESTART`, a fast reboot). A download refused, cut short or failed
+  is tried again, five times at most. `cargo xtask update-test` runs it on both
+  ISAs from a disk whose slot A holds version 2: the host's first answer
+  (changed after signing) is refused by the manager, its second cut off half way,
+  its third staged; the machine restarts into version 3 from slot B, which
+  confirms and is told nothing is newer.
 - Signed app packages (`superior_objects::package`). A package is a bundle
   signed like the system, but with the publisher key (`packages.key` in the
   system or boot bundle), holding its components' manifest and images. With
@@ -1460,7 +1475,8 @@ AArch64 by the firmware), measurements extended into a TPM and attestation,
 the boot bundle itself in A/B slots (it is built into the kernel image), a
 rollback counter kept in tamper-resistant storage (the floor is on the system
 disk, and the kernel's oldest version built into it), a boot record written
-atomically (two copies), an updater that downloads, apps that provide services, a package store on a
+atomically (two copies), downloads over TLS (the updater trusts the signature,
+not the connection), apps that provide services, a package store on a
 filesystem rather than fixed disk slots, an app's right to the control
 capability (today any component holding one may shut the machine down), and release keys kept off the build machine; the IDL describing interfaces other than the bus server's; escalating a component
 given up on to a supervisor above it (today the

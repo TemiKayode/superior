@@ -16,6 +16,7 @@ pub mod bundle;
 pub mod cap;
 pub mod crypto;
 pub mod elf;
+pub mod http;
 pub mod idl;
 pub mod image;
 pub mod interfaces;

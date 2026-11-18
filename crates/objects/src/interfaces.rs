@@ -742,6 +742,9 @@ pub mod update {
     /// Reply `[status]`: `Denied` if it does not verify, `Invalid` if it is
     /// older than the rollback floor or the slot is empty.
     pub const OP_UPDATE_READY: u64 = 11;
+    /// `[OP_RESTART]`: restart the machine (a fast reboot), which boots
+    /// the update staged, if any. Not answered.
+    pub const OP_RESTART: u64 = 21;
 }
 
 /// App packages (`crate::package`): calls to the Component Manager from a

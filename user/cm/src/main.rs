@@ -1669,6 +1669,12 @@ pub extern "C" fn _start(arg: u64) -> ! {
                 Some([m.suspend(msg.msg[1]) as u64, 0, 0, 0])
             }
             BADGE_REPORT
+                if i < MAX_COMPONENTS && m.component(i).update_control && msg.msg[0] == update::OP_RESTART =>
+            {
+                say!("{} asked to restart the machine", m.component(i).name);
+                reboot()
+            }
+            BADGE_REPORT
                 if i < MAX_COMPONENTS
                     && m.component(i).update_control
                     && (update::OP_BOOT_INFO..=update::OP_UPDATE_READY).contains(&msg.msg[0]) =>
