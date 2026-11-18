@@ -553,12 +553,34 @@ fn linux_test(img: &Image) -> Result<(), String> {
         "linux: busybox sh -c echo $((6 * 7)) from the shell; exit 3 exited with status 3",
         "linux: > pi is 3.141593",
         "linux: busybox awk BEGIN { printf \"pi is %.6f\\n\", atan2(0, -1) } exited with status 0",
+        // Processes: fork, execve, wait4 and the status passed on.
+        "linux: > false said 1",
+        "linux: > true said 0",
+        // Pipelines: children joined by pipes.
+        "linux: > 1000",
+        "linux: sh -c seq 1 1000 | wc -l exited with status 0",
+        "linux: > 5 4 3 2 1",
+        // Files: redirections, directories, copies, renames, removal.
+        "linux: > first line",
+        "linux: > second line",
+        "linux: sh -c mkdir -p /tmp/notes && echo first line > /tmp/notes/a && echo second line >> /tmp/notes/a && cat /tmp/notes/a exited with status 0",
+        "linux: > a",
+        "linux: > c",
+        "linux: > 23",
+        "linux: > c",
+        "linux: sh -c cd /tmp/notes && cp a b && mv b c && ls && wc -c < c && rm a && ls exited with status 0",
+        // A later run sees what the earlier ones left.
+        "linux: running cat /tmp/notes/c (pid ",
+        "linux: > first line",
+        "linux: > second line",
+        "linux: cat /tmp/notes/c exited with status 0",
+        "linux: > cat said 1",
         "[cm] linux asked to shut down (pass)",
     ];
     if let Err(step) = find_in_order(&out, &steps) {
         return Err(format!("Linux personality test: missing (in order) {step:?}"));
     }
-    for bad in ["[fail]", "could not", "panic", "[fault]"] {
+    for bad in ["[fail]", "could not", "panic", "[fault]", "not implemented", "killed"] {
         if out.contains(bad) {
             return Err(format!("Linux personality test: log contains {bad:?}"));
         }

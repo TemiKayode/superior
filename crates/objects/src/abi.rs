@@ -503,6 +503,11 @@ pub const REGS_TLS: u64 = 3;
 /// [`FaultKind::ForeignSyscall`] (and its registers are restored exactly
 /// on return, but for the result); 0: they are Superior's again.
 pub const REGS_FOREIGN: u64 = 4;
+/// `fork`'s child: every register, the thread pointer and the FPU state of
+/// the thread in slot `rdx` (Write right), but 0 in the result register
+/// (`rax`, `x0`). The thread must be configured and not yet started; it
+/// starts where the other will resume.
+pub const REGS_FORK_FROM: u64 = 5;
 
 /// [`Syscall::FrameMapInto`] flags.
 pub const MAP_WRITE: u64 = 1;

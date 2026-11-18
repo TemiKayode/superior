@@ -906,7 +906,9 @@ fn raise_fault(k: &mut Kernel, cur: Tid, kind: FaultKind, addr: u64, pc: u64, co
 /// `ThreadRegisters`: rdi = thread (Write right), rsi = operation, rdx =
 /// its value. See the `REGS_*` constants.
 fn thread_registers(k: &mut Kernel, cur: Tid, f: &Args) -> Result<(), u64> {
-    use superior_objects::abi::{REGS_FOREIGN, REGS_SET_TLS, REGS_SYSCALL, REGS_SYSCALL_MORE, REGS_TLS};
+    use superior_objects::abi::{
+        REGS_FOREIGN, REGS_FORK_FROM, REGS_SET_TLS, REGS_SYSCALL, REGS_SYSCALL_MORE, REGS_TLS,
+    };
     let t = thread_cap(k, cur, f.a0)? as usize;
     let r = k.frames[t].foreign_syscall();
     let msg = match f.a1 {
@@ -921,6 +923,22 @@ fn thread_registers(k: &mut Kernel, cur: Tid, f: &Args) -> Result<(), u64> {
             [0; 4]
         }
         REGS_TLS => [k.tls[t], 0, 0, 0],
+        REGS_FORK_FROM => {
+            let from = thread_cap(k, cur, f.a2)? as usize;
+            if !thread_inactive(k, t as Tid) || k.configured[t].is_none() || from == t {
+                return Err(Error::IllegalOperation.code());
+            }
+            disown(k, t as Tid);
+            let mut frame = k.frames[from];
+            frame.resume_at(frame.pc(), 0);
+            k.frames[t] = frame;
+            k.tls[t] = k.tls[from];
+            k.fp[t] = k.fp[from];
+            // Every register exactly as given, not a fresh thread's.
+            k.fresh[t] = false;
+            k.preempted[t] = true;
+            [0; 4]
+        }
         REGS_FOREIGN if f.a2 <= 1 => {
             k.foreign[t] = f.a2 == 1;
             k.fp[t] = arch::FpState::INITIAL;

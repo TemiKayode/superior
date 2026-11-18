@@ -1517,6 +1517,27 @@ holds the rest):
   checked against pinned hashes, on both ISAs: `echo`, `uname -sm`, the shell
   doing arithmetic and exiting with status 3, and `awk` printing pi from
   `atan2`.
+- The Linux personality's processes and files: shell scripts run with pipes and
+  redirections. Each process is an address space and a foreign thread of its
+  own, made from one of seven blocks of the personality's memory and revoked
+  when it exits or execs. `fork` (and `clone` without `CLONE_VM`) copies the
+  process's own pages (code and read-only data stay the bundle file's pages,
+  shared by all) and its descriptors, and the kernel copies the thread
+  (`ThreadRegisters`, `REGS_FORK_FROM`: every register, the thread pointer and
+  the FPU state, 0 in the result register); `execve` replaces the address space
+  under the same pid, closing close-on-exec descriptors; `exit` leaves a zombie
+  for `wait4`, whose status the shell reports as `$?`. A call that must wait
+  (`wait4` for a running child, reading an empty pipe, writing a full one) is
+  set aside with `ReplySave` and answered with `ReplyTo` when it can go on.
+  Descriptors (`dup`, `dup2`, `dup3`, `fcntl`, `pipe2`) point at shared open
+  files, with offsets; files are an in-memory tree in the personality
+  (`user/linux/src/fs.rs`): `/bin` with BusyBox and a link per applet, the
+  interpreter, `/tmp`, `/home`, `/dev/null`, with `openat`, `stat`,
+  `getdents64`, `mkdir`, `unlink`, `rename`, `symlink`, `readlink`, `chdir`,
+  `getcwd` and `ftruncate`. `linux-test` adds `false; echo $?` and `true &&`,
+  `seq 1 1000 | wc -l`, a three-stage pipeline, `>` and `>>` into a new
+  directory, `cp`, `mv`, `ls`, `wc -c <` and `rm`, and a later run reading what
+  an earlier one left, on both ISAs.
 - Interrupt and exception entries clear the direction flag. User code may be
   interrupted mid-way through a backward copy, with the flag set; the kernel's own
   copies need it clear, and without the `cld` they ran backwards, wrecking saved
@@ -1588,8 +1609,9 @@ system bundle's rollback floor in the TPM too (the boot bundle's is; the
 system's is on the system disk), a boot record written atomically (two
 copies), certificate chains and revocation for the update server (the updater
 pins one key), apps that provide services, a package store on a
-filesystem rather than fixed disk slots, the Linux personality's processes
-(`fork`, `clone`, `execve`), files, signals, terminals and threads, and
+filesystem rather than fixed disk slots, the Linux personality's files on
+the filesystem server (today they are in its memory), signals, terminals
+and threads (`clone` with `CLONE_VM`), and
 fixed-address (non-PIE) Linux executables, which are linked at 4 MiB, where
 the AArch64 kernel's identity map lives (the kernel needs moving to the high
 half first), an app's right to the control
