@@ -1,16 +1,32 @@
 //! The personality's files: an in-memory tree (directories, files,
-//! symbolic links, the programs from the bundle, `/dev/null`, the terminal), pipes, and
+//! symbolic links, the programs from the bundle, `/dev/null`, the
+//! terminal), with the filesystem server's tree under `/home`; pipes; and
 //! the open-file descriptions processes share through their descriptors.
 //!
 //! Everything lives in pages this server maps at start (all zero is a
 //! valid empty state). A file's data is up to [`FILE_BLOCKS`] pages from a
 //! pool; directories hold no entries of their own: an inode names its
 //! parent, and a directory's entries are the inodes that name it.
+//!
+//! Under `/home` ([`Fs::mount`]) the files are the server's ([`remote`]):
+//! a name looked up there becomes an inode here, marked remote, holding
+//! the server's handle and the size, and its path is the names up to
+//! `/home`. So walking paths, the working directory and `getcwd` are as
+//! for the rest; reads, writes and changes go to the server, and a
+//! directory's entries are listed from it. Such inodes no descriptor or
+//! directory needs are let go when inodes run short ([`Fs::evict`]).
+
+use crate::remote;
+use core::cell::Cell;
+use superior_objects::interfaces::fs as server;
 
 pub const MAX_INODES: usize = 256;
 pub const FILE_BLOCKS: usize = 16;
-pub const POOL_PAGES: usize = 220;
-pub const NAME_MAX: usize = 27;
+pub const POOL_PAGES: usize = 216;
+/// The filesystem server's longest name.
+pub const NAME_MAX: usize = server::MAX_NAME;
+/// Bytes of a path under `/home`, as the server is given it.
+const PATH_MAX: usize = 1024;
 pub const PIPE_BUF: usize = 4096;
 pub const MAX_PIPES: usize = 8;
 pub const MAX_FILES: usize = 64;
@@ -20,6 +36,8 @@ pub const ROOT: u16 = 1;
 // Linux error numbers.
 pub const ENOENT: u64 = 2;
 pub const EBADF: u64 = 9;
+pub const EBUSY: u64 = 16;
+pub const EXDEV: u64 = 18;
 pub const EEXIST: u64 = 17;
 pub const ENOTDIR: u64 = 20;
 pub const EISDIR: u64 = 21;
@@ -56,6 +74,25 @@ pub struct Inode {
     pub size: u32,
     /// Pool pages, 1-based (0: none yet, a hole of zeros).
     blocks: [u16; FILE_BLOCKS],
+    /// The filesystem server's, and its handle there (0 for a link).
+    remote: bool,
+    handle: u64,
+}
+
+/// A directory entry, as [`Fs::entry`] gives it.
+pub struct Dirent {
+    /// The position of the entry after it.
+    pub next: u64,
+    pub ino: u64,
+    pub kind: Kind,
+    len: u8,
+    name: [u8; NAME_MAX],
+}
+
+impl Dirent {
+    pub fn name(&self) -> &[u8] {
+        &self.name[..self.len as usize]
+    }
 }
 
 pub struct Fs {
@@ -65,6 +102,13 @@ pub struct Fs {
     /// length).
     pub pool: u64,
     pub images: [(u64, u64); MAX_IMAGES],
+    /// `/home`'s inode when it is the server's (0 until it is).
+    pub mount: u16,
+    /// The entries the buffer holds from the server's last `READDIR`, if
+    /// no call since: the directory's handle, the position asked for, the
+    /// entries before it (as [`Fs::entry`] counts them), how many came,
+    /// the position after them, and [`remote::calls`] then.
+    listed: Cell<[u64; 6]>,
 }
 
 /// Files from the bundle at most.
@@ -117,6 +161,112 @@ impl Fs {
         Err(EINVAL)
     }
 
+    /// Makes `/home` the filesystem server's tree (its root made if this
+    /// is the first time); whether the server answered.
+    pub fn mount(&mut self) -> bool {
+        let Some(home) = self.cached(ROOT, b"home") else { return false };
+        let Ok((handle, _, _)) = remote::open(b"", server::CREATE) else { return false };
+        let n = &mut self.inodes[home as usize];
+        (n.remote, n.handle) = (true, handle);
+        self.mount = home;
+        true
+    }
+
+    pub fn is_remote(&self, ino: u16) -> bool {
+        self.inodes[ino as usize].remote
+    }
+
+    /// Remote inode `ino`'s path on the server, into `out`: the names
+    /// from `/home` down, `/` between. Its length.
+    fn path(&self, ino: u16, out: &mut [u8; PATH_MAX]) -> Result<usize, u64> {
+        let mut chain = [0u16; 32];
+        let (mut n, mut at) = (0, ino);
+        while at != self.mount {
+            if !self.is_remote(at) || n == chain.len() {
+                return Err(EINVAL);
+            }
+            chain[n] = at;
+            n += 1;
+            at = self.inodes[at as usize].parent;
+        }
+        let mut len = 0;
+        for &k in chain[..n].iter().rev() {
+            let name = self.name(k);
+            if len + name.len() + 1 > PATH_MAX {
+                return Err(ENAMETOOLONG);
+            }
+            if len > 0 {
+                out[len] = b'/';
+                len += 1;
+            }
+            out[len..len + name.len()].copy_from_slice(name);
+            len += name.len();
+        }
+        Ok(len)
+    }
+
+    /// The server's path for `name` in remote directory `dir`.
+    fn child_path(&self, dir: u16, name: &[u8], out: &mut [u8; PATH_MAX]) -> Result<usize, u64> {
+        let mut len = self.path(dir, out)?;
+        if len + name.len() + 1 > PATH_MAX {
+            return Err(ENAMETOOLONG);
+        }
+        if len > 0 {
+            out[len] = b'/';
+            len += 1;
+        }
+        out[len..len + name.len()].copy_from_slice(name);
+        Ok(len + name.len())
+    }
+
+    /// An inode for the server's `name` in `dir`.
+    fn proxy(&mut self, dir: u16, name: &[u8], kind: Kind, handle: u64, size: u64) -> Result<u16, u64> {
+        let ino = self.alloc_inode(dir, name, kind)?;
+        let n = &mut self.inodes[ino as usize];
+        (n.remote, n.handle, n.size) = (true, handle, size.min(u32::MAX as u64) as u32);
+        Ok(ino)
+    }
+
+    /// Frees remote inode `ino`, and any under it.
+    fn drop_proxy(&mut self, ino: u16) {
+        for k in 2..MAX_INODES as u16 {
+            let n = &self.inodes[k as usize];
+            if n.kind != Kind::Free && n.parent == ino && k != ino {
+                self.drop_proxy(k);
+            }
+        }
+        self.inodes[ino as usize].kind = Kind::Free;
+    }
+
+    /// Inodes free.
+    pub fn free_inodes(&self) -> usize {
+        self.inodes[2..].iter().filter(|n| n.kind == Kind::Free).count()
+    }
+
+    /// Lets go of remote inodes nothing needs: not `/home`, not `busy`
+    /// (open, or a working directory), with nothing under them. They are
+    /// looked up again when next named. How many.
+    pub fn evict(&mut self, busy: impl Fn(u16) -> bool) -> usize {
+        let mut freed = 0;
+        loop {
+            let mut any = false;
+            for k in 2..MAX_INODES as u16 {
+                let n = &self.inodes[k as usize];
+                if n.kind == Kind::Free || !n.remote || k == self.mount || busy(k) {
+                    continue;
+                }
+                if self.inodes.iter().any(|c| c.kind != Kind::Free && c.parent == k) {
+                    continue;
+                }
+                self.inodes[k as usize].kind = Kind::Free;
+                (any, freed) = (true, freed + 1);
+            }
+            if !any {
+                return freed;
+            }
+        }
+    }
+
     pub fn name(&self, ino: u16) -> &[u8] {
         let i = &self.inodes[ino as usize];
         &i.name[..i.nlen as usize]
@@ -141,7 +291,28 @@ impl Fs {
         }
     }
 
-    pub fn lookup(&self, dir: u16, name: &[u8]) -> Option<u16> {
+    /// What `name` names in `dir`: an inode already here, or, in a
+    /// remote directory, the server's (an inode made for it).
+    pub fn lookup(&mut self, dir: u16, name: &[u8]) -> Option<u16> {
+        if let Some(ino) = self.cached(dir, name) {
+            return Some(ino);
+        }
+        if !self.is_remote(dir) || self.kind(dir) != Kind::Dir || name.len() > NAME_MAX {
+            return None;
+        }
+        let mut p = [0u8; PATH_MAX];
+        let n = self.child_path(dir, name, &mut p).ok()?;
+        let (kind, handle, size) = match remote::open(&p[..n], server::NOFOLLOW) {
+            Ok((h, s, k)) => (if k == server::KIND_DIR { Kind::Dir } else { Kind::File }, h, s),
+            // A link (`NOFOLLOW`): its size is its target's length.
+            Err(ELOOP) => (Kind::Symlink, 0, remote::readlink(&p[..n], &mut [0; PATH_MAX]).ok()? as u64),
+            Err(_) => return None,
+        };
+        self.proxy(dir, name, kind, handle, size).ok()
+    }
+
+    /// What `name` names in `dir` among the inodes here.
+    fn cached(&self, dir: u16, name: &[u8]) -> Option<u16> {
         match name {
             b"." => return Some(dir),
             b".." => return Some(self.inodes[dir as usize].parent),
@@ -153,7 +324,8 @@ impl Fs {
         })
     }
 
-    pub fn create(&mut self, dir: u16, name: &[u8], kind: Kind) -> Result<u16, u64> {
+    /// Checks that `name` may be made in `dir`.
+    fn may_create(&mut self, dir: u16, name: &[u8]) -> Result<(), u64> {
         if name.len() > NAME_MAX {
             return Err(ENAMETOOLONG);
         }
@@ -166,34 +338,131 @@ impl Fs {
         if self.lookup(dir, name).is_some() {
             return Err(EEXIST);
         }
+        Ok(())
+    }
+
+    /// Makes an empty file or directory (or a node of another kind, but
+    /// not under `/home`).
+    pub fn create(&mut self, dir: u16, name: &[u8], kind: Kind) -> Result<u16, u64> {
+        self.may_create(dir, name)?;
+        if !self.is_remote(dir) {
+            return self.alloc_inode(dir, name, kind);
+        }
+        let mut p = [0u8; PATH_MAX];
+        let n = self.child_path(dir, name, &mut p)?;
+        let path = &p[..n];
+        let (handle, size, _) = match kind {
+            Kind::File => remote::open(path, server::CREATE | server::EXCL)?,
+            Kind::Dir => {
+                remote::mkdir(path)?;
+                remote::open(path, server::DIRECTORY)?
+            }
+            _ => return Err(EINVAL),
+        };
+        self.proxy(dir, name, kind, handle, size)
+    }
+
+    /// Makes a symbolic link to `target`.
+    pub fn symlink(&mut self, dir: u16, name: &[u8], target: &[u8]) -> Result<u16, u64> {
+        self.may_create(dir, name)?;
+        if !self.is_remote(dir) {
+            let l = self.alloc_inode(dir, name, Kind::Symlink)?;
+            return self.write(l, 0, target).map(|_| l);
+        }
+        let mut p = [0u8; PATH_MAX];
+        let n = self.child_path(dir, name, &mut p)?;
+        remote::symlink(&p[..n], target)?;
+        self.proxy(dir, name, Kind::Symlink, 0, target.len() as u64)
+    }
+
+    fn alloc_inode(&mut self, dir: u16, name: &[u8], kind: Kind) -> Result<u16, u64> {
+        if name.len() > NAME_MAX {
+            return Err(ENAMETOOLONG);
+        }
         let ino = (2..MAX_INODES as u16).find(|&i| self.inodes[i as usize].kind == Kind::Free).ok_or(ENOSPC)?;
         let n = &mut self.inodes[ino as usize];
-        *n = Inode { kind, parent: dir, nlen: name.len() as u8, name: [0; NAME_MAX], size: 0, blocks: [0; FILE_BLOCKS] };
+        *n = Inode {
+            kind,
+            parent: dir,
+            nlen: name.len() as u8,
+            name: [0; NAME_MAX],
+            size: 0,
+            blocks: [0; FILE_BLOCKS],
+            remote: false,
+            handle: 0,
+        };
         n.name[..name.len()].copy_from_slice(name);
         Ok(ino)
     }
 
-    /// The entry after position `pos` of directory `dir`: positions 0 and
-    /// 1 are `.` and `..`, then each inode's number plus 2.
-    pub fn entry(&self, dir: u16, pos: u64) -> Option<(u64, u16, &[u8])> {
+    /// The entry at position `pos` of directory `dir`, or after it:
+    /// positions 0 and 1 are `.` and `..`; then, in memory, each inode's
+    /// number plus 2, and in a remote directory the server's entries in
+    /// its order, counted from 2.
+    pub fn entry(&self, dir: u16, pos: u64) -> Option<Dirent> {
+        let make = |next, ino: u64, kind, name: &[u8]| {
+            let mut d = Dirent { next, ino, kind, len: name.len().min(NAME_MAX) as u8, name: [0; NAME_MAX] };
+            d.name[..d.len as usize].copy_from_slice(&name[..d.len as usize]);
+            d
+        };
         match pos {
-            0 => return Some((1, dir, b".")),
-            1 => return Some((2, self.inodes[dir as usize].parent, b"..")),
+            0 => return Some(make(1, dir as u64, Kind::Dir, b".")),
+            1 => return Some(make(2, self.inodes[dir as usize].parent as u64, Kind::Dir, b"..")),
+            _ if self.is_remote(dir) => return self.remote_entry(dir, pos - 2).map(|(ino, kind, name, len)| make(pos + 1, ino, kind, &name[..len])),
             _ => {}
         }
         (pos.saturating_sub(2) as usize..MAX_INODES).find_map(|i| {
             let n = &self.inodes[i];
-            (i >= 2 && n.kind != Kind::Free && n.parent == dir).then(|| (i as u64 + 3, i as u16, self.name(i as u16)))
+            (i >= 2 && n.kind != Kind::Free && n.parent == dir).then(|| make(i as u64 + 3, i as u64, n.kind, self.name(i as u16)))
         })
+    }
+
+    /// Remote directory `dir`'s entry `k` (from 0): its inode number (the
+    /// one here if it has one), kind and name. Entries come from the
+    /// server 64 at a time, the last batch kept while the buffer holds it.
+    fn remote_entry(&self, dir: u16, k: u64) -> Option<(u64, Kind, [u8; NAME_MAX], usize)> {
+        let handle = self.inodes[dir as usize].handle;
+        let [h, cookie, base, count, next, stamp] = self.listed.get();
+        let kept = h == handle && stamp == remote::calls() && base <= k;
+        let at = if kept && k < base + count {
+            k - base
+        } else {
+            let (mut cookie, mut base) = if kept { (next, base + count) } else { (0, 0) };
+            loop {
+                let (count, next) = remote::readdir(handle, cookie).ok()?;
+                if count == 0 {
+                    return None;
+                }
+                if k < base + count as u64 {
+                    self.listed.set([handle, cookie, base, count as u64, next, remote::calls()]);
+                    break k - base;
+                }
+                base += count as u64;
+                cookie = next;
+            }
+        };
+        let _ = cookie;
+        let e = server::Entry(&remote::buf()[at as usize * server::ENTRY..(at as usize + 1) * server::ENTRY]);
+        let mut name = [0u8; NAME_MAX];
+        let len = e.name().len();
+        name[..len].copy_from_slice(e.name());
+        let kind = match e.kind() {
+            server::KIND_DIR => Kind::Dir,
+            server::KIND_LINK => Kind::Symlink,
+            _ => Kind::File,
+        };
+        let theirs = u32::from_le_bytes(e.0[..4].try_into().unwrap()) as u64;
+        let ino = self.cached(dir, &name[..len]).map_or(MAX_INODES as u64 + theirs, |i| i as u64);
+        Some((ino, kind, name, len))
     }
 
     /// Follows `path` from `cwd` (or the root, if absolute). The last part
     /// is followed through symbolic links only if `follow`.
-    pub fn resolve(&self, cwd: u16, path: &[u8], follow: bool) -> Result<u16, u64> {
+    pub fn resolve(&mut self, cwd: u16, path: &[u8], follow: bool) -> Result<u16, u64> {
         self.walk(cwd, path, follow, 0)
     }
 
-    fn walk(&self, cwd: u16, path: &[u8], follow: bool, depth: u32) -> Result<u16, u64> {
+    fn walk(&mut self, cwd: u16, path: &[u8], follow: bool, depth: u32) -> Result<u16, u64> {
         if path.is_empty() {
             return Err(ENOENT);
         }
@@ -220,7 +489,7 @@ impl Fs {
     }
 
     /// The directory `path`'s last part is in, and that part.
-    pub fn parent_of<'a>(&self, cwd: u16, path: &'a [u8]) -> Result<(u16, &'a [u8]), u64> {
+    pub fn parent_of<'a>(&mut self, cwd: u16, path: &'a [u8]) -> Result<(u16, &'a [u8]), u64> {
         let trimmed = {
             let mut e = path.len();
             while e > 1 && path[e - 1] == b'/' {
@@ -255,6 +524,17 @@ impl Fs {
         }
         let n = buf.len().min((size - off) as usize);
         let i = &self.inodes[ino as usize];
+        if i.remote {
+            if i.kind == Kind::Symlink {
+                let mut p = [0u8; PATH_MAX];
+                let mut t = [0u8; PATH_MAX];
+                let Ok(len) = self.path(ino, &mut p).and_then(|len| remote::readlink(&p[..len], &mut t)) else { return 0 };
+                let n = n.min(len.saturating_sub(off as usize));
+                buf[..n].copy_from_slice(&t[off as usize..off as usize + n]);
+                return n;
+            }
+            return remote::read(i.handle, off, &mut buf[..n]).unwrap_or(0);
+        }
         match i.kind {
             Kind::Image => {
                 let base = self.images[i.size as usize].0;
@@ -281,6 +561,15 @@ impl Fs {
             return Err(EINVAL);
         }
         let end = off.checked_add(data.len() as u64).ok_or(EFBIG)?;
+        if self.is_remote(ino) {
+            if end > u32::MAX as u64 || self.kind(ino) != Kind::File {
+                return Err(EFBIG);
+            }
+            remote::write(self.inodes[ino as usize].handle, off, data)?;
+            let i = &mut self.inodes[ino as usize];
+            i.size = i.size.max(end as u32);
+            return Ok(data.len());
+        }
         if end > (FILE_BLOCKS * PAGE) as u64 {
             return Err(EFBIG);
         }
@@ -302,6 +591,14 @@ impl Fs {
     pub fn truncate(&mut self, ino: u16, len: u64) -> Result<(), u64> {
         if self.kind(ino) != Kind::File {
             return Err(EINVAL);
+        }
+        if self.is_remote(ino) {
+            if len > u32::MAX as u64 {
+                return Err(EFBIG);
+            }
+            remote::truncate(self.inodes[ino as usize].handle, len)?;
+            self.inodes[ino as usize].size = len as u32;
+            return Ok(());
         }
         if len > (FILE_BLOCKS * PAGE) as u64 {
             return Err(EFBIG);
@@ -328,6 +625,16 @@ impl Fs {
         if ino == ROOT {
             return Err(EINVAL);
         }
+        if ino == self.mount {
+            return Err(EBUSY);
+        }
+        if self.is_remote(ino) {
+            let mut p = [0u8; PATH_MAX];
+            let n = self.path(ino, &mut p)?;
+            remote::unlink(&p[..n])?;
+            self.drop_proxy(ino);
+            return Ok(());
+        }
         if self.kind(ino) == Kind::Dir && self.entry(ino, 2).is_some() {
             return Err(ENOTEMPTY);
         }
@@ -345,6 +652,13 @@ impl Fs {
         if name.len() > NAME_MAX {
             return Err(ENAMETOOLONG);
         }
+        if ino == self.mount {
+            return Err(EBUSY);
+        }
+        // Not across the server's edge.
+        if self.is_remote(ino) != self.is_remote(dir) {
+            return Err(EXDEV);
+        }
         // Not into itself.
         let mut d = dir;
         loop {
@@ -356,13 +670,28 @@ impl Fs {
             }
             d = self.inodes[d as usize].parent;
         }
-        if let Some(old) = self.lookup(dir, name) {
+        let old = self.lookup(dir, name);
+        if let Some(old) = old {
             if old == ino {
                 return Ok(());
             }
             if self.kind(old) == Kind::Dir && self.kind(ino) != Kind::Dir {
                 return Err(EISDIR);
             }
+            if self.kind(old) != Kind::Dir && self.kind(ino) == Kind::Dir {
+                return Err(ENOTDIR);
+            }
+        }
+        if self.is_remote(ino) {
+            // The server replaces what is there.
+            let (mut from, mut to) = ([0u8; PATH_MAX], [0u8; PATH_MAX]);
+            let f = self.path(ino, &mut from)?;
+            let t = self.child_path(dir, name, &mut to)?;
+            remote::rename(&from[..f], &to[..t])?;
+            if let Some(old) = old {
+                self.drop_proxy(old);
+            }
+        } else if let Some(old) = old {
             self.remove(old)?;
         }
         let n = &mut self.inodes[ino as usize];

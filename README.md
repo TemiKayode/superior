@@ -1586,6 +1586,28 @@ holds the rest):
   block is lent one of four spare blocks, from a second untyped capability.
   `linux-test` compresses 48 KiB with `pigz -p 2 -b 32` and checks that
   BusyBox's `gzip -dc` gives back the same MD5, on both ISAs.
+- The Linux personality's files on the filesystem server: `/home` is the
+  server's tree, the personality's own container there, so what Linux
+  programs write under it is on the disk (journalled, each write durable
+  before it is answered) and still there at the next boot; `/tmp` and the
+  rest stay in the personality's memory, as a `tmpfs` would. A name looked
+  up under `/home` becomes an inode in the personality's table, marked as
+  the server's and holding its handle and size, its path the names up to
+  `/home`; so path walking, symbolic links (followed by the personality,
+  with Linux's meaning for an absolute target), the working directory and
+  `getcwd` are as for the rest. Opens, reads, writes, `truncate`, `mkdir`,
+  `unlink`, `rename` (`EXDEV` across the edge), `symlink` and `readlink`
+  go to the server, through one frame lent with each call; directories
+  are listed from it 64 entries at a time. The server's tree changes only
+  through this one client, so what the personality keeps of it stays true;
+  such inodes nothing holds open (or as a working directory) are let go
+  when the table runs short. Names may now be 58 bytes, the server's
+  longest. `linux-test` makes the disk empty, then has the shell make a
+  directory under `/home`, copy pigz's output there, write and append a
+  file, link to it, rename and list; a second boot of the same disk
+  (`boot/linux-verify.manifest`, the personality's `arg 1`) counts a second
+  boot, lists the files, reads the note through the link and decompresses
+  the copy to the same MD5, then removes them, on both ISAs.
 - Interrupt and exception entries clear the direction flag. User code may be
   interrupted mid-way through a backward copy, with the flag set; the kernel's own
   copies need it clear, and without the `cld` they ran backwards, wrecking saved
@@ -1657,8 +1679,8 @@ system bundle's rollback floor in the TPM too (the boot bundle's is; the
 system's is on the system disk), a boot record written atomically (two
 copies), certificate chains and revocation for the update server (the updater
 pins one key), apps that provide services, a package store on a
-filesystem rather than fixed disk slots, the Linux personality's files on
-the filesystem server (today they are in its memory), a Linux process's
+filesystem rather than fixed disk slots, the rest of the Linux personality's
+tree on the filesystem server (`/home` is there; the rest is in its memory), a Linux process's
 threads on more than one CPU, `munmap` returning pages, stopping jobs (`^Z`),
 and a handled signal reaching a process
 that spins without system calls (it is taken at the next one), and
@@ -1719,7 +1741,7 @@ https://claude.ai/artifact/QKJS8qH5Dfbjzn58RStq1j
 | `user/hid/` | The USB HID keyboard, mouse and tablet driver |
 | `user/linux/` | The Linux personality: runs unmodified Linux programs |
 | `user/echo/`, `user/counter/`, `user/testclient/` | Test components for the Component Manager, supervision and drivers |
-| `boot/` | Component manifests: `shell.manifest` (normal boot), `test.manifest` (`cm-test`), `supervise.manifest` (`supervise-test`) , `drivers.manifest` (`drivers-test`) , `memory.manifest` (`memory-test`), `reboot.manifest` (`reboot-test`), `fs.manifest` and `fs-verify.manifest` (`fs-test`), `net.manifest` (`net-test`), `tcp.manifest` (`tcp-test`), `keyboard.manifest` (`keyboard-test`), `display.manifest` (`display-test`), `desktop.manifest` (`desktop-test`), `input.manifest` (`input-test`), `windows.manifest` (`windows-test`), `toolkit.manifest` (`toolkit-test`), `panel.manifest` (`panel-test`), `resize.manifest` (`resize-test`), `widgets.manifest` (`widgets-test`), `notes.manifest` (`notes-test`), `audio.manifest` (`audio-test`), `suspend.manifest` (`suspend-test`), `linux.manifest` (`linux-test`) |
+| `boot/` | Component manifests: `shell.manifest` (normal boot), `test.manifest` (`cm-test`), `supervise.manifest` (`supervise-test`) , `drivers.manifest` (`drivers-test`) , `memory.manifest` (`memory-test`), `reboot.manifest` (`reboot-test`), `fs.manifest` and `fs-verify.manifest` (`fs-test`), `net.manifest` (`net-test`), `tcp.manifest` (`tcp-test`), `keyboard.manifest` (`keyboard-test`), `display.manifest` (`display-test`), `desktop.manifest` (`desktop-test`), `input.manifest` (`input-test`), `windows.manifest` (`windows-test`), `toolkit.manifest` (`toolkit-test`), `panel.manifest` (`panel-test`), `resize.manifest` (`resize-test`), `widgets.manifest` (`widgets-test`), `notes.manifest` (`notes-test`), `audio.manifest` (`audio-test`), `suspend.manifest` (`suspend-test`), `linux.manifest` and `linux-verify.manifest` (`linux-test`) |
 | `sel4/` | Docker build of seL4 and rust-sel4's kernel loader, for running the shell on seL4 |
 | `tpm/` | Docker image with QEMU, swtpm and Secure Boot tools, for the TPM and Secure Boot tests |
 | `xtask/` | Build driver: user program, kernel, disk image, QEMU boot |
@@ -1760,7 +1782,7 @@ cargo xtask tpm-test       # in Docker (QEMU + swtpm): PCR 9 measured, the TPM's
 cargo xtask secure-boot-test aarch64  # in Docker and QEMU: the db-signed loader boots under Secure Boot; foreign, changed, unsigned ones refused
 cargo xtask ab-test        # A/B system slots: an update staged, tried, fallen back from, confirmed; rollbacks refused
 cargo xtask packages-test  # signed app packages: bad ones refused, the app installed, kept across boots, uninstalled
-cargo xtask linux-test     # the Linux personality runs Alpine's BusyBox and pigz, unmodified: the shell, signals, threads
+cargo xtask linux-test     # the Linux personality runs Alpine's BusyBox and pigz, unmodified: the shell, signals, threads, /home on disk
 cargo xtask run            # boot the shell in QEMU (x86-64), its console on this terminal
 cargo xtask run aarch64    # the same on QEMU's AArch64 virt machine
 cargo xtask console-test   # the kernel's log on the boot framebuffer, from a BIOS and from UEFI, checked by screenshot

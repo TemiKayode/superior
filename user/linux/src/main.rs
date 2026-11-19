@@ -34,14 +34,17 @@
 //! waking its joiner), `exit_group` the process. Files ([`fs`]): an
 //! in-memory tree with `/bin` (BusyBox and a link per applet), the
 //! interpreter, pigz in `/usr/bin` and zlib in `/lib`, `/tmp`,
-//! `/dev/null`; pipes; the console. They last as long as this server.
+//! `/dev/null`; pipes; the console. They last as long as this server,
+//! but for `/home`, which is the filesystem server's tree (this
+//! component's container there), so what is written there is on the disk.
 //!
 //! Slots: 0 the untyped memory everything is made from, cut into eight
 //! blocks (slots 8 to 15): seven for processes, revoked when one exits or
 //! execs, and one for this server's state and the files' pages (from
 //! [`STATE_SLOTS`]). 5 more untyped memory, cut into spare blocks (from
 //! [`SPARE_BLOCKS`]) lent to a process that outgrows its own. 1 the
-//! manager's control endpoint, 2 the endpoint faults arrive on. The
+//! manager's control endpoint, 2 the endpoint faults arrive on, 6 the
+//! filesystem server (its buffer frame in [`remote::BUF`]). The
 //! bundle's files' pages from 16: musl's, pigz's from 180, zlib's from
 //! 216, BusyBox's from 250 (`file` in the manifest). Process `i` owns the
 //! slots from `PROC_SLOTS + i * PROC_SPAN`: its address space, then its
@@ -55,13 +58,14 @@
 //!
 //! Not yet: more than one CPU for a process's threads, `vfork`'s kind of
 //! `clone` (memory shared without `CLONE_THREAD`), returning `munmap`'d
-//! pages, stopping and continuing jobs (`^Z`), the filesystem server
-//! underneath, fixed-address (non-PIE) executables.
+//! pages, stopping and continuing jobs (`^Z`), the rest of the tree on
+//! the filesystem server, fixed-address (non-PIE) executables.
 
 #![no_std]
 #![no_main]
 
 mod fs;
+mod remote;
 mod signal;
 mod tty;
 
@@ -102,7 +106,7 @@ const PIGZ_FILE: u64 = 180;
 const LIBZ_FILE: u64 = 216;
 const PROGRAM_FILE: u64 = 250;
 const STATE_SLOTS: u64 = 512;
-const STATE_PAGES: u64 = 28;
+const STATE_PAGES: u64 = 32;
 const POOL_SLOTS: u64 = STATE_SLOTS + STATE_PAGES;
 /// The signal restorer's page ([`signal::TRAMPOLINE`]).
 const TRAMPOLINE_SLOT: u64 = 1000;
@@ -1431,10 +1435,7 @@ fn answer(st: &mut State, t: usize, call: Sys, a: [u64; 6]) -> Out {
         Sys::Symlinkat => r({
             let mut target = [0u8; 256];
             st.cstr(i, a[0], &mut target).and_then(|n| {
-                path_op(st, i, a[1], a[2], |fs, dir, name| {
-                    let l = fs.create(dir, name, Kind::Symlink)?;
-                    fs.write(l, 0, &target[..n]).map(|_| 0)
-                })
+                path_op(st, i, a[1], a[2], |fs, dir, name| fs.symlink(dir, name, &target[..n]).map(|_| 0))
             })
         }),
         Sys::Renameat => r(renameat(st, i, a)),
@@ -1599,7 +1600,8 @@ fn getdents(st: &mut State, i: usize, fd: u64, buf: u64, count: u64) -> Result<u
         return Err(ENOTDIR);
     }
     let (mut pos, mut out) = (o.off, 0u64);
-    while let Some((next, ino, name)) = st.fs.entry(o.ino, pos) {
+    while let Some(e) = st.fs.entry(o.ino, pos) {
+        let (next, ino, name) = (e.next, e.ino, e.name());
         let reclen = (19 + name.len() as u64 + 1).next_multiple_of(8);
         if out + reclen > count {
             if out == 0 {
@@ -1607,11 +1609,11 @@ fn getdents(st: &mut State, i: usize, fd: u64, buf: u64, count: u64) -> Result<u
             }
             break;
         }
-        let mut rec = [0u8; 56];
-        rec[..8].copy_from_slice(&(ino as u64).to_le_bytes());
+        let mut rec = [0u8; 88];
+        rec[..8].copy_from_slice(&ino.to_le_bytes());
         rec[8..16].copy_from_slice(&next.to_le_bytes());
         rec[16..18].copy_from_slice(&(reclen as u16).to_le_bytes());
-        rec[18] = match st.fs.kind(ino) {
+        rec[18] = match e.kind {
             Kind::Dir => 4,
             Kind::Symlink => 10,
             Kind::Null => 2,
@@ -2375,6 +2377,14 @@ fn run(st: &mut State, argv: &[&str], env: &[&str], interactive: bool) -> Result
     let interp = core::str::from_utf8(interp).unwrap_or("?");
     say!("linux: running {} (pid {pid}, interpreter {interp})", Joined(argv));
     while st.procs.iter().any(|p| p.used && !p.zombie) {
+        // Remote inodes nothing needs go when inodes run short.
+        if st.fs.free_inodes() < 32 {
+            let (fs, files, procs) = (&mut st.fs, &st.files, &st.procs);
+            fs.evict(|ino| {
+                files.iter().any(|f| f.kind == FileKind::Node && f.ino == ino)
+                    || procs.iter().any(|p| p.used && !p.zombie && p.cwd == ino)
+            });
+        }
         let r = syscall(Syscall::Recv, EP, [0; 4]);
         if r.status == Error::Notified as u64 {
             if r.badge & 1 != 0 {
@@ -2690,6 +2700,16 @@ const RUNS: &[(&[&str], u32)] = &[
     // A program with a library of its own: pigz, with zlib, which musl's
     // dynamic linker loads. BusyBox's gzip checks what it wrote.
     (&["sh", "-c", "seq 1 10000 > /tmp/n && pigz -p 2 -b 32 -k /tmp/n && ls /tmp && gzip -dc /tmp/n.gz | md5sum && md5sum < /tmp/n"], 0),
+    // Files on the filesystem server, for the second boot to find.
+    (&["sh", "-c", "mkdir -p /home/docs/old && cd /home/docs && cp /tmp/n.gz . && echo first > note && echo second >> note && ln -s note link && mv old new && ls && pwd && cat link"], 0),
+    (&["sh", "-c", "echo boot >> /home/boots; wc -l < /home/boots"], 0),
+];
+
+/// The second boot's runs (`arg 1`, boot/linux-verify.manifest): what the
+/// first left under /home, read back, and then removed.
+const VERIFY_RUNS: &[(&[&str], u32)] = &[
+    (&["sh", "-c", "echo boot >> /home/boots; wc -l < /home/boots"], 0),
+    (&["sh", "-c", "cd /home/docs && ls && cat note && readlink link && gzip -dc n.gz | md5sum && cd / && rm -r /home/docs && ls /home"], 0),
 ];
 
 /// Then a shell on the terminal, until it exits (the test types into it).
@@ -2697,7 +2717,7 @@ const SESSION: &[&str] = &["sh"];
 const SESSION_ENV: &[&str] = &["PATH=/usr/bin:/bin", "HOME=/home", "PS1=linux$ "];
 
 #[unsafe(no_mangle)]
-pub extern "C" fn _start(_: u64) -> ! {
+pub extern "C" fn _start(arg: u64) -> ! {
     let failures = setup().map_or_else(
         |why| {
             say!("linux: could not start: {why}");
@@ -2705,7 +2725,8 @@ pub extern "C" fn _start(_: u64) -> ! {
         },
         |st| {
             let mut failures = 0;
-            let runs = RUNS.iter().map(|&(argv, want)| (argv, want, false)).chain([(SESSION, 0, true)]);
+            let (batch, session): (_, &[_]) = if arg == 1 { (VERIFY_RUNS, &[]) } else { (RUNS, &[(SESSION, 0, true)]) };
+            let runs = batch.iter().map(|&(argv, want)| (argv, want, false)).chain(session.iter().copied());
             for (argv, want, interactive) in runs {
                 let line = Joined(argv);
                 let env: &[&str] = if interactive { SESSION_ENV } else { &["PATH=/usr/bin:/bin", "HOME=/home"] };
@@ -2790,6 +2811,14 @@ fn setup() -> Result<&'static mut State, &'static str> {
         }
     }
     st.fs.init(POOL_VA, &tree[..n], APPLETS);
+    // /home on the filesystem server, through a frame lent with each call.
+    sys(Syscall::Retype, FS_BLOCK, [ObjectType::Frame as u64, 0, remote::BUF, 0]).map_err(|_| "no memory for files")?;
+    sys(Syscall::FrameMap, remote::BUF, [remote::BUF_VA, 1, 0, 0]).map_err(|_| "no room for files")?;
+    if st.fs.mount() {
+        say!("linux: /home is on the filesystem server");
+    } else {
+        say!("linux: no filesystem server; /home is in memory");
+    }
     Ok(st)
 }
 

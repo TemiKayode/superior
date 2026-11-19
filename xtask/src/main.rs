@@ -634,15 +634,20 @@ fn drive_linux(img: &Image, script: &[(&str, &str, bool)]) -> Result<String, Str
 /// Boots `boot/linux.manifest`: the Linux personality runs Alpine's
 /// programs, unmodified and dynamically linked against musl. BusyBox
 /// first, a run at a time: commands, shell scripts with processes, pipes
-/// and files, signals; pigz, compressing with threads; then the shell on
-/// the terminal, typed into ([`LINUX_SESSION`]).
+/// and files, signals; pigz, compressing with threads; files under
+/// `/home`, on the filesystem server; then the shell on the terminal,
+/// typed into ([`LINUX_SESSION`]). Then `boot/linux-verify.manifest` on
+/// the same disk reads back what the first boot left under `/home`.
 fn linux_test(img: &Image) -> Result<(), String> {
     println!("== Linux personality test on {}", img.path.display());
+    let disk = linux_disk();
+    std::fs::write(&disk, vec![0u8; 16 << 20]).map_err(|e| format!("writing {}: {e}", disk.display()))?;
     let out = drive_linux(img, LINUX_SESSION)?;
     let isa = if img.arch == Arch::X86_64 { "x86_64" } else { "aarch64" };
     let interp = format!("interpreter /lib/ld-musl-{isa}.so.1)");
     let machine = format!("linux: > Linux {isa}");
     let steps = [
+        "linux: /home is on the filesystem server",
         "linux: running busybox echo hello from Linux (",
         &interp,
         "linux: > hello from Linux",
@@ -690,6 +695,17 @@ fn linux_test(img: &Image) -> Result<(), String> {
         "linux: > 72d4ff27a28afbc066d5804999d5a504  -",
         "linux: > 72d4ff27a28afbc066d5804999d5a504  -",
         "gzip -dc /tmp/n.gz | md5sum && md5sum < /tmp/n exited with status 0",
+        // Files under /home, on the filesystem server.
+        "linux: > link",
+        "linux: > n.gz",
+        "linux: > new",
+        "linux: > note",
+        "linux: > /home/docs",
+        "linux: > first",
+        "linux: > second",
+        "&& mv old new && ls && pwd && cat link exited with status 0",
+        "linux: > 1",
+        "echo boot >> /home/boots; wc -l < /home/boots exited with status 0",
         // The terminal session (its steps were checked as it ran).
         "linux: running sh (pid ",
         "linux: sh exited with status 0",
@@ -701,6 +717,32 @@ fn linux_test(img: &Image) -> Result<(), String> {
     for bad in ["[fail]", "could not", "panic", "[fault]", "not implemented", "killed"] {
         if out.contains(bad) {
             return Err(format!("Linux personality test: log contains {bad:?}"));
+        }
+    }
+    // The second boot, on the same disk: what the first left under /home.
+    let verify = image_with(false, img.arch, "linux-verify")?;
+    println!("== Linux personality test, second boot: {}", verify.path.display());
+    let out = run_to_exit(&verify, Duration::from_secs(300))?;
+    let steps = [
+        "linux: /home is on the filesystem server",
+        "linux: > 2",
+        "echo boot >> /home/boots; wc -l < /home/boots exited with status 0",
+        "linux: > link",
+        "linux: > n.gz",
+        "linux: > new",
+        "linux: > note",
+        "linux: > first",
+        "linux: > second",
+        "linux: > note",
+        "linux: > 72d4ff27a28afbc066d5804999d5a504  -",
+        "linux: > boots",
+        "&& rm -r /home/docs && ls /home exited with status 0",
+        "[cm] linux asked to shut down (pass)",
+    ];
+    check_log("Linux personality test (second boot)", &out, &steps)?;
+    for bad in ["[fault]", "not implemented", "killed"] {
+        if out.contains(bad) {
+            return Err(format!("Linux personality test (second boot): log contains {bad:?}"));
         }
     }
     println!("== Linux personality test passed ({})", img.arch.name());
@@ -904,7 +946,7 @@ fn bundle(arch: Arch, manifest: &str, driver: &str) -> Result<PathBuf, String> {
         files.push((name.to_string(), bytes));
     }
     // The Linux programs the personality runs (`file` in its manifest).
-    if manifest == "linux" {
+    if manifest.starts_with("linux") {
         files.extend(alpine_files(arch)?);
     }
     // Icon images (`icon NAME.pam` in a manifest), by their file names.
@@ -1142,6 +1184,8 @@ fn image_sealed(
         Some(test_disk()?)
     } else if fs {
         Some(fs_disk())
+    } else if manifest.starts_with("linux") {
+        Some(linux_disk())
     } else if manifest == "ab" {
         Some(ab_disk(arch))
     } else if manifest == "update" {
@@ -1156,7 +1200,7 @@ fn image_sealed(
         arch,
         sel4: false,
         disk,
-        writable: fs || matches!(manifest, "ab" | "update" | "packages"),
+        writable: fs || matches!(manifest, "ab" | "update" | "packages" | "linux" | "linux-verify"),
         driver,
         net: matches!(manifest, "net" | "tcp" | "update" | "suspend") || linux_nic(manifest).is_some(),
         linux_nic: linux_nic(manifest).map(|l| l.1),
@@ -2311,6 +2355,12 @@ fn drivers_test_log(img: &Image) -> Result<String, String> {
 /// The filesystem tests' disk (4 MiB), shared by both boots.
 fn fs_disk() -> PathBuf {
     root().join("target").join("fs-test-disk.img")
+}
+
+/// The Linux personality test's disk, under its `/home`: made empty
+/// before the first boot, read back by the second.
+fn linux_disk() -> PathBuf {
+    root().join("target").join("linux-test-disk.img")
 }
 
 /// The filesystem server, in two boots of one fresh disk:

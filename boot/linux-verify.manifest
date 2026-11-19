@@ -1,0 +1,65 @@
+# The Linux personality test, second boot (cargo xtask linux-test).
+#
+# boot/linux.manifest with the personality's arg 1: on the same disk, it
+# runs only what reads back the files the first boot left under /home,
+# then stops.
+
+
+# The disk under /home: PCI, its driver and the filesystem server, as
+# boot/fs.manifest has them. The personality is component 3 here and in
+# boot/linux-verify.manifest, so both boots see the same container.
+
+component pcibus
+  image pcibus
+  priority 12
+  # 2^7 slots: an ECAM page for each of 32 functions, BAR pages, domains.
+  cspace 7
+  provides pci 0
+  device pci-config 1
+  device pci-mmio 2
+  # Ports for I/O BARs.
+  device pci-io 88
+  device msi 3
+  device iommu 11
+  untyped 18 12
+
+component virtio-blk
+  image virtio-blk
+  priority 11
+  uses pci 0
+  provides block 1
+  notification 2
+  untyped 17 3
+
+component fs
+  image fs
+  priority 10
+  uses block 0
+  provides fs 1
+  untyped 19 2
+  cspace 8
+
+component linux
+  image linux
+  arg 1
+  priority 10
+  # Its CNode (2^13 slots: a 1024-slot span per process, the state's and
+  # files' pages, the files), address space, image, stack, the four files,
+  # the 8 MiB block and the 4 MiB one.
+  memory 24
+  cspace 13
+  vspace 20
+  # The files before the blocks, smallest first: memory is handed out in
+  # order, and each block is aligned to its size.
+  file ld-musl 16
+  file pigz 180
+  file libz 216
+  file busybox 250
+  untyped 22 5
+  untyped 23 0
+  control 1
+  # Its files under /home.
+  uses fs 6
+  # The terminal: the serial console's UART and its interrupt.
+  device uart 3
+  device uart-irq 4
