@@ -718,6 +718,8 @@ fn linux_test(img: &Image) -> Result<(), String> {
         "linux: > fptest said 0",
         "linux: > two threads ran at once",
         "linux: > smptest said 0",
+        "linux: > mapped and unmapped 25 MiB",
+        "linux: > mmaptest said 0",
         // Threads (clone, futexes) in pigz, and zlib loaded by musl: what
         // two threads compressed BusyBox's gzip takes back unchanged.
         " started thread ",
@@ -1016,7 +1018,7 @@ fn bundle(arch: Arch, manifest: &str, driver: &str) -> Result<PathBuf, String> {
     if manifest.starts_with("linux") {
         files.extend(alpine_files(arch)?);
         // Linux programs of our own (the first boot's runs use them).
-        for name in ["fptest", "smptest"] {
+        for name in ["fptest", "smptest", "mmaptest"] {
             let path = user_program(&format!("superior-linux-{name}"), arch)?;
             let bytes = std::fs::read(&path).map_err(|e| format!("reading {}: {e}", path.display()))?;
             files.push((name.to_string(), bytes));

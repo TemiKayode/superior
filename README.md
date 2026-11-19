@@ -1686,6 +1686,24 @@ holds the rest):
   it is done at once. The test also checks `nproc` says 2. The terminal
   session now waits a second before `jobs` checks that a background `read`
   stopped, since the job may still be starting on the other CPU.
+- `munmap` in the Linux personality gives memory back; before, it did
+  nothing. A process's own pages in the range are unmapped from it and from
+  the personality's mirror of its memory, and pages reserved but never
+  touched are dropped. A later access there is a fault, and a system call
+  given an address there gets `EFAULT`. The personality now notes which page
+  each frame slot of a process backs. A frame given back is kept and used,
+  zeroed, for the next page the process makes, before any new memory or
+  slot. `mmap` puts a mapping at the lowest free place in the mapping area,
+  with a guard page after it, instead of always past the last one, so freed
+  address space is used again too. Pages of bundle files (code, read-only
+  data) stay mapped. `linux-test` runs mmaptest (`user/linux-mmaptest`),
+  another Linux program of our own in assembly. It maps 64 KiB, checks
+  every page reads as zeros, writes every page and unmaps it, 400 times:
+  25 MiB, far more than a process's memory. Every map must land at the
+  first one's address, and a `write` from there afterwards must fail with
+  `EFAULT`. With `munmap` doing nothing again, it fails. A component's
+  manifest may now name 16 capabilities, up from 12: the Linux component's
+  seven bundle files took it past the old limit.
 - Interrupt and exception entries clear the direction flag. User code may be
   interrupted mid-way through a backward copy, with the flag set; the kernel's own
   copies need it clear, and without the `cld` they ran backwards, wrecking saved
@@ -1757,7 +1775,7 @@ system bundle's rollback floor in the TPM too (the boot bundle's is; the
 system's is on the system disk), a boot record written atomically (two
 copies), certificate chains and revocation for the update server (the updater
 pins one key), apps that provide services, a package store on a
-filesystem rather than fixed disk slots, `munmap` returning pages,
+filesystem rather than fixed disk slots,
 and a handled signal reaching a process
 that spins without system calls (it is taken at the next one), and
 fixed-address (non-PIE) Linux executables, which are linked at 4 MiB, where

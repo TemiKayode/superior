@@ -33,8 +33,8 @@
 //! `exit` ends a thread (clearing its `CLONE_CHILD_CLEARTID` word and
 //! waking its joiner), `exit_group` the process. Files ([`fs`]): an
 //! in-memory tree with `/bin` (BusyBox and a link per applet), the
-//! interpreter, pigz, fptest and smptest (`user/linux-fptest`,
-//! `user/linux-smptest`, for the test) in
+//! interpreter, pigz, fptest, smptest and mmaptest (`user/linux-fptest`,
+//! `user/linux-smptest`, `user/linux-mmaptest`, for the test) in
 //! `/usr/bin` and zlib in `/lib`, `/tmp`,
 //! `/dev/null`; pipes; the console. They last as long as this server,
 //! but for what is made outside them, which is the filesystem server's
@@ -48,7 +48,8 @@
 //! [`SPARE_BLOCKS`]) lent to a process that outgrows its own. 1 the
 //! manager's control endpoint, 2 the endpoint faults arrive on, 6 the
 //! filesystem server (its buffer frame in [`remote::BUF`]). The
-//! bundle's files' pages from 16: musl's, pigz's from 180, smptest's
+//! bundle's files' pages from 16: musl's, mmaptest's from 177, pigz's
+//! from 180, smptest's
 //! from 213, zlib's from 216, fptest's from 250, BusyBox's from 252 (`file` in the manifest;
 //! a file's first slot is below 256). Process `i` owns the
 //! slots from `PROC_SLOTS + i * PROC_SPAN`: its address space, then its
@@ -64,9 +65,12 @@
 //! gives every CPU online, and `membarrier` has each CPU in the address
 //! space pass a barrier (`REGS_BARRIER`).
 //!
-//! Not yet: `vfork`'s kind of
-//! `clone` (memory shared without `CLONE_THREAD`), returning `munmap`'d
-//! pages, fixed-address (non-PIE) executables.
+//! `munmap` gives a process's own pages back: unmapped, their frames are
+//! kept and used (zeroed) for the next pages it makes, and `mmap` puts a
+//! mapping in the lowest free space, so freed space is used again too.
+//!
+//! Not yet: `vfork`'s kind of `clone` (memory shared without
+//! `CLONE_THREAD`), fixed-address (non-PIE) executables.
 
 #![no_std]
 #![no_main]
@@ -107,9 +111,10 @@ const NTFN: u64 = 1001;
 const NTFN_UART: u64 = 1002;
 const NTFN_TIMER: u64 = 1003;
 /// The bundle's files (`file` in the manifest), their first slots: musl's
-/// dynamic linker, BusyBox, pigz, zlib, fptest and smptest (the last two
-/// if there: not on the second boot).
+/// dynamic linker, BusyBox, pigz, zlib, and fptest, smptest and mmaptest
+/// (if there: not on the second boot).
 const INTERP_FILE: u64 = 16;
+const MMAPTEST_FILE: u64 = 177;
 const PIGZ_FILE: u64 = 180;
 const SMPTEST_FILE: u64 = 213;
 const LIBZ_FILE: u64 = 216;
@@ -122,6 +127,8 @@ const POOL_SLOTS: u64 = STATE_SLOTS + STATE_PAGES;
 const TRAMPOLINE_SLOT: u64 = 1000;
 const PROC_SLOTS: u64 = 1024;
 const PROC_SPAN: u64 = 1024;
+/// A frame of a process's that `munmap` gave back ([`Proc::frames`]).
+const FREE: u16 = u16::MAX;
 const MAX_PROCS: usize = 7;
 /// Threads, in all processes.
 const MAX_TASKS: usize = 16;
@@ -142,6 +149,7 @@ const PIGZ_VA: u64 = USER_BASE + 0x1_5000_0000;
 const LIBZ_VA: u64 = USER_BASE + 0x1_5800_0000;
 const FPTEST_VA: u64 = USER_BASE + 0x1_5c00_0000;
 const SMPTEST_VA: u64 = USER_BASE + 0x1_5d00_0000;
+const MMAPTEST_VA: u64 = USER_BASE + 0x1_5e00_0000;
 
 /// A process's address space: everything inside [`CHILD`, `CHILD_END`).
 const CHILD: u64 = USER_BASE + 0x40_0000_0000;
@@ -549,9 +557,13 @@ struct Proc {
     cloexec: u32,
     brk_start: u64,
     brk: u64,
-    mmap_next: u64,
     /// Its own pages (mapped in the mirror too).
     present: [u64; CHILD_PAGES / 64],
+    /// What each slot of its span holds that is one of its own pages'
+    /// frames (the slot after is its copy for the mirror): the page's
+    /// number + 1, or [`FREE`] for a frame `munmap` gave back, to be used
+    /// again; 0 for any other slot.
+    frames: [u16; PROC_SPAN as usize],
     /// Pages of anonymous mappings not yet touched: each becomes one of
     /// its own when first used (a page fault there, or a system call
     /// writing there).
@@ -807,7 +819,8 @@ impl State {
     }
 
     /// A fresh zeroed page of process `i`'s own at page-aligned `va`
-    /// (writable), mapped in the mirror too, unless it has one there.
+    /// (writable), mapped in the mirror too, unless it has one there: a
+    /// frame `munmap` gave back if there is one (zeroed), else a new one.
     fn map_private(&mut self, i: usize, va: u64) -> Result<(), u64> {
         if !(CHILD..CHILD_END).contains(&va) {
             return Err(EFAULT);
@@ -815,20 +828,85 @@ impl State {
         if self.is_present(i, va) {
             return Ok(());
         }
+        let k = ((va - CHILD) / PAGE) as usize;
+        let mirror = va - CHILD + MIRROR + i as u64 * SPAN;
         let p = &mut self.procs[i];
-        if p.cursor + 2 > PROC_SPAN {
+        let n = if let Some(n) = p.frames.iter().position(|&f| f == FREE) {
+            let slot = slot_base(i) + n as u64;
+            sys(Syscall::FrameMap, slot + 1, [mirror, 1, 0, 0]).map_err(|_| ENOMEM)?;
+            // SAFETY: the frame was just mapped here, writable, a whole
+            // page at `mirror`; the process has it nowhere (munmap took
+            // it away) and waits on this server meanwhile.
+            unsafe { core::ptr::write_bytes(mirror as *mut u8, 0, PAGE as usize) };
+            n
+        } else {
+            if p.cursor + 2 > PROC_SPAN {
+                return Err(ENOMEM);
+            }
+            let slot = slot_base(i) + p.cursor;
+            self.retype(i, ObjectType::Frame, 0, slot)?;
+            let p = &mut self.procs[i];
+            sys(Syscall::CapMint, slot, [slot + 1, ALL, 0, 0]).map_err(|_| ENOMEM)?;
+            p.cursor += 2;
+            sys(Syscall::FrameMap, slot + 1, [mirror, 1, 0, 0]).map_err(|_| ENOMEM)?;
+            (slot - slot_base(i)) as usize
+        };
+        let slot = slot_base(i) + n as u64;
+        let p = &mut self.procs[i];
+        if sys(Syscall::FrameMapInto, slot, [va, MAP_WRITE, space_slot(i), 0]).is_err() {
+            // Kept for another try.
+            let _ = syscall(Syscall::FrameUnmap, slot + 1, [0; 4]);
+            p.frames[n] = FREE;
             return Err(ENOMEM);
         }
-        let slot = slot_base(i) + p.cursor;
-        self.retype(i, ObjectType::Frame, 0, slot)?;
-        let p = &mut self.procs[i];
-        sys(Syscall::CapMint, slot, [slot + 1, ALL, 0, 0]).map_err(|_| ENOMEM)?;
-        p.cursor += 2;
-        sys(Syscall::FrameMap, slot + 1, [va - CHILD + MIRROR + i as u64 * SPAN, 1, 0, 0]).map_err(|_| ENOMEM)?;
-        sys(Syscall::FrameMapInto, slot, [va, MAP_WRITE, space_slot(i), 0]).map_err(|_| ENOMEM)?;
-        let k = ((va - CHILD) / PAGE) as usize;
+        p.frames[n] = k as u16 + 1;
         p.present[k / 64] |= 1 << (k % 64);
         Ok(())
+    }
+
+    /// `munmap` of process `i`'s own page at `va`, if it has one there:
+    /// unmapped from it and from the mirror, its frame kept to be used
+    /// again ([`State::map_private`]).
+    fn unmap_private(&mut self, i: usize, va: u64) {
+        if !self.is_present(i, va) {
+            return;
+        }
+        let k = ((va - CHILD) / PAGE) as usize;
+        let p = &mut self.procs[i];
+        let Some(n) = p.frames.iter().position(|&f| f == k as u16 + 1) else { return };
+        let slot = slot_base(i) + n as u64;
+        let _ = syscall(Syscall::FrameUnmap, slot, [0; 4]);
+        let _ = syscall(Syscall::FrameUnmap, slot + 1, [0; 4]);
+        p.frames[n] = FREE;
+        p.present[k / 64] &= !(1 << (k % 64));
+    }
+
+    /// Whether process `i` has anything at page `va`: a page of its own, a
+    /// reserved one, a bundle file's, or a library's span.
+    fn taken(&self, i: usize, va: u64) -> bool {
+        let p = &self.procs[i];
+        self.is_present(i, va)
+            || self.is_reserved(i, va)
+            || p.shared[..p.nshared].iter().any(|s| (s.start..s.end).contains(&va))
+            || p.libs[..p.nlibs].iter().any(|&(s, e, _)| (s..e).contains(&va))
+    }
+
+    /// Where `mmap` puts `len` bytes (page-aligned) in process `i`: the
+    /// lowest place in the mapping area with nothing there, and a free
+    /// page after it (a guard). So space `munmap` gave back is used again.
+    fn place(&self, i: usize, len: u64) -> Result<u64, u64> {
+        let limit = STACK_TOP - STACK_PAGES * PAGE;
+        let mut at = MMAP_BASE;
+        let mut va = MMAP_BASE;
+        while va < limit {
+            if self.taken(i, va) {
+                at = va + PAGE;
+            } else if va + PAGE - at >= len + PAGE {
+                return Ok(at);
+            }
+            va += PAGE;
+        }
+        Err(ENOMEM)
     }
 
     /// Maps the bundle file's page in `file_slot` at `va` in process `i`
@@ -941,6 +1019,7 @@ impl State {
         p.cloexec = 0;
         p.present = [0; CHILD_PAGES / 64];
         p.reserved = [0; CHILD_PAGES / 64];
+        p.frames = [0; PROC_SPAN as usize];
         (p.pgid, p.sid) = (pid, pid);
         p.pending = 0;
         p.actions = [Action { handler: 0, flags: 0, restorer: 0, mask: 0 }; 64];
@@ -1041,6 +1120,7 @@ impl State {
         p.cursor = 0;
         p.present = [0; CHILD_PAGES / 64];
         p.reserved = [0; CHILD_PAGES / 64];
+        p.frames = [0; PROC_SPAN as usize];
     }
 
     /// Runs bundle file `image` (a program) as task `t`'s process, its
@@ -1070,7 +1150,6 @@ impl State {
         let p = &mut self.procs[i];
         p.brk_start = end + PAGE;
         p.brk = p.brk_start;
-        p.mmap_next = MMAP_BASE;
 
         // The stack Linux gives a new program: strings at the top, then
         // the auxiliary vector, environment and argument pointers, argc.
@@ -1503,7 +1582,7 @@ fn answer(st: &mut State, t: usize, call: Sys, a: [u64; 6]) -> Out {
         Sys::Zero => Ret(0),
         Sys::Brk => Ret(brk(st, i, a[0])),
         Sys::Mmap => r(mmap(st, i, a)),
-        Sys::Munmap => Ret(0),
+        Sys::Munmap => r(munmap(st, i, a[0], a[1])),
         Sys::Uname => {
             let mut u = [0u8; 6 * 65];
             for (k, f) in ["Linux", "superior", "6.1.0-superior", "#1 Superior", PLATFORM, ""].iter().enumerate() {
@@ -1951,13 +2030,7 @@ fn mmap(st: &mut State, i: usize, a: [u64; 6]) -> Result<u64, u64> {
     if flags & MAP_ANONYMOUS == 0 {
         return mmap_file(st, i, addr, len, flags & MAP_FIXED != 0, a[4], a[5]);
     }
-    let at = if flags & MAP_FIXED != 0 {
-        addr
-    } else {
-        let at = st.procs[i].mmap_next;
-        st.procs[i].mmap_next += len + PAGE;
-        at
-    };
+    let at = if flags & MAP_FIXED != 0 { addr } else { st.place(i, len)? };
     if at % PAGE != 0 || at < CHILD || at + len > STACK_TOP - STACK_PAGES * PAGE {
         return Err(ENOMEM);
     }
@@ -1970,6 +2043,22 @@ fn mmap(st: &mut State, i: usize, a: [u64; 6]) -> Result<u64, u64> {
         }
     }
     Ok(at)
+}
+
+/// `munmap`: process `i`'s own pages in [`addr`, `addr + len`) are
+/// unmapped and their frames kept to be used again, and reserved ones
+/// dropped; a later access there is a fault. Pages of bundle files (code,
+/// read-only data) stay as they are.
+fn munmap(st: &mut State, i: usize, addr: u64, len: u64) -> Result<u64, u64> {
+    if addr % PAGE != 0 || len == 0 {
+        return Err(EINVAL);
+    }
+    let end = addr.checked_add(len.next_multiple_of(PAGE)).ok_or(EINVAL)?;
+    for va in (addr.max(CHILD)..end.min(CHILD_END)).step_by(PAGE as usize) {
+        st.set_reserved(i, va, false);
+        st.unmap_private(i, va);
+    }
+    Ok(0)
 }
 
 /// `mmap` of a file (private: what the process writes stays its own).
@@ -1992,14 +2081,7 @@ fn mmap_file(st: &mut State, i: usize, addr: u64, len: u64, fixed: bool, fd: u64
     if fixed && p.libs[..p.nlibs].iter().any(|&(s, e, ino)| ino == o.ino && s <= addr && addr + len <= e) {
         return Ok(addr);
     }
-    let reserve = |st: &mut State| -> Result<u64, u64> {
-        let at = st.procs[i].mmap_next;
-        if at + len > STACK_TOP - STACK_PAGES * PAGE {
-            return Err(ENOMEM);
-        }
-        st.procs[i].mmap_next += len + PAGE;
-        Ok(at)
-    };
+    let reserve = |st: &mut State| st.place(i, len);
     if let (Some(k), false, 0) = (st.fs.image(o.ino), fixed, off) {
         let Img { bytes, slot } = st.images[k];
         if let Ok(elf) = Elf::parse(bytes) {
@@ -2066,13 +2148,13 @@ fn fork(st: &mut State, t: usize) -> Result<u64, u64> {
         return fail(st, ENOMEM);
     }
     let (fds, cloexec, cwd) = (st.procs[i].fds, st.procs[i].cloexec, st.procs[i].cwd);
-    let (b0, b1, m) = (st.procs[i].brk_start, st.procs[i].brk, st.procs[i].mmap_next);
+    let (b0, b1) = (st.procs[i].brk_start, st.procs[i].brk);
     for &f in fds.iter().filter(|&&f| f != 0) {
         st.files[f as usize - 1].refs += 1;
     }
     let (pgid, sid, actions) = (st.procs[i].pgid, st.procs[i].sid, st.procs[i].actions);
     let p = &mut st.procs[c];
-    (p.fds, p.cloexec, p.cwd, p.brk_start, p.brk, p.mmap_next) = (fds, cloexec, cwd, b0, b1, m);
+    (p.fds, p.cloexec, p.cwd, p.brk_start, p.brk) = (fds, cloexec, cwd, b0, b1);
     (p.pgid, p.sid, p.actions) = (pgid, sid, actions);
     st.tasks[ct].mask = st.tasks[t].mask;
     if st.start(ct, CHILD + PAGE, CHILD + 2 * PAGE, Some(t)).is_err() {
@@ -2830,6 +2912,9 @@ const RUNS: &[(&[&str], u32)] = &[
     // A process's threads on two CPUs at once (smptest, of our own), and
     // as many CPUs as there are online for programs that ask.
     (&["sh", "-c", "smptest && echo smptest said $? && echo cpus $(nproc)"], 0),
+    // Memory unmapped is given back and used again: far more mapped,
+    // touched and unmapped than a process has (mmaptest, of our own).
+    (&["sh", "-c", "mmaptest && echo mmaptest said $?"], 0),
     // A program with a library of its own: pigz, with zlib, which musl's
     // dynamic linker loads. BusyBox's gzip checks what it wrote.
     (&["sh", "-c", "seq 1 10000 > /tmp/n && pigz -p 2 -b 32 -k /tmp/n && ls /tmp && gzip -dc /tmp/n.gz | md5sum && md5sum < /tmp/n"], 0),
@@ -2917,7 +3002,8 @@ fn setup() -> Result<&'static mut State, &'static str> {
     // server's life; all zero is a valid empty State (every enum's zero
     // is its empty variant), and this is its only reference.
     let st = unsafe { &mut *(STATE_VA as *mut State) };
-    let interp = map_file(INTERP_FILE, INTERP_VA, PIGZ_FILE - INTERP_FILE);
+    let interp = map_file(INTERP_FILE, INTERP_VA, MMAPTEST_FILE - INTERP_FILE);
+    let mmaptest = map_file(MMAPTEST_FILE, MMAPTEST_VA, PIGZ_FILE - MMAPTEST_FILE);
     let pigz = map_file(PIGZ_FILE, PIGZ_VA, SMPTEST_FILE - PIGZ_FILE);
     let smptest = map_file(SMPTEST_FILE, SMPTEST_VA, LIBZ_FILE - SMPTEST_FILE);
     let libz = map_file(LIBZ_FILE, LIBZ_VA, FPTEST_FILE - LIBZ_FILE);
@@ -2932,15 +3018,16 @@ fn setup() -> Result<&'static mut State, &'static str> {
     st.trampoline = Shared { start: TRAMPOLINE, end: TRAMPOLINE + PAGE, ptr: TRAMPOLINE_VA, slot: TRAMPOLINE_SLOT, flags: MAP_EXEC };
     let interp_path = Elf::parse(program).ok().and_then(|e| e.interpreter()).ok_or("BusyBox is not dynamically linked")?;
     // Where each file is: BusyBox first (the runs' programs are its).
-    let files: [(&[u8], &'static [u8], u64); 6] = [
+    let files: [(&[u8], &'static [u8], u64); 7] = [
         (b"/bin/busybox", program, PROGRAM_FILE),
         (interp_path, interp, INTERP_FILE),
         (b"/usr/bin/pigz", pigz, PIGZ_FILE),
         (b"/lib/libz.so.1", libz, LIBZ_FILE),
         (b"/usr/bin/fptest", fptest, FPTEST_FILE),
         (b"/usr/bin/smptest", smptest, SMPTEST_FILE),
+        (b"/usr/bin/mmaptest", mmaptest, MMAPTEST_FILE),
     ];
-    let mut tree = [(&b""[..], &b""[..]); 6];
+    let mut tree = [(&b""[..], &b""[..]); 7];
     let mut n = 0;
     for (path, bytes, slot) in files {
         if !bytes.is_empty() {

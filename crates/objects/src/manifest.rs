@@ -65,7 +65,7 @@
 //! could never start).
 
 pub const MAX_COMPONENTS: usize = 16;
-pub const MAX_CAPS: usize = 12;
+pub const MAX_CAPS: usize = 16;
 /// Every component's CSpace size, in bits and slots.
 pub const CSPACE_BITS: u8 = 6;
 pub const CSPACE_SLOTS: usize = 1 << CSPACE_BITS;

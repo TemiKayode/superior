@@ -1,0 +1,13 @@
+[package]
+name = "superior-linux-mmaptest"
+description = "A Linux program for the Linux personality's test: memory it unmaps is given back and used again."
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "superior-linux-mmaptest"
+test = false
+bench = false

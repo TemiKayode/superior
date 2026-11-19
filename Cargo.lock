@@ -865,6 +865,10 @@ name = "superior-linux-fptest"
 version = "0.1.0"
 
 [[package]]
+name = "superior-linux-mmaptest"
+version = "0.1.0"
+
+[[package]]
 name = "superior-linux-smptest"
 version = "0.1.0"
 
