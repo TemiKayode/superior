@@ -544,7 +544,7 @@ fn alpine_files(arch: Arch) -> Result<Vec<(String, Vec<u8>)>, String> {
 /// bundle file of the name given, or, for a name starting with `/`, into
 /// the toolchain's archive at that path.)
 type ToolPackage = (&'static str, &'static str, &'static str, &'static [(&'static str, &'static str)]);
-const TOOLCHAIN_X86_64: [ToolPackage; 8] = [
+const TOOLCHAIN_X86_64: [ToolPackage; 14] = [
     ("v3.22/community", "tcc-0.9.27_git20250106-r0", "db4720f2f9c6c5cf46812d52af151cbeaa95c0e4676aa956b3e57b2c3ad9802a", &[("usr/bin/tcc", "tcc")]),
     ("v3.22/community", "tcc-libs-0.9.27_git20250106-r0", "f0d06346af0ffd0d4bca073d56b51e6baaa2825b82996a58ddf6a31dba5df2d0", &[("usr/lib/libtcc.so", "libtcc")]),
     ("v3.22/community", "tcc-libs-static-0.9.27_git20250106-r0", "2aab7f70b8f8918ebe431f9b77193a6f43b72c9206b0e5c7b35fe3975e64f3a9", TCC_RUNTIME),
@@ -553,8 +553,14 @@ const TOOLCHAIN_X86_64: [ToolPackage; 8] = [
     ("v3.18/main", "musl-dev-1.2.4-r3", "d288f1cae4a503826df1ecff8d4c3818b8c765d3e4c63d397fddd3b52de3c17b", MUSL_DEV),
     ("v3.18/main", "binutils-2.40-r8", "d8260a11280e85306f51a2642c996feeb13356a2226e74e3b76218212a512415", BINUTILS_X86_64),
     ("v3.18/main", "zstd-libs-1.5.5-r4", "79c0aa9461b1cdd238f17e24cc00916c282df2b6ba060f339993b277b4258016", ZSTD),
+    ("v3.18/main", "gcc-12.2.1_git20220924-r10", "ff9dc5bf2b8d80cc560c49ce3156d31e88eed94517781ee5e1b30c5ee7db7ea2", GCC_X86_64),
+    ("v3.18/main", "libgcc-12.2.1_git20220924-r10", "51c4130bac12e199ad216f0395d09f8ee3086ec143daf2efb142f63bd23c5158", LIBGCC),
+    ("v3.18/main", "gmp-6.2.1-r3", "b81925ecab46d1737c3ee8cbe18b8a89f4ec075f82dcd761ec572cd0e9609b5c", GMP),
+    ("v3.18/main", "mpfr4-4.2.0_p12-r0", "f06c43c2352b35510625b4b624b85eccd8e07bb1c6d93d37681c3b1fc821f061", MPFR),
+    ("v3.18/main", "mpc1-1.3.1-r1", "34d68badb2d45d16221c5e5029133d100a9a66b3899e334a11e19e50d3925685", MPC),
+    ("v3.18/main", "isl26-0.26-r1", "25847e5374469cc46dc419904c10ccd87e4f59fa879fb50ddba37651c201bfcc", ISL),
 ];
-const TOOLCHAIN_AARCH64: [ToolPackage; 8] = [
+const TOOLCHAIN_AARCH64: [ToolPackage; 14] = [
     ("v3.22/community", "tcc-0.9.27_git20250106-r0", "556e5a32cb2b7270c0007039143a905160b7dbadd3deca7e3710c760623a50dc", &[("usr/bin/tcc", "tcc")]),
     ("v3.22/community", "tcc-libs-0.9.27_git20250106-r0", "93e9707704d398f88c2292d115db22f5a10a98d87e0fbf466940e06ca4a386fb", &[("usr/lib/libtcc.so", "libtcc")]),
     ("v3.22/community", "tcc-libs-static-0.9.27_git20250106-r0", "5dc97008751c0770cad9ad94c29cc5bf2a19e555fd37313b3eb256aabe973245", TCC_RUNTIME),
@@ -563,7 +569,51 @@ const TOOLCHAIN_AARCH64: [ToolPackage; 8] = [
     ("v3.18/main", "musl-dev-1.2.4-r3", "2965901b73567405ce95f396884b8e01558dc0ab4232b6d68e5a87f2c84e046c", MUSL_DEV),
     ("v3.18/main", "binutils-2.40-r8", "0e2be25ca7b7595b08ca1804ec63dcbb7173994974203fb2c68cb6a540f371d8", BINUTILS_AARCH64),
     ("v3.18/main", "zstd-libs-1.5.5-r4", "e803a78407cb28168b681741753ddf2496cbd0b6d91e0c9aeb143aa48a5a46ff", ZSTD),
+    ("v3.18/main", "gcc-12.2.1_git20220924-r10", "b97ab04fde94dae04a9f6801148d3649ad497f4ee12a94af341e06dd41942d06", GCC_AARCH64),
+    ("v3.18/main", "libgcc-12.2.1_git20220924-r10", "45907c59e25a6698019f9f39d3f4d61b7a5e11a7c41fcd3a7fa5a3a430e2a692", LIBGCC),
+    ("v3.18/main", "gmp-6.2.1-r3", "13f042e07fe32b5487111d6dec4289f6e745cc950a6d64232be679f2435b715d", GMP),
+    ("v3.18/main", "mpfr4-4.2.0_p12-r0", "2dd2a525c899871cfca477b982d35d33d09833a06c893a67719d133e62a872eb", MPFR),
+    ("v3.18/main", "mpc1-1.3.1-r1", "5569656bc1cde66a32a437e488bb4f56faeaa2151ef2bf354858fa347f6d9c16", MPC),
+    ("v3.18/main", "isl26-0.26-r1", "d0832299b2008052681471e7c907e357556fb752c365252a727cfd879c791076", ISL),
 ];
+/// gcc: the driver (its own name on AArch64, `gcc` a link to it), cc1,
+/// collect2 and libgcc.a as bundle files; its start files, headers and
+/// libgcc_s's link script into the archive.
+const GCC_X86_64: &[(&str, &str)] = &[
+    ("usr/bin/gcc", "gcc"),
+    ("usr/libexec/gcc/x86_64-alpine-linux-musl/12.2.1/cc1", "cc1"),
+    ("usr/libexec/gcc/x86_64-alpine-linux-musl/12.2.1/collect2", "collect2"),
+    ("usr/lib/gcc/x86_64-alpine-linux-musl/12.2.1/libgcc.a", "libgcc-a"),
+    ("usr/lib/gcc/x86_64-alpine-linux-musl/12.2.1/crtbeginS.o", "/usr/lib/gcc/x86_64-alpine-linux-musl/12.2.1/crtbeginS.o"),
+    ("usr/lib/gcc/x86_64-alpine-linux-musl/12.2.1/crtendS.o", "/usr/lib/gcc/x86_64-alpine-linux-musl/12.2.1/crtendS.o"),
+    ("usr/lib/gcc/x86_64-alpine-linux-musl/12.2.1/include/stddef.h", "/usr/lib/gcc/x86_64-alpine-linux-musl/12.2.1/include/stddef.h"),
+    ("usr/lib/gcc/x86_64-alpine-linux-musl/12.2.1/include/stdarg.h", "/usr/lib/gcc/x86_64-alpine-linux-musl/12.2.1/include/stdarg.h"),
+    ("usr/lib/gcc/x86_64-alpine-linux-musl/12.2.1/include/stdbool.h", "/usr/lib/gcc/x86_64-alpine-linux-musl/12.2.1/include/stdbool.h"),
+    ("usr/lib/gcc/x86_64-alpine-linux-musl/12.2.1/include/float.h", "/usr/lib/gcc/x86_64-alpine-linux-musl/12.2.1/include/float.h"),
+    ("usr/lib/libgcc_s.so", "/usr/lib/libgcc_s.so"),
+    // The linker plugin the driver asks ld to load (for LTO objects).
+    ("usr/libexec/gcc/x86_64-alpine-linux-musl/12.2.1/liblto_plugin.so", "/usr/libexec/gcc/x86_64-alpine-linux-musl/12.2.1/liblto_plugin.so"),
+];
+const GCC_AARCH64: &[(&str, &str)] = &[
+    ("usr/bin/aarch64-alpine-linux-musl-gcc", "gcc"),
+    ("usr/libexec/gcc/aarch64-alpine-linux-musl/12.2.1/cc1", "cc1"),
+    ("usr/libexec/gcc/aarch64-alpine-linux-musl/12.2.1/collect2", "collect2"),
+    ("usr/lib/gcc/aarch64-alpine-linux-musl/12.2.1/libgcc.a", "libgcc-a"),
+    ("usr/lib/gcc/aarch64-alpine-linux-musl/12.2.1/crtbeginS.o", "/usr/lib/gcc/aarch64-alpine-linux-musl/12.2.1/crtbeginS.o"),
+    ("usr/lib/gcc/aarch64-alpine-linux-musl/12.2.1/crtendS.o", "/usr/lib/gcc/aarch64-alpine-linux-musl/12.2.1/crtendS.o"),
+    ("usr/lib/gcc/aarch64-alpine-linux-musl/12.2.1/include/stddef.h", "/usr/lib/gcc/aarch64-alpine-linux-musl/12.2.1/include/stddef.h"),
+    ("usr/lib/gcc/aarch64-alpine-linux-musl/12.2.1/include/stdarg.h", "/usr/lib/gcc/aarch64-alpine-linux-musl/12.2.1/include/stdarg.h"),
+    ("usr/lib/gcc/aarch64-alpine-linux-musl/12.2.1/include/stdbool.h", "/usr/lib/gcc/aarch64-alpine-linux-musl/12.2.1/include/stdbool.h"),
+    ("usr/lib/gcc/aarch64-alpine-linux-musl/12.2.1/include/float.h", "/usr/lib/gcc/aarch64-alpine-linux-musl/12.2.1/include/float.h"),
+    ("usr/lib/libgcc_s.so", "/usr/lib/libgcc_s.so"),
+    // The linker plugin the driver asks ld to load (for LTO objects).
+    ("usr/libexec/gcc/aarch64-alpine-linux-musl/12.2.1/liblto_plugin.so", "/usr/libexec/gcc/aarch64-alpine-linux-musl/12.2.1/liblto_plugin.so"),
+];
+const LIBGCC: &[(&str, &str)] = &[("usr/lib/libgcc_s.so.1", "libgcc-s")];
+const GMP: &[(&str, &str)] = &[("usr/lib/libgmp.so.10.4.1", "libgmp")];
+const MPFR: &[(&str, &str)] = &[("usr/lib/libmpfr.so.6.2.0", "libmpfr")];
+const MPC: &[(&str, &str)] = &[("usr/lib/libmpc.so.3.3.1", "libmpc")];
+const ISL: &[(&str, &str)] = &[("usr/lib/libisl.so.23.3.0", "libisl")];
 /// as and ld and the libraries they load. Each package has as and ld
 /// once, the other names hard links to them: in `/usr/bin` on x86-64, in
 /// the target's own directory on AArch64.
@@ -598,6 +648,8 @@ const MUSL_DEV: &[(&str, &str)] = &[
     ("usr/include/features.h", "/usr/include/features.h"),
     ("usr/include/bits/alltypes.h", "/usr/include/bits/alltypes.h"),
     ("usr/lib/crt1.o", "/usr/lib/crt1.o"),
+    ("usr/lib/Scrt1.o", "/usr/lib/Scrt1.o"),
+    ("usr/lib/libssp_nonshared.a", "/usr/lib/libssp_nonshared.a"),
     ("usr/lib/crti.o", "/usr/lib/crti.o"),
     ("usr/lib/crtn.o", "/usr/lib/crtn.o"),
 ];
@@ -959,6 +1011,8 @@ fn linux_test(img: &Image) -> Result<(), String> {
         "linux: > built by tcc: 42",
         // GNU as and ld, with tcc: their program running.
         "linux: > assembled by as, linked by ld",
+        // gcc: driver, cc1, as, collect2 and ld, and its program running.
+        "linux: > compiled by gcc: 42",
         // A program far larger than a page, loaded from its file.
         "linux: > ran a program of more than 200000 bytes",
         // Threads (clone, futexes) in pigz, and zlib loaded by musl: what

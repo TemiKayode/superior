@@ -12,7 +12,9 @@
 # linker and C library and GNU hello, linked against them. A toolchain:
 # tcc (compiler, assembler and linker) and make, with musl's headers and
 # start files (tools, an archive unpacked into the tree), and GNU
-# binutils' as and ld, with their libraries and zstd's. Shell
+# binutils' as and ld, with their libraries and zstd's, and gcc (its
+# driver, cc1, collect2, runtime library, and GMP, MPFR, MPC and isl).
+# Shell
 # scripts run with processes (fork, execve, wait4), pipes and an
 # in-memory file tree. Each process is an address space and its threads,
 # made from one of seven blocks cut from the untyped memory in slot 0, and
@@ -84,13 +86,13 @@ component net
 component linux
   image linux
   priority 10
-  # Its CNode (2^15 slots: the state's and files' pages, the files,
+  # Its CNode (2^16 slots: the state's and files' pages, the files,
   # glibc's from 8192, the toolchain's from 8832, the buffer at 9216,
-  # binutils' from 9472, and a 2048-slot span per process from 16384),
-  # address space, image, stack, the twenty-one files (copied into its
-  # memory, 32 MiB for them) and the 8 MiB block.
-  memory 25
-  cspace 15
+  # binutils' from 9472, gcc's from 11072, and a 6144-slot span per
+  # process from 22528), address space, image, stack, the thirty files
+  # (copied into its memory, 64 MiB for them) and the 8 MiB block.
+  memory 26
+  cspace 16
   vspace 20
   # The files before the blocks, smallest first: memory is handed out in
   # order, and each block is aligned to its size.
@@ -115,6 +117,15 @@ component linux
   file libsframe 10496
   file libzstd 10528
   file libopcodes 10752
+  file cc1 11072
+  file gcc 19328
+  file collect2 19664
+  file libgcc-a 19840
+  file libgmp 20608
+  file libmpfr 20736
+  file libmpc 20912
+  file libisl 20960
+  file libgcc-s 21504
   untyped 23 0
   # The rest of RAM, for the spare blocks (slots 920 on).
   untyped spare 920

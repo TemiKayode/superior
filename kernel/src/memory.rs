@@ -171,9 +171,11 @@ pub fn add_region(s: &mut Summary, start: u64, end: u64) {
 
 /// Hands out what is left of RAM: every untyped block's uncarved part,
 /// cut into naturally aligned blocks, each carved (so the kernel never
-/// uses it) and passed to `out`, which says whether it took it. The first
-/// blocks, `keep` bytes or more, stay with the kernel for its own later
-/// needs. Returns the bytes handed out.
+/// uses it) and passed to `out`, which says whether it took it. `keep`
+/// bytes (or a little more), at the end of the first blocks, stay with
+/// the kernel for its own later needs; a large block's rest is handed out
+/// (so a block of 256 MiB is not kept whole for 16 MiB). Returns the bytes
+/// handed out.
 pub fn take_spare(keep: u64, mut out: impl FnMut(u64, u8) -> bool) -> u64 {
     let mut cnode = ROOT_CNODE.lock();
     let (mut kept, mut given, mut full) = (0, 0, false);
@@ -185,12 +187,15 @@ pub fn take_spare(keep: u64, mut out: impl FnMut(u64, u8) -> bool) -> u64 {
         if free < 4096 || full {
             continue;
         }
-        if kept < keep {
-            kept += free;
+        // What this block keeps, at its end: carving goes on in order from
+        // where it is up to there.
+        let keep_here = (keep - kept.min(keep)).min(free);
+        kept += keep_here;
+        let end = base + (1u64 << bits);
+        if free - keep_here < 4096 {
             continue;
         }
-        let end = base + (1u64 << bits);
-        split_region(end - free, end, |block| {
+        split_region(end - free, end - keep_here, |block| {
             if full || block.size_bits < 12 {
                 return;
             }

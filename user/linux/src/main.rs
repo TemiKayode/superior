@@ -116,9 +116,12 @@ const UNTYPED_SPARE_COUNT: u64 = 32;
 const BLOCKS: u64 = 8;
 const BLOCK_BITS: u64 = 20;
 /// Blocks lent to processes that outgrow their own, one at a time (1 MiB
-/// each, so a process has up to 17 MiB of memory).
+/// each).
 const SPARE_BLOCKS: u64 = 1024;
-const SPARES: usize = 16;
+const SPARES: usize = 32;
+/// The block this server's state is in, from the rest of RAM.
+const STATE_BLOCK: u64 = 1100;
+const STATE_BLOCK_BITS: u64 = 19;
 /// The notification this server's thread is bound to (so `Recv` also
 /// returns when it is signalled), and two badged copies of it: the UART's
 /// interrupt (bit 0) and the timer for sleepers (bit 1).
@@ -141,13 +144,13 @@ const HELLO_FILE: u64 = 8256;
 const LIBC_FILE: u64 = 8320;
 const LIBC_PAGES: u64 = 512;
 /// The toolchain: tcc, make, tcc's library, and an archive (ustar) of the
-/// rest (C headers, start files, tcc's runtime library), unpacked into the
-/// tree here.
+/// rest (C headers, start files, runtime libraries, gcc's linker plugin;
+/// up to 512 KiB), unpacked into the tree here.
 const TCC_FILE: u64 = 8832;
 const MAKE_FILE: u64 = 8864;
 const LIBTCC_FILE: u64 = 8960;
 const TOOLS_FILE: u64 = 9088;
-const TOOLS_END: u64 = 9152;
+const TOOLS_END: u64 = EXEC_BLOCK;
 /// Where the first page of a program in a file of the tree (not the
 /// bundle's) is read, for its headers, as it is loaded: `EXEC_PAGES`
 /// pages cut from a block of the rest of RAM. Its segments are read from
@@ -165,14 +168,26 @@ const LIBCTF_FILE: u64 = 10432;
 const LIBSFRAME_FILE: u64 = 10496;
 const LIBZSTD_FILE: u64 = 10528;
 const LIBOPCODES_FILE: u64 = 10752;
-const BINUTILS_END: u64 = 11072;
+/// gcc: its driver, compiler proper (cc1, some 30 MB) and collect2 (which
+/// runs ld), its runtime library (libgcc.a; libgcc_s), and the libraries
+/// cc1 links to (GMP, MPFR, MPC, isl).
+const CC1_FILE: u64 = 11072;
+const GCC_FILE: u64 = 19328;
+const COLLECT2_FILE: u64 = 19664;
+const LIBGCC_A_FILE: u64 = 19840;
+const LIBGMP_FILE: u64 = 20608;
+const LIBMPFR_FILE: u64 = 20736;
+const LIBMPC_FILE: u64 = 20912;
+const LIBISL_FILE: u64 = 20960;
+const LIBGCC_S_FILE: u64 = 21504;
+const GCC_END: u64 = 21552;
 const STATE_SLOTS: u64 = 512;
-const STATE_PAGES: u64 = 42;
+const STATE_PAGES: u64 = 128;
 const POOL_SLOTS: u64 = STATE_SLOTS + STATE_PAGES;
 /// The signal restorer's page ([`signal::TRAMPOLINE`]).
 const TRAMPOLINE_SLOT: u64 = 1000;
-const PROC_SLOTS: u64 = 16384;
-const PROC_SPAN: u64 = 2048;
+const PROC_SLOTS: u64 = 22528;
+const PROC_SPAN: u64 = 6144;
 /// A frame of a process's that `munmap` gave back ([`Proc::frames`]).
 const FREE: u16 = u16::MAX;
 const MAX_PROCS: usize = 7;
@@ -211,6 +226,31 @@ const LIBCTF_VA: u64 = USER_BASE + 0x1_7e00_0000;
 const LIBSFRAME_VA: u64 = USER_BASE + 0x1_7f00_0000;
 const LIBZSTD_VA: u64 = USER_BASE + 0x1_8000_0000;
 const LIBOPCODES_VA: u64 = USER_BASE + 0x1_8100_0000;
+const GCC_VA: u64 = USER_BASE + 0x1_8200_0000;
+const COLLECT2_VA: u64 = USER_BASE + 0x1_8300_0000;
+const LIBGCC_A_VA: u64 = USER_BASE + 0x1_8400_0000;
+const LIBGMP_VA: u64 = USER_BASE + 0x1_8500_0000;
+const LIBMPFR_VA: u64 = USER_BASE + 0x1_8600_0000;
+const LIBMPC_VA: u64 = USER_BASE + 0x1_8700_0000;
+const LIBISL_VA: u64 = USER_BASE + 0x1_8800_0000;
+const LIBGCC_S_VA: u64 = USER_BASE + 0x1_8900_0000;
+const CC1_VA: u64 = USER_BASE + 0x1_9000_0000;
+/// Where Alpine puts gcc's own files: under its target's name.
+const CC1_PATH: &[u8] = if cfg!(target_arch = "x86_64") {
+    b"/usr/libexec/gcc/x86_64-alpine-linux-musl/12.2.1/cc1"
+} else {
+    b"/usr/libexec/gcc/aarch64-alpine-linux-musl/12.2.1/cc1"
+};
+const COLLECT2_PATH: &[u8] = if cfg!(target_arch = "x86_64") {
+    b"/usr/libexec/gcc/x86_64-alpine-linux-musl/12.2.1/collect2"
+} else {
+    b"/usr/libexec/gcc/aarch64-alpine-linux-musl/12.2.1/collect2"
+};
+const LIBGCC_A_PATH: &[u8] = if cfg!(target_arch = "x86_64") {
+    b"/usr/lib/gcc/x86_64-alpine-linux-musl/12.2.1/libgcc.a"
+} else {
+    b"/usr/lib/gcc/aarch64-alpine-linux-musl/12.2.1/libgcc.a"
+};
 /// Where Debian puts glibc.
 const LIBC_PATH: &[u8] = if cfg!(target_arch = "x86_64") {
     b"/lib/x86_64-linux-gnu/libc.so.6"
@@ -218,16 +258,17 @@ const LIBC_PATH: &[u8] = if cfg!(target_arch = "x86_64") {
     b"/lib/aarch64-linux-gnu/libc.so.6"
 };
 
-/// A process's address space: everything inside [`CHILD`, `CHILD_END`),
-/// in the kernel's low user window (from 64 KiB), so a fixed-address
-/// program, linked at 4 MiB, is loaded where it is linked: where a
-/// position-independent one goes ([`PROGRAM_BASE`]).
+/// A process's address space: everything inside [`CHILD`, `CHILD_END`)
+/// (256 MiB), in the kernel's low user window (from 64 KiB), so a
+/// fixed-address program, linked at 4 MiB, is loaded where it is linked:
+/// where a position-independent one goes ([`PROGRAM_BASE`]). A program
+/// has up to 96 MiB (cc1 is 38), then the interpreter, then mappings.
 const CHILD: u64 = 0x1_0000;
-const SPAN: u64 = 0x400_0000;
+const SPAN: u64 = 0x1000_0000;
 const CHILD_END: u64 = CHILD + SPAN;
 const PROGRAM_BASE: u64 = CHILD + 0x40_0000;
-const INTERP_BASE: u64 = CHILD + 0x100_0000;
-const MMAP_BASE: u64 = CHILD + 0x180_0000;
+const INTERP_BASE: u64 = CHILD + 0x600_0000;
+const MMAP_BASE: u64 = CHILD + 0x680_0000;
 const STACK_TOP: u64 = CHILD_END - 0x10_0000;
 const STACK_PAGES: u64 = 32;
 const BRK_MAX: u64 = 0x80_0000;
@@ -249,6 +290,7 @@ const EIO: u64 = 5;
 const EAGAIN: u64 = 11;
 const ENOMEM: u64 = 12;
 const EACCES: u64 = 13;
+const E2BIG: u64 = 7;
 const EFAULT: u64 = 14;
 const ENODEV: u64 = 19;
 const EMFILE: u64 = 24;
@@ -344,6 +386,7 @@ enum Sys {
     Prlimit,
     Getrlimit,
     Getrusage,
+    Sysinfo,
     Times,
     /// Answered with `ENOSYS` without a word: callers expect it.
     Quiet,
@@ -480,6 +523,7 @@ fn decode(nr: u64, a: [u64; 6]) -> (Sys, [u64; 6]) {
         96 => Sys::Gettimeofday,
         97 => Sys::Getrlimit,
         98 => Sys::Getrusage,
+        99 => Sys::Sysinfo,
         100 => Sys::Times,
         102 | 104 | 107 | 108 => Sys::Zero,
         109 => Sys::Setpgid,
@@ -568,6 +612,7 @@ fn decode(nr: u64, a: [u64; 6]) -> (Sys, [u64; 6]) {
         160 => Sys::Uname,
         163 => Sys::Getrlimit,
         165 => Sys::Getrusage,
+        179 => Sys::Sysinfo,
         166 => Sys::Umask,
         169 => Sys::Gettimeofday,
         173 => Sys::Getppid,
@@ -709,6 +754,9 @@ struct Proc {
     /// Which of its own pages hold code (a program from a file of the
     /// tree, copied): executable, never writable, in its space.
     code: [u64; CHILD_PAGES / 64],
+    /// Which pages of its shared runs are mapped in its space so far
+    /// ([`State::take_shared`]).
+    mapped: [u64; CHILD_PAGES / 64],
     /// The runs of bundle-file pages it maps (code, read-only data; the
     /// restorer page first).
     shared: [Shared; 24],
@@ -777,6 +825,10 @@ struct State {
     files: [Open; MAX_FILES],
     pipes: [Pipe; MAX_PIPES],
     procs: [Proc; MAX_PROCS],
+    /// The arguments and environment of the program being started, here
+    /// for their size ([`State::exec`]).
+    exec_args: Strs,
+    exec_env: Strs,
     tasks: [Task; MAX_TASKS],
     /// Process and thread ids come from one count, as Linux's do.
     next_pid: u32,
@@ -800,15 +852,22 @@ const _: () = assert!(core::mem::size_of::<State>() as u64 <= STATE_PAGES * PAGE
 
 /// Strings gathered from a process (arguments, environment).
 struct Strs {
-    buf: [u8; 2048],
+    buf: [u8; STRS_BYTES],
     len: usize,
-    off: [(u16, u16); 32],
+    off: [(u16, u16); MAX_STRS],
     n: usize,
 }
 
+/// A new program's arguments, or its environment: as many as gcc gives
+/// collect2 and ld (some forty, long paths among them).
+const STRS_BYTES: usize = 16384;
+const MAX_STRS: usize = 256;
+/// The longest one.
+const MAX_STR: usize = 4096;
+
 impl Strs {
-    const fn new() -> Strs {
-        Strs { buf: [0; 2048], len: 0, off: [(0, 0); 32], n: 0 }
+    fn clear(&mut self) {
+        (self.len, self.n) = (0, 0);
     }
     fn push(&mut self, s: &[u8]) -> bool {
         if self.n == self.off.len() || self.len + s.len() > self.buf.len() {
@@ -1098,23 +1157,29 @@ impl State {
         Ok(())
     }
 
-    /// Maps a shared run in process `i`, but where it has its own page.
-    fn map_run(&mut self, i: usize, s: Shared) -> Result<(), u64> {
-        for va in (s.start..s.end).step_by(PAGE as usize) {
-            if !self.is_present(i, va) {
-                self.map_shared(i, va, s.slot + (va - s.start) / PAGE, s.flags)?;
-            }
+    /// Maps the page of a shared run at `va` (any address in it) in
+    /// process `i`, on its first touch: a run's pages are mapped only as
+    /// they are used, so a slot is spent on each page a program touches,
+    /// not on each it has (cc1's code alone is some 7000 pages). Whether
+    /// it is now mapped (or was, by another of its threads meanwhile).
+    fn take_shared(&mut self, i: usize, va: u64) -> bool {
+        let page = va & !(PAGE - 1);
+        if !(CHILD..CHILD_END).contains(&page) || self.is_present(i, page) {
+            return false;
         }
-        Ok(())
-    }
-
-    /// Maps every shared run of process `i`'s (a `fork`'s new copy).
-    fn map_all_shared(&mut self, i: usize) -> Result<(), u64> {
-        for k in 0..self.procs[i].nshared {
-            let s = self.procs[i].shared[k];
-            self.map_run(i, s)?;
+        let k = ((page - CHILD) / PAGE) as usize;
+        let p = &self.procs[i];
+        if p.mapped[k / 64] & 1 << (k % 64) != 0 {
+            return true;
         }
-        Ok(())
+        let Some(s) = p.shared[..p.nshared].iter().copied().find(|s| (s.start..s.end).contains(&page)) else {
+            return false;
+        };
+        if self.map_shared(i, page, s.slot + (page - s.start) / PAGE, s.flags).is_err() {
+            return false;
+        }
+        self.procs[i].mapped[k / 64] |= 1 << (k % 64);
+        true
     }
 
     /// Loads an image (the file whose pages are in slots from
@@ -1197,7 +1262,6 @@ impl State {
                 }
                 p.shared[p.nshared] = run;
                 p.nshared += 1;
-                self.map_run(i, run).map_err(|_| "out of memory")?;
             }
         }
         Ok((base + elf.entry, phdr, phnum as u64, base + end))
@@ -1264,6 +1328,7 @@ impl State {
         p.present = [0; CHILD_PAGES / 64];
         p.reserved = [0; CHILD_PAGES / 64];
         p.code = [0; CHILD_PAGES / 64];
+        p.mapped = [0; CHILD_PAGES / 64];
         p.frames = [0; PROC_SPAN as usize];
         (p.alarm, p.alarm_every) = (0, 0);
         (p.pgid, p.sid) = (pid, pid);
@@ -1304,7 +1369,8 @@ impl State {
     /// endpoint, at the start of the process's span.
     fn make_space(&mut self, i: usize, t: usize) -> Result<(), &'static str> {
         let b = slot_base(i);
-        self.retype(i, ObjectType::AddressSpace, 17, b).map_err(|_| "no address space")?;
+        // Room for the page tables of a 256 MiB space, sparse.
+        self.retype(i, ObjectType::AddressSpace, 18, b).map_err(|_| "no address space")?;
         self.procs[i].cursor = 1;
         self.make_thread(t).map_err(|_| "no thread")
     }
@@ -1362,19 +1428,19 @@ impl State {
         p.present = [0; CHILD_PAGES / 64];
         p.reserved = [0; CHILD_PAGES / 64];
         p.code = [0; CHILD_PAGES / 64];
+        p.mapped = [0; CHILD_PAGES / 64];
         p.frames = [0; PROC_SPAN as usize];
     }
 
     /// Runs bundle file `image` (a program) as task `t`'s process, its
     /// address space made afresh, with `argv` and `envp`, and the
     /// interpreter the program names, if it names one.
-    fn exec(&mut self, t: usize, image: Prog, argv: &Strs, envp: &Strs, execfn: &[u8]) -> Result<(), &'static str> {
+    fn exec(&mut self, t: usize, image: Prog, execfn: &[u8]) -> Result<(), &'static str> {
         let i = self.tasks[t].proc as usize;
         self.make_space(i, t)?;
         let tramp = self.trampoline;
         let p = &mut self.procs[i];
         (p.shared[0], p.nshared, p.nlibs) = (tramp, 1, 0);
-        self.map_run(i, tramp).map_err(|_| "out of memory")?;
         let src = match image {
             Prog::Image(k) => Src::Bundle { bytes: self.images[k].bytes, slot: self.images[k].slot },
             // SAFETY: the file's first bytes, read into the buffer at
@@ -1405,13 +1471,19 @@ impl State {
             top -= s.len() as u64 + 1;
             if st.copy_out(i, top, s) && st.copy_out(i, top + s.len() as u64, &[0]) { Ok(top) } else { Err("stack") }
         };
-        let mut argp = [0u64; 32];
-        let mut envp_at = [0u64; 32];
-        for k in 0..argv.n {
-            argp[k] = push_str(self, argv.get(k))?;
+        let mut argp = [0u64; MAX_STRS];
+        let mut envp_at = [0u64; MAX_STRS];
+        let mut s = [0u8; MAX_STR];
+        let (nargs, nenv) = (self.exec_args.n, self.exec_env.n);
+        for k in 0..nargs {
+            let a = self.exec_args.get(k);
+            s[..a.len()].copy_from_slice(a);
+            argp[k] = push_str(self, &s[..a.len()])?;
         }
-        for k in 0..envp.n {
-            envp_at[k] = push_str(self, envp.get(k))?;
+        for k in 0..nenv {
+            let e = self.exec_env.get(k);
+            s[..e.len()].copy_from_slice(e);
+            envp_at[k] = push_str(self, &s[..e.len()])?;
         }
         let execfn = push_str(self, execfn)?;
         let platform = push_str(self, PLATFORM.as_bytes())?;
@@ -1435,20 +1507,20 @@ impl State {
             (25, random),
             (31, execfn),
         ];
-        let words = 1 + argv.n + 1 + envp.n + 1 + 2 * (aux.len() + 1);
+        let words = 1 + nargs + 1 + nenv + 1 + 2 * (aux.len() + 1);
         // At argc, on a 16-byte boundary, as Linux starts a program (glibc's
         // dynamic linker relies on it; musl's realigns its stack itself).
         let sp = (top - 8 * words as u64) & !15;
-        let mut words = [0u64; 1 + 32 + 1 + 32 + 1 + 36];
+        let mut words = [0u64; 1 + MAX_STRS + 1 + MAX_STRS + 1 + 36];
         let mut n = 0;
         let mut w = |v: u64| {
             words[n] = v;
             n += 1;
         };
-        w(argv.n as u64);
-        argp[..argv.n].iter().for_each(|&p| w(p));
+        w(nargs as u64);
+        argp[..nargs].iter().for_each(|&p| w(p));
         w(0);
-        envp_at[..envp.n].iter().for_each(|&p| w(p));
+        envp_at[..nenv].iter().for_each(|&p| w(p));
         w(0);
         for (k, v) in aux {
             w(k);
@@ -1907,6 +1979,18 @@ fn answer(st: &mut State, t: usize, call: Sys, a: [u64; 6]) -> Out {
         Sys::Times => Ret(superior_sys::ticks()),
         // Resources used (as reports its time): none counted, all zero.
         Sys::Getrusage => r(st.put(i, a[1], &[0u8; 144])),
+        // The uptime, the memory a process may have (its window, the most
+        // of it free), and the processes: what gcc sizes its collector by.
+        Sys::Sysinfo => {
+            let mut b = [0u8; 112];
+            b[0..8].copy_from_slice(&(superior_sys::ticks() / TICK_HZ).to_le_bytes());
+            b[32..40].copy_from_slice(&SPAN.to_le_bytes());
+            b[40..48].copy_from_slice(&(SPAN / 2).to_le_bytes());
+            let procs = st.procs.iter().filter(|p| p.used && !p.zombie).count() as u16;
+            b[80..82].copy_from_slice(&procs.to_le_bytes());
+            b[104..108].copy_from_slice(&1u32.to_le_bytes());
+            r(st.put(i, a[0], &b))
+        }
         Sys::Quiet => Ret(err(ENOSYS)),
         Sys::Sendfile => Ret(err(EINVAL)),
         Sys::Unsupported(n) => {
@@ -2488,6 +2572,37 @@ fn mmap_file(st: &mut State, i: usize, addr: u64, len: u64, prot: u64, fixed: bo
             return Ok(at);
         }
     }
+    // So too a library in a file of the tree (gcc's linker plugin, which
+    // ld loads): its first page read into the exec buffer for its headers,
+    // then loaded as a program in a file is, code into pages of code.
+    if let (None, false, 0, Kind::File) = (st.fs.image(o.ino), fixed, off, st.fs.kind(o.ino)) {
+        let flen = st.fs.size(o.ino);
+        let want = flen.min(EXEC_PAGES * PAGE) as usize;
+        // SAFETY: the buffer's EXEC_PAGES pages, mapped writable here for
+        // this server's life; used by one exec or mmap at a time.
+        let buf = unsafe { core::slice::from_raw_parts_mut(EXEC_VA as *mut u8, want) };
+        let mut n = 0;
+        while n < want {
+            let got = st.fs.read(o.ino, n as u64, &mut buf[n..]);
+            if got == 0 {
+                break;
+            }
+            n += got;
+        }
+        if let Some(elf) = Elf::parse_head(&buf[..n], flen).ok().filter(|e| e.pie && e.machine == MACHINE) {
+            let lowest = elf.segments().flatten().map(|s| s.vaddr & !(PAGE - 1)).min().unwrap_or(0);
+            let at = reserve(st)?;
+            // SAFETY: the n bytes just read into the buffer.
+            let head = unsafe { core::slice::from_raw_parts(EXEC_VA as *const u8, n) };
+            st.load(i, Src::Tree { head, ino: o.ino, len: flen }, at - lowest).map_err(|_| ENOMEM)?;
+            let p = &mut st.procs[i];
+            if p.nlibs < p.libs.len() {
+                p.libs[p.nlibs] = (at, at + len, o.ino);
+                p.nlibs += 1;
+            }
+            return Ok(at);
+        }
+    }
     let at = if fixed { addr } else { reserve(st)? };
     if at % PAGE != 0 || at < CHILD || at + len > STACK_TOP - STACK_PAGES * PAGE {
         return Err(ENOMEM);
@@ -2514,7 +2629,6 @@ fn mmap_file(st: &mut State, i: usize, addr: u64, len: u64, prot: u64, fixed: bo
             let p = &mut st.procs[i];
             p.shared[p.nshared] = run;
             p.nshared += 1;
-            st.map_run(i, run)?;
             return Ok(at);
         }
     }
@@ -2595,9 +2709,6 @@ fn fork_on(st: &mut State, t: usize, sp: u64) -> Result<u64, u64> {
     st.procs[c].reserved = st.procs[i].reserved;
     (st.procs[c].shared, st.procs[c].nshared) = (st.procs[i].shared, st.procs[i].nshared);
     (st.procs[c].libs, st.procs[c].nlibs) = (st.procs[i].libs, st.procs[i].nlibs);
-    if st.map_all_shared(c).is_err() {
-        return fail(st, ENOMEM);
-    }
     let (fds, cloexec, cwd) = (st.procs[i].fds, st.procs[i].cloexec, st.procs[i].cwd);
     let (b0, b1) = (st.procs[i].brk_start, st.procs[i].brk);
     for &f in fds.iter().filter(|&&f| f != 0) {
@@ -2663,8 +2774,9 @@ fn execve(st: &mut State, t: usize, path: u64, argv: u64, envp: u64) -> Result<(
         }
         _ => return Err(ENOEXEC),
     };
-    let (mut args, mut env) = (Strs::new(), Strs::new());
-    for (list, at) in [(&mut args, argv), (&mut env, envp)] {
+    st.exec_args.clear();
+    st.exec_env.clear();
+    for (env, at) in [(false, argv), (true, envp)] {
         if at == 0 {
             continue;
         }
@@ -2673,10 +2785,11 @@ fn execve(st: &mut State, t: usize, path: u64, argv: u64, envp: u64) -> Result<(
             if ptr == 0 {
                 break;
             }
-            let mut s = [0u8; 512];
-            let len = st.cstr(i, ptr, &mut s)?;
+            let mut s = [0u8; MAX_STR];
+            let len = st.cstr(i, ptr, &mut s).map_err(|_| E2BIG)?;
+            let list = if env { &mut st.exec_env } else { &mut st.exec_args };
             if !list.push(&s[..len]) {
-                return Err(fs::ENAMETOOLONG);
+                return Err(E2BIG);
             }
         }
     }
@@ -2697,7 +2810,7 @@ fn execve(st: &mut State, t: usize, path: u64, argv: u64, envp: u64) -> Result<(
         }
     }
     st.reset_handlers(i);
-    if let Err(why) = st.exec(t, image, &args, &env, &name[..n]) {
+    if let Err(why) = st.exec(t, image, &name[..n]) {
         say!("linux: pid {}: exec failed after the old program was gone: {why}", st.procs[i].pid);
         st.exit(i, 127 << 8);
     }
@@ -3084,13 +3197,14 @@ fn run(st: &mut State, argv: &[&str], env: &[&str], interactive: bool) -> Result
     if interactive {
         st.tty.reset(pid);
     }
-    let (mut args, mut envs) = (Strs::new(), Strs::new());
-    argv.iter().for_each(|a| _ = args.push(a.as_bytes()));
-    env.iter().for_each(|e| _ = envs.push(e.as_bytes()));
+    st.exec_args.clear();
+    st.exec_env.clear();
+    argv.iter().for_each(|a| _ = st.exec_args.push(a.as_bytes()));
+    env.iter().for_each(|e| _ = st.exec_env.push(e.as_bytes()));
     let execfn = [b"/bin/" as &[u8], argv[0].as_bytes()].concat_into::<64>();
     let image = st.fs.resolve(ROOT, execfn.as_slice(), true).ok().and_then(|ino| st.fs.image(ino));
     let started = match image {
-        Some(k) => st.exec(t, Prog::Image(k), &args, &envs, execfn.as_slice()),
+        Some(k) => st.exec(t, Prog::Image(k), execfn.as_slice()),
         None => Err("no such program"),
     };
     if let Err(why) = started {
@@ -3132,7 +3246,9 @@ fn run(st: &mut State, argv: &[&str], env: &[&str], interactive: bool) -> Result
         let made = |st: &State| {
             (CHILD..CHILD_END).contains(&nr) && st.is_present(i, nr & !(PAGE - 1)) && st.tasks[t].last_fault != nr
         };
-        if page_fault && (made(st) || st.take_reserved(i, nr)) {
+        // Or a shared run's page, mapped on its first touch (a second
+        // fault there is the access refused).
+        if page_fault && (made(st) || st.take_reserved(i, nr) || st.tasks[t].last_fault != nr && st.take_shared(i, nr)) {
             st.tasks[t].last_fault = nr;
             syscall(Syscall::Reply, 0, [FaultReply::Retry as u64, 0, 0, 0]);
             continue;
@@ -3778,6 +3894,16 @@ const RUNS: &[(&[&str], u32)] = &[
         ],
         0,
     ),
+    // gcc: its driver runs cc1 (some 30 MB, fixed-address), as, and
+    // collect2, which runs ld, and the program it made runs.
+    (
+        &[
+            "sh",
+            "-c",
+            r#"cd /tmp/cc && printf '#include <stdio.h>\nint main(void) { printf("compiled by gcc: %%d\\n", 6 * 7); return 0; }\n' > g.c && gcc -o g g.c && ./g"#,
+        ],
+        0,
+    ),
     // A program larger than a page many times over, read from its file
     // as it is loaded.
     (
@@ -3868,12 +3994,11 @@ fn setup() -> Result<&'static mut State, &'static str> {
     }
     // From the first blocks of the rest of RAM with room for them.
     let mut from = UNTYPED_SPARE;
-    for k in 0..SPARES as u64 {
-        while sys(Syscall::Retype, from, [ObjectType::Untyped as u64, BLOCK_BITS, SPARE_BLOCKS + k, 0]).is_err() {
-            from += 1;
-            if from == UNTYPED_SPARE + UNTYPED_SPARE_COUNT {
-                return Err("no spare memory");
-            }
+    // This server's state.
+    while sys(Syscall::Retype, from, [ObjectType::Untyped as u64, STATE_BLOCK_BITS, STATE_BLOCK, 0]).is_err() {
+        from += 1;
+        if from == UNTYPED_SPARE + UNTYPED_SPARE_COUNT {
+            return Err("no spare memory");
         }
     }
     // The buffer programs in the tree's files are read into.
@@ -3888,6 +4013,19 @@ fn setup() -> Result<&'static mut State, &'static str> {
         sys(Syscall::Retype, EXEC_BLOCK, [ObjectType::Frame as u64, 0, EXEC_SLOTS + p, 0]).map_err(|_| "no memory")?;
         sys(Syscall::FrameMap, EXEC_SLOTS + p, [EXEC_VA + p * PAGE, 1, 0, 0]).map_err(|_| "no room")?;
     }
+    // Then as many spare blocks as the rest has room for (the more, the
+    // larger a process can grow), at least one.
+    let mut spares = 0;
+    while spares < SPARES && from < UNTYPED_SPARE + UNTYPED_SPARE_COUNT {
+        if sys(Syscall::Retype, from, [ObjectType::Untyped as u64, BLOCK_BITS, SPARE_BLOCKS + spares as u64, 0]).is_ok() {
+            spares += 1;
+        } else {
+            from += 1;
+        }
+    }
+    if spares == 0 {
+        return Err("no spare memory");
+    }
     sys(Syscall::Retype, FS_BLOCK, [ObjectType::Endpoint as u64, 0, EP, 0]).map_err(|_| "no endpoint")?;
     sys(Syscall::Retype, FS_BLOCK, [ObjectType::Notification as u64, 0, NTFN, 0]).map_err(|_| "no notification")?;
     sys(Syscall::CapMint, NTFN, [NTFN_UART, ALL, 1, 0]).map_err(|_| "no notification")?;
@@ -3899,14 +4037,16 @@ fn setup() -> Result<&'static mut State, &'static str> {
     sys(Syscall::IrqSetNotification, tty::UART_IRQ, [NTFN_UART, 0, 0, 0]).map_err(|_| "no UART interrupt")?;
     for p in 0..STATE_PAGES + fs::POOL_PAGES as u64 {
         let slot = STATE_SLOTS + p;
-        let va = if p < STATE_PAGES { STATE_VA + p * PAGE } else { POOL_VA + (slot - POOL_SLOTS) * PAGE };
-        sys(Syscall::Retype, FS_BLOCK, [ObjectType::Frame as u64, 0, slot, 0]).map_err(|_| "no memory for files")?;
+        let (va, block) = if p < STATE_PAGES { (STATE_VA + p * PAGE, STATE_BLOCK) } else { (POOL_VA + (slot - POOL_SLOTS) * PAGE, FS_BLOCK) };
+        sys(Syscall::Retype, block, [ObjectType::Frame as u64, 0, slot, 0]).map_err(|_| "no memory for files")?;
         sys(Syscall::FrameMap, slot, [va, 1, 0, 0]).map_err(|_| "no room for files")?;
     }
     // SAFETY: STATE_PAGES zeroed pages are mapped at STATE_VA, for this
     // server's life; all zero is a valid empty State (every enum's zero
     // is its empty variant), and this is its only reference.
     let st = unsafe { &mut *(STATE_VA as *mut State) };
+    // Spare blocks there was no room for: never lent.
+    st.spare_owner[spares..].fill(u8::MAX);
     let interp = map_file(INTERP_FILE, INTERP_VA, MMAPTEST_FILE - INTERP_FILE);
     let mmaptest = map_file(MMAPTEST_FILE, MMAPTEST_VA, PIGZ_FILE - MMAPTEST_FILE);
     let pigz = map_file(PIGZ_FILE, PIGZ_VA, SMPTEST_FILE - PIGZ_FILE);
@@ -3927,7 +4067,16 @@ fn setup() -> Result<&'static mut State, &'static str> {
     let libctf = map_file(LIBCTF_FILE, LIBCTF_VA, LIBSFRAME_FILE - LIBCTF_FILE);
     let libsframe = map_file(LIBSFRAME_FILE, LIBSFRAME_VA, LIBZSTD_FILE - LIBSFRAME_FILE);
     let libzstd = map_file(LIBZSTD_FILE, LIBZSTD_VA, LIBOPCODES_FILE - LIBZSTD_FILE);
-    let libopcodes = map_file(LIBOPCODES_FILE, LIBOPCODES_VA, BINUTILS_END - LIBOPCODES_FILE);
+    let libopcodes = map_file(LIBOPCODES_FILE, LIBOPCODES_VA, CC1_FILE - LIBOPCODES_FILE);
+    let cc1 = map_file(CC1_FILE, CC1_VA, GCC_FILE - CC1_FILE);
+    let gcc = map_file(GCC_FILE, GCC_VA, COLLECT2_FILE - GCC_FILE);
+    let collect2 = map_file(COLLECT2_FILE, COLLECT2_VA, LIBGCC_A_FILE - COLLECT2_FILE);
+    let libgcc_a = map_file(LIBGCC_A_FILE, LIBGCC_A_VA, LIBGMP_FILE - LIBGCC_A_FILE);
+    let libgmp = map_file(LIBGMP_FILE, LIBGMP_VA, LIBMPFR_FILE - LIBGMP_FILE);
+    let libmpfr = map_file(LIBMPFR_FILE, LIBMPFR_VA, LIBMPC_FILE - LIBMPFR_FILE);
+    let libmpc = map_file(LIBMPC_FILE, LIBMPC_VA, LIBISL_FILE - LIBMPC_FILE);
+    let libisl = map_file(LIBISL_FILE, LIBISL_VA, LIBGCC_S_FILE - LIBISL_FILE);
+    let libgcc_s = map_file(LIBGCC_S_FILE, LIBGCC_S_VA, GCC_END - LIBGCC_S_FILE);
     // glibc's dynamic linker is where hello says it is.
     let glibc_ld_path = Elf::parse(hello).ok().and_then(|e| e.interpreter()).unwrap_or(b"");
     st.next_pid = 1;
@@ -3960,6 +4109,15 @@ fn setup() -> Result<&'static mut State, &'static str> {
         (b"/usr/lib/libsframe.so.0", libsframe, LIBSFRAME_FILE),
         (b"/usr/lib/libzstd.so.1", libzstd, LIBZSTD_FILE),
         (b"/usr/lib/libopcodes-2.40.so", libopcodes, LIBOPCODES_FILE),
+        (b"/usr/bin/gcc", gcc, GCC_FILE),
+        (CC1_PATH, cc1, CC1_FILE),
+        (COLLECT2_PATH, collect2, COLLECT2_FILE),
+        (LIBGCC_A_PATH, libgcc_a, LIBGCC_A_FILE),
+        (b"/usr/lib/libgmp.so.10", libgmp, LIBGMP_FILE),
+        (b"/usr/lib/libmpfr.so.6", libmpfr, LIBMPFR_FILE),
+        (b"/usr/lib/libmpc.so.3", libmpc, LIBMPC_FILE),
+        (b"/usr/lib/libisl.so.23", libisl, LIBISL_FILE),
+        (b"/usr/lib/libgcc_s.so.1", libgcc_s, LIBGCC_S_FILE),
     ];
     let mut tree = [(&b""[..], &b""[..]); MAX_IMAGES];
     let mut n = 0;

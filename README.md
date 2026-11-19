@@ -1835,6 +1835,35 @@ holds the rest):
   `tcc -c`, links the two with `ld` against musl's start files and
   dynamic linker, and runs it (`assembled by as, linked by ld`), and runs
   a 200 KB program tcc built under `/home`, on both ISAs.
+- The Linux personality runs gcc: its driver runs cc1, as and collect2
+  (which runs ld with gcc's linker plugin), and the program runs. xtask
+  adds Alpine 3.18's gcc 12.2.1 (driver, cc1, collect2, libgcc.a, start
+  files, a few headers, the plugin), libgcc_s, GMP, MPFR, MPC and isl,
+  pinned by hash, and musl-dev's `Scrt1.o` and `libssp_nonshared.a`. A
+  process's window is now 256 MiB (cc1 is fixed-address and ends at 38
+  MiB; the interpreter is at 96 MiB, mappings after), its address space
+  object 2^18. A bundle file's pages are now mapped in a process on their
+  first touch (a fault), not when the run is mapped, so a slot is spent
+  only on a page it uses (cc1's code is some 7000 pages); a second
+  thread faulting on a page another just mapped tries again. A library in
+  a file of the tree (the plugin, which ld `dlopen`s) is loaded as a
+  program in a file is, its code in pages of code. `execve` takes up to
+  256 arguments in 16 KiB (gcc gives collect2 some forty), kept in the
+  state rather than on the stack; too many is `E2BIG`. `sysinfo` is
+  answered (gcc sizes its collector by it). The tools archive may be 512
+  KiB. For the room: the personality's CSpace is 2^16, gcc's files from
+  slot 11072 and a 6144-slot span per process from 22528; its state is
+  in a block of its own (512 KiB, slot 1100); it takes up to 32 spare
+  blocks, as many as there is room for. It has 64 MiB (`memory 26`, the
+  most a component may now have) and 37 capabilities (40 now the most).
+  The kernel sizes the manager's untyped memory by the bundle (twice it,
+  at least 64 MiB: 128 MiB for the Linux test's 52 MB one), gives the
+  root task a 256 KiB stack (the manager's manifest parse, with 40
+  capabilities a component, outgrew 128 KiB), and keeps only 16 MiB of
+  the first block of RAM it would keep rather than the whole block (on
+  AArch64 a 256 MiB one, which left no spare RAM). `linux-test` has gcc
+  compile and link a C program, which prints `compiled by gcc: 42`, on
+  both ISAs.
 - Interrupt and exception entries clear the direction flag. User code may be
   interrupted mid-way through a backward copy, with the flag set; the kernel's own
   copies need it clear, and without the `cld` they ran backwards, wrecking saved

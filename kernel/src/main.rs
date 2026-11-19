@@ -36,7 +36,7 @@ mod tpm;
 pub use arch::serial;
 
 use core::panic::PanicInfo;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use superior_objects::cap::{Capability, Object, Rights};
 
 /// The boot self-test program, built by `cargo xtask` (empty if none).
@@ -239,10 +239,14 @@ fn start_component_manager() -> Result<(), &'static str> {
     };
     // Made once, at the first start.
     static UNTYPED: AtomicU64 = AtomicU64::new(0);
+    static UNTYPED_BITS: AtomicU8 = AtomicU8::new(0);
     static STATE_STORE: AtomicU64 = AtomicU64::new(0);
     if UNTYPED.load(Ordering::SeqCst) == 0 {
-        let base =
-            memory::carve(root::UNTYPED_BITS).ok_or("no memory for the Component Manager")?;
+        // The components' memory holds copies of the bundle's files: room
+        // for twice the bundle, and never less than the least.
+        let bits = ((2 * bundle.len() as u64).next_power_of_two().ilog2() as u8).max(root::UNTYPED_BITS);
+        UNTYPED_BITS.store(bits, Ordering::SeqCst);
+        let base = memory::carve(bits).ok_or("no memory for the Component Manager")?;
         let store = memory::carve(12 + root::STATE_PAGES.ilog2() as u8)
             .ok_or("no memory for the state store")?;
         // SAFETY: just carved, so no one else has it; RAM the kernel maps.
@@ -293,7 +297,7 @@ fn start_component_manager() -> Result<(), &'static str> {
             Capability::new(
                 Object::Untyped {
                     base,
-                    size_bits: root::UNTYPED_BITS,
+                    size_bits: UNTYPED_BITS.load(Ordering::SeqCst),
                 },
                 Rights::ALL,
             ),

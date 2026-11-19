@@ -39,9 +39,9 @@ pub fn is_user(va: u64) -> bool {
 pub fn is_user_range(va: u64, end: u64) -> bool {
     va <= end && (LOW_BASE <= va && end <= LOW_END || USER_BASE <= va && end <= USER_END)
 }
-/// The root task's stack: 128 KiB (the Component Manager keeps its state,
+/// The root task's stack: 256 KiB (the Component Manager keeps its state,
 /// manifests included, on it).
-const USER_STACK_PAGES: u64 = 32;
+const USER_STACK_PAGES: u64 = 64;
 const PAGE: u64 = 4096;
 
 static mut PHYS_OFFSET: u64 = 0;
