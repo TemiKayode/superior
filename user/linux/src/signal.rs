@@ -80,7 +80,7 @@ pub const TRAMPOLINE_CODE: &[u8] = if cfg!(target_arch = "x86_64") {
 /// result, stack pointer and program counter.
 const COUNT: usize = REGS_COUNT as usize;
 const RESULT: usize = if cfg!(target_arch = "x86_64") { 13 } else { 0 };
-const SP: usize = if cfg!(target_arch = "x86_64") { 15 } else { 31 };
+pub const SP: usize = if cfg!(target_arch = "x86_64") { 15 } else { 31 };
 const PC: usize = if cfg!(target_arch = "x86_64") { 16 } else { 32 };
 /// The `ucontext` the handler gets: its size, and where its registers
 /// (`uc_mcontext`'s general registers) and signal mask are in it.
@@ -91,37 +91,49 @@ const INFO_LEN: u64 = 128;
 /// The instruction that made a system call, to make it again.
 pub const SYSCALL_LEN: u64 = if cfg!(target_arch = "x86_64") { 2 } else { 4 };
 
-fn regs(i: usize) -> Option<[u64; COUNT]> {
+fn regs(th: u64) -> Option<[u64; COUNT]> {
     let mut r = [0; COUNT];
     for k in (0..COUNT).step_by(4) {
-        let m = sys(Syscall::ThreadRegisters, thread_slot(i), [REGS_GET, k as u64, 0, 0]).ok()?;
+        let m = sys(Syscall::ThreadRegisters, th, [REGS_GET, k as u64, 0, 0]).ok()?;
         let n = (COUNT - k).min(4);
         r[k..k + n].copy_from_slice(&m[..n]);
     }
     Some(r)
 }
 
-fn set_regs(i: usize, r: &[u64; COUNT]) -> Option<()> {
+fn set_regs(th: u64, r: &[u64; COUNT]) -> Option<()> {
     for k in (0..COUNT).step_by(2) {
-        sys(Syscall::ThreadRegisters, thread_slot(i), [REGS_SET, k as u64, r[k], r[k + 1]]).ok()?;
+        sys(Syscall::ThreadRegisters, th, [REGS_SET, k as u64, r[k], r[k + 1]]).ok()?;
     }
     Some(())
 }
 
 impl State {
-    /// Sends `sig` to process `i`. A signal its action ignores is dropped
-    /// (unless masked: the action may change before it is unmasked).
-    pub fn post(&mut self, i: usize, sig: u32) {
-        let p = &mut self.procs[i];
-        if !p.used || p.zombie || sig == 0 || sig > NSIG {
-            return;
-        }
-        let a = p.actions[sig as usize - 1];
+    /// Whether process `i` drops `sig` when sent: its action ignores it,
+    /// and no thread masks it (the action may change before it is
+    /// unmasked).
+    fn dropped(&self, i: usize, sig: u32) -> bool {
+        let a = self.procs[i].actions[sig as usize - 1];
         let ignored = sig != SIGKILL && (a.handler == SIG_IGN || a.handler == SIG_DFL && ignored_by_default(sig));
-        if ignored && p.mask & bit(sig) == 0 {
+        ignored && self.tasks_of(i).all(|t| self.tasks[t].mask & bit(sig) == 0)
+    }
+
+    /// Sends `sig` to process `i`, for whichever of its threads takes it.
+    pub fn post(&mut self, i: usize, sig: u32) {
+        let p = &self.procs[i];
+        if !p.used || p.zombie || sig == 0 || sig > NSIG || self.dropped(i, sig) {
             return;
         }
-        p.pending |= bit(sig);
+        self.procs[i].pending |= bit(sig);
+    }
+
+    /// Sends `sig` to task `t` alone (`tkill`).
+    pub fn post_task(&mut self, t: usize, sig: u32) {
+        let i = self.tasks[t].proc as usize;
+        if sig == 0 || sig > NSIG || self.procs[i].zombie || self.dropped(i, sig) {
+            return;
+        }
+        self.tasks[t].pending |= bit(sig);
     }
 
     /// Sends `sig` to every process in group `pgid`; whether there was one.
@@ -136,12 +148,14 @@ impl State {
         any
     }
 
-    /// What process `i` must do about its pending signals, dropping those
-    /// now ignored.
-    pub fn next_signal(&mut self, i: usize) -> Next {
+    /// What task `t` must do about the signals pending for it or its
+    /// process, dropping those now ignored.
+    pub fn next_signal(&mut self, t: usize) -> Next {
+        let i = self.tasks[t].proc as usize;
+        let task = &mut self.tasks[t];
         let p = &mut self.procs[i];
         loop {
-            let live = p.pending & (!p.mask | UNBLOCKABLE);
+            let live = (p.pending | task.pending) & (!task.mask | UNBLOCKABLE);
             if live == 0 {
                 return Next::None;
             }
@@ -152,29 +166,37 @@ impl State {
             }
             if a.handler == SIG_IGN || a.handler == SIG_DFL {
                 p.pending &= !bit(sig);
+                task.pending &= !bit(sig);
                 continue;
             }
             return Next::Handle(sig);
         }
     }
 
-    /// Process `i` (stopped in a system call) takes `sig`'s handler: the
+    /// Task `t` (stopped in a system call) takes `sig`'s handler: the
     /// registers it would resume with (at `pc`, with `result` in the
     /// result register unless `None`: a restarted call keeps its
     /// arguments) and its mask are saved on its stack. Returns where it
     /// resumes and the result register's value there.
-    pub fn enter_handler(&mut self, i: usize, sig: u32, pc: u64, result: Option<u64>) -> Option<(u64, u64)> {
-        let mut r = regs(i)?;
+    pub fn enter_handler(&mut self, t: usize, sig: u32, pc: u64, result: Option<u64>) -> Option<(u64, u64)> {
+        let (i, th) = (self.tasks[t].proc as usize, self.tasks[t].thread);
+        let mut r = regs(th)?;
         r[PC] = pc;
         if let Some(v) = result {
             r[RESULT] = v;
         }
+        let task = &mut self.tasks[t];
         let p = &mut self.procs[i];
         let a = p.actions[sig as usize - 1];
-        let old_mask = if core::mem::take(&mut p.suspended) { p.saved_mask } else { p.mask };
-        p.pending &= !bit(sig);
-        p.mask |= a.mask | if a.flags & SA_NODEFER != 0 { 0 } else { bit(sig) };
-        p.mask &= !UNBLOCKABLE;
+        let old_mask = if core::mem::take(&mut task.suspended) { task.saved_mask } else { task.mask };
+        // The thread's own first, as Linux takes them.
+        if task.pending & bit(sig) != 0 {
+            task.pending &= !bit(sig);
+        } else {
+            p.pending &= !bit(sig);
+        }
+        task.mask |= a.mask | if a.flags & SA_NODEFER != 0 { 0 } else { bit(sig) };
+        task.mask &= !UNBLOCKABLE;
         if a.flags & SA_RESETHAND != 0 {
             p.actions[sig as usize - 1].handler = SIG_DFL;
         }
@@ -203,7 +225,7 @@ impl State {
             }
             (r[8], r[9], r[12], r[SP], r[PC]) = (sig as u64, infop, ucp, frame, a.handler);
             r[17] &= !0x400; // the direction flag
-            set_regs(i, &r)?;
+            set_regs(th, &r)?;
             Some((a.handler, 0))
         } else {
             // The siginfo, the ucontext and a frame record (the
@@ -218,7 +240,7 @@ impl State {
                 return None;
             }
             (r[0], r[1], r[2], r[29], r[30], r[SP], r[PC]) = (sig as u64, infop, ucp, record, restorer, frame, a.handler);
-            set_regs(i, &r)?;
+            set_regs(th, &r)?;
             Some((a.handler, sig as u64))
         }
     }
@@ -226,8 +248,9 @@ impl State {
     /// `rt_sigreturn`: the registers and mask saved by
     /// [`State::enter_handler`] back. Where the process resumes, and its
     /// result register there.
-    pub fn sigreturn(&mut self, i: usize) -> Option<(u64, u64)> {
-        let sp = regs(i)?[SP];
+    pub fn sigreturn(&mut self, t: usize) -> Option<(u64, u64)> {
+        let (i, th) = (self.tasks[t].proc as usize, self.tasks[t].thread);
+        let sp = regs(th)?[SP];
         // x86-64: the handler's return took the return address; AArch64:
         // the stack is as the handler was given it.
         let ucp = if cfg!(target_arch = "x86_64") { sp } else { sp + INFO_LEN };
@@ -240,8 +263,8 @@ impl State {
         for (k, v) in r.iter_mut().enumerate() {
             *v = word(UC_REGS + 8 * k as u64);
         }
-        set_regs(i, &r)?;
-        self.procs[i].mask = word(UC_MASK) & !UNBLOCKABLE;
+        set_regs(th, &r)?;
+        self.tasks[t].mask = word(UC_MASK) & !UNBLOCKABLE;
         Some((r[PC], r[RESULT]))
     }
 
@@ -265,18 +288,22 @@ impl State {
             }
             let w = |n: u64| self.word(i, act + 8 * n).ok_or(EFAULT);
             let new = Action { handler: w(0)?, flags: w(1)?, restorer: w(2)?, mask: w(3)? };
-            let p = &mut self.procs[i];
-            p.actions[k] = new;
+            self.procs[i].actions[k] = new;
             if new.handler == SIG_IGN || new.handler == SIG_DFL && ignored_by_default(sig as u32) {
-                p.pending &= !bit(sig as u32);
+                self.procs[i].pending &= !bit(sig as u32);
+                for t in 0..MAX_TASKS {
+                    if self.tasks[t].used && self.tasks[t].proc as usize == i {
+                        self.tasks[t].pending &= !bit(sig as u32);
+                    }
+                }
             }
         }
         Ok(0)
     }
 
-    /// `rt_sigprocmask`.
-    pub fn sigprocmask(&mut self, i: usize, how: u64, set: u64, old: u64) -> Result<u64, u64> {
-        let cur = self.procs[i].mask;
+    /// `rt_sigprocmask`: task `t`'s mask.
+    pub fn sigprocmask(&mut self, t: usize, how: u64, set: u64, old: u64) -> Result<u64, u64> {
+        let (i, cur) = (self.tasks[t].proc as usize, self.tasks[t].mask);
         if old != 0 {
             self.put(i, old, &cur.to_le_bytes())?;
         }
@@ -288,7 +315,7 @@ impl State {
                 2 => s,
                 _ => return Err(EINVAL),
             };
-            self.procs[i].mask = new & !UNBLOCKABLE;
+            self.tasks[t].mask = new & !UNBLOCKABLE;
         }
         Ok(0)
     }
@@ -329,18 +356,19 @@ impl State {
 
     /// `rt_sigsuspend` (or `pause`, `mask` `None`): waits for a signal
     /// with `mask` in place, the old one back once the handler returns.
-    pub fn sigsuspend(&mut self, i: usize, mask: Option<u64>) -> Out {
+    pub fn sigsuspend(&mut self, t: usize, mask: Option<u64>) -> Out {
+        let i = self.tasks[t].proc as usize;
         let new = match mask {
             Some(at) => match self.word(i, at) {
                 Some(m) => m,
                 None => return Out::Ret(err(EFAULT)),
             },
-            None => self.procs[i].mask,
+            None => self.tasks[t].mask,
         };
-        let p = &mut self.procs[i];
-        p.saved_mask = p.mask;
-        p.suspended = true;
-        p.mask = new & !UNBLOCKABLE;
+        let task = &mut self.tasks[t];
+        task.saved_mask = task.mask;
+        task.suspended = true;
+        task.mask = new & !UNBLOCKABLE;
         Out::Block(Blocked::Suspend)
     }
 

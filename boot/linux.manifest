@@ -3,26 +3,31 @@
 # The personality runs Alpine Linux's BusyBox, unmodified: a dynamically
 # linked, position-independent executable, with musl's dynamic linker
 # (also its C library) as its interpreter. Both come from the bundle as
-# files, copied into the personality's own memory. Shell scripts run with
-# processes (fork, execve, wait4), pipes and an in-memory file tree. Each
-# process is an address space and a thread of its own, made from one of
-# seven blocks cut from the untyped memory in slot 0, and revoked when it
-# exits or execs; the eighth block holds the personality's state and the
-# files' pages.
+# files, copied into the personality's own memory, with pigz and the zlib
+# it links to (a threaded program, and a library musl loads). Shell
+# scripts run with processes (fork, execve, wait4), pipes and an
+# in-memory file tree. Each process is an address space and its threads,
+# made from one of seven blocks cut from the untyped memory in slot 0, and
+# revoked when it exits or execs; the eighth block holds the
+# personality's state and the files' pages. A process that outgrows its
+# block is lent one of four more, cut from the untyped memory in slot 5.
 
 component linux
   image linux
   priority 10
   # Its CNode (2^13 slots: a 1024-slot span per process, the state's and
-  # files' pages, the two files), address space, image, stack, the two
-  # files and the 8 MiB block.
+  # files' pages, the files), address space, image, stack, the four files,
+  # the 8 MiB block and the 4 MiB one.
   memory 24
   cspace 13
   vspace 20
-  # The files before the block: memory is handed out in order, and the
-  # block is aligned to its size.
+  # The files before the blocks, smallest first: memory is handed out in
+  # order, and each block is aligned to its size.
   file ld-musl 16
-  file busybox 200
+  file pigz 180
+  file libz 216
+  file busybox 250
+  untyped 22 5
   untyped 23 0
   control 1
   # The terminal: the serial console's UART and its interrupt.

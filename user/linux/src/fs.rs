@@ -9,7 +9,7 @@
 
 pub const MAX_INODES: usize = 256;
 pub const FILE_BLOCKS: usize = 16;
-pub const POOL_PAGES: usize = 224;
+pub const POOL_PAGES: usize = 220;
 pub const NAME_MAX: usize = 27;
 pub const PIPE_BUF: usize = 4096;
 pub const MAX_PIPES: usize = 8;
@@ -39,10 +39,9 @@ pub enum Kind {
     Dir,
     File,
     Symlink,
-    /// The program from the bundle (BusyBox).
-    Program,
-    /// Its interpreter (musl's dynamic linker).
-    Interp,
+    /// A file from the bundle (a program or a library), mapped here:
+    /// [`Fs::images`], at the index its `size` holds.
+    Image,
     Null,
     /// The terminal (`/dev/tty`, `/dev/console`).
     Tty,
@@ -62,31 +61,37 @@ pub struct Inode {
 pub struct Fs {
     pub inodes: [Inode; MAX_INODES],
     used: [u64; POOL_PAGES.div_ceil(64)],
-    /// Where the pool and the two images are mapped here.
+    /// Where the pool and the bundle's files are mapped here (address,
+    /// length).
     pub pool: u64,
-    pub program: (u64, u64),
-    pub interp: (u64, u64),
+    pub images: [(u64, u64); MAX_IMAGES],
 }
 
+/// Files from the bundle at most.
+pub const MAX_IMAGES: usize = 6;
+
 impl Fs {
-    /// Makes the root and the tree a new system starts with.
-    pub fn init(&mut self, pool: u64, program: &[u8], interp: &[u8], interp_path: &[u8], applets: &[&str]) {
+    /// Makes the tree: each of `images` (the bundle's files) at its path,
+    /// a link in `/bin` to `/bin/busybox` for each of `applets`, and the
+    /// rest a new system starts with.
+    pub fn init(&mut self, pool: u64, images: &[(&[u8], &[u8])], applets: &[&str]) {
         self.pool = pool;
-        self.program = (program.as_ptr() as u64, program.len() as u64);
-        self.interp = (interp.as_ptr() as u64, interp.len() as u64);
         let root = &mut self.inodes[ROOT as usize];
         root.kind = Kind::Dir;
         root.parent = ROOT;
         let bin = self.create(ROOT, b"bin", Kind::Dir).unwrap_or(ROOT);
-        let _ = self.create(bin, b"busybox", Kind::Program);
+        for (k, &(path, bytes)) in images.iter().enumerate().take(MAX_IMAGES) {
+            self.images[k] = (bytes.as_ptr() as u64, bytes.len() as u64);
+            if let Ok((dir, name)) = self.make_dirs_for(path) {
+                if let Ok(ino) = self.create(dir, name, Kind::Image) {
+                    self.inodes[ino as usize].size = k as u32;
+                }
+            }
+        }
         for a in applets {
             if let Ok(l) = self.create(bin, a.as_bytes(), Kind::Symlink) {
                 let _ = self.write(l, 0, b"busybox");
             }
-        }
-        // The interpreter where the program says it is.
-        if let Ok((dir, name)) = self.make_dirs_for(interp_path) {
-            let _ = self.create(dir, name, Kind::Interp);
         }
         let _ = self.create(ROOT, b"tmp", Kind::Dir);
         let _ = self.create(ROOT, b"home", Kind::Dir);
@@ -121,11 +126,17 @@ impl Fs {
         self.inodes[ino as usize].kind
     }
 
+    /// The bundle file inode `ino` is, if it is one: its index in
+    /// [`Fs::images`].
+    pub fn image(&self, ino: u16) -> Option<usize> {
+        let i = &self.inodes[ino as usize];
+        (i.kind == Kind::Image).then_some(i.size as usize)
+    }
+
     pub fn size(&self, ino: u16) -> u64 {
         let i = &self.inodes[ino as usize];
         match i.kind {
-            Kind::Program => self.program.1,
-            Kind::Interp => self.interp.1,
+            Kind::Image => self.images[i.size as usize].1,
             _ => i.size as u64,
         }
     }
@@ -245,8 +256,8 @@ impl Fs {
         let n = buf.len().min((size - off) as usize);
         let i = &self.inodes[ino as usize];
         match i.kind {
-            Kind::Program | Kind::Interp => {
-                let base = if i.kind == Kind::Program { self.program.0 } else { self.interp.0 };
+            Kind::Image => {
+                let base = self.images[i.size as usize].0;
                 // SAFETY: the image is mapped for this server's life and
                 // off + n is within its length.
                 let src = unsafe { core::slice::from_raw_parts((base + off) as *const u8, n) };

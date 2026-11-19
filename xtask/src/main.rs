@@ -490,22 +490,27 @@ fn linux_nic(manifest: &str) -> Option<(&'static str, &'static str)> {
 const ALPINE: &str = "https://dl-cdn.alpinelinux.org/alpine/v3.18/main";
 
 /// The packages, for each ISA: (Alpine's name for the ISA, package, its
-/// SHA-256, the file taken from it).
-const ALPINE_PACKAGES: [(&str, &str, &str, &str); 4] = [
-    ("x86_64", "busybox-1.36.1-r7", "d2cdd10ad7dce8e8ed48e100679b182646344dab8e07c1ea972d9eb6f9d809d7", "bin/busybox"),
-    ("x86_64", "musl-1.2.4-r3", "466e1e985756113655b65f49a4c5fb0013fd4da682fbef3dac91ec44ae986f0a", "lib/ld-musl-x86_64.so.1"),
-    ("aarch64", "busybox-1.36.1-r7", "9ecc170cae8289a86597a057670bbdc8cc4b3db327b4006f04000890711edf1d", "bin/busybox"),
-    ("aarch64", "musl-1.2.4-r3", "d9674ebd60a55330fcca142a02e7e3e5a9ee889d65dc929311f53f735c5c8ac5", "lib/ld-musl-aarch64.so.1"),
+/// SHA-256, the file taken from it, its name in the bundle).
+const ALPINE_PACKAGES: [(&str, &str, &str, &str, &str); 8] = [
+    ("x86_64", "busybox-1.36.1-r7", "d2cdd10ad7dce8e8ed48e100679b182646344dab8e07c1ea972d9eb6f9d809d7", "bin/busybox", "busybox"),
+    ("x86_64", "musl-1.2.4-r3", "466e1e985756113655b65f49a4c5fb0013fd4da682fbef3dac91ec44ae986f0a", "lib/ld-musl-x86_64.so.1", "ld-musl"),
+    ("x86_64", "pigz-2.7-r3", "d7cdca4f05916018a242a7bfaffb13318bcc079d92a6076f50083250052f3731", "usr/bin/pigz", "pigz"),
+    ("x86_64", "zlib-1.2.13-r1", "5a25eef56ef21fca1749a3a298062821d5b4e465aa7815192a076adc54f8e778", "lib/libz.so.1.2.13", "libz"),
+    ("aarch64", "busybox-1.36.1-r7", "9ecc170cae8289a86597a057670bbdc8cc4b3db327b4006f04000890711edf1d", "bin/busybox", "busybox"),
+    ("aarch64", "musl-1.2.4-r3", "d9674ebd60a55330fcca142a02e7e3e5a9ee889d65dc929311f53f735c5c8ac5", "lib/ld-musl-aarch64.so.1", "ld-musl"),
+    ("aarch64", "pigz-2.7-r3", "3baf210c43ab8c8e38af17557ea0016bcf8e71527728217fbcab3aa58167b531", "usr/bin/pigz", "pigz"),
+    ("aarch64", "zlib-1.2.13-r1", "4e8cbd2d87633f9b1d469b8f8f0edb3a0371b99f7cae7adeb86cecea52fe3466", "lib/libz.so.1.2.13", "libz"),
 ];
 
-/// BusyBox and musl's dynamic linker (which is also its C library), as
-/// Alpine builds them for `arch`, unmodified: each package downloaded once
-/// and checked against its pinned hash every time.
-fn alpine_files(arch: Arch) -> Result<(Vec<u8>, Vec<u8>), String> {
+/// BusyBox, musl's dynamic linker (which is also its C library), pigz and
+/// zlib, as Alpine builds them for `arch`, unmodified, with their names
+/// in the bundle: each package downloaded once and checked against its
+/// pinned hash every time.
+fn alpine_files(arch: Arch) -> Result<Vec<(String, Vec<u8>)>, String> {
     let isa = if arch == Arch::X86_64 { "x86_64" } else { "aarch64" };
     let dir = root().join("target/linux/alpine");
     let mut out = Vec::new();
-    for &(_, package, sha256, file) in ALPINE_PACKAGES.iter().filter(|p| p.0 == isa) {
+    for &(_, package, sha256, file, name) in ALPINE_PACKAGES.iter().filter(|p| p.0 == isa) {
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
         let apk = dir.join(format!("{package}-{isa}.apk"));
         if !apk.exists() {
@@ -523,18 +528,11 @@ fn alpine_files(arch: Arch) -> Result<(Vec<u8>, Vec<u8>), String> {
         std::fs::create_dir_all(&to).map_err(|e| e.to_string())?;
         run(Command::new("tar").arg("-xzf").arg(&apk).arg("-C").arg(&to).arg(file))?;
         let path = to.join(file);
-        out.push(std::fs::read(&path).map_err(|e| format!("reading {}: {e}", path.display()))?);
+        out.push((name.to_string(), std::fs::read(&path).map_err(|e| format!("reading {}: {e}", path.display()))?));
     }
-    let ld_musl = out.pop().ok_or("no musl")?;
-    let busybox = out.pop().ok_or("no BusyBox")?;
-    Ok((busybox, ld_musl))
+    Ok(out)
 }
 
-/// Boots `boot/linux.manifest`: the Linux personality runs Alpine's
-/// BusyBox, unmodified and dynamically linked against musl, four times:
-/// `echo`, `uname` (a system call answered with a structure), the shell
-/// with arithmetic and an exit status, and `awk` with floating point (the
-/// FPU's registers are the program's own).
 /// What the Linux test types into the shell on the terminal, after the
 /// batch runs: each step's bytes, what must then appear, and whether the
 /// prompt must come back after it.
@@ -633,6 +631,11 @@ fn drive_linux(img: &Image, script: &[(&str, &str, bool)]) -> Result<String, Str
     }
 }
 
+/// Boots `boot/linux.manifest`: the Linux personality runs Alpine's
+/// programs, unmodified and dynamically linked against musl. BusyBox
+/// first, a run at a time: commands, shell scripts with processes, pipes
+/// and files, signals; pigz, compressing with threads; then the shell on
+/// the terminal, typed into ([`LINUX_SESSION`]).
 fn linux_test(img: &Image) -> Result<(), String> {
     println!("== Linux personality test on {}", img.path.display());
     let out = drive_linux(img, LINUX_SESSION)?;
@@ -679,6 +682,14 @@ fn linux_test(img: &Image) -> Result<(), String> {
         "linux: > status after kill 143",
         "linux: sh -c yes | head -n 3 | wc -l exited with status 0",
         "linux: > slept",
+        // Threads (clone, futexes) in pigz, and zlib loaded by musl: what
+        // two threads compressed BusyBox's gzip takes back unchanged.
+        " started thread ",
+        " started thread ",
+        "linux: > n.gz",
+        "linux: > 72d4ff27a28afbc066d5804999d5a504  -",
+        "linux: > 72d4ff27a28afbc066d5804999d5a504  -",
+        "gzip -dc /tmp/n.gz | md5sum && md5sum < /tmp/n exited with status 0",
         // The terminal session (its steps were checked as it ran).
         "linux: running sh (pid ",
         "linux: sh exited with status 0",
@@ -894,9 +905,7 @@ fn bundle(arch: Arch, manifest: &str, driver: &str) -> Result<PathBuf, String> {
     }
     // The Linux programs the personality runs (`file` in its manifest).
     if manifest == "linux" {
-        let (busybox, ld_musl) = alpine_files(arch)?;
-        files.push(("busybox".to_string(), busybox));
-        files.push(("ld-musl".to_string(), ld_musl));
+        files.extend(alpine_files(arch)?);
     }
     // Icon images (`icon NAME.pam` in a manifest), by their file names.
     let mut icons: Vec<_> = std::fs::read_dir(root().join("boot/icons"))

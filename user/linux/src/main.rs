@@ -1,10 +1,11 @@
 //! The Linux personality (Phase 3): runs unmodified Linux programs.
 //!
-//! Each Linux process is an address space of its own with one thread the
-//! kernel marks foreign (`ThreadRegisters`, `REGS_FOREIGN`): its `syscall`
-//! (x86-64) or `svc` (AArch64) does not reach the kernel's system calls but
-//! comes here as a [`FaultKind::ForeignSyscall`] fault, badged with the
-//! process's slot. This server reads the arguments, does what Linux would,
+//! Each Linux process is an address space of its own with one or more
+//! threads (tasks) the kernel marks foreign (`ThreadRegisters`,
+//! `REGS_FOREIGN`): a thread's `syscall` (x86-64) or `svc` (AArch64) does
+//! not reach the kernel's system calls but comes here as a
+//! [`FaultKind::ForeignSyscall`] fault, badged with the task's index. This
+//! server reads the arguments, does what Linux would,
 //! and resumes the thread after the instruction with the result, every
 //! other register as it was. A call that must wait (`wait4` for a child
 //! that is still running, reading an empty pipe, writing a full one) is set
@@ -17,34 +18,45 @@
 //! that are never written (code and read-only data) are the bundle file's
 //! own pages, shared by every process; the rest are each process's own and
 //! also mapped here, in a mirror window per process, so system calls read
-//! and write a process's memory in place.
+//! and write a process's memory in place. A shared library musl's linker
+//! maps (`mmap` of a bundle file) is loaded the same way. Anonymous
+//! mappings and the stack are made a page at a time as they are first
+//! touched (a page fault, retried once the page is there).
 //!
 //! Processes: `fork` (or `clone` without `CLONE_VM`) copies the address
 //! space's own pages and the descriptors, and the kernel copies the
 //! thread's registers (`REGS_FORK_FROM`); `execve` replaces the address
 //! space and thread under the same pid; `exit` leaves a zombie for
-//! `wait4`. Files ([`fs`]): an in-memory tree with `/bin` (BusyBox and a
-//! link per applet), the interpreter, `/tmp`, `/dev/null`; pipes; the
-//! console. They last as long as this server.
+//! `wait4`. Threads: `clone` with `CLONE_THREAD` adds a task to the
+//! process, its registers the caller's but for its stack (and thread
+//! pointer); `futex` waits and wakes on a word of the process's memory;
+//! `exit` ends a thread (clearing its `CLONE_CHILD_CLEARTID` word and
+//! waking its joiner), `exit_group` the process. Files ([`fs`]): an
+//! in-memory tree with `/bin` (BusyBox and a link per applet), the
+//! interpreter, pigz in `/usr/bin` and zlib in `/lib`, `/tmp`,
+//! `/dev/null`; pipes; the console. They last as long as this server.
 //!
 //! Slots: 0 the untyped memory everything is made from, cut into eight
 //! blocks (slots 8 to 15): seven for processes, revoked when one exits or
 //! execs, and one for this server's state and the files' pages (from
-//! [`STATE_SLOTS`]). 1 the manager's control endpoint, 2 the endpoint
-//! faults arrive on. The interpreter's pages from 16, the program's from
-//! 200 (`file` in the manifest). Process `i` owns the slots from
-//! `PROC_SLOTS + i * PROC_SPAN`: its address space, thread, badged fault
-//! endpoint, then its pages.
+//! [`STATE_SLOTS`]). 5 more untyped memory, cut into spare blocks (from
+//! [`SPARE_BLOCKS`]) lent to a process that outgrows its own. 1 the
+//! manager's control endpoint, 2 the endpoint faults arrive on. The
+//! bundle's files' pages from 16: musl's, pigz's from 180, zlib's from
+//! 216, BusyBox's from 250 (`file` in the manifest). Process `i` owns the
+//! slots from `PROC_SLOTS + i * PROC_SPAN`: its address space, then its
+//! threads (each with a badged fault endpoint) and pages as made.
 //!
-//! Signals ([`signal`]): actions, masks, `kill`, handlers run on the
-//! process's stack and returned from. The terminal ([`tty`]): the serial
+//! Signals ([`signal`]): actions per process, masks per thread, `kill`
+//! and `tkill`, handlers run on the thread's stack and returned from. The terminal ([`tty`]): the serial
 //! console with Linux's line discipline, settings and foreground process
 //! group, so `^C` interrupts a job; `poll` and `nanosleep` wait on it and
 //! on the timer.
 //!
-//! Not yet: threads (`clone` with `CLONE_VM`), stopping and continuing
-//! jobs (`^Z`), the filesystem server underneath, fixed-address (non-PIE)
-//! executables.
+//! Not yet: more than one CPU for a process's threads, `vfork`'s kind of
+//! `clone` (memory shared without `CLONE_THREAD`), returning `munmap`'d
+//! pages, stopping and continuing jobs (`^Z`), the filesystem server
+//! underneath, fixed-address (non-PIE) executables.
 
 #![no_std]
 #![no_main]
@@ -53,7 +65,7 @@ mod fs;
 mod signal;
 mod tty;
 
-use fs::{FileKind, Fs, Kind, Open, Pipe, MAX_FILES, MAX_PIPES, PIPE_BUF, ROOT};
+use fs::{FileKind, Fs, Kind, MAX_FILES, MAX_IMAGES, MAX_PIPES, Open, PIPE_BUF, Pipe, ROOT};
 use signal::{Action, Next, SA_RESTART, SIGCHLD, SIGPIPE, SIGSEGV, SYSCALL_LEN, TRAMPOLINE, TRAMPOLINE_CODE};
 use superior_objects::abi::{
     Error, FaultKind, FaultReply, MAP_EXEC, MAP_WRITE, ObjectType, REGS_COUNT, REGS_FOREIGN, REGS_FORK_FROM, REGS_GET,
@@ -69,24 +81,36 @@ macro_rules! say {
 const UNTYPED: u64 = 0;
 const CONTROL: u64 = 1;
 const EP: u64 = 2;
+/// More untyped memory: the spare blocks.
+const UNTYPED_SPARE: u64 = 5;
+/// Each process's block, then the state's and files' (`FS_BLOCK`).
+const BLOCKS: u64 = 8;
+const BLOCK_BITS: u64 = 20;
+/// Blocks lent to processes that outgrow their own, one at a time.
+const SPARE_BLOCKS: u64 = 1004;
+const SPARES: usize = 4;
 /// The notification this server's thread is bound to (so `Recv` also
 /// returns when it is signalled), and two badged copies of it: the UART's
 /// interrupt (bit 0) and the timer for sleepers (bit 1).
-const NTFN: u64 = 5;
-const NTFN_UART: u64 = 6;
-const NTFN_TIMER: u64 = 7;
-const BLOCKS: u64 = 8;
-const BLOCK_BITS: u64 = 20;
+const NTFN: u64 = 1001;
+const NTFN_UART: u64 = 1002;
+const NTFN_TIMER: u64 = 1003;
+/// The bundle's files (`file` in the manifest), their first slots: musl's
+/// dynamic linker, BusyBox, pigz and zlib.
 const INTERP_FILE: u64 = 16;
-const PROGRAM_FILE: u64 = 200;
+const PIGZ_FILE: u64 = 180;
+const LIBZ_FILE: u64 = 216;
+const PROGRAM_FILE: u64 = 250;
 const STATE_SLOTS: u64 = 512;
-const STATE_PAGES: u64 = 24;
+const STATE_PAGES: u64 = 28;
 const POOL_SLOTS: u64 = STATE_SLOTS + STATE_PAGES;
 /// The signal restorer's page ([`signal::TRAMPOLINE`]).
 const TRAMPOLINE_SLOT: u64 = 1000;
 const PROC_SLOTS: u64 = 1024;
 const PROC_SPAN: u64 = 1024;
 const MAX_PROCS: usize = 7;
+/// Threads, in all processes.
+const MAX_TASKS: usize = 16;
 const FS_BLOCK: u64 = BLOCKS + MAX_PROCS as u64;
 const OP_SHUTDOWN: u64 = 2;
 const ALL: u64 = 0x1f;
@@ -100,6 +124,8 @@ const PROGRAM_VA: u64 = USER_BASE + 0x1_1000_0000;
 const STATE_VA: u64 = USER_BASE + 0x1_2000_0000;
 const POOL_VA: u64 = USER_BASE + 0x1_3000_0000;
 const TRAMPOLINE_VA: u64 = USER_BASE + 0x1_4000_0000;
+const PIGZ_VA: u64 = USER_BASE + 0x1_5000_0000;
+const LIBZ_VA: u64 = USER_BASE + 0x1_5800_0000;
 
 /// A process's address space: everything inside [`CHILD`, `CHILD_END`).
 const CHILD: u64 = USER_BASE + 0x40_0000_0000;
@@ -153,6 +179,12 @@ const O_NOFOLLOW: u32 = if cfg!(target_arch = "x86_64") { 0o400000 } else { 0o10
 const O_CLOEXEC: u32 = 0o2000000;
 const CLONE_VM: u64 = 0x100;
 const WNOHANG: u64 = 1;
+const ETIMEDOUT: u64 = 110;
+const CLONE_THREAD: u64 = 0x1_0000;
+const CLONE_SETTLS: u64 = 0x8_0000;
+const CLONE_PARENT_SETTID: u64 = 0x10_0000;
+const CLONE_CHILD_CLEARTID: u64 = 0x20_0000;
+const CLONE_CHILD_SETTID: u64 = 0x100_0000;
 
 const fn err(e: u64) -> u64 {
     e.wrapping_neg()
@@ -233,6 +265,13 @@ enum Sys {
     Poll,
     /// `ppoll`'s, the timeout a `timespec`.
     Ppoll,
+    /// `exit` ends a thread; `exit_group` ([`Sys::Exit`]) the process.
+    ExitThread,
+    Gettid,
+    SetTidAddress,
+    Futex,
+    SchedGetaffinity,
+    Membarrier,
     Unsupported(u64),
 }
 
@@ -275,12 +314,18 @@ fn decode(nr: u64, a: [u64; 6]) -> (Sys, [u64; 6]) {
         25 => return (Sys::Mmap, [0; 6]),
         32 => Sys::Dup,
         33 => Sys::Dup2,
-        39 | 186 | 218 => Sys::Getpid,
+        39 => Sys::Getpid,
+        186 => Sys::Gettid,
+        202 => Sys::Futex,
+        204 => Sys::SchedGetaffinity,
+        218 => Sys::SetTidAddress,
+        324 => Sys::Membarrier,
         40 => Sys::Sendfile,
         56 => Sys::Clone,
         57 | 58 => Sys::Fork,
         59 => Sys::Execve,
-        60 | 231 => Sys::Exit,
+        60 => Sys::ExitThread,
+        231 => Sys::Exit,
         61 => Sys::Wait4,
         63 => Sys::Uname,
         72 => Sys::Fcntl,
@@ -350,8 +395,14 @@ fn decode(nr: u64, a: [u64; 6]) -> (Sys, [u64; 6]) {
         78 => Sys::Readlinkat,
         79 => Sys::Fstatat,
         80 => Sys::Fstat,
-        93 | 94 => Sys::Exit,
-        96 | 172 | 178 => Sys::Getpid,
+        93 => Sys::ExitThread,
+        94 => Sys::Exit,
+        96 => Sys::SetTidAddress,
+        98 => Sys::Futex,
+        123 => Sys::SchedGetaffinity,
+        283 => Sys::Membarrier,
+        172 => Sys::Getpid,
+        178 => Sys::Gettid,
         113 => Sys::ClockGettime,
         153 => Sys::Times,
         154 => Sys::Setpgid,
@@ -378,7 +429,7 @@ fn decode(nr: u64, a: [u64; 6]) -> (Sys, [u64; 6]) {
         214 => Sys::Brk,
         215 => Sys::Munmap,
         216 => return (Sys::Mmap, [0; 6]),
-        220 => Sys::Clone,
+        220 => return (Sys::Clone, [a[0], a[1], a[2], a[4], a[3], 0]),
         221 => Sys::Execve,
         222 => Sys::Mmap,
         260 => Sys::Wait4,
@@ -421,6 +472,9 @@ enum Blocked {
     Suspend,
     /// `poll`: until a descriptor is ready, or the tick `until`.
     Poll { fds: u64, n: u64, until: u64 },
+    /// `futex`: until woken at `addr` or the tick `until`; `seq` orders
+    /// the waiters.
+    Futex { addr: u64, until: u64, seq: u64 },
 }
 
 /// What a system call comes to.
@@ -443,12 +497,9 @@ struct Proc {
     /// Its process group and session.
     pgid: u32,
     sid: u32,
-    /// Signals sent and not yet taken; held back; the mask to restore
-    /// after a `sigsuspend` (`suspended`); what each signal does.
+    /// Signals sent to the process and not yet taken (by any of its
+    /// threads); what each signal does.
     pending: u64,
-    mask: u64,
-    saved_mask: u64,
-    suspended: bool,
     actions: [Action; 64],
     /// Its wait status once a zombie.
     status: u32,
@@ -461,12 +512,53 @@ struct Proc {
     brk_start: u64,
     brk: u64,
     mmap_next: u64,
+    /// Its own pages (mapped in the mirror too).
+    present: [u64; CHILD_PAGES / 64],
+    /// Pages of anonymous mappings not yet touched: each becomes one of
+    /// its own when first used (a page fault there, or a system call
+    /// writing there).
+    reserved: [u64; CHILD_PAGES / 64],
+    /// The runs of bundle-file pages it maps (code, read-only data; the
+    /// restorer page first).
+    shared: [Shared; 12],
+    nshared: usize,
+    /// Libraries loaded by `mmap` ([`mmap_file`]): their span and inode.
+    libs: [(u64, u64, u16); 4],
+    nlibs: usize,
+}
+
+/// A thread: Linux's task. Every process has one or more; they share its
+/// address space, descriptors and signal actions.
+struct Task {
+    used: bool,
+    /// Its process.
+    proc: u8,
+    tid: u32,
+    /// Its thread's slot and its fault endpoint's (badged with the task's
+    /// index + 1), in its process's span.
+    thread: u64,
+    fault: u64,
     blocked: Blocked,
     /// Where its waiting call was set aside, and where it resumes.
     place: u64,
     pc: u64,
-    /// Its own pages (mapped in the mirror too).
-    present: [u64; CHILD_PAGES / 64],
+    /// Signals sent to this thread alone (`tkill`); held back; the mask
+    /// to restore after a `sigsuspend` (`suspended`).
+    pending: u64,
+    mask: u64,
+    saved_mask: u64,
+    suspended: bool,
+    /// Where to write 0 and wake a futex when it ends
+    /// (`CLONE_CHILD_CLEARTID`, `set_tid_address`).
+    clear_tid: u64,
+}
+
+/// A file from the bundle: its bytes (mapped here) and its first page's
+/// slot.
+#[derive(Clone, Copy)]
+struct Img {
+    bytes: &'static [u8],
+    slot: u64,
 }
 
 /// A run of pages every process maps from a bundle file: [start, end) at
@@ -485,16 +577,21 @@ struct State {
     files: [Open; MAX_FILES],
     pipes: [Pipe; MAX_PIPES],
     procs: [Proc; MAX_PROCS],
+    tasks: [Task; MAX_TASKS],
+    /// Process and thread ids come from one count, as Linux's do.
     next_pid: u32,
-    shared: [Shared; 12],
-    nshared: usize,
+    /// Futex waits so far: the order waiters are woken in.
+    futex_seq: u64,
+    /// Which process (its index + 1) each spare block is lent to.
+    spare_owner: [u8; SPARES],
+    /// The restorer page's run, which every process maps.
+    trampoline: Shared,
+    images: [Img; MAX_IMAGES],
     /// Console output not yet printed: the line being written.
     line: [u8; 160],
     len: usize,
     /// The wait status of the run's first process, once it is gone.
     top_status: Option<u32>,
-    program: &'static [u8],
-    interp: &'static [u8],
     /// The terminal (the serial console).
     tty: tty::Tty,
 }
@@ -535,12 +632,6 @@ fn slot_base(i: usize) -> u64 {
 fn space_slot(i: usize) -> u64 {
     slot_base(i)
 }
-fn thread_slot(i: usize) -> u64 {
-    slot_base(i) + 1
-}
-fn fault_slot(i: usize) -> u64 {
-    slot_base(i) + 2
-}
 fn block_slot(i: usize) -> u64 {
     BLOCKS + i as u64
 }
@@ -548,9 +639,53 @@ fn block_slot(i: usize) -> u64 {
 impl State {
     // ---- memory ------------------------------------------------------
 
+    /// Makes an object of process `i`'s in `slot`: from its block, or a
+    /// spare block it has been lent, or one lent now.
+    fn retype(&mut self, i: usize, ty: ObjectType, size: u64, slot: u64) -> Result<(), u64> {
+        let msg = [ty as u64, size, slot, 0];
+        if sys(Syscall::Retype, block_slot(i), msg).is_ok() {
+            return Ok(());
+        }
+        for k in 0..SPARES {
+            if self.spare_owner[k] as usize == i + 1 && sys(Syscall::Retype, SPARE_BLOCKS + k as u64, msg).is_ok() {
+                return Ok(());
+            }
+        }
+        let k = self.spare_owner.iter().position(|&o| o == 0).ok_or(ENOMEM)?;
+        self.spare_owner[k] = i as u8 + 1;
+        sys(Syscall::Retype, SPARE_BLOCKS + k as u64, msg).map(drop).map_err(|_| ENOMEM)
+    }
+
     fn is_present(&self, i: usize, va: u64) -> bool {
         let k = ((va - CHILD) / PAGE) as usize;
         self.procs[i].present[k / 64] & (1 << (k % 64)) != 0
+    }
+
+    /// Whether `va` is in process `i`'s window, in an anonymous mapping's
+    /// page not yet made (see [`Proc::reserved`]).
+    fn is_reserved(&self, i: usize, va: u64) -> bool {
+        if !(CHILD..CHILD_END).contains(&va) {
+            return false;
+        }
+        let k = ((va - CHILD) / PAGE) as usize;
+        self.procs[i].reserved[k / 64] & (1 << (k % 64)) != 0
+    }
+
+    fn set_reserved(&mut self, i: usize, va: u64, on: bool) {
+        let k = ((va - CHILD) / PAGE) as usize;
+        let w = &mut self.procs[i].reserved[k / 64];
+        if on { *w |= 1 << (k % 64) } else { *w &= !(1 << (k % 64)) }
+    }
+
+    /// Makes the reserved page at `va` (any address in it) one of process
+    /// `i`'s own. Whether it was reserved and is now made.
+    fn take_reserved(&mut self, i: usize, va: u64) -> bool {
+        let page = va & !(PAGE - 1);
+        if !self.is_reserved(i, page) || self.map_private(i, page).is_err() {
+            return false;
+        }
+        self.set_reserved(i, page, false);
+        true
     }
 
     /// Where byte `va` of process `i` is here, if it is mapped, and
@@ -562,7 +697,8 @@ impl State {
         if self.is_present(i, va) {
             return Some(((va - CHILD + MIRROR + i as u64 * SPAN) as *mut u8, true));
         }
-        self.shared[..self.nshared]
+        let p = &self.procs[i];
+        p.shared[..p.nshared]
             .iter()
             .find(|s| (s.start..s.end).contains(&va))
             .map(|s| ((s.ptr + va - s.start) as *mut u8, false))
@@ -572,8 +708,16 @@ impl State {
         let mut done = 0;
         while done < buf.len() {
             let at = va + done as u64;
-            let Some((p, _)) = self.locate(i, at) else { return false };
             let n = (PAGE - at % PAGE).min((buf.len() - done) as u64) as usize;
+            let Some((p, _)) = self.locate(i, at) else {
+                // A page not yet made reads as zeros.
+                if !self.is_reserved(i, at) {
+                    return false;
+                }
+                buf[done..done + n].fill(0);
+                done += n;
+                continue;
+            };
             // SAFETY: p..p+n lies in one mapped page.
             unsafe { core::ptr::copy_nonoverlapping(p, buf[done..].as_mut_ptr(), n) };
             done += n;
@@ -581,10 +725,13 @@ impl State {
         true
     }
 
-    fn copy_out(&self, i: usize, va: u64, data: &[u8]) -> bool {
+    fn copy_out(&mut self, i: usize, va: u64, data: &[u8]) -> bool {
         let mut done = 0;
         while done < data.len() {
             let at = va + done as u64;
+            if !self.is_present(i, at & !(PAGE - 1)) && CHILD <= at {
+                self.take_reserved(i, at);
+            }
             let Some((p, true)) = self.locate(i, at) else { return false };
             let n = (PAGE - at % PAGE).min((data.len() - done) as u64) as usize;
             // SAFETY: p..p+n lies in one of the process's own pages, mapped
@@ -595,7 +742,7 @@ impl State {
         true
     }
 
-    fn put(&self, i: usize, va: u64, data: &[u8]) -> Result<u64, u64> {
+    fn put(&mut self, i: usize, va: u64, data: &[u8]) -> Result<u64, u64> {
         if self.copy_out(i, va, data) { Ok(0) } else { Err(EFAULT) }
     }
 
@@ -633,7 +780,8 @@ impl State {
             return Err(ENOMEM);
         }
         let slot = slot_base(i) + p.cursor;
-        sys(Syscall::Retype, block_slot(i), [ObjectType::Frame as u64, 0, slot, 0]).map_err(|_| ENOMEM)?;
+        self.retype(i, ObjectType::Frame, 0, slot)?;
+        let p = &mut self.procs[i];
         sys(Syscall::CapMint, slot, [slot + 1, ALL, 0, 0]).map_err(|_| ENOMEM)?;
         p.cursor += 2;
         sys(Syscall::FrameMap, slot + 1, [va - CHILD + MIRROR + i as u64 * SPAN, 1, 0, 0]).map_err(|_| ENOMEM)?;
@@ -657,15 +805,21 @@ impl State {
         Ok(())
     }
 
-    /// Maps every shared run in process `i`, but where it has its own page.
-    fn map_all_shared(&mut self, i: usize) -> Result<(), u64> {
-        for k in 0..self.nshared {
-            let s = self.shared[k];
-            for va in (s.start..s.end).step_by(PAGE as usize) {
-                if !self.is_present(i, va) {
-                    self.map_shared(i, va, s.slot + (va - s.start) / PAGE, s.flags)?;
-                }
+    /// Maps a shared run in process `i`, but where it has its own page.
+    fn map_run(&mut self, i: usize, s: Shared) -> Result<(), u64> {
+        for va in (s.start..s.end).step_by(PAGE as usize) {
+            if !self.is_present(i, va) {
+                self.map_shared(i, va, s.slot + (va - s.start) / PAGE, s.flags)?;
             }
+        }
+        Ok(())
+    }
+
+    /// Maps every shared run of process `i`'s (a `fork`'s new copy).
+    fn map_all_shared(&mut self, i: usize) -> Result<(), u64> {
+        for k in 0..self.procs[i].nshared {
+            let s = self.procs[i].shared[k];
+            self.map_run(i, s)?;
         }
         Ok(())
     }
@@ -713,12 +867,14 @@ impl State {
             if (first_page + (hi - lo) / PAGE) * PAGE > image.len() as u64 {
                 return Err("a segment past the file's end");
             }
-            if !self.shared[..self.nshared].iter().any(|s| s.start == run.start) {
-                if self.nshared == self.shared.len() {
+            let p = &mut self.procs[i];
+            if !p.shared[..p.nshared].iter().any(|s| s.start == run.start) {
+                if p.nshared == p.shared.len() {
                     return Err("too many segments");
                 }
-                self.shared[self.nshared] = run;
-                self.nshared += 1;
+                p.shared[p.nshared] = run;
+                p.nshared += 1;
+                self.map_run(i, run).map_err(|_| "out of memory")?;
             }
         }
         let (phoff, phnum) = elf.program_headers();
@@ -741,38 +897,89 @@ impl State {
         p.cwd = ROOT;
         p.fds = [0; MAX_FDS];
         p.cloexec = 0;
-        p.blocked = Blocked::None;
         p.present = [0; CHILD_PAGES / 64];
+        p.reserved = [0; CHILD_PAGES / 64];
         (p.pgid, p.sid) = (pid, pid);
-        (p.pending, p.mask, p.saved_mask, p.suspended) = (0, 0, 0, false);
+        p.pending = 0;
         p.actions = [Action { handler: 0, flags: 0, restorer: 0, mask: 0 }; 64];
         Some(i)
     }
 
-    /// Makes process `i`'s address space, thread and fault endpoint.
-    fn make_space(&mut self, i: usize) -> Result<(), &'static str> {
+    /// A new task in process `i` (its thread made later), with its
+    /// own id, or `tid` if given.
+    fn new_task(&mut self, i: usize, tid: Option<u32>) -> Option<usize> {
+        let t = self.tasks.iter().position(|t| !t.used)?;
+        let tid = tid.unwrap_or_else(|| {
+            self.next_pid += 1;
+            self.next_pid - 1
+        });
+        self.tasks[t] = Task {
+            used: true,
+            proc: i as u8,
+            tid,
+            thread: 0,
+            fault: 0,
+            blocked: Blocked::None,
+            place: 0,
+            pc: 0,
+            pending: 0,
+            mask: 0,
+            saved_mask: 0,
+            suspended: false,
+            clear_tid: 0,
+        };
+        Some(t)
+    }
+
+    /// Makes process `i`'s address space, and task `t`'s thread and fault
+    /// endpoint, at the start of the process's span.
+    fn make_space(&mut self, i: usize, t: usize) -> Result<(), &'static str> {
         let b = slot_base(i);
-        let made = |r: Result<[u64; 4], u64>, what| r.map(drop).map_err(|_| what);
-        made(sys(Syscall::Retype, block_slot(i), [ObjectType::AddressSpace as u64, 17, b, 0]), "no address space")?;
-        made(sys(Syscall::Retype, block_slot(i), [ObjectType::Thread as u64, 0, b + 1, 0]), "no thread")?;
-        made(sys(Syscall::CapMint, EP, [b + 2, WRITE_RIGHT, i as u64 + 1, 0]), "no endpoint")?;
-        self.procs[i].cursor = 3;
+        self.retype(i, ObjectType::AddressSpace, 17, b).map_err(|_| "no address space")?;
+        self.procs[i].cursor = 1;
+        self.make_thread(t).map_err(|_| "no thread")
+    }
+
+    /// Makes task `t`'s thread and its fault endpoint, in the next slots
+    /// of its process's span.
+    fn make_thread(&mut self, t: usize) -> Result<(), u64> {
+        let i = self.tasks[t].proc as usize;
+        let p = &mut self.procs[i];
+        if p.cursor + 2 > PROC_SPAN {
+            return Err(ENOMEM);
+        }
+        let s = slot_base(i) + p.cursor;
+        p.cursor += 2;
+        self.retype(i, ObjectType::Thread, 0, s).map_err(|_| EAGAIN)?;
+        sys(Syscall::CapMint, EP, [s + 1, WRITE_RIGHT, t as u64 + 1, 0]).map_err(|_| EAGAIN)?;
+        (self.tasks[t].thread, self.tasks[t].fault) = (s, s + 1);
         Ok(())
     }
 
-    /// Starts process `i`'s thread: at `entry` with stack `top`, or with
-    /// another process's registers (`fork`).
-    fn start(&mut self, i: usize, entry: u64, top: u64, fork_from: Option<usize>) -> Result<(), &'static str> {
-        let t = thread_slot(i);
+    /// Readies task `t`'s thread: at `entry` with stack `top`, or with
+    /// another task's registers (`fork`, `clone`). Not yet started.
+    fn configure(&mut self, t: usize, entry: u64, top: u64, from: Option<usize>) -> Result<(), &'static str> {
+        let (th, i) = (self.tasks[t].thread, self.tasks[t].proc as usize);
         let made = |r: Result<[u64; 4], u64>, what| r.map(drop).map_err(|_| what);
-        made(sys(Syscall::ThreadSetVSpace, t, [space_slot(i), 0, 0, 0]), "set address space")?;
-        made(sys(Syscall::ThreadConfigure, t, [entry, top, 0, 5]), "configure the thread")?;
-        made(sys(Syscall::ThreadSetFaultHandler, t, [fault_slot(i), 0, 0, 0]), "set fault handler")?;
-        made(sys(Syscall::ThreadRegisters, t, [REGS_FOREIGN, 1, 0, 0]), "make the thread foreign")?;
-        if let Some(f) = fork_from {
-            made(sys(Syscall::ThreadRegisters, t, [REGS_FORK_FROM, thread_slot(f), 0, 0]), "copy registers")?;
+        made(sys(Syscall::ThreadSetVSpace, th, [space_slot(i), 0, 0, 0]), "set address space")?;
+        made(sys(Syscall::ThreadConfigure, th, [entry, top, 0, 5]), "configure the thread")?;
+        made(sys(Syscall::ThreadSetFaultHandler, th, [self.tasks[t].fault, 0, 0, 0]), "set fault handler")?;
+        made(sys(Syscall::ThreadRegisters, th, [REGS_FOREIGN, 1, 0, 0]), "make the thread foreign")?;
+        if let Some(f) = from {
+            made(sys(Syscall::ThreadRegisters, th, [REGS_FORK_FROM, self.tasks[f].thread, 0, 0]), "copy registers")?;
         }
-        made(sys(Syscall::ThreadResume, t, [0; 4]), "start the thread")
+        Ok(())
+    }
+
+    /// Readies and starts task `t`'s thread (see [`State::configure`]).
+    fn start(&mut self, t: usize, entry: u64, top: u64, from: Option<usize>) -> Result<(), &'static str> {
+        self.configure(t, entry, top, from)?;
+        sys(Syscall::ThreadResume, self.tasks[t].thread, [0; 4]).map(drop).map_err(|_| "start the thread")
+    }
+
+    /// The tasks of process `i`.
+    fn tasks_of(&self, i: usize) -> impl Iterator<Item = usize> + '_ {
+        (0..MAX_TASKS).filter(move |&t| self.tasks[t].used && self.tasks[t].proc as usize == i)
     }
 
     /// Destroys process `i`'s address space, thread and pages.
@@ -781,23 +988,42 @@ impl State {
             let _ = syscall(Syscall::CapDelete, s, [0; 4]);
         }
         let _ = syscall(Syscall::CapRevoke, block_slot(i), [0; 4]);
+        for k in 0..SPARES {
+            if self.spare_owner[k] as usize == i + 1 {
+                let _ = syscall(Syscall::CapRevoke, SPARE_BLOCKS + k as u64, [0; 4]);
+                self.spare_owner[k] = 0;
+            }
+        }
         let p = &mut self.procs[i];
         p.cursor = 0;
         p.present = [0; CHILD_PAGES / 64];
+        p.reserved = [0; CHILD_PAGES / 64];
     }
 
-    /// Runs the program in process `i` (its address space made afresh)
-    /// with `argv` and `envp`.
-    fn exec(&mut self, i: usize, argv: &Strs, envp: &Strs, execfn: &[u8]) -> Result<(), &'static str> {
-        self.make_space(i)?;
-        let program = self.program;
-        let interp = self.interp;
-        let (entry, phdr, phnum, end) = self.load(i, program, PROGRAM_FILE, PROGRAM_BASE)?;
-        let (interp_entry, ..) = self.load(i, interp, INTERP_FILE, INTERP_BASE)?;
+    /// Runs bundle file `image` (a program) as task `t`'s process, its
+    /// address space made afresh, with `argv` and `envp`, and the
+    /// interpreter the program names, if it names one.
+    fn exec(&mut self, t: usize, image: usize, argv: &Strs, envp: &Strs, execfn: &[u8]) -> Result<(), &'static str> {
+        let i = self.tasks[t].proc as usize;
+        self.make_space(i, t)?;
+        let tramp = self.trampoline;
+        let p = &mut self.procs[i];
+        (p.shared[0], p.nshared, p.nlibs) = (tramp, 1, 0);
+        self.map_run(i, tramp).map_err(|_| "out of memory")?;
+        let Img { bytes: program, slot } = self.images[image];
+        let (entry, phdr, phnum, end) = self.load(i, program, slot, PROGRAM_BASE)?;
+        let (start, interp_base) = match Elf::parse(program).ok().and_then(|e| e.interpreter()) {
+            Some(path) => {
+                let ino = self.fs.resolve(ROOT, path, true).map_err(|_| "its interpreter is missing")?;
+                let k = self.fs.image(ino).ok_or("its interpreter is not a program")?;
+                let Img { bytes, slot } = self.images[k];
+                (self.load(i, bytes, slot, INTERP_BASE)?.0, INTERP_BASE)
+            }
+            None => (entry, 0),
+        };
         for p in 1..=STACK_PAGES {
-            self.map_private(i, STACK_TOP - p * PAGE).map_err(|_| "out of memory")?;
+            self.set_reserved(i, STACK_TOP - p * PAGE, true);
         }
-        self.map_all_shared(i).map_err(|_| "out of memory")?;
         let p = &mut self.procs[i];
         p.brk_start = end + PAGE;
         p.brk = p.brk_start;
@@ -806,7 +1032,7 @@ impl State {
         // The stack Linux gives a new program: strings at the top, then
         // the auxiliary vector, environment and argument pointers, argc.
         let mut top = STACK_TOP;
-        let mut push_str = |st: &State, s: &[u8]| -> Result<u64, &'static str> {
+        let mut push_str = |st: &mut State, s: &[u8]| -> Result<u64, &'static str> {
             top -= s.len() as u64 + 1;
             if st.copy_out(i, top, s) && st.copy_out(i, top + s.len() as u64, &[0]) { Ok(top) } else { Err("stack") }
         };
@@ -826,7 +1052,7 @@ impl State {
             (4, 56),
             (5, phnum),
             (6, PAGE),
-            (7, INTERP_BASE),
+            (7, interp_base),
             (8, 0),
             (9, entry),
             (11, 0),
@@ -872,7 +1098,7 @@ impl State {
                 return Err("stack");
             }
         }
-        self.start(i, interp_entry, thread_top, None)
+        self.start(t, start, thread_top, None)
     }
 
     /// Process `i` ends with wait status `status`: its descriptors are
@@ -883,6 +1109,11 @@ impl State {
             self.close(i, fd);
         }
         self.unmake_space(i);
+        for t in 0..MAX_TASKS {
+            if self.tasks[t].used && self.tasks[t].proc as usize == i {
+                self.tasks[t].used = false;
+            }
+        }
         let pid = self.procs[i].pid;
         for c in 0..MAX_PROCS {
             if self.procs[c].used && self.procs[c].ppid == pid && c != i {
@@ -899,12 +1130,29 @@ impl State {
         let p = &mut self.procs[i];
         p.zombie = true;
         p.status = status;
-        p.blocked = Blocked::None;
         if p.ppid == 0 {
             p.used = false;
             if self.top_status.is_none() && pid == self.first_pid() {
                 self.top_status = Some(status);
             }
+        }
+    }
+
+    /// Task `t` ends (`exit`): its thread is destroyed, and the word
+    /// `clear_tid` names is cleared and its futex woken, for `pthread_join`.
+    /// The last thread's end is its process's, with wait status `status`.
+    fn exit_thread(&mut self, t: usize, status: u32) {
+        let i = self.tasks[t].proc as usize;
+        if self.tasks_of(i).count() == 1 {
+            return self.exit(i, status);
+        }
+        let task = &mut self.tasks[t];
+        task.used = false;
+        let (clear, th, fault) = (task.clear_tid, task.thread, task.fault);
+        let _ = syscall(Syscall::CapDelete, th, [0; 4]);
+        let _ = syscall(Syscall::CapDelete, fault, [0; 4]);
+        if clear != 0 && self.copy_out(i, clear, &0u32.to_le_bytes()) {
+            futex_wake(self, i, clear, 1, None);
         }
     }
 
@@ -1017,7 +1265,7 @@ fn mode_of(kind: Kind) -> u32 {
         Kind::Dir => 0o40755,
         Kind::File => 0o100644,
         Kind::Symlink => 0o120777,
-        Kind::Program | Kind::Interp => 0o100755,
+        Kind::Image => 0o100755,
         Kind::Null => 0o20666,
         Kind::Tty => 0o20620,
         Kind::Free => 0,
@@ -1025,13 +1273,39 @@ fn mode_of(kind: Kind) -> u32 {
 }
 
 /// Does what Linux would for process `i`'s call.
-fn answer(st: &mut State, i: usize, call: Sys, a: [u64; 6]) -> Out {
+fn answer(st: &mut State, t: usize, call: Sys, a: [u64; 6]) -> Out {
     use Out::Ret;
     let r = |v: Result<u64, u64>| Ret(v.unwrap_or_else(err));
+    let i = st.tasks[t].proc as usize;
     match call {
         Sys::Exit => {
             st.exit(i, ((a[0] & 0xff) << 8) as u32);
             Out::Gone
+        }
+        Sys::ExitThread => {
+            st.exit_thread(t, ((a[0] & 0xff) << 8) as u32);
+            Out::Gone
+        }
+        Sys::Gettid => Ret(st.tasks[t].tid as u64),
+        Sys::SetTidAddress => {
+            st.tasks[t].clear_tid = a[0];
+            Ret(st.tasks[t].tid as u64)
+        }
+        Sys::Futex => futex(st, t, a),
+        // One CPU, and every thread stopped in here or between calls: a
+        // barrier is already had. The global and private expedited kinds
+        // (and registering for the latter) are what it offers.
+        Sys::Membarrier => match a[0] {
+            0 => Ret(0b1_1001),
+            1 | 8 | 16 => Ret(0),
+            _ => Ret(err(EINVAL)),
+        },
+        Sys::SchedGetaffinity => {
+            // One CPU, as far as programs need to know.
+            if a[1] < 8 {
+                return Ret(err(EINVAL));
+            }
+            r(st.put(i, a[2], &1u64.to_le_bytes()).map(|_| 8))
         }
         Sys::Read => read(st, i, a[0], a[1], a[2]),
         Sys::Write => write(st, i, a[0], a[1], a[2]),
@@ -1050,15 +1324,14 @@ fn answer(st: &mut State, i: usize, call: Sys, a: [u64; 6]) -> Out {
         Sys::Getdents64 => r(getdents(st, i, a[0], a[1], a[2])),
         Sys::Ioctl => r(ioctl(st, i, a[0], a[1], a[2])),
         Sys::Sigaction => r(st.sigaction(i, a[0], a[1], a[2])),
-        Sys::Sigprocmask => r(st.sigprocmask(i, a[0], a[1], a[2])),
+        Sys::Sigprocmask => r(st.sigprocmask(t, a[0], a[1], a[2])),
         Sys::Sigpending => {
-            let p = &st.procs[i];
-            let pending = p.pending & p.mask;
+            let pending = (st.procs[i].pending | st.tasks[t].pending) & st.tasks[t].mask;
             r(st.put(i, a[0], &pending.to_le_bytes()))
         }
-        Sys::Sigsuspend => st.sigsuspend(i, Some(a[0])),
-        Sys::Pause => st.sigsuspend(i, None),
-        Sys::Sigreturn => match st.sigreturn(i) {
+        Sys::Sigsuspend => st.sigsuspend(t, Some(a[0])),
+        Sys::Pause => st.sigsuspend(t, None),
+        Sys::Sigreturn => match st.sigreturn(t) {
             Some((pc, value)) => Out::Resume { pc, value },
             None => {
                 st.exit(i, SIGSEGV);
@@ -1066,8 +1339,14 @@ fn answer(st: &mut State, i: usize, call: Sys, a: [u64; 6]) -> Out {
             }
         },
         Sys::Kill => r(st.kill(i, a[0] as i32 as i64, a[1])),
-        Sys::Tkill if (a[0] as i32) <= 0 => Ret(err(EINVAL)),
-        Sys::Tkill => r(st.kill(i, a[0] as i32 as i64, a[1])),
+        Sys::Tkill if (a[0] as i32) <= 0 || a[1] > 64 => Ret(err(EINVAL)),
+        Sys::Tkill => match st.tasks.iter().position(|k| k.used && k.tid as u64 == a[0]) {
+            Some(k) => {
+                st.post_task(k, a[1] as u32);
+                Ret(0)
+            }
+            None => Ret(err(ESRCH)),
+        },
         Sys::Nanosleep => nanosleep(st, i, a[1], a[2]),
         Sys::Poll => {
             let ms = a[2] as i32;
@@ -1114,10 +1393,12 @@ fn answer(st: &mut State, i: usize, call: Sys, a: [u64; 6]) -> Out {
             }
             st.fs.truncate(o.ino, a[1]).map(|_| 0)
         })),
-        Sys::Fork => r(fork(st, i)),
-        Sys::Clone if a[0] & CLONE_VM != 0 => Ret(err(ENOSYS)),
-        Sys::Clone => r(fork(st, i)),
-        Sys::Execve => match execve(st, i, a[0], a[1], a[2]) {
+        Sys::Fork => r(fork(st, t)),
+        Sys::Clone if a[0] & CLONE_THREAD != 0 && a[0] & CLONE_VM != 0 => r(new_thread(st, t, a)),
+        // A process sharing its parent's memory (vfork's kind): not yet.
+        Sys::Clone if a[0] & (CLONE_VM | CLONE_THREAD) != 0 => Ret(err(ENOSYS)),
+        Sys::Clone => r(fork(st, t)),
+        Sys::Execve => match execve(st, t, a[0], a[1], a[2]) {
             Ok(()) => Out::Gone,
             Err(e) => Ret(err(e)),
         },
@@ -1177,11 +1458,11 @@ fn answer(st: &mut State, i: usize, call: Sys, a: [u64; 6]) -> Out {
         Sys::ArchPrctl => {
             const ARCH_SET_FS: u64 = 0x1002;
             const ARCH_GET_FS: u64 = 0x1003;
-            let t = thread_slot(i);
+            let th = st.tasks[t].thread;
             match a[0] {
-                ARCH_SET_FS => r(sys(Syscall::ThreadRegisters, t, [REGS_SET_TLS, a[1], 0, 0]).map(|_| 0).map_err(|_| EINVAL)),
+                ARCH_SET_FS => r(sys(Syscall::ThreadRegisters, th, [REGS_SET_TLS, a[1], 0, 0]).map(|_| 0).map_err(|_| EINVAL)),
                 ARCH_GET_FS => {
-                    let fs = sys(Syscall::ThreadRegisters, t, [REGS_TLS, 0, 0, 0]).map_or(0, |m| m[0]);
+                    let fs = sys(Syscall::ThreadRegisters, th, [REGS_TLS, 0, 0, 0]).map_or(0, |m| m[0]);
                     r(st.put(i, a[1], &fs.to_le_bytes()))
                 }
                 _ => Ret(err(EINVAL)),
@@ -1260,7 +1541,7 @@ fn openat(st: &mut State, i: usize, a: [u64; 6]) -> Result<u64, u64> {
     if kind == Kind::Dir && writing {
         return Err(EISDIR);
     }
-    if writing && matches!(kind, Kind::Program | Kind::Interp) {
+    if writing && kind == Kind::Image {
         return Err(EACCES);
     }
     if flags & O_TRUNC != 0 && writing && kind == Kind::File {
@@ -1596,11 +1877,11 @@ fn mmap(st: &mut State, i: usize, a: [u64; 6]) -> Result<u64, u64> {
     const MAP_FIXED: u64 = 0x10;
     const MAP_ANONYMOUS: u64 = 0x20;
     let (addr, len, flags) = (a[0], a[1].next_multiple_of(PAGE), a[3]);
-    if flags & MAP_ANONYMOUS == 0 {
-        return Err(if len == 0 { ENOMEM } else { ENODEV });
-    }
     if len == 0 {
         return Err(EINVAL);
+    }
+    if flags & MAP_ANONYMOUS == 0 {
+        return mmap_file(st, i, addr, len, flags & MAP_FIXED != 0, a[4], a[5]);
     }
     let at = if flags & MAP_FIXED != 0 {
         addr
@@ -1612,26 +1893,90 @@ fn mmap(st: &mut State, i: usize, a: [u64; 6]) -> Result<u64, u64> {
     if at % PAGE != 0 || at < CHILD || at + len > STACK_TOP - STACK_PAGES * PAGE {
         return Err(ENOMEM);
     }
+    // Pages made as they are first used; any already there zeroed.
     for p in (at..at + len).step_by(PAGE as usize) {
-        let was = st.is_present(i, p);
-        st.map_private(i, p)?;
-        if was {
+        if st.is_present(i, p) {
             st.copy_out(i, p, &[0; PAGE as usize]);
+        } else {
+            st.set_reserved(i, p, true);
         }
     }
     Ok(at)
 }
 
-/// `fork`: a new process with a copy of `i`'s own pages, its descriptors
-/// and directory, and its registers (0 in the result).
-fn fork(st: &mut State, i: usize) -> Result<u64, u64> {
+/// `mmap` of a file (private: what the process writes stays its own).
+/// A bundle file that is an ELF image, mapped from its start where the
+/// process chooses not, is a library musl's dynamic linker is loading: it
+/// is loaded as the program loader loads one (code and read-only data the
+/// file's own pages, shared; data a copy), and the linker's mappings of
+/// its segments into that span after are already there. Anything else is
+/// a copy of the file's bytes in pages of the process's own.
+fn mmap_file(st: &mut State, i: usize, addr: u64, len: u64, fixed: bool, fd: u64, off: u64) -> Result<u64, u64> {
+    let f = st.file(i, fd).ok_or(EBADF)?;
+    let o = st.files[f];
+    if o.kind != FileKind::Node || st.fs.kind(o.ino) == Kind::Dir {
+        return Err(ENODEV);
+    }
+    if off % PAGE != 0 {
+        return Err(EINVAL);
+    }
+    let p = &st.procs[i];
+    if fixed && p.libs[..p.nlibs].iter().any(|&(s, e, ino)| ino == o.ino && s <= addr && addr + len <= e) {
+        return Ok(addr);
+    }
+    let reserve = |st: &mut State| -> Result<u64, u64> {
+        let at = st.procs[i].mmap_next;
+        if at + len > STACK_TOP - STACK_PAGES * PAGE {
+            return Err(ENOMEM);
+        }
+        st.procs[i].mmap_next += len + PAGE;
+        Ok(at)
+    };
+    if let (Some(k), false, 0) = (st.fs.image(o.ino), fixed, off) {
+        let Img { bytes, slot } = st.images[k];
+        if let Ok(elf) = Elf::parse(bytes) {
+            let lowest = elf.segments().flatten().map(|s| s.vaddr & !(PAGE - 1)).min().unwrap_or(0);
+            let at = reserve(st)?;
+            st.load(i, bytes, slot, at - lowest).map_err(|_| ENOMEM)?;
+            let p = &mut st.procs[i];
+            if p.nlibs < p.libs.len() {
+                p.libs[p.nlibs] = (at, at + len, o.ino);
+                p.nlibs += 1;
+            }
+            return Ok(at);
+        }
+    }
+    let at = if fixed { addr } else { reserve(st)? };
+    if at % PAGE != 0 || at < CHILD || at + len > STACK_TOP - STACK_PAGES * PAGE {
+        return Err(ENOMEM);
+    }
+    let mut buf = [0u8; PAGE as usize];
+    for page in (at..at + len).step_by(PAGE as usize) {
+        st.map_private(i, page)?;
+        buf.fill(0);
+        st.fs.read(o.ino, off + (page - at), &mut buf);
+        st.copy_out(i, page, &buf);
+    }
+    Ok(at)
+}
+
+/// `fork`: a new process with a copy of task `t`'s process's own pages,
+/// its descriptors and directory, and one thread, with `t`'s registers (0
+/// in the result).
+fn fork(st: &mut State, t: usize) -> Result<u64, u64> {
+    let i = st.tasks[t].proc as usize;
     let c = st.new_proc(st.procs[i].pid).ok_or(EAGAIN)?;
+    let Some(ct) = st.new_task(c, Some(st.procs[c].pid)) else {
+        st.procs[c].used = false;
+        return Err(EAGAIN);
+    };
     let fail = |st: &mut State, e| {
         st.unmake_space(c);
         st.procs[c].used = false;
+        st.tasks[ct].used = false;
         Err(e)
     };
-    if st.make_space(c).is_err() {
+    if st.make_space(c, ct).is_err() {
         return fail(st, ENOMEM);
     }
     for k in 0..CHILD_PAGES {
@@ -1646,6 +1991,9 @@ fn fork(st: &mut State, i: usize) -> Result<u64, u64> {
         // SAFETY: both are whole pages mapped in the mirrors.
         unsafe { core::ptr::copy_nonoverlapping(from as *const u8, to as *mut u8, PAGE as usize) };
     }
+    st.procs[c].reserved = st.procs[i].reserved;
+    (st.procs[c].shared, st.procs[c].nshared) = (st.procs[i].shared, st.procs[i].nshared);
+    (st.procs[c].libs, st.procs[c].nlibs) = (st.procs[i].libs, st.procs[i].nlibs);
     if st.map_all_shared(c).is_err() {
         return fail(st, ENOMEM);
     }
@@ -1654,11 +2002,12 @@ fn fork(st: &mut State, i: usize) -> Result<u64, u64> {
     for &f in fds.iter().filter(|&&f| f != 0) {
         st.files[f as usize - 1].refs += 1;
     }
-    let (pgid, sid, mask, actions) = (st.procs[i].pgid, st.procs[i].sid, st.procs[i].mask, st.procs[i].actions);
+    let (pgid, sid, actions) = (st.procs[i].pgid, st.procs[i].sid, st.procs[i].actions);
     let p = &mut st.procs[c];
     (p.fds, p.cloexec, p.cwd, p.brk_start, p.brk, p.mmap_next) = (fds, cloexec, cwd, b0, b1, m);
-    (p.pgid, p.sid, p.mask, p.actions) = (pgid, sid, mask, actions);
-    if st.start(c, CHILD + PAGE, CHILD + 2 * PAGE, Some(i)).is_err() {
+    (p.pgid, p.sid, p.actions) = (pgid, sid, actions);
+    st.tasks[ct].mask = st.tasks[t].mask;
+    if st.start(ct, CHILD + PAGE, CHILD + 2 * PAGE, Some(t)).is_err() {
         for fd in 0..MAX_FDS {
             st.close(c, fd);
         }
@@ -1667,16 +2016,18 @@ fn fork(st: &mut State, i: usize) -> Result<u64, u64> {
     Ok(st.procs[c].pid as u64)
 }
 
-/// `execve`: the program `path` names replaces process `i`'s.
-fn execve(st: &mut State, i: usize, path: u64, argv: u64, envp: u64) -> Result<(), u64> {
+/// `execve`: the program `path` names replaces task `t`'s process's; its
+/// other threads end, and `t` goes on as the process's one thread.
+fn execve(st: &mut State, t: usize, path: u64, argv: u64, envp: u64) -> Result<(), u64> {
+    let i = st.tasks[t].proc as usize;
     let mut name = [0u8; 256];
     let n = st.cstr(i, path, &mut name)?;
     let ino = st.fs.resolve(st.procs[i].cwd, &name[..n], true)?;
-    match st.fs.kind(ino) {
-        Kind::Program => {}
-        Kind::Dir => return Err(EACCES),
+    let image = match (st.fs.image(ino), st.fs.kind(ino)) {
+        (Some(k), _) => k,
+        (None, Kind::Dir) => return Err(EACCES),
         _ => return Err(ENOEXEC),
-    }
+    };
     let (mut args, mut env) = (Strs::new(), Strs::new());
     for (list, at) in [(&mut args, argv), (&mut env, envp)] {
         if at == 0 {
@@ -1696,6 +2047,12 @@ fn execve(st: &mut State, i: usize, path: u64, argv: u64, envp: u64) -> Result<(
     }
     // Past here there is no going back: the old program is gone.
     st.unmake_space(i);
+    for k in 0..MAX_TASKS {
+        if k != t && st.tasks[k].used && st.tasks[k].proc as usize == i {
+            st.tasks[k].used = false;
+        }
+    }
+    st.tasks[t].tid = st.procs[i].pid;
     let cloexec = st.procs[i].cloexec;
     for fd in 0..MAX_FDS {
         if cloexec & 1 << fd != 0 {
@@ -1703,7 +2060,7 @@ fn execve(st: &mut State, i: usize, path: u64, argv: u64, envp: u64) -> Result<(
         }
     }
     st.reset_handlers(i);
-    if let Err(why) = st.exec(i, &args, &env, &name[..n]) {
+    if let Err(why) = st.exec(t, image, &args, &env, &name[..n]) {
         say!("linux: pid {}: exec failed after the old program was gone: {why}", st.procs[i].pid);
         st.exit(i, 127 << 8);
     }
@@ -1730,18 +2087,22 @@ fn wait4(st: &mut State, i: usize, pid: i64, status: u64, options: u64) -> Out {
     Out::Ret(cpid as u64)
 }
 
-/// Answers process `i`'s call with `value`, resuming at `pc` (the call
+/// Answers task `t`'s call with `value`, resuming at `pc` (the call
 /// just received if `place` is `None`, else the one set aside there),
-/// unless a signal it must take comes first: then it ends, or starts in
-/// the handler with that answer saved for after.
-fn finish(st: &mut State, i: usize, pc: u64, value: u64, place: Option<u64>) {
-    let (pc, value) = match st.next_signal(i) {
+/// unless a signal it must take comes first: then its process ends, or it
+/// starts in the handler with that answer saved for after.
+fn finish(st: &mut State, t: usize, pc: u64, value: u64, place: Option<u64>) {
+    if !st.tasks[t].used {
+        return;
+    }
+    let i = st.tasks[t].proc as usize;
+    let (pc, value) = match st.next_signal(t) {
         Next::None => (pc, value),
         Next::Kill(sig) => {
             st.exit(i, sig);
             return;
         }
-        Next::Handle(sig) => match st.enter_handler(i, sig, pc, Some(value)) {
+        Next::Handle(sig) => match st.enter_handler(t, sig, pc, Some(value)) {
             Some(at) => at,
             None => {
                 st.exit(i, SIGSEGV);
@@ -1757,21 +2118,22 @@ fn finish(st: &mut State, i: usize, pc: u64, value: u64, place: Option<u64>) {
 }
 
 /// Tries every waiting call again, answering those that can go on, and
-/// acts on signals: a process waiting in a call is interrupted for a
+/// acts on signals: a thread waiting in a call is interrupted for a
 /// handler, and any process a signal ends is ended. Until nothing moves.
 fn wake(st: &mut State) {
     loop {
         let mut moved = false;
-        for i in 0..MAX_PROCS {
-            let p = &st.procs[i];
-            if !p.used || p.zombie {
+        for t in 0..MAX_TASKS {
+            if !st.tasks[t].used {
                 continue;
             }
-            let blocked = p.blocked;
+            let i = st.tasks[t].proc as usize;
+            let blocked = st.tasks[t].blocked;
+            let now = superior_sys::ticks();
             let out = match blocked {
                 Blocked::None => {
                     // Running: only a signal that ends it acts now.
-                    if let Next::Kill(sig) = st.next_signal(i) {
+                    if let Next::Kill(sig) = st.next_signal(t) {
                         st.exit(i, sig);
                         moved = true;
                     }
@@ -1781,18 +2143,23 @@ fn wake(st: &mut State) {
                 Blocked::Write { fd, buf, len } => write(st, i, fd, buf, len),
                 Blocked::Writev { fd, iov, cnt } => writev(st, i, fd, iov, cnt),
                 Blocked::Wait { pid, status, options } => wait4(st, i, pid, status, options),
-                Blocked::Sleep { until } if superior_sys::ticks() >= until => Out::Ret(0),
+                Blocked::Sleep { until } if now >= until => Out::Ret(0),
                 Blocked::Poll { fds, n, until } => poll(st, i, fds, n, until),
-                Blocked::Sleep { .. } | Blocked::Suspend => Out::Block(blocked),
+                Blocked::Futex { until, .. } if now >= until => Out::Ret(err(ETIMEDOUT)),
+                Blocked::Sleep { .. } | Blocked::Suspend | Blocked::Futex { .. } => Out::Block(blocked),
             };
-            let (place, pc) = (st.procs[i].place, st.procs[i].pc);
-            if let Out::Ret(v) = out {
-                st.procs[i].blocked = Blocked::None;
-                finish(st, i, pc, v, Some(place));
+            if !st.tasks[t].used {
                 moved = true;
                 continue;
             }
-            match st.next_signal(i) {
+            let (place, pc) = (st.tasks[t].place, st.tasks[t].pc);
+            if let Out::Ret(v) = out {
+                st.tasks[t].blocked = Blocked::None;
+                finish(st, t, pc, v, Some(place));
+                moved = true;
+                continue;
+            }
+            match st.next_signal(t) {
                 Next::None => {}
                 Next::Kill(sig) => {
                     st.exit(i, sig);
@@ -1803,11 +2170,11 @@ fn wake(st: &mut State) {
                     // SA_RESTART the call made again.
                     let restart = st.procs[i].actions[sig as usize - 1].flags & SA_RESTART != 0
                         && matches!(blocked, Blocked::Read { .. } | Blocked::Write { .. } | Blocked::Writev { .. } | Blocked::Wait { .. });
-                    st.procs[i].blocked = Blocked::None;
+                    st.tasks[t].blocked = Blocked::None;
                     let entered = if restart {
-                        st.enter_handler(i, sig, pc - SYSCALL_LEN, None)
+                        st.enter_handler(t, sig, pc - SYSCALL_LEN, None)
                     } else {
-                        st.enter_handler(i, sig, pc, Some(err(EINTR)))
+                        st.enter_handler(t, sig, pc, Some(err(EINTR)))
                     };
                     match entered {
                         Some((at, v)) => {
@@ -1825,17 +2192,135 @@ fn wake(st: &mut State) {
     }
     // The timer for the next sleeper to wake, if any.
     let next = st
-        .procs
+        .tasks
         .iter()
-        .filter(|p| p.used && !p.zombie)
-        .filter_map(|p| match p.blocked {
+        .filter(|t| t.used)
+        .filter_map(|t| match t.blocked {
             Blocked::Sleep { until } => Some(until),
-            Blocked::Poll { until, .. } if until != u64::MAX => Some(until),
+            Blocked::Poll { until, .. } | Blocked::Futex { until, .. } if until != u64::MAX => Some(until),
             _ => None,
         })
         .min();
     let ticks = next.map_or(0, |until| until.saturating_sub(superior_sys::ticks()).max(1));
     syscall(Syscall::TimerSignal, NTFN_TIMER, [ticks, 0, 0, 0]);
+}
+
+/// `clone` for a thread: a new task in task `t`'s process, starting where
+/// `t` returns, with 0 as its result, the stack `a[1]` and, as `a[0]`'s
+/// flags say, its thread pointer (`a[4]`), its id written for the parent
+/// (`a[2]`) or the child (`a[3]`), and the child's id cleared at `a[3]`
+/// (and a futex there woken) when it ends. Its id.
+fn new_thread(st: &mut State, t: usize, a: [u64; 6]) -> Result<u64, u64> {
+    let [flags, stack, ptid, ctid, tls, _] = a;
+    let i = st.tasks[t].proc as usize;
+    let c = st.new_task(i, None).ok_or(EAGAIN)?;
+    let fail = |st: &mut State, e| {
+        st.tasks[c].used = false;
+        Err(e)
+    };
+    if st.make_thread(c).is_err() || st.configure(c, CHILD + PAGE, CHILD + 2 * PAGE, Some(t)).is_err() {
+        return fail(st, EAGAIN);
+    }
+    let th = st.tasks[c].thread;
+    // Its stack, and the pc the registers' copy already has.
+    let sp = signal::SP as u64;
+    let Ok(r) = sys(Syscall::ThreadRegisters, th, [REGS_GET, sp, 0, 0]) else { return fail(st, EAGAIN) };
+    if sys(Syscall::ThreadRegisters, th, [REGS_SET, sp, stack, r[1]]).is_err() {
+        return fail(st, EINVAL);
+    }
+    if flags & CLONE_SETTLS != 0 && sys(Syscall::ThreadRegisters, th, [REGS_SET_TLS, tls, 0, 0]).is_err() {
+        return fail(st, EINVAL);
+    }
+    let tid = st.tasks[c].tid;
+    if flags & CLONE_PARENT_SETTID != 0 && !st.copy_out(i, ptid, &tid.to_le_bytes()) {
+        return fail(st, EFAULT);
+    }
+    if flags & CLONE_CHILD_SETTID != 0 && !st.copy_out(i, ctid, &tid.to_le_bytes()) {
+        return fail(st, EFAULT);
+    }
+    if flags & CLONE_CHILD_CLEARTID != 0 {
+        st.tasks[c].clear_tid = ctid;
+    }
+    st.tasks[c].mask = st.tasks[t].mask;
+    if sys(Syscall::ThreadResume, th, [0; 4]).is_err() {
+        return fail(st, EAGAIN);
+    }
+    say!("linux: pid {} started thread {tid}", st.procs[i].pid);
+    Ok(tid as u64)
+}
+
+/// `futex`: wait while the word at `a[0]` holds `a[2]` (`FUTEX_WAIT`,
+/// with a relative timeout; `FUTEX_WAIT_BITSET`, absolute), wake up to
+/// `a[2]` waiters (`FUTEX_WAKE`, `FUTEX_WAKE_BITSET`), or wake some and
+/// move up to `a[3]` more to the word at `a[4]` (`FUTEX_REQUEUE`;
+/// `FUTEX_CMP_REQUEUE` first checks the word holds `a[5]`). Waiters are
+/// the process's threads, oldest first; the bitsets are not looked at.
+fn futex(st: &mut State, t: usize, a: [u64; 6]) -> Out {
+    let i = st.tasks[t].proc as usize;
+    let (addr, op, val) = (a[0], a[1] & 0x7f, a[2] as u32);
+    let word = |st: &State, at: u64| {
+        let mut b = [0u8; 4];
+        st.copy_in(i, at, &mut b).then(|| u32::from_le_bytes(b))
+    };
+    match op {
+        0 | 9 => {
+            match word(st, addr) {
+                None => return Out::Ret(err(EFAULT)),
+                Some(v) if v != val => return Out::Ret(err(EAGAIN)),
+                _ => {}
+            }
+            let until = if a[3] == 0 {
+                u64::MAX
+            } else {
+                let (Some(sec), Some(ns)) = (st.word(i, a[3]), st.word(i, a[3] + 8)) else { return Out::Ret(err(EFAULT)) };
+                let ticks = sec.saturating_mul(TICK_HZ).saturating_add((ns * TICK_HZ).div_ceil(1_000_000_000));
+                if op == 0 { superior_sys::ticks().saturating_add(ticks) } else { ticks }
+            };
+            st.futex_seq += 1;
+            Out::Block(Blocked::Futex { addr, until, seq: st.futex_seq })
+        }
+        1 | 10 => Out::Ret(futex_wake(st, i, addr, val as u64, None)),
+        3 | 4 => {
+            if op == 4 && word(st, addr) != Some(a[5] as u32) {
+                return Out::Ret(err(EAGAIN));
+            }
+            let woke = futex_wake(st, i, addr, val as u64, None);
+            let moved = futex_wake(st, i, addr, a[3] as u32 as u64, Some(a[4]));
+            Out::Ret(woke + moved)
+        }
+        _ => Out::Ret(err(ENOSYS)),
+    }
+}
+
+/// Wakes up to `n` of process `i`'s threads waiting on the futex at
+/// `addr`, oldest first, answering their waits with 0; or, `to` given,
+/// moves them to wait on the futex there instead. How many.
+fn futex_wake(st: &mut State, i: usize, addr: u64, n: u64, to: Option<u64>) -> u64 {
+    let mut done = 0;
+    while done < n {
+        let next = (0..MAX_TASKS)
+            .filter(|&k| st.tasks[k].used && st.tasks[k].proc as usize == i)
+            .filter_map(|k| match st.tasks[k].blocked {
+                Blocked::Futex { addr: at, seq, .. } if at == addr => Some((seq, k)),
+                _ => None,
+            })
+            .min();
+        let Some((_, k)) = next else { break };
+        match to {
+            Some(new) => {
+                if let Blocked::Futex { until, seq, .. } = st.tasks[k].blocked {
+                    st.tasks[k].blocked = Blocked::Futex { addr: new, until, seq };
+                }
+            }
+            None => {
+                st.tasks[k].blocked = Blocked::None;
+                let (pc, place) = (st.tasks[k].pc, st.tasks[k].place);
+                finish(st, k, pc, 0, Some(place));
+            }
+        }
+        done += 1;
+    }
+    done
 }
 
 /// Typed bytes from the UART: into the terminal, signals to its
@@ -1859,6 +2344,10 @@ fn uart_input(st: &mut State) {
 fn run(st: &mut State, argv: &[&str], env: &[&str], interactive: bool) -> Result<u32, &'static str> {
     let i = st.new_proc(0).ok_or("no process slot")?;
     let pid = st.procs[i].pid;
+    let Some(t) = st.new_task(i, Some(pid)) else {
+        st.procs[i].used = false;
+        return Err("no thread slot");
+    };
     RUN_PID.store(pid, core::sync::atomic::Ordering::Relaxed);
     st.top_status = None;
     let kind = if interactive { FileKind::Tty } else { FileKind::Console };
@@ -1872,12 +2361,18 @@ fn run(st: &mut State, argv: &[&str], env: &[&str], interactive: bool) -> Result
     argv.iter().for_each(|a| _ = args.push(a.as_bytes()));
     env.iter().for_each(|e| _ = envs.push(e.as_bytes()));
     let execfn = [b"/bin/" as &[u8], argv[0].as_bytes()].concat_into::<64>();
-    if let Err(why) = st.exec(i, &args, &envs, execfn.as_slice()) {
+    let image = st.fs.resolve(ROOT, execfn.as_slice(), true).ok().and_then(|ino| st.fs.image(ino));
+    let started = match image {
+        Some(k) => st.exec(t, k, &args, &envs, execfn.as_slice()),
+        None => Err("no such program"),
+    };
+    if let Err(why) = started {
         st.exit(i, 127 << 8);
         return Err(why);
     }
-    let interp = Elf::parse(st.program).ok().and_then(|e| e.interpreter()).unwrap_or(b"?");
-    let interp = core::str::from_utf8(interp).unwrap_or("?").trim_end_matches(char::from(0));
+    let program = st.images[image.unwrap_or(0)].bytes;
+    let interp = Elf::parse(program).ok().and_then(|e| e.interpreter()).unwrap_or(b"(none)");
+    let interp = core::str::from_utf8(interp).unwrap_or("?");
     say!("linux: running {} (pid {pid}, interpreter {interp})", Joined(argv));
     while st.procs.iter().any(|p| p.used && !p.zombie) {
         let r = syscall(Syscall::Recv, EP, [0; 4]);
@@ -1889,9 +2384,18 @@ fn run(st: &mut State, argv: &[&str], env: &[&str], interactive: bool) -> Result
             continue;
         }
         let [kind, nr, pc, _] = r.msg;
-        let Some(i) = (r.badge as usize).checked_sub(1).filter(|&i| i < MAX_PROCS && st.procs[i].used) else {
+        let Some(t) = (r.badge as usize).checked_sub(1).filter(|&t| t < MAX_TASKS && st.tasks[t].used) else {
             continue;
         };
+        let i = st.tasks[t].proc as usize;
+        // A first touch of an anonymous mapping's page: made, and the
+        // access tried again; or another thread made it first.
+        let page_fault = r.status == 0 && FaultKind::from_u64(kind) == Some(FaultKind::PageFault);
+        let made = |st: &State| (CHILD..CHILD_END).contains(&nr) && st.is_present(i, nr & !(PAGE - 1));
+        if page_fault && (made(st) || st.take_reserved(i, nr)) {
+            syscall(Syscall::Reply, 0, [FaultReply::Retry as u64, 0, 0, 0]);
+            continue;
+        }
         if r.status != 0 || FaultKind::from_u64(kind) != Some(FaultKind::ForeignSyscall) {
             st.flush();
             let (what, signal) = match FaultKind::from_u64(kind) {
@@ -1905,19 +2409,21 @@ fn run(st: &mut State, argv: &[&str], env: &[&str], interactive: bool) -> Result
             wake(st);
             continue;
         }
-        let t = thread_slot(i);
-        let x = sys(Syscall::ThreadRegisters, t, [REGS_SYSCALL, 0, 0, 0]).unwrap_or([0; 4]);
-        let y = sys(Syscall::ThreadRegisters, t, [REGS_SYSCALL_MORE, 0, 0, 0]).unwrap_or([0; 4]);
+        let th = st.tasks[t].thread;
+        let x = sys(Syscall::ThreadRegisters, th, [REGS_SYSCALL, 0, 0, 0]).unwrap_or([0; 4]);
+        let y = sys(Syscall::ThreadRegisters, th, [REGS_SYSCALL_MORE, 0, 0, 0]).unwrap_or([0; 4]);
         let (call, args) = decode(nr, [x[1], x[2], x[3], y[0], y[1], y[2]]);
-        match answer(st, i, call, args) {
-            Out::Ret(v) => finish(st, i, pc, v, None),
-            Out::Resume { pc, value } => finish(st, i, pc, value, None),
+        match answer(st, t, call, args) {
+            // The task may be gone (its process killed meanwhile).
+            Out::Ret(v) => finish(st, t, pc, v, None),
+            Out::Resume { pc, value } => finish(st, t, pc, value, None),
+            Out::Block(_) if !st.tasks[t].used => {}
             Out::Block(b) => {
                 let saved = syscall(Syscall::ReplySave, 0, [0; 4]);
-                let p = &mut st.procs[i];
-                p.blocked = b;
-                p.place = saved.msg[0];
-                p.pc = pc;
+                let task = &mut st.tasks[t];
+                task.blocked = b;
+                task.place = saved.msg[0];
+                task.pc = pc;
             }
             Out::Gone => {}
         }
@@ -2152,7 +2658,7 @@ const APPLETS: &[&str] = &[
     "sh", "ash", "echo", "cat", "ls", "wc", "seq", "mkdir", "rmdir", "rm", "touch", "true", "false", "uname", "awk",
     "sort", "head", "tail", "grep", "tr", "env", "pwd", "test", "[", "basename", "dirname", "cp", "mv", "ln", "printf",
     "expr", "cut", "uniq", "sed", "xargs", "find", "stat", "readlink", "sleep", "yes", "tee", "od", "stty",
-    "kill",
+    "kill", "gzip", "md5sum",
 ];
 
 /// What the test runs, and the exit status each must end with. They share
@@ -2181,11 +2687,14 @@ const RUNS: &[(&[&str], u32)] = &[
     (&["sh", "-c", "sleep 30 & kill $!; wait $!; echo status after kill $?"], 0),
     (&["sh", "-c", "yes | head -n 3 | wc -l"], 0),
     (&["sh", "-c", "sleep 1 && echo slept"], 0),
+    // A program with a library of its own: pigz, with zlib, which musl's
+    // dynamic linker loads. BusyBox's gzip checks what it wrote.
+    (&["sh", "-c", "seq 1 10000 > /tmp/n && pigz -p 2 -b 32 -k /tmp/n && ls /tmp && gzip -dc /tmp/n.gz | md5sum && md5sum < /tmp/n"], 0),
 ];
 
 /// Then a shell on the terminal, until it exits (the test types into it).
 const SESSION: &[&str] = &["sh"];
-const SESSION_ENV: &[&str] = &["PATH=/bin", "HOME=/home", "PS1=linux$ "];
+const SESSION_ENV: &[&str] = &["PATH=/usr/bin:/bin", "HOME=/home", "PS1=linux$ "];
 
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(_: u64) -> ! {
@@ -2199,7 +2708,7 @@ pub extern "C" fn _start(_: u64) -> ! {
             let runs = RUNS.iter().map(|&(argv, want)| (argv, want, false)).chain([(SESSION, 0, true)]);
             for (argv, want, interactive) in runs {
                 let line = Joined(argv);
-                let env: &[&str] = if interactive { SESSION_ENV } else { &["PATH=/bin", "HOME=/home"] };
+                let env: &[&str] = if interactive { SESSION_ENV } else { &["PATH=/usr/bin:/bin", "HOME=/home"] };
                 match run(st, argv, env, interactive) {
                     Ok(status) if status & 0x7f == 0 => {
                         let code = status >> 8;
@@ -2229,6 +2738,10 @@ fn setup() -> Result<&'static mut State, &'static str> {
     for b in 0..8 {
         sys(Syscall::Retype, UNTYPED, [ObjectType::Untyped as u64, BLOCK_BITS, BLOCKS + b, 0]).map_err(|_| "no memory")?;
     }
+    for k in 0..SPARES as u64 {
+        sys(Syscall::Retype, UNTYPED_SPARE, [ObjectType::Untyped as u64, BLOCK_BITS, SPARE_BLOCKS + k, 0])
+            .map_err(|_| "no spare memory")?;
+    }
     sys(Syscall::Retype, FS_BLOCK, [ObjectType::Endpoint as u64, 0, EP, 0]).map_err(|_| "no endpoint")?;
     sys(Syscall::Retype, FS_BLOCK, [ObjectType::Notification as u64, 0, NTFN, 0]).map_err(|_| "no notification")?;
     sys(Syscall::CapMint, NTFN, [NTFN_UART, ALL, 1, 0]).map_err(|_| "no notification")?;
@@ -2248,19 +2761,35 @@ fn setup() -> Result<&'static mut State, &'static str> {
     // server's life; all zero is a valid empty State (every enum's zero
     // is its empty variant), and this is its only reference.
     let st = unsafe { &mut *(STATE_VA as *mut State) };
-    st.interp = map_file(INTERP_FILE, INTERP_VA, PROGRAM_FILE - INTERP_FILE);
-    st.program = map_file(PROGRAM_FILE, PROGRAM_VA, STATE_SLOTS - PROGRAM_FILE);
+    let interp = map_file(INTERP_FILE, INTERP_VA, PIGZ_FILE - INTERP_FILE);
+    let pigz = map_file(PIGZ_FILE, PIGZ_VA, LIBZ_FILE - PIGZ_FILE);
+    let libz = map_file(LIBZ_FILE, LIBZ_VA, PROGRAM_FILE - LIBZ_FILE);
+    let program = map_file(PROGRAM_FILE, PROGRAM_VA, STATE_SLOTS - PROGRAM_FILE);
     st.next_pid = 1;
     // The restorer page, executable in every process.
     sys(Syscall::Retype, FS_BLOCK, [ObjectType::Frame as u64, 0, TRAMPOLINE_SLOT, 0]).map_err(|_| "no memory")?;
     sys(Syscall::FrameMap, TRAMPOLINE_SLOT, [TRAMPOLINE_VA, 1, 0, 0]).map_err(|_| "no room")?;
     // SAFETY: the page was just mapped, writable, at TRAMPOLINE_VA.
     unsafe { core::ptr::copy_nonoverlapping(TRAMPOLINE_CODE.as_ptr(), TRAMPOLINE_VA as *mut u8, TRAMPOLINE_CODE.len()) };
-    st.shared[0] = Shared { start: TRAMPOLINE, end: TRAMPOLINE + PAGE, ptr: TRAMPOLINE_VA, slot: TRAMPOLINE_SLOT, flags: MAP_EXEC };
-    st.nshared = 1;
-    let interp_path = Elf::parse(st.program).ok().and_then(|e| e.interpreter()).ok_or("the program is not dynamically linked")?;
-    let (program, interp) = (st.program, st.interp);
-    st.fs.init(POOL_VA, program, interp, interp_path, APPLETS);
+    st.trampoline = Shared { start: TRAMPOLINE, end: TRAMPOLINE + PAGE, ptr: TRAMPOLINE_VA, slot: TRAMPOLINE_SLOT, flags: MAP_EXEC };
+    let interp_path = Elf::parse(program).ok().and_then(|e| e.interpreter()).ok_or("BusyBox is not dynamically linked")?;
+    // Where each file is: BusyBox first (the runs' programs are its).
+    let files: [(&[u8], &'static [u8], u64); 4] = [
+        (b"/bin/busybox", program, PROGRAM_FILE),
+        (interp_path, interp, INTERP_FILE),
+        (b"/usr/bin/pigz", pigz, PIGZ_FILE),
+        (b"/lib/libz.so.1", libz, LIBZ_FILE),
+    ];
+    let mut tree = [(&b""[..], &b""[..]); 4];
+    let mut n = 0;
+    for (path, bytes, slot) in files {
+        if !bytes.is_empty() {
+            st.images[n] = Img { bytes, slot };
+            tree[n] = (path, bytes);
+            n += 1;
+        }
+    }
+    st.fs.init(POOL_VA, &tree[..n], APPLETS);
     Ok(st)
 }
 

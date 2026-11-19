@@ -1563,6 +1563,29 @@ holds the rest):
   trap's handler, kills a sleeping child (`143`), ends `yes` with SIGPIPE and
   sleeps, then types into the shell on the terminal: `[ -t 0 ]`, `stty size`,
   a trap, and `^C` interrupting a foreground job, `$?` then 130.
+- The Linux personality's threads and shared libraries: Alpine's pigz runs
+  with two compressing threads, linked against zlib, which musl's dynamic
+  linker loads. A process is now an address space and its tasks, each a
+  foreign thread with its own badged fault endpoint, signal mask and
+  thread-directed signals. `clone` with `CLONE_THREAD` makes a task whose
+  registers are the caller's but for its stack (`REGS_SET`) and thread
+  pointer, writing its id where `CLONE_PARENT_SETTID` or
+  `CLONE_CHILD_SETTID` say; `futex` waits (with a timeout), wakes oldest
+  first and requeues; `exit` ends one thread, clearing its
+  `CLONE_CHILD_CLEARTID` word and waking the futex there for
+  `pthread_join`, and `exit_group` the process. `gettid`,
+  `set_tid_address`, `tkill`, `sched_getaffinity` (one CPU) and
+  `membarrier` (already satisfied, on one CPU with every call serialised
+  here) are answered. Programs are found by path in a table of bundle
+  files (BusyBox, musl, pigz, zlib); `mmap` of a library from its start
+  loads it as the program loader would (code shared, data a copy), and
+  the linker's own fixed mappings of its segments then find them there.
+  Memory is made as it is used: anonymous mappings and the stack are
+  reserved, and a page fault there (or a system call writing there) makes
+  the page, the access then retried. A process that outgrows its 1 MiB
+  block is lent one of four spare blocks, from a second untyped capability.
+  `linux-test` compresses 48 KiB with `pigz -p 2 -b 32` and checks that
+  BusyBox's `gzip -dc` gives back the same MD5, on both ISAs.
 - Interrupt and exception entries clear the direction flag. User code may be
   interrupted mid-way through a backward copy, with the flag set; the kernel's own
   copies need it clear, and without the `cld` they ran backwards, wrecking saved
@@ -1635,8 +1658,9 @@ system's is on the system disk), a boot record written atomically (two
 copies), certificate chains and revocation for the update server (the updater
 pins one key), apps that provide services, a package store on a
 filesystem rather than fixed disk slots, the Linux personality's files on
-the filesystem server (today they are in its memory), threads (`clone` with
-`CLONE_VM`), stopping jobs (`^Z`), and a handled signal reaching a process
+the filesystem server (today they are in its memory), a Linux process's
+threads on more than one CPU, `munmap` returning pages, stopping jobs (`^Z`),
+and a handled signal reaching a process
 that spins without system calls (it is taken at the next one), and
 fixed-address (non-PIE) Linux executables, which are linked at 4 MiB, where
 the AArch64 kernel's identity map lives (the kernel needs moving to the high
@@ -1736,7 +1760,7 @@ cargo xtask tpm-test       # in Docker (QEMU + swtpm): PCR 9 measured, the TPM's
 cargo xtask secure-boot-test aarch64  # in Docker and QEMU: the db-signed loader boots under Secure Boot; foreign, changed, unsigned ones refused
 cargo xtask ab-test        # A/B system slots: an update staged, tried, fallen back from, confirmed; rollbacks refused
 cargo xtask packages-test  # signed app packages: bad ones refused, the app installed, kept across boots, uninstalled
-cargo xtask linux-test     # the Linux personality runs Alpine's BusyBox, unmodified: echo, uname, the shell, awk
+cargo xtask linux-test     # the Linux personality runs Alpine's BusyBox and pigz, unmodified: the shell, signals, threads
 cargo xtask run            # boot the shell in QEMU (x86-64), its console on this terminal
 cargo xtask run aarch64    # the same on QEMU's AArch64 virt machine
 cargo xtask console-test   # the kernel's log on the boot framebuffer, from a BIOS and from UEFI, checked by screenshot
