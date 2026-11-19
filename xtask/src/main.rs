@@ -538,27 +538,52 @@ fn alpine_files(arch: Arch) -> Result<Vec<(String, Vec<u8>)>, String> {
 
 /// The toolchain the Linux personality runs: tcc (Alpine 3.22's, the first
 /// with it, in community), which compiles, assembles and links C, and
-/// make, with musl's headers and start files (Alpine 3.18's, as its musl).
+/// make, with musl's headers and start files, and GNU binutils' as and ld
+/// with their libraries and zstd's (Alpine 3.18's, as its musl).
 /// (Alpine's repository, package, its SHA-256, and the files taken: to a
 /// bundle file of the name given, or, for a name starting with `/`, into
 /// the toolchain's archive at that path.)
 type ToolPackage = (&'static str, &'static str, &'static str, &'static [(&'static str, &'static str)]);
-const TOOLCHAIN_X86_64: [ToolPackage; 6] = [
+const TOOLCHAIN_X86_64: [ToolPackage; 8] = [
     ("v3.22/community", "tcc-0.9.27_git20250106-r0", "db4720f2f9c6c5cf46812d52af151cbeaa95c0e4676aa956b3e57b2c3ad9802a", &[("usr/bin/tcc", "tcc")]),
     ("v3.22/community", "tcc-libs-0.9.27_git20250106-r0", "f0d06346af0ffd0d4bca073d56b51e6baaa2825b82996a58ddf6a31dba5df2d0", &[("usr/lib/libtcc.so", "libtcc")]),
     ("v3.22/community", "tcc-libs-static-0.9.27_git20250106-r0", "2aab7f70b8f8918ebe431f9b77193a6f43b72c9206b0e5c7b35fe3975e64f3a9", TCC_RUNTIME),
     ("v3.22/community", "tcc-dev-0.9.27_git20250106-r0", "5bd123d6b22a9e39c5e26a79759573c47243dd1d04bcdc26ce8275ca35fd91f7", TCC_HEADERS),
     ("v3.18/main", "make-4.4.1-r1", "139e1d308ed231bd6c3b35db9c8bee88f732609817524663dfeb7ecc3d7445c8", &[("usr/bin/make", "make")]),
     ("v3.18/main", "musl-dev-1.2.4-r3", "d288f1cae4a503826df1ecff8d4c3818b8c765d3e4c63d397fddd3b52de3c17b", MUSL_DEV),
+    ("v3.18/main", "binutils-2.40-r8", "d8260a11280e85306f51a2642c996feeb13356a2226e74e3b76218212a512415", BINUTILS_X86_64),
+    ("v3.18/main", "zstd-libs-1.5.5-r4", "79c0aa9461b1cdd238f17e24cc00916c282df2b6ba060f339993b277b4258016", ZSTD),
 ];
-const TOOLCHAIN_AARCH64: [ToolPackage; 6] = [
+const TOOLCHAIN_AARCH64: [ToolPackage; 8] = [
     ("v3.22/community", "tcc-0.9.27_git20250106-r0", "556e5a32cb2b7270c0007039143a905160b7dbadd3deca7e3710c760623a50dc", &[("usr/bin/tcc", "tcc")]),
     ("v3.22/community", "tcc-libs-0.9.27_git20250106-r0", "93e9707704d398f88c2292d115db22f5a10a98d87e0fbf466940e06ca4a386fb", &[("usr/lib/libtcc.so", "libtcc")]),
     ("v3.22/community", "tcc-libs-static-0.9.27_git20250106-r0", "5dc97008751c0770cad9ad94c29cc5bf2a19e555fd37313b3eb256aabe973245", TCC_RUNTIME),
     ("v3.22/community", "tcc-dev-0.9.27_git20250106-r0", "b51ebbadc4f91f1c102f183bad9b60aac3d26bf22f22e66ce2b3e68f72c516de", TCC_HEADERS),
     ("v3.18/main", "make-4.4.1-r1", "e38ee3a4189d098a3b35b937670fb2e5a2e0e1712c5c74924cc474aaeaf44977", &[("usr/bin/make", "make")]),
     ("v3.18/main", "musl-dev-1.2.4-r3", "2965901b73567405ce95f396884b8e01558dc0ab4232b6d68e5a87f2c84e046c", MUSL_DEV),
+    ("v3.18/main", "binutils-2.40-r8", "0e2be25ca7b7595b08ca1804ec63dcbb7173994974203fb2c68cb6a540f371d8", BINUTILS_AARCH64),
+    ("v3.18/main", "zstd-libs-1.5.5-r4", "e803a78407cb28168b681741753ddf2496cbd0b6d91e0c9aeb143aa48a5a46ff", ZSTD),
 ];
+/// as and ld and the libraries they load. Each package has as and ld
+/// once, the other names hard links to them: in `/usr/bin` on x86-64, in
+/// the target's own directory on AArch64.
+const BINUTILS_X86_64: &[(&str, &str)] = &[
+    ("usr/bin/as", "as"),
+    ("usr/bin/ld", "ld"),
+    ("usr/lib/libbfd-2.40.so", "libbfd"),
+    ("usr/lib/libopcodes-2.40.so", "libopcodes"),
+    ("usr/lib/libctf.so.0.0.0", "libctf"),
+    ("usr/lib/libsframe.so.0.0.0", "libsframe"),
+];
+const BINUTILS_AARCH64: &[(&str, &str)] = &[
+    ("usr/aarch64-alpine-linux-musl/bin/as", "as"),
+    ("usr/aarch64-alpine-linux-musl/bin/ld", "ld"),
+    ("usr/lib/libbfd-2.40.so", "libbfd"),
+    ("usr/lib/libopcodes-2.40.so", "libopcodes"),
+    ("usr/lib/libctf.so.0.0.0", "libctf"),
+    ("usr/lib/libsframe.so.0.0.0", "libsframe"),
+];
+const ZSTD: &[(&str, &str)] = &[("usr/lib/libzstd.so.1.5.5", "libzstd")];
 const TCC_RUNTIME: &[(&str, &str)] = &[("usr/lib/tcc/libtcc1.a", "/usr/lib/tcc/libtcc1.a")];
 const TCC_HEADERS: &[(&str, &str)] = &[
     ("usr/lib/tcc/include/stdarg.h", "/usr/lib/tcc/include/stdarg.h"),
@@ -932,6 +957,10 @@ fn linux_test(img: &Image) -> Result<(), String> {
         // program against musl, and the program it made running.
         "linux: > tcc -o hi hi.c",
         "linux: > built by tcc: 42",
+        // GNU as and ld, with tcc: their program running.
+        "linux: > assembled by as, linked by ld",
+        // A program far larger than a page, loaded from its file.
+        "linux: > ran a program of more than 200000 bytes",
         // Threads (clone, futexes) in pigz, and zlib loaded by musl: what
         // two threads compressed BusyBox's gzip takes back unchanged.
         " started thread ",

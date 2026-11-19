@@ -52,10 +52,14 @@
 //! bundle's files' pages from 16: musl's, mmaptest's from 177, pigz's
 //! from 180, smptest's
 //! from 213, zlib's from 216, fptest's from 250, BusyBox's from 252, and
-//! glibc's dynamic linker's from 8192, hello's from 8256 and glibc's from
-//! 8320 (`file` in the manifest). Process `i` owns the
-//! slots from `PROC_SLOTS + i * PROC_SPAN`: its address space, then its
-//! threads (each with a badged fault endpoint) and pages as made.
+//! glibc's dynamic linker's from 8192, hello's from 8256, glibc's from
+//! 8320, the toolchain's from 8832 (tcc, make, libtcc, the archive of the
+//! rest), the exec buffer at 9216, and binutils' from 9472 (as, ld and
+//! their libraries) (`file` in the manifest). Process `i` owns the
+//! slots from `PROC_SLOTS + i * PROC_SPAN` (16384 on, 2048 each): its
+//! address space, then its threads (each with a badged fault endpoint)
+//! and pages as made, two slots a page (its frame and the mirror's copy),
+//! so up to 4 MiB of its own.
 //!
 //! Signals ([`signal`]): actions per process, masks per thread, `kill`
 //! and `tkill`, handlers run on the thread's stack and returned from. The terminal ([`tty`]): the serial
@@ -93,7 +97,7 @@ use superior_objects::abi::{
     Error, FaultKind, FaultReply, MAP_EXEC, MAP_WRITE, ObjectType, REGS_COUNT, REGS_FOREIGN, REGS_FORK_FROM, REGS_FP_GET,
     REGS_BARRIER, REGS_FP_SET, REGS_FP_WORDS, REGS_GET, REGS_SET, REGS_SET_TLS, REGS_SYSCALL, REGS_SYSCALL_MORE, REGS_TLS, Syscall, TICK_HZ,
 };
-use superior_objects::elf::{Elf, Machine};
+use superior_objects::elf::{Elf, Machine, Segment};
 use superior_sys::{USER_BASE, print_line, syscall};
 
 macro_rules! say {
@@ -111,9 +115,10 @@ const UNTYPED_SPARE_COUNT: u64 = 32;
 /// Each process's block, then the state's and files' (`FS_BLOCK`).
 const BLOCKS: u64 = 8;
 const BLOCK_BITS: u64 = 20;
-/// Blocks lent to processes that outgrow their own, one at a time.
-const SPARE_BLOCKS: u64 = 1004;
-const SPARES: usize = 4;
+/// Blocks lent to processes that outgrow their own, one at a time (1 MiB
+/// each, so a process has up to 17 MiB of memory).
+const SPARE_BLOCKS: u64 = 1024;
+const SPARES: usize = 16;
 /// The notification this server's thread is bound to (so `Recv` also
 /// returns when it is signalled), and two badged copies of it: the UART's
 /// interrupt (bit 0) and the timer for sleepers (bit 1).
@@ -143,18 +148,31 @@ const MAKE_FILE: u64 = 8864;
 const LIBTCC_FILE: u64 = 8960;
 const TOOLS_FILE: u64 = 9088;
 const TOOLS_END: u64 = 9152;
-/// Where a program in a file of the tree (not the bundle's) is read to be
-/// run: `EXEC_PAGES` pages cut from a block of the rest of RAM.
+/// Where the first page of a program in a file of the tree (not the
+/// bundle's) is read, for its headers, as it is loaded: `EXEC_PAGES`
+/// pages cut from a block of the rest of RAM. Its segments are read from
+/// the file a page at a time.
 const EXEC_BLOCK: u64 = 9216;
 const EXEC_SLOTS: u64 = 9217;
-const EXEC_PAGES: u64 = 32;
+const EXEC_PAGES: u64 = 1;
+/// GNU binutils' assembler and linker, their libraries (BFD, CTF, SFrame,
+/// and the opcodes AArch64's assembler links to) and zstd's, which BFD
+/// links to.
+const AS_FILE: u64 = 9472;
+const LD_FILE: u64 = 9664;
+const LIBBFD_FILE: u64 = 10112;
+const LIBCTF_FILE: u64 = 10432;
+const LIBSFRAME_FILE: u64 = 10496;
+const LIBZSTD_FILE: u64 = 10528;
+const LIBOPCODES_FILE: u64 = 10752;
+const BINUTILS_END: u64 = 11072;
 const STATE_SLOTS: u64 = 512;
-const STATE_PAGES: u64 = 36;
+const STATE_PAGES: u64 = 42;
 const POOL_SLOTS: u64 = STATE_SLOTS + STATE_PAGES;
 /// The signal restorer's page ([`signal::TRAMPOLINE`]).
 const TRAMPOLINE_SLOT: u64 = 1000;
-const PROC_SLOTS: u64 = 1024;
-const PROC_SPAN: u64 = 1024;
+const PROC_SLOTS: u64 = 16384;
+const PROC_SPAN: u64 = 2048;
 /// A frame of a process's that `munmap` gave back ([`Proc::frames`]).
 const FREE: u16 = u16::MAX;
 const MAX_PROCS: usize = 7;
@@ -186,6 +204,13 @@ const MAKE_VA: u64 = USER_BASE + 0x1_7700_0000;
 const LIBTCC_VA: u64 = USER_BASE + 0x1_7800_0000;
 const TOOLS_VA: u64 = USER_BASE + 0x1_7900_0000;
 const EXEC_VA: u64 = USER_BASE + 0x1_7a00_0000;
+const AS_VA: u64 = USER_BASE + 0x1_7b00_0000;
+const LD_VA: u64 = USER_BASE + 0x1_7c00_0000;
+const LIBBFD_VA: u64 = USER_BASE + 0x1_7d00_0000;
+const LIBCTF_VA: u64 = USER_BASE + 0x1_7e00_0000;
+const LIBSFRAME_VA: u64 = USER_BASE + 0x1_7f00_0000;
+const LIBZSTD_VA: u64 = USER_BASE + 0x1_8000_0000;
+const LIBOPCODES_VA: u64 = USER_BASE + 0x1_8100_0000;
 /// Where Debian puts glibc.
 const LIBC_PATH: &[u8] = if cfg!(target_arch = "x86_64") {
     b"/lib/x86_64-linux-gnu/libc.so.6"
@@ -248,6 +273,7 @@ const O_DIRECTORY: u32 = if cfg!(target_arch = "x86_64") { 0o200000 } else { 0o4
 const O_NOFOLLOW: u32 = if cfg!(target_arch = "x86_64") { 0o400000 } else { 0o100000 };
 const O_CLOEXEC: u32 = 0o2000000;
 const CLONE_VM: u64 = 0x100;
+const CLONE_VFORK: u64 = 0x4000;
 const WNOHANG: u64 = 1;
 const WUNTRACED: u64 = 2;
 const WCONTINUED: u64 = 8;
@@ -271,6 +297,7 @@ enum Sys {
     Read,
     Write,
     Writev,
+    Readv,
     Openat,
     Close,
     Fstat,
@@ -288,6 +315,7 @@ enum Sys {
     Dup3,
     Fcntl,
     Fork,
+    Vfork,
     Clone,
     Execve,
     Exit,
@@ -315,6 +343,7 @@ enum Sys {
     Getrandom,
     Prlimit,
     Getrlimit,
+    Getrusage,
     Times,
     /// Answered with `ENOSYS` without a word: callers expect it.
     Quiet,
@@ -398,6 +427,7 @@ fn decode(nr: u64, a: [u64; 6]) -> (Sys, [u64; 6]) {
         11 => Sys::Munmap,
         12 => Sys::Brk,
         16 => Sys::Ioctl,
+        19 => Sys::Readv,
         20 => Sys::Writev,
         21 => return (Sys::Faccessat, [cwd, a[0], a[1], 0, 0, 0]),
         22 => return (Sys::Pipe2, [a[0], 0, 0, 0, 0, 0]),
@@ -428,7 +458,8 @@ fn decode(nr: u64, a: [u64; 6]) -> (Sys, [u64; 6]) {
         55 => Sys::Getsockopt,
         40 => Sys::Sendfile,
         56 => Sys::Clone,
-        57 | 58 => Sys::Fork,
+        57 => Sys::Fork,
+        58 => Sys::Vfork,
         59 => Sys::Execve,
         60 => Sys::ExitThread,
         231 => Sys::Exit,
@@ -448,6 +479,7 @@ fn decode(nr: u64, a: [u64; 6]) -> (Sys, [u64; 6]) {
         95 => Sys::Umask,
         96 => Sys::Gettimeofday,
         97 => Sys::Getrlimit,
+        98 => Sys::Getrusage,
         100 => Sys::Times,
         102 | 104 | 107 | 108 => Sys::Zero,
         109 => Sys::Setpgid,
@@ -497,6 +529,7 @@ fn decode(nr: u64, a: [u64; 6]) -> (Sys, [u64; 6]) {
         67 => Sys::Pread,
         63 => Sys::Read,
         64 => Sys::Write,
+        65 => Sys::Readv,
         66 => Sys::Writev,
         71 => Sys::Sendfile,
         78 => Sys::Readlinkat,
@@ -534,6 +567,7 @@ fn decode(nr: u64, a: [u64; 6]) -> (Sys, [u64; 6]) {
         157 => Sys::Setsid,
         160 => Sys::Uname,
         163 => Sys::Getrlimit,
+        165 => Sys::Getrusage,
         166 => Sys::Umask,
         169 => Sys::Gettimeofday,
         173 => Sys::Getppid,
@@ -595,6 +629,9 @@ enum Blocked {
     Suspend,
     /// `poll`: until a descriptor is ready, or the tick `until`.
     Poll { fds: u64, n: u64, until: u64 },
+    /// `vfork` (or `clone` with `CLONE_VFORK`): until child `pid` has
+    /// exec'd or ended.
+    Vfork { pid: u32 },
     /// `futex`: until woken at `addr` or the tick `until`; `seq` orders
     /// the waiters.
     Futex { addr: u64, until: u64, seq: u64 },
@@ -648,6 +685,8 @@ struct Proc {
     stopped: bool,
     stop_sig: u8,
     report: Report,
+    /// A `vfork` child that has yet to exec or end: its parent waits.
+    vfork: bool,
     /// Slots used of its span.
     cursor: u64,
     cwd: u16,
@@ -672,10 +711,10 @@ struct Proc {
     code: [u64; CHILD_PAGES / 64],
     /// The runs of bundle-file pages it maps (code, read-only data; the
     /// restorer page first).
-    shared: [Shared; 12],
+    shared: [Shared; 24],
     nshared: usize,
     /// Libraries loaded by `mmap` ([`mmap_file`]): their span and inode.
-    libs: [(u64, u64, u16); 4],
+    libs: [(u64, u64, u16); 8],
     nlibs: usize,
     /// `setitimer`'s real-time timer: the tick `SIGALRM` is due (0: none),
     /// and the ticks between one and the next (0: once).
@@ -1083,10 +1122,11 @@ impl State {
     /// fixed-address program where it is linked (as the program, below the
     /// mapping area, only). (entry, program headers' address, their count,
     /// the image's end). Pages that are written get a copy; the rest are
-    /// the file's own, shared; or, for a file of the tree (no `file_slot`),
-    /// copies too, code in pages of code ([`State::map_code`]).
-    fn load(&mut self, i: usize, image: &[u8], file_slot: Option<u64>, base: u64) -> Result<(u64, u64, u64, u64), &'static str> {
-        let elf = Elf::parse(image).map_err(|_| "not an ELF executable")?;
+    /// the file's own, shared; or, for a file of the tree, every page is
+    /// read from the file into one of its own, code into pages of code
+    /// ([`State::map_code`]).
+    fn load(&mut self, i: usize, src: Src, base: u64) -> Result<(u64, u64, u64, u64), &'static str> {
+        let elf = src.elf().map_err(|_| "not an ELF executable")?;
         if elf.machine != MACHINE {
             return Err("not for this machine");
         }
@@ -1114,6 +1154,16 @@ impl State {
                 phdr = base + seg.vaddr + (phoff - seg.file_offset);
             }
             end = end.max(hi);
+            let (image, file_slot) = match src {
+                Src::Bundle { bytes, slot } => (bytes, slot),
+                Src::Tree { ino, .. } => {
+                    if seg.executable && seg.writable {
+                        return Err("an unsupported segment layout");
+                    }
+                    self.load_pages(i, ino, &seg, base, lo, hi)?;
+                    continue;
+                }
+            };
             if seg.writable {
                 for page in (lo..hi).step_by(PAGE as usize) {
                     self.map_private(i, base + page).map_err(|_| "out of memory")?;
@@ -1126,27 +1176,6 @@ impl State {
             if seg.executable && seg.writable {
                 return Err("an unsupported segment layout");
             }
-            let Some(file_slot) = file_slot else {
-                // Each page as the file has it (zeros past its bytes).
-                let bytes = elf.file_bytes(&seg);
-                for page in (lo..hi).step_by(PAGE as usize) {
-                    let mut buf = [0u8; PAGE as usize];
-                    let (from, to) = (page.max(seg.vaddr), (page + PAGE).min(seg.vaddr + seg.file_size));
-                    if from < to {
-                        let src = &bytes[(from - seg.vaddr) as usize..(to - seg.vaddr) as usize];
-                        buf[(from - page) as usize..(to - page) as usize].copy_from_slice(src);
-                    }
-                    let made = if seg.executable {
-                        self.map_code(i, base + page, &buf)
-                    } else {
-                        self.map_private(i, base + page).map(|_| {
-                            self.copy_out(i, base + page, &buf);
-                        })
-                    };
-                    made.map_err(|_| "out of memory")?;
-                }
-                continue;
-            };
             if seg.vaddr % PAGE != seg.file_offset % PAGE {
                 return Err("an unsupported segment layout");
             }
@@ -1174,6 +1203,45 @@ impl State {
         Ok((base + elf.entry, phdr, phnum as u64, base + end))
     }
 
+    /// Segment `seg`'s pages [`lo`, `hi`) of a program in file `ino` of
+    /// the tree, each read from the file (zeros past its bytes) into a
+    /// page of process `i`'s own at `base` on.
+    fn load_pages(&mut self, i: usize, ino: u16, seg: &Segment, base: u64, lo: u64, hi: u64) -> Result<(), &'static str> {
+        for page in (lo..hi).step_by(PAGE as usize) {
+            let mut buf = [0u8; PAGE as usize];
+            let (from, to) = (page.max(seg.vaddr), (page + PAGE).min(seg.vaddr + seg.file_size));
+            let mut at = from;
+            while at < to {
+                let got = self.fs.read(ino, seg.file_offset + (at - seg.vaddr), &mut buf[(at - page) as usize..(to - page) as usize]);
+                if got == 0 {
+                    return Err("the file is cut short");
+                }
+                at += got as u64;
+            }
+            if self.is_present(i, base + page) {
+                // A page an earlier segment has too (a linker that packs
+                // them, as tcc does on AArch64): this one's bytes and zeros
+                // written into it, the rest kept.
+                let end = (page + PAGE).min(seg.vaddr + seg.mem_size);
+                let mirror = base + page - CHILD + MIRROR + i as u64 * SPAN;
+                let at = (from - page) as usize;
+                // SAFETY: the page is mapped here, writable, at `mirror`;
+                // [at, end - page) is within it.
+                unsafe { core::ptr::copy_nonoverlapping(buf[at..].as_ptr(), (mirror as *mut u8).add(at), (end - from) as usize) };
+                continue;
+            }
+            let made = if seg.executable {
+                self.map_code(i, base + page, &buf)
+            } else {
+                self.map_private(i, base + page).map(|_| {
+                    self.copy_out(i, base + page, &buf);
+                })
+            };
+            made.map_err(|_| "out of memory")?;
+        }
+        Ok(())
+    }
+
     // ---- processes ---------------------------------------------------
 
     fn new_proc(&mut self, ppid: u32) -> Option<usize> {
@@ -1188,6 +1256,7 @@ impl State {
         p.status = 0;
         p.stopped = false;
         p.report = Report::None;
+        p.vfork = false;
         p.cursor = 0;
         p.cwd = ROOT;
         p.fds = [0; MAX_FDS];
@@ -1306,19 +1375,19 @@ impl State {
         let p = &mut self.procs[i];
         (p.shared[0], p.nshared, p.nlibs) = (tramp, 1, 0);
         self.map_run(i, tramp).map_err(|_| "out of memory")?;
-        let (program, slot) = match image {
-            Prog::Image(k) => (self.images[k].bytes, Some(self.images[k].slot)),
-            // SAFETY: the file's bytes, read into the buffer at EXEC_VA,
-            // which nothing else uses until the next exec.
-            Prog::File(n) => (unsafe { core::slice::from_raw_parts(EXEC_VA as *const u8, n) }, None),
+        let src = match image {
+            Prog::Image(k) => Src::Bundle { bytes: self.images[k].bytes, slot: self.images[k].slot },
+            // SAFETY: the file's first bytes, read into the buffer at
+            // EXEC_VA, which nothing else uses until the next exec.
+            Prog::File { ino, len, head } => Src::Tree { head: unsafe { core::slice::from_raw_parts(EXEC_VA as *const u8, head) }, ino, len },
         };
-        let (entry, phdr, phnum, end) = self.load(i, program, slot, PROGRAM_BASE)?;
-        let (start, interp_base) = match Elf::parse(program).ok().and_then(|e| e.interpreter()) {
+        let (entry, phdr, phnum, end) = self.load(i, src, PROGRAM_BASE)?;
+        let (start, interp_base) = match src.elf().ok().and_then(|e| e.interpreter()) {
             Some(path) => {
                 let ino = self.fs.resolve(ROOT, path, true).map_err(|_| "its interpreter is missing")?;
                 let k = self.fs.image(ino).ok_or("its interpreter is not a program")?;
                 let Img { bytes, slot } = self.images[k];
-                (self.load(i, bytes, Some(slot), INTERP_BASE)?.0, INTERP_BASE)
+                (self.load(i, Src::Bundle { bytes, slot }, INTERP_BASE)?.0, INTERP_BASE)
             }
             None => (entry, 0),
         };
@@ -1644,6 +1713,7 @@ fn answer(st: &mut State, t: usize, call: Sys, a: [u64; 6]) -> Out {
         Sys::Read => read(st, i, a[0], a[1], a[2]),
         Sys::Write => write(st, i, a[0], a[1], a[2]),
         Sys::Writev => writev(st, i, a[0], a[1], a[2]),
+        Sys::Readv => readv(st, i, a[0], a[1], a[2]),
         Sys::Openat => r(openat(st, i, a)),
         Sys::Close => {
             if st.file(i, a[0]).is_none() {
@@ -1729,12 +1799,13 @@ fn answer(st: &mut State, t: usize, call: Sys, a: [u64; 6]) -> Out {
             st.fs.truncate(o.ino, a[1]).map(|_| 0)
         })),
         Sys::Fork => r(fork(st, t)),
+        Sys::Vfork => vfork(st, t, 0),
         Sys::Clone if a[0] & CLONE_THREAD != 0 && a[0] & CLONE_VM != 0 => r(new_thread(st, t, a)),
         Sys::Clone if a[0] & CLONE_THREAD != 0 => Ret(err(ENOSYS)),
-        // A process sharing its parent's memory (vfork's kind, as musl's
-        // posix_spawn makes one): a copy, on the stack it was given. The
-        // parent goes on meanwhile, where vfork's would wait for an exec;
-        // posix_spawn's waits on a pipe the exec closes anyway.
+        // vfork's kind, as musl's posix_spawn makes one: see [`vfork`].
+        Sys::Clone if a[0] & CLONE_VFORK != 0 => vfork(st, t, a[1]),
+        // A process sharing its parent's memory without vfork's wait: a
+        // copy, on the stack it was given.
         Sys::Clone if a[0] & CLONE_VM != 0 => r(fork_on(st, t, a[1])),
         Sys::Clone => r(fork(st, t)),
         Sys::Execve => match execve(st, t, a[0], a[1], a[2]) {
@@ -1834,6 +1905,8 @@ fn answer(st: &mut State, t: usize, call: Sys, a: [u64; 6]) -> Out {
             if at == 0 { Ret(0) } else { r(st.put(i, at, &l)) }
         }
         Sys::Times => Ret(superior_sys::ticks()),
+        // Resources used (as reports its time): none counted, all zero.
+        Sys::Getrusage => r(st.put(i, a[1], &[0u8; 144])),
         Sys::Quiet => Ret(err(ENOSYS)),
         Sys::Sendfile => Ret(err(EINVAL)),
         Sys::Unsupported(n) => {
@@ -2188,6 +2261,32 @@ fn writev(st: &mut State, i: usize, fd: u64, iov: u64, cnt: u64) -> Out {
     Out::Ret(total)
 }
 
+/// `readv`: [`read`] into each buffer in turn, until one is not filled.
+/// Waiting, it waits as a `read` into the first.
+fn readv(st: &mut State, i: usize, fd: u64, iov: u64, cnt: u64) -> Out {
+    let mut total = 0;
+    for k in 0..cnt.min(64) {
+        let (Some(base), Some(len)) = (st.word(i, iov + 16 * k), st.word(i, iov + 16 * k + 8)) else {
+            return Out::Ret(err(EFAULT));
+        };
+        if len == 0 {
+            continue;
+        }
+        match read(st, i, fd, base, len) {
+            Out::Ret(v) if (v as i64) < 0 => return Out::Ret(if total > 0 { total } else { v }),
+            Out::Ret(v) => {
+                total += v;
+                if v < len {
+                    break;
+                }
+            }
+            Out::Block(_) if total == 0 => return Out::Block(Blocked::Read { fd, buf: base, len }),
+            _ => break,
+        }
+    }
+    Out::Ret(total)
+}
+
 fn getcwd(st: &mut State, i: usize, buf: u64, size: u64) -> Result<u64, u64> {
     // Walk up to the root, writing names backwards.
     let mut path = [0u8; 256];
@@ -2323,12 +2422,30 @@ fn unpack(fs: &mut Fs, mut tar: &[u8]) -> Result<(), &'static str> {
     Ok(())
 }
 
-/// What `exec` runs: a bundle file, or a file of the tree read into the
-/// buffer (its length).
+/// What `exec` runs: a bundle file, or a file of the tree (its inode and
+/// length, and how much of it is in the buffer).
 #[derive(Clone, Copy)]
 enum Prog {
     Image(usize),
-    File(usize),
+    File { ino: u16, len: u64, head: usize },
+}
+
+/// What [`State::load`] loads: a bundle file (its bytes, mapped here, and
+/// its first page's slot), or a file of the tree, its first bytes (`head`)
+/// at hand and the rest read as it is loaded.
+#[derive(Clone, Copy)]
+enum Src {
+    Bundle { bytes: &'static [u8], slot: u64 },
+    Tree { head: &'static [u8], ino: u16, len: u64 },
+}
+
+impl Src {
+    fn elf(self) -> Result<Elf<'static>, superior_objects::elf::ElfError> {
+        match self {
+            Src::Bundle { bytes, .. } => Elf::parse(bytes),
+            Src::Tree { head, len, .. } => Elf::parse_head(head, len),
+        }
+    }
 }
 
 /// A bundle file that is an ELF image, mapped from its start where the
@@ -2362,7 +2479,7 @@ fn mmap_file(st: &mut State, i: usize, addr: u64, len: u64, prot: u64, fixed: bo
         if let Ok(elf) = Elf::parse(bytes) {
             let lowest = elf.segments().flatten().map(|s| s.vaddr & !(PAGE - 1)).min().unwrap_or(0);
             let at = reserve(st)?;
-            st.load(i, bytes, Some(slot), at - lowest).map_err(|_| ENOMEM)?;
+            st.load(i, Src::Bundle { bytes, slot }, at - lowest).map_err(|_| ENOMEM)?;
             let p = &mut st.procs[i];
             if p.nlibs < p.libs.len() {
                 p.libs[p.nlibs] = (at, at + len, o.ino);
@@ -2414,6 +2531,25 @@ fn mmap_file(st: &mut State, i: usize, addr: u64, len: u64, prot: u64, fixed: bo
 /// `fork`: a new process with a copy of task `t`'s process's own pages,
 /// its descriptors and directory, and one thread, with `t`'s registers (0
 /// in the result).
+/// `vfork`, or `clone` with `CLONE_VFORK`: a `fork` (onto stack `sp`, if
+/// not 0) whose parent waits until the child has exec'd or ended, as
+/// Linux's does. Linux's child borrows its parent's memory meanwhile;
+/// this one has a copy, so the wait is what is the same (what the child
+/// writes before it execs, its parent does not see, which a program
+/// keeping to what vfork allows does not rely on).
+fn vfork(st: &mut State, t: usize, sp: u64) -> Out {
+    match fork_on(st, t, sp) {
+        Ok(pid) => {
+            // The child runs once this server next waits: not yet.
+            if let Some(c) = st.procs.iter().position(|p| p.used && p.pid as u64 == pid) {
+                st.procs[c].vfork = true;
+            }
+            Out::Block(Blocked::Vfork { pid: pid as u32 })
+        }
+        Err(e) => Out::Ret(err(e)),
+    }
+}
+
 fn fork(st: &mut State, t: usize) -> Result<u64, u64> {
     fork_on(st, t, 0)
 }
@@ -2500,29 +2636,30 @@ fn execve(st: &mut State, t: usize, path: u64, argv: u64, envp: u64) -> Result<(
     let image = match (st.fs.image(ino), st.fs.kind(ino)) {
         (Some(k), _) => Prog::Image(k),
         (None, Kind::Dir) => return Err(EACCES),
-        // A program in a file of the tree (one a compiler made, say):
-        // read whole into the buffer, if it fits; else not one to run here
-        // (a shell runs a script so refused itself).
+        // A program in a file of the tree (one a compiler made, say): its
+        // first page read into the buffer, for its headers, the rest as it
+        // is loaded; else not one to run here (a shell runs a script so
+        // refused itself).
         (None, Kind::File) => {
-            let size = st.fs.size(ino);
-            if size > EXEC_PAGES * PAGE {
-                return Err(ENOMEM);
-            }
+            let len = st.fs.size(ino);
+            let want = len.min(EXEC_PAGES * PAGE) as usize;
             // SAFETY: the buffer's EXEC_PAGES pages, mapped writable here
             // for this server's life; only exec uses them.
-            let buf = unsafe { core::slice::from_raw_parts_mut(EXEC_VA as *mut u8, (EXEC_PAGES * PAGE) as usize) };
+            let buf = unsafe { core::slice::from_raw_parts_mut(EXEC_VA as *mut u8, want) };
             let mut n = 0;
-            while (n as u64) < size {
-                let got = st.fs.read(ino, n as u64, &mut buf[n..size as usize]);
+            while n < want {
+                let got = st.fs.read(ino, n as u64, &mut buf[n..]);
                 if got == 0 {
                     break;
                 }
                 n += got;
             }
-            if Elf::parse(&buf[..n]).map_or(true, |e| e.machine != MACHINE) {
+            // Refused now, while the old program is still there: a file
+            // not for this machine, or one cut short of its segments.
+            if Elf::parse_head(&buf[..n], len).map_or(true, |e| e.machine != MACHINE || e.segments().any(|s| s.is_err())) {
                 return Err(ENOEXEC);
             }
-            Prog::File(n)
+            Prog::File { ino, len, head: n }
         }
         _ => return Err(ENOEXEC),
     };
@@ -2543,7 +2680,9 @@ fn execve(st: &mut State, t: usize, path: u64, argv: u64, envp: u64) -> Result<(
             }
         }
     }
-    // Past here there is no going back: the old program is gone.
+    // Past here there is no going back: the old program is gone (and a
+    // vfork parent goes on).
+    st.procs[i].vfork = false;
     st.unmake_space(i);
     for k in 0..MAX_TASKS {
         if k != t && st.tasks[k].used && st.tasks[k].proc as usize == i {
@@ -2702,6 +2841,8 @@ fn wake(st: &mut State) {
                 Blocked::Sleep { until } if now >= until => Out::Ret(0),
                 Blocked::Poll { fds, n, until } => poll(st, i, fds, n, until),
                 Blocked::Net { call, a } => net_call(st, i, call, a),
+                Blocked::Vfork { pid } if st.procs.iter().any(|p| p.used && !p.zombie && p.pid == pid && p.vfork) => Out::Block(blocked),
+                Blocked::Vfork { pid } => Out::Ret(pid as u64),
                 Blocked::Futex { until, .. } if now >= until => Out::Ret(err(ETIMEDOUT)),
                 Blocked::Sleep { .. } | Blocked::Suspend | Blocked::Futex { .. } => Out::Block(blocked),
             };
@@ -2714,6 +2855,12 @@ fn wake(st: &mut State) {
                 st.tasks[t].blocked = Blocked::None;
                 finish(st, t, pc, v, Some(place));
                 moved = true;
+                continue;
+            }
+            // A vfork parent takes signals once its child has exec'd or
+            // ended, as Linux's waits (it cannot fail the call: the child
+            // is there).
+            if let Blocked::Vfork { .. } = blocked {
                 continue;
             }
             match st.next_signal(t) {
@@ -3620,6 +3767,27 @@ const RUNS: &[(&[&str], u32)] = &[
         ],
         0,
     ),
+    // GNU binutils: as assembles a string (data alone, the same on both
+    // ISAs), tcc compiles the C that prints it, and ld links the two
+    // against musl, the start files and the dynamic linker given.
+    (
+        &[
+            "sh",
+            "-c",
+            r#"cd /tmp/cc && printf '.section .rodata\n.globl greeting\ngreeting: .asciz "assembled by as, linked by ld"\n' > msg.s && as -o msg.o msg.s && printf '#include <stdio.h>\nextern const char greeting[];\nint main(void) { puts(greeting); return 0; }\n' > main.c && tcc -c -o main.o main.c && ld -o linked -dynamic-linker /lib/ld-musl-$(uname -m).so.1 /usr/lib/crt1.o /usr/lib/crti.o main.o msg.o -L/usr/lib -lc /usr/lib/crtn.o && ./linked"#,
+        ],
+        0,
+    ),
+    // A program larger than a page many times over, read from its file
+    // as it is loaded.
+    (
+        &[
+            "sh",
+            "-c",
+            r#"mkdir -p /home/big && cd /home/big && printf 'char big[200000] = {1};\nint main(void) { return big[0] == 1 && big[199999] == 0 ? 0 : 1; }\n' > big.c && tcc -o big big.c && [ $(wc -c < big) -gt 200000 ] && ./big && cd / && rm -r /home/big && echo ran a program of more than 200000 bytes"#,
+        ],
+        0,
+    ),
     // A program with a library of its own: pigz, with zlib, which musl's
     // dynamic linker loads. BusyBox's gzip checks what it wrote.
     (&["sh", "-c", "seq 1 10000 > /tmp/n && pigz -p 2 -b 32 -k /tmp/n && ls /tmp && gzip -dc /tmp/n.gz | md5sum && md5sum < /tmp/n"], 0),
@@ -3753,6 +3921,13 @@ fn setup() -> Result<&'static mut State, &'static str> {
     let make = map_file(MAKE_FILE, MAKE_VA, LIBTCC_FILE - MAKE_FILE);
     let libtcc = map_file(LIBTCC_FILE, LIBTCC_VA, TOOLS_FILE - LIBTCC_FILE);
     let tools = map_file(TOOLS_FILE, TOOLS_VA, TOOLS_END - TOOLS_FILE);
+    let as_ = map_file(AS_FILE, AS_VA, LD_FILE - AS_FILE);
+    let ld = map_file(LD_FILE, LD_VA, LIBBFD_FILE - LD_FILE);
+    let libbfd = map_file(LIBBFD_FILE, LIBBFD_VA, LIBCTF_FILE - LIBBFD_FILE);
+    let libctf = map_file(LIBCTF_FILE, LIBCTF_VA, LIBSFRAME_FILE - LIBCTF_FILE);
+    let libsframe = map_file(LIBSFRAME_FILE, LIBSFRAME_VA, LIBZSTD_FILE - LIBSFRAME_FILE);
+    let libzstd = map_file(LIBZSTD_FILE, LIBZSTD_VA, LIBOPCODES_FILE - LIBZSTD_FILE);
+    let libopcodes = map_file(LIBOPCODES_FILE, LIBOPCODES_VA, BINUTILS_END - LIBOPCODES_FILE);
     // glibc's dynamic linker is where hello says it is.
     let glibc_ld_path = Elf::parse(hello).ok().and_then(|e| e.interpreter()).unwrap_or(b"");
     st.next_pid = 1;
@@ -3778,6 +3953,13 @@ fn setup() -> Result<&'static mut State, &'static str> {
         (b"/usr/bin/tcc", tcc, TCC_FILE),
         (b"/usr/bin/make", make, MAKE_FILE),
         (b"/usr/lib/libtcc.so", libtcc, LIBTCC_FILE),
+        (b"/usr/bin/as", as_, AS_FILE),
+        (b"/usr/bin/ld", ld, LD_FILE),
+        (b"/usr/lib/libbfd-2.40.so", libbfd, LIBBFD_FILE),
+        (b"/usr/lib/libctf.so.0", libctf, LIBCTF_FILE),
+        (b"/usr/lib/libsframe.so.0", libsframe, LIBSFRAME_FILE),
+        (b"/usr/lib/libzstd.so.1", libzstd, LIBZSTD_FILE),
+        (b"/usr/lib/libopcodes-2.40.so", libopcodes, LIBOPCODES_FILE),
     ];
     let mut tree = [(&b""[..], &b""[..]); MAX_IMAGES];
     let mut n = 0;

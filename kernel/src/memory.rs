@@ -42,33 +42,38 @@ static ARENA: Mutex<Arena> = Mutex::new(Arena {
     on: false,
 });
 
-/// Size of the root task's arena, in bits.
+/// Least size of the root task's arena, in bits.
 pub const ARENA_BITS: u8 = 23;
+/// What the root task's arena holds besides its boot bundle: its image,
+/// stack and page tables.
+const ARENA_SLACK: u64 = 2 << 20;
 
 /// Carves the root task's arena, once: before spare RAM is given away
 /// (see [`take_spare`]), so that a block of its size, aligned, is still
 /// whole. UEFI firmware leaves RAM in many more pieces than a BIOS does.
-/// False if there is no memory for it.
-pub fn reserve_arena() -> bool {
+/// Its size: [`ARENA_BITS`], or more for a boot bundle of `bundle` bytes
+/// that needs it. False if there is no memory for it.
+pub fn reserve_arena(bundle: u64) -> bool {
     let mut a = ARENA.lock();
     if a.end == 0 {
-        let Some(base) = carve(ARENA_BITS) else {
+        let bits = ((bundle + ARENA_SLACK).next_power_of_two().ilog2() as u8).max(ARENA_BITS);
+        let Some(base) = carve(bits) else {
             return false;
         };
         a.start = base;
-        a.end = base + (1 << ARENA_BITS);
+        a.end = base + (1 << bits);
     }
     true
 }
 
 /// Starts (or, after a fast reboot, starts again) handing out the root
 /// task's arena: from now until [`arena_off`], [`user_page`] takes pages
-/// from it. False if there is no memory for it.
+/// from it. False if it was never reserved ([`reserve_arena`]).
 pub fn arena_on() -> bool {
-    if !reserve_arena() {
+    let mut a = ARENA.lock();
+    if a.end == 0 {
         return false;
     }
-    let mut a = ARENA.lock();
     a.next = a.start;
     a.on = true;
     true

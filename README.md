@@ -1807,6 +1807,34 @@ holds the rest):
   stack given. `linux-test` runs `make` building `hi.c` and `./hi`
   printing `built by tcc: 42`, on both ISAs; the second boot's CSpace is
   2^14 slots too, for the buffer's.
+- The Linux personality runs GNU binutils, and programs of any size from
+  the tree. xtask adds Alpine 3.18's `as` and `ld` (2.40) with libbfd,
+  libopcodes, libctf, libsframe and zstd's library, pinned by hash
+  (AArch64's package keeps the two programs under the target's own
+  directory, `/usr/bin` linking to them). `execve` of a file of the tree
+  now reads only its first page, for the headers (`Elf::parse_head`
+  checks segments against the file's length), and the segments a page at
+  a time from the file, so there is no limit but memory; a file cut short
+  of its segments is refused before the old program is gone. A segment
+  sharing a page with an earlier one (tcc packs them on AArch64) has its
+  bytes written into that page rather than lost. `vfork` (and `clone`
+  with `CLONE_VFORK`, musl's `posix_spawn`) now has the parent wait until
+  the child execs or ends; the child still has a copy of the memory, not
+  the parent's own. `getrusage` and `readv` are answered. Files in memory
+  (`/tmp`) take more than 16 pages: the inode's last entry names an
+  indirect page of up to 2048 more (ld's AArch64 output is aligned to 64
+  KiB). For the room: a process's span is 2048 slots from 16384 (4 MiB
+  of its own pages, the personality's CSpace 2^15) and there are 16 spare
+  1 MiB blocks, from slot 1024; a process may map 24 runs and 8
+  libraries; the personality has 32 MiB (its 21 files are copied into its
+  memory) and 28 capabilities, so a component may now have 32 MiB
+  (`memory 25`) and 32 capabilities, and the manager's untyped memory is
+  64 MiB. The kernel sizes the manager's arena by the boot bundle (at
+  least 8 MiB, 16 MiB for the Linux test's 11 MiB one). `linux-test`
+  assembles a string with `as`, compiles the C printing it with
+  `tcc -c`, links the two with `ld` against musl's start files and
+  dynamic linker, and runs it (`assembled by as, linked by ld`), and runs
+  a 200 KB program tcc built under `/home`, on both ISAs.
 - Interrupt and exception entries clear the direction flag. User code may be
   interrupted mid-way through a backward copy, with the flag set; the kernel's own
   copies need it clear, and without the `cld` they ran backwards, wrecking saved

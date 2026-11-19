@@ -735,8 +735,10 @@ pub mod root {
     /// The root task's argument: the bundle's length, and in the bits from
     /// [`REBOOTS_SHIFT`] how many fast reboots came before this start.
     pub const REBOOTS_SHIFT: u32 = 32;
-    /// Size of [`UNTYPED`], in bits.
-    pub const UNTYPED_BITS: u8 = 25;
+    /// Size of [`UNTYPED`], in bits: 64 MiB, what every component's
+    /// memory comes from (the Linux personality's 32 MiB, its bundle files
+    /// copied into it, among them).
+    pub const UNTYPED_BITS: u8 = 26;
     /// Where the bundle is mapped, as an offset from the user window's base.
     pub const BUNDLE_OFFSET: u64 = 0x1_0000_0000;
     /// The root task's priority; a component can be given at most this.

@@ -63,6 +63,8 @@ impl Machine {
 
 pub struct Elf<'a> {
     data: &'a [u8],
+    /// The file's length: `data`'s, or more for [`Elf::parse_head`]'s.
+    len: u64,
     pub machine: Machine,
     pub entry: u64,
     /// Position-independent: load at any base and apply [`Elf::relocations`].
@@ -138,6 +140,7 @@ impl<'a> Elf<'a> {
         }
         Ok(Elf {
             data,
+            len: data.len() as u64,
             machine,
             entry,
             pie,
@@ -145,6 +148,18 @@ impl<'a> Elf<'a> {
             phentsize,
             phnum,
         })
+    }
+
+    /// Parses an image of which only its first bytes, `head`, are at hand
+    /// (the program headers must be in them), the file being `len` bytes
+    /// long: for a loader that reads the segments itself. Segments are
+    /// checked against `len`; [`Elf::file_bytes`] and the relocations are
+    /// not for such an image, and [`Elf::interpreter`] finds the
+    /// interpreter only if `head` holds its name.
+    pub fn parse_head(head: &'a [u8], len: u64) -> Result<Self, ElfError> {
+        let mut elf = Self::parse(head)?;
+        elf.len = len.max(head.len() as u64);
+        Ok(elf)
     }
 
     /// The `PT_LOAD` segments, validated. Iteration yields an error for
@@ -167,7 +182,7 @@ impl<'a> Elf<'a> {
                 executable: flags & PF_X != 0,
             };
             let file_end = seg.file_offset.checked_add(seg.file_size);
-            let ok = file_end.is_some_and(|e| e <= d.len() as u64)
+            let ok = file_end.is_some_and(|e| e <= self.len)
                 && seg.mem_size >= seg.file_size
                 && seg.vaddr.checked_add(seg.mem_size).is_some();
             Some(if ok {
@@ -313,6 +328,20 @@ mod tests {
         );
         assert!(s.readable && s.executable && !s.writable);
         assert_eq!(elf.file_bytes(&s), b"code");
+    }
+
+    #[test]
+    fn parses_only_the_head_of_a_longer_file() {
+        let img = image(0x1000, &[7u8; 5000], 5000);
+        let head = &img[..64 + PHDR_SIZE];
+        // Its segment runs past the head: within the file's length, fine;
+        // past it, not.
+        let elf = Elf::parse_head(head, img.len() as u64).unwrap();
+        let s = elf.segments().next().unwrap().unwrap();
+        assert_eq!((s.file_offset, s.file_size), ((64 + PHDR_SIZE) as u64, 5000));
+        let short = Elf::parse_head(head, img.len() as u64 - 1).unwrap();
+        assert_eq!(short.segments().next(), Some(Err(ElfError::BadSegment)));
+        assert_eq!(Elf::parse(head).unwrap().segments().next(), Some(Err(ElfError::BadSegment)));
     }
 
     #[test]

@@ -265,7 +265,7 @@ fn start_component_manager() -> Result<(), &'static str> {
         let mut spare = SPARE.lock();
         if spare.1 == 0 {
             // The Component Manager's arena first, while RAM is whole.
-            if !memory::reserve_arena() {
+            if !memory::reserve_arena(bundle.len() as u64) {
                 return Err("no memory for the Component Manager's arena");
             }
             let given = memory::take_spare(KERNEL_KEEPS, |base, bits| {

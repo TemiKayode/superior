@@ -4,8 +4,9 @@
 //! open-file descriptions processes share through their descriptors.
 //!
 //! Everything lives in pages this server maps at start (all zero is a
-//! valid empty state). A file's data is up to [`FILE_BLOCKS`] pages from a
-//! pool; directories hold no entries of their own: an inode names its
+//! valid empty state). A file's data is pages from a pool: the first
+//! [`DIRECT`] named in its inode, the rest (up to [`MAX_FILE_PAGES`]) in an
+//! indirect page the inode's last entry names; directories hold no entries of their own: an inode names its
 //! parent, and a directory's entries are the inodes that name it.
 //!
 //! The root is the server's ([`Fs::mount`], [`remote`]): what is made
@@ -27,7 +28,13 @@ use superior_objects::interfaces::fs as server;
 
 pub const MAX_INODES: usize = 256;
 pub const FILE_BLOCKS: usize = 16;
-pub const POOL_PAGES: usize = 196;
+/// A file's pages named in its inode; its last entry names the indirect
+/// page, which names the rest.
+const DIRECT: usize = FILE_BLOCKS - 1;
+const INDIRECT: usize = FILE_BLOCKS - 1;
+/// The most pages a file of the tree may have.
+const MAX_FILE_PAGES: usize = DIRECT + PAGE / 2;
+pub const POOL_PAGES: usize = 192;
 /// The filesystem server's longest name.
 pub const NAME_MAX: usize = server::MAX_NAME;
 /// Bytes of a path on the server, as it is given it.
@@ -120,7 +127,7 @@ pub struct Fs {
 }
 
 /// Files from the bundle at most.
-pub const MAX_IMAGES: usize = 13;
+pub const MAX_IMAGES: usize = 20;
 
 impl Fs {
     /// Makes the tree: each of `images` (the bundle's files) at its path,
@@ -588,7 +595,7 @@ impl Fs {
             _ => {
                 for (k, b) in buf[..n].iter_mut().enumerate() {
                     let at = off as usize + k;
-                    let block = i.blocks[at / PAGE];
+                    let block = self.block(ino, at / PAGE);
                     // SAFETY: a used block is a mapped pool page.
                     *b = if block == 0 { 0 } else { unsafe { *self.page(block).add(at % PAGE) } };
                 }
@@ -612,15 +619,18 @@ impl Fs {
             i.size = i.size.max(end as u32);
             return Ok(data.len());
         }
-        if end > (FILE_BLOCKS * PAGE) as u64 {
+        if end > (MAX_FILE_PAGES * PAGE) as u64 {
             return Err(EFBIG);
         }
         for (k, &b) in data.iter().enumerate() {
             let at = off as usize + k;
-            let mut block = self.inodes[ino as usize].blocks[at / PAGE];
+            let mut block = self.block(ino, at / PAGE);
             if block == 0 {
                 block = self.alloc().ok_or(ENOSPC)?;
-                self.inodes[ino as usize].blocks[at / PAGE] = block;
+                if let Err(e) = self.set_block(ino, at / PAGE, block) {
+                    self.free(block);
+                    return Err(e);
+                }
             }
             // SAFETY: as in `read`.
             unsafe { *self.page(block).add(at % PAGE) = b };
@@ -642,24 +652,74 @@ impl Fs {
             self.inodes[ino as usize].size = len as u32;
             return Ok(());
         }
-        if len > (FILE_BLOCKS * PAGE) as u64 {
+        if len > (MAX_FILE_PAGES * PAGE) as u64 {
             return Err(EFBIG);
         }
         let old = self.inodes[ino as usize].size as u64;
         // Zero what is cut off in the last page, free whole pages past it.
         for at in len..old.min(len.next_multiple_of(PAGE as u64)) {
-            let block = self.inodes[ino as usize].blocks[at as usize / PAGE];
+            let block = self.block(ino, at as usize / PAGE);
             if block != 0 {
                 // SAFETY: as in `read`.
                 unsafe { *self.page(block).add(at as usize % PAGE) = 0 };
             }
         }
-        for p in (len as usize).div_ceil(PAGE)..FILE_BLOCKS {
+        self.free_from(ino, (len as usize).div_ceil(PAGE));
+        self.inodes[ino as usize].size = len as u32;
+        Ok(())
+    }
+
+    /// Page `p` of file `ino`'s pool page (0: none, a hole).
+    fn block(&self, ino: u16, p: usize) -> u16 {
+        let i = &self.inodes[ino as usize];
+        if p < DIRECT {
+            return i.blocks[p];
+        }
+        match i.blocks[INDIRECT] {
+            0 => 0,
+            // SAFETY: a used block is a mapped pool page, of PAGE / 2 u16s.
+            ind => unsafe { *(self.page(ind) as *const u16).add(p - DIRECT) },
+        }
+    }
+
+    /// Makes `block` page `p` of file `ino`, making its indirect page if
+    /// it needs one.
+    fn set_block(&mut self, ino: u16, p: usize, block: u16) -> Result<(), u64> {
+        if p < DIRECT {
+            self.inodes[ino as usize].blocks[p] = block;
+            return Ok(());
+        }
+        let mut ind = self.inodes[ino as usize].blocks[INDIRECT];
+        if ind == 0 {
+            ind = self.alloc().ok_or(ENOSPC)?;
+            self.inodes[ino as usize].blocks[INDIRECT] = ind;
+        }
+        // SAFETY: as in `block`; p - DIRECT < PAGE / 2 (checked by the
+        // callers against MAX_FILE_PAGES).
+        unsafe { *(self.page(ind) as *mut u16).add(p - DIRECT) = block };
+        Ok(())
+    }
+
+    /// Frees file `ino`'s pages from page `first` on, and its indirect page
+    /// if none it names is left.
+    fn free_from(&mut self, ino: u16, first: usize) {
+        for p in first..DIRECT {
             let block = core::mem::take(&mut self.inodes[ino as usize].blocks[p]);
             self.free(block);
         }
-        self.inodes[ino as usize].size = len as u32;
-        Ok(())
+        let ind = self.inodes[ino as usize].blocks[INDIRECT];
+        if ind == 0 {
+            return;
+        }
+        for p in first.max(DIRECT)..MAX_FILE_PAGES {
+            // SAFETY: as in `set_block`.
+            let block = unsafe { core::mem::take(&mut *(self.page(ind) as *mut u16).add(p - DIRECT)) };
+            self.free(block);
+        }
+        if first <= DIRECT {
+            self.inodes[ino as usize].blocks[INDIRECT] = 0;
+            self.free(ind);
+        }
     }
 
     /// Removes `ino` (a directory only if empty).
@@ -680,10 +740,7 @@ impl Fs {
         if self.kind(ino) == Kind::Dir && self.entry(ino, 2).is_some() {
             return Err(ENOTEMPTY);
         }
-        for p in 0..FILE_BLOCKS {
-            let block = core::mem::take(&mut self.inodes[ino as usize].blocks[p]);
-            self.free(block);
-        }
+        self.free_from(ino, 0);
         self.inodes[ino as usize].kind = Kind::Free;
         Ok(())
     }

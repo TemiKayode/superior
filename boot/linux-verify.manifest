@@ -66,12 +66,12 @@ component linux
   image linux
   arg 1
   priority 10
-  # Its CNode (2^14 slots: a 1024-slot span per process, the state's and
-  # files' pages, the files, and from 9216 the buffer a program in a file
-  # of the tree is read into), address space, image, stack, the four
-  # files, the 8 MiB block and the 4 MiB one.
+  # Its CNode (2^15 slots: the state's and files' pages, the files, from
+  # 9216 the buffer a program in a file of the tree is read into, and a
+  # 2048-slot span per process from 16384), address space, image, stack,
+  # the four files, the 8 MiB block and the 4 MiB one.
   memory 24
-  cspace 14
+  cspace 15
   vspace 20
   # The files before the blocks, smallest first: memory is handed out in
   # order, and each block is aligned to its size.
