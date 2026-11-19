@@ -54,13 +54,12 @@
 //! Signals ([`signal`]): actions per process, masks per thread, `kill`
 //! and `tkill`, handlers run on the thread's stack and returned from. The terminal ([`tty`]): the serial
 //! console with Linux's line discipline, settings and foreground process
-//! group, so `^C` interrupts a job; `poll` and `nanosleep` wait on it and
-//! on the timer.
+//! group, so `^C` interrupts a job and `^Z` stops one (job control:
+//! [`signal`]); `poll` and `nanosleep` wait on it and on the timer.
 //!
 //! Not yet: more than one CPU for a process's threads, `vfork`'s kind of
 //! `clone` (memory shared without `CLONE_THREAD`), returning `munmap`'d
-//! pages, stopping and continuing jobs (`^Z`), fixed-address (non-PIE)
-//! executables.
+//! pages, fixed-address (non-PIE) executables.
 
 #![no_std]
 #![no_main]
@@ -156,6 +155,7 @@ const ESRCH: u64 = 3;
 const EINTR: u64 = 4;
 const ENOEXEC: u64 = 8;
 const ECHILD: u64 = 10;
+const EIO: u64 = 5;
 const EAGAIN: u64 = 11;
 const ENOMEM: u64 = 12;
 const EACCES: u64 = 13;
@@ -184,6 +184,8 @@ const O_NOFOLLOW: u32 = if cfg!(target_arch = "x86_64") { 0o400000 } else { 0o10
 const O_CLOEXEC: u32 = 0o2000000;
 const CLONE_VM: u64 = 0x100;
 const WNOHANG: u64 = 1;
+const WUNTRACED: u64 = 2;
+const WCONTINUED: u64 = 8;
 const ETIMEDOUT: u64 = 110;
 const CLONE_THREAD: u64 = 0x1_0000;
 const CLONE_SETTLS: u64 = 0x8_0000;
@@ -480,6 +482,20 @@ enum Blocked {
     /// `futex`: until woken at `addr` or the tick `until`; `seq` orders
     /// the waiters.
     Futex { addr: u64, until: u64, seq: u64 },
+    /// Its process stopped as its call was answered: the answer, given
+    /// once it continues.
+    Stopped { value: u64 },
+}
+
+/// What a process's parent has yet to hear from `wait4`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum Report {
+    None = 0,
+    /// It stopped (`WUNTRACED`).
+    Stopped,
+    /// It continued (`WCONTINUED`).
+    Continued,
 }
 
 /// What a system call comes to.
@@ -508,6 +524,11 @@ struct Proc {
     actions: [Action; 64],
     /// Its wait status once a zombie.
     status: u32,
+    /// Stopped (job control), by which signal, and what its parent has
+    /// yet to hear.
+    stopped: bool,
+    stop_sig: u8,
+    report: Report,
     /// Slots used of its span.
     cursor: u64,
     cwd: u16,
@@ -553,6 +574,8 @@ struct Task {
     mask: u64,
     saved_mask: u64,
     suspended: bool,
+    /// Suspended where it ran, its process stopped.
+    frozen: bool,
     /// Where to write 0 and wake a futex when it ends
     /// (`CLONE_CHILD_CLEARTID`, `set_tid_address`).
     clear_tid: u64,
@@ -898,6 +921,8 @@ impl State {
         p.pid = pid;
         p.ppid = ppid;
         p.status = 0;
+        p.stopped = false;
+        p.report = Report::None;
         p.cursor = 0;
         p.cwd = ROOT;
         p.fds = [0; MAX_FDS];
@@ -931,6 +956,7 @@ impl State {
             mask: 0,
             saved_mask: 0,
             suspended: false,
+            frozen: false,
             clear_tid: 0,
         };
         Some(t)
@@ -1134,6 +1160,7 @@ impl State {
         }
         let p = &mut self.procs[i];
         p.zombie = true;
+        p.stopped = false;
         p.status = status;
         if p.ppid == 0 {
             p.used = false;
@@ -1697,6 +1724,17 @@ fn read(st: &mut State, i: usize, fd: u64, buf: u64, len: u64) -> Out {
     let want = len.min(tmp.len() as u64) as usize;
     let n = match o.kind {
         FileKind::Console => 0,
+        // A reader not in the terminal's foreground group: its group is
+        // stopped (SIGTTIN), and it reads once continued in the
+        // foreground; or, if it ignores or blocks SIGTTIN, EIO.
+        FileKind::Tty if st.procs[i].pgid != st.tty.fg => {
+            if !st.takes(i, signal::SIGTTIN) {
+                return Out::Ret(err(EIO));
+            }
+            let g = st.procs[i].pgid;
+            st.post_group(g, signal::SIGTTIN);
+            return Out::Block(Blocked::Read { fd, buf, len });
+        }
         FileKind::Tty if !st.tty.readable() => {
             if o.flags & O_NONBLOCK != 0 {
                 return Out::Ret(err(EAGAIN));
@@ -2076,17 +2114,34 @@ fn wait4(st: &mut State, i: usize, pid: i64, status: u64, options: u64) -> Out {
     if !st.procs.iter().any(|p| mine(p)) {
         return Out::Ret(err(ECHILD));
     }
-    let Some(c) = st.procs.iter().position(|p| mine(p) && p.zombie) else {
+    // An ended child; or, if asked, one that stopped or continued since
+    // its parent last heard (wait status 0x7f with the signal above it,
+    // or 0xffff).
+    let told = |p: &Proc| {
+        p.zombie
+            || options & WUNTRACED != 0 && p.stopped && p.report == Report::Stopped
+            || options & WCONTINUED != 0 && p.report == Report::Continued
+    };
+    let Some(c) = st.procs.iter().position(|p| mine(p) && told(p)) else {
         if options & WNOHANG != 0 {
             return Out::Ret(0);
         }
         return Out::Block(Blocked::Wait { pid, status, options });
     };
-    let (cpid, cstatus) = (st.procs[c].pid, st.procs[c].status);
+    let p = &st.procs[c];
+    let (cpid, cstatus) = match (p.zombie, p.report) {
+        (true, _) => (p.pid, p.status),
+        (false, Report::Stopped) => (p.pid, (p.stop_sig as u32) << 8 | 0x7f),
+        _ => (p.pid, 0xffff),
+    };
     if status != 0 && st.put(i, status, &cstatus.to_le_bytes()).is_err() {
         return Out::Ret(err(EFAULT));
     }
-    st.procs[c].used = false;
+    if st.procs[c].zombie {
+        st.procs[c].used = false;
+    } else {
+        st.procs[c].report = Report::None;
+    }
     Out::Ret(cpid as u64)
 }
 
@@ -2099,8 +2154,22 @@ fn finish(st: &mut State, t: usize, pc: u64, value: u64, place: Option<u64>) {
         return;
     }
     let i = st.tasks[t].proc as usize;
+    // Its process stopped (by a signal it takes now, or another thread
+    // took): the answer is kept, and given once it continues.
+    let hold = |st: &mut State, t: usize| {
+        let place = place.unwrap_or_else(|| syscall(Syscall::ReplySave, 0, [0; 4]).msg[0]);
+        let task = &mut st.tasks[t];
+        (task.place, task.pc, task.blocked) = (place, pc, Blocked::Stopped { value });
+    };
+    if st.procs[i].stopped {
+        return hold(st, t);
+    }
     let (pc, value) = match st.next_signal(t) {
         Next::None => (pc, value),
+        Next::Stop(sig) => {
+            st.stop(i, sig, Some(t));
+            return hold(st, t);
+        }
         Next::Kill(sig) => {
             st.exit(i, sig);
             return;
@@ -2131,17 +2200,35 @@ fn wake(st: &mut State) {
                 continue;
             }
             let i = st.tasks[t].proc as usize;
+            // Stopped: nothing goes on but SIGKILL.
+            if st.procs[i].stopped {
+                if st.killed_while_stopped(i) {
+                    st.exit(i, signal::SIGKILL);
+                    moved = true;
+                }
+                continue;
+            }
             let blocked = st.tasks[t].blocked;
             let now = superior_sys::ticks();
             let out = match blocked {
                 Blocked::None => {
-                    // Running: only a signal that ends it acts now.
-                    if let Next::Kill(sig) = st.next_signal(t) {
-                        st.exit(i, sig);
-                        moved = true;
+                    // Running: only a signal that ends or stops it acts
+                    // now.
+                    match st.next_signal(t) {
+                        Next::Kill(sig) => {
+                            st.exit(i, sig);
+                            moved = true;
+                        }
+                        Next::Stop(sig) => {
+                            st.stop(i, sig, None);
+                            moved = true;
+                        }
+                        _ => {}
                     }
                     continue;
                 }
+                // Continued: the answer it was held with.
+                Blocked::Stopped { value } => Out::Ret(value),
                 Blocked::Read { fd, buf, len } => read(st, i, fd, buf, len),
                 Blocked::Write { fd, buf, len } => write(st, i, fd, buf, len),
                 Blocked::Writev { fd, iov, cnt } => writev(st, i, fd, iov, cnt),
@@ -2166,6 +2253,12 @@ fn wake(st: &mut State) {
                 Next::None => {}
                 Next::Kill(sig) => {
                     st.exit(i, sig);
+                    moved = true;
+                }
+                // Stopped where it waits; the call goes on once it
+                // continues.
+                Next::Stop(sig) => {
+                    st.stop(i, sig, None);
                     moved = true;
                 }
                 Next::Handle(sig) => {

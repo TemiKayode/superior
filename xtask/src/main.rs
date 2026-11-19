@@ -547,6 +547,29 @@ const LINUX_SESSION: &[(&str, &str, bool)] = &[
     ("sh -c 'echo started; sleep 100'\n", "\nstarted", false),
     ("\x03", "", true),
     ("echo status $?\n", "\nstatus 130", true),
+    // Job control. ^Z stops the foreground job (SIGTSTP to its group:
+    // the shell and the sleep it waits for); fg continues it.
+    ("sh -c 'echo one; sleep 2; echo two'\n", "\none", false),
+    ("\x1a", "Stopped", true),
+    ("jobs\n", "Stopped", true),
+    ("fg\n", "\ntwo", true),
+    // bg continues it in the background, and wait waits for it.
+    ("sh -c 'echo started; sleep 2; echo in the background'\n", "\nstarted", false),
+    ("\x1a", "Stopped", true),
+    ("bg; wait; echo waited\n", "\nwaited", true),
+    // A background job reading the terminal is stopped (SIGTTIN), and
+    // reads once brought to the foreground.
+    ("sh -c 'read x; echo read $x' &\n", "", true),
+    ("jobs\n", "Stopped", true),
+    ("fg\n", "read x;", false),
+    ("hello\n", "\nread hello", true),
+    // A job stopped while running in user space (suspended where it
+    // was), then ended by SIGKILL while stopped: the shell reports the
+    // job so ended.
+    ("sh -c 'echo spinning; while :; do :; done'\n", "\nspinning", false),
+    ("\x1a", "Stopped", true),
+    ("kill -9 %1\n", "", true),
+    ("jobs\n", "Killed", true),
     ("exit\n", "", false),
 ];
 const LINUX_PROMPT: &str = "linux$ ";

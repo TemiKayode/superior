@@ -225,6 +225,9 @@ struct Kernel {
     fault_ep: [Option<(u16, u64)>; MAX_THREADS],
     /// Blocked in a fault call: the reply says how to resume.
     in_fault: [bool; MAX_THREADS],
+    /// That fault call is a foreign system call: its pc is past the
+    /// instruction that made it.
+    syscall_fault: [bool; MAX_THREADS],
     /// Runs a foreign ABI: its system calls are faults (`REGS_FOREIGN`).
     foreign: [bool; MAX_THREADS],
     /// Its thread pointer (`REGS_SET_TLS`; on AArch64 also whatever it
@@ -396,6 +399,7 @@ static KERNEL: Mutex<Kernel> = Mutex::new(Kernel {
     io_mapped: no_slice(),
     fault_ep: [None; MAX_THREADS],
     in_fault: [false; MAX_THREADS],
+    syscall_fault: [false; MAX_THREADS],
     foreign: [false; MAX_THREADS],
     tls: [0; MAX_THREADS],
     fp: [arch::FpState::INITIAL; MAX_THREADS],
@@ -896,6 +900,7 @@ fn raise_fault(k: &mut Kernel, cur: Tid, kind: FaultKind, addr: u64, pc: u64, co
     };
     k.stats.faults_handled += 1;
     k.in_fault[cur as usize] = true;
+    k.syscall_fault[cur as usize] = matches!(kind, FaultKind::ForeignSyscall);
     k.ipc.set_transfer(CapTransfer::NONE);
     if k.ipc.call(ep, badge, [kind as u64, addr, pc, code]).is_err() {
         k.in_fault[cur as usize] = false;
@@ -2398,9 +2403,13 @@ fn thread_resume(k: &mut Kernel, cur: Tid, slot: u64) -> Result<(), u64> {
 fn thread_suspend(k: &mut Kernel, cur: Tid, slot: u64) -> Result<(), u64> {
     let t = thread_cap(k, cur, slot)?;
     // A cancelled fault call is simply retried on resume: the faulting
-    // instruction runs again and faults again.
-    k.in_fault[t as usize] = false;
-    k.ipc.suspend(t).map_err(|e| e.status())
+    // instruction runs again and faults again. A foreign system call's
+    // pc is past its instruction, so it is pointed back at it.
+    k.ipc.suspend(t).map_err(|e| e.status())?;
+    if core::mem::take(&mut k.in_fault[t as usize]) && k.syscall_fault[t as usize] {
+        k.frames[t as usize].rewind_syscall();
+    }
+    Ok(())
 }
 
 /// `ThreadCopyCap`: rdi = thread, rsi = caller's slot, rdx = the thread's

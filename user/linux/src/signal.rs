@@ -18,6 +18,17 @@
 //! the frame back. Not yet in the frame: the FPU and SIMD registers (a
 //! handler that uses them leaves them changed for the code it
 //! interrupted), and an alternate signal stack.
+//!
+//! Job control: a stop signal whose action is the default (`SIGSTOP`,
+//! and `SIGTSTP`, `SIGTTIN`, `SIGTTOU` unless caught) stops the whole
+//! process. Its threads running in user space are suspended where they
+//! are; one coming back from a call is held there, its answer kept; one
+//! waiting in a call goes on waiting, and is not answered while stopped.
+//! The parent hears of it (`SIGCHLD`, unless `SA_NOCLDSTOP`; `wait4` with
+//! `WUNTRACED`). `SIGCONT` continues it, whatever its action, and drops
+//! any stop pending (as a stop drops a pending `SIGCONT`); `wait4` with
+//! `WCONTINUED` reports that. Only `SIGKILL` acts on a stopped process;
+//! other signals wait until it continues.
 
 use super::*;
 
@@ -25,11 +36,17 @@ pub const SIGKILL: u32 = 9;
 pub const SIGSEGV: u32 = 11;
 pub const SIGPIPE: u32 = 13;
 pub const SIGCHLD: u32 = 17;
+pub const SIGCONT: u32 = 18;
 pub const SIGSTOP: u32 = 19;
+pub const SIGTTIN: u32 = 21;
 const NSIG: u32 = 64;
 
+/// The stop signals: `SIGSTOP`, `SIGTSTP`, `SIGTTIN` and `SIGTTOU`.
+const STOPS: u64 = bit(19) | bit(20) | bit(21) | bit(22);
+
 const SIG_DFL: u64 = 0;
-const SIG_IGN: u64 = 1;
+pub const SIG_IGN: u64 = 1;
+const SA_NOCLDSTOP: u64 = 1;
 const SA_RESTORER: u64 = 0x0400_0000;
 pub const SA_RESTART: u64 = 0x1000_0000;
 const SA_NODEFER: u64 = 0x4000_0000;
@@ -51,10 +68,15 @@ pub struct Action {
     pub mask: u64,
 }
 
-/// Signals whose default is to do nothing. The stop signals are among
-/// them for now (stopping a process is not yet done).
+/// Signals whose default is to do nothing: `SIGCHLD`, `SIGCONT` (whose
+/// continuing is done when it is sent), `SIGURG`, `SIGWINCH`.
 fn ignored_by_default(sig: u32) -> bool {
-    matches!(sig, 17 | 18 | 19..=22 | 23 | 28)
+    matches!(sig, 17 | 18 | 23 | 28)
+}
+
+/// Signals whose default is to stop the process.
+fn stops_by_default(sig: u32) -> bool {
+    STOPS & bit(sig) != 0
 }
 
 /// What a process must do about its signals now.
@@ -64,6 +86,8 @@ pub enum Next {
     Kill(u32),
     /// Run this signal's handler.
     Handle(u32),
+    /// Stop, for this signal (taken: no longer pending).
+    Stop(u32),
 }
 
 /// Where the restorer page is in every process: `rt_sigreturn`, for
@@ -121,7 +145,11 @@ impl State {
     /// Sends `sig` to process `i`, for whichever of its threads takes it.
     pub fn post(&mut self, i: usize, sig: u32) {
         let p = &self.procs[i];
-        if !p.used || p.zombie || sig == 0 || sig > NSIG || self.dropped(i, sig) {
+        if !p.used || p.zombie || sig == 0 || sig > NSIG {
+            return;
+        }
+        self.job_control(i, sig);
+        if self.dropped(i, sig) {
             return;
         }
         self.procs[i].pending |= bit(sig);
@@ -130,10 +158,108 @@ impl State {
     /// Sends `sig` to task `t` alone (`tkill`).
     pub fn post_task(&mut self, t: usize, sig: u32) {
         let i = self.tasks[t].proc as usize;
-        if sig == 0 || sig > NSIG || self.procs[i].zombie || self.dropped(i, sig) {
+        if sig == 0 || sig > NSIG || self.procs[i].zombie {
+            return;
+        }
+        self.job_control(i, sig);
+        if self.dropped(i, sig) {
             return;
         }
         self.tasks[t].pending |= bit(sig);
+    }
+
+    /// What sending `sig` to process `i` does at once: `SIGCONT`
+    /// continues it and drops pending stops; a stop drops a pending
+    /// `SIGCONT`.
+    fn job_control(&mut self, i: usize, sig: u32) {
+        let drop = if sig == SIGCONT {
+            STOPS
+        } else if STOPS & bit(sig) != 0 {
+            bit(SIGCONT)
+        } else {
+            return;
+        };
+        self.procs[i].pending &= !drop;
+        for t in 0..MAX_TASKS {
+            if self.tasks[t].used && self.tasks[t].proc as usize == i {
+                self.tasks[t].pending &= !drop;
+            }
+        }
+        if sig == SIGCONT {
+            self.cont(i);
+        }
+    }
+
+    /// Process `i`'s parent, if it is still there.
+    fn parent(&self, i: usize) -> Option<usize> {
+        let ppid = self.procs[i].ppid;
+        self.procs.iter().position(|q| q.used && !q.zombie && q.pid == ppid)
+    }
+
+    /// Tells process `i`'s parent it stopped or continued: `SIGCHLD`,
+    /// unless its action says `SA_NOCLDSTOP`.
+    fn tell_parent(&mut self, i: usize) {
+        if let Some(parent) = self.parent(i) {
+            if self.procs[parent].actions[SIGCHLD as usize - 1].flags & SA_NOCLDSTOP == 0 {
+                self.post(parent, SIGCHLD);
+            }
+        }
+    }
+
+    /// Stops process `i` for `sig`: its threads running in user space are
+    /// suspended where they are (all but `current`, whose call is being
+    /// answered: the caller holds it), and its parent told.
+    pub fn stop(&mut self, i: usize, sig: u32, current: Option<usize>) {
+        if self.procs[i].stopped {
+            return;
+        }
+        for t in 0..MAX_TASKS {
+            let task = &mut self.tasks[t];
+            if !task.used || task.proc as usize != i || Some(t) == current || task.frozen {
+                continue;
+            }
+            if matches!(task.blocked, Blocked::None) && sys(Syscall::ThreadSuspend, task.thread, [0; 4]).is_ok() {
+                task.frozen = true;
+            }
+        }
+        let p = &mut self.procs[i];
+        p.stopped = true;
+        p.stop_sig = sig as u8;
+        p.report = Report::Stopped;
+        self.tell_parent(i);
+    }
+
+    /// Continues process `i`, if stopped: its suspended threads go on
+    /// where they were; calls held or set aside are answered as they can
+    /// be ([`wake`]).
+    fn cont(&mut self, i: usize) {
+        if !self.procs[i].stopped {
+            return;
+        }
+        for t in 0..MAX_TASKS {
+            let task = &mut self.tasks[t];
+            if task.used && task.proc as usize == i && core::mem::take(&mut task.frozen) {
+                let _ = sys(Syscall::ThreadResume, task.thread, [0; 4]);
+            }
+        }
+        let p = &mut self.procs[i];
+        p.stopped = false;
+        p.report = Report::Continued;
+        self.tell_parent(i);
+    }
+
+    /// Whether process `i` is stopped with a `SIGKILL` waiting for it,
+    /// which ends it even so.
+    pub fn killed_while_stopped(&self, i: usize) -> bool {
+        self.procs[i].stopped
+            && ((self.procs[i].pending | self.tasks_of(i).fold(0, |m, t| m | self.tasks[t].pending)) & bit(SIGKILL)) != 0
+    }
+
+    /// Whether process `i` neither ignores nor blocks `sig` (in any of its
+    /// threads): for `SIGTTIN`, which stops a background reader of the
+    /// terminal only then (else the read fails).
+    pub fn takes(&self, i: usize, sig: u32) -> bool {
+        self.procs[i].actions[sig as usize - 1].handler != SIG_IGN && self.tasks_of(i).all(|t| self.tasks[t].mask & bit(sig) == 0)
     }
 
     /// Sends `sig` to every process in group `pgid`; whether there was one.
@@ -161,6 +287,11 @@ impl State {
             }
             let sig = live.trailing_zeros() + 1;
             let a = p.actions[sig as usize - 1];
+            if sig == SIGSTOP || a.handler == SIG_DFL && stops_by_default(sig) {
+                p.pending &= !bit(sig);
+                task.pending &= !bit(sig);
+                return Next::Stop(sig);
+            }
             if sig == SIGKILL || a.handler == SIG_DFL && !ignored_by_default(sig) {
                 return Next::Kill(sig);
             }

@@ -1618,6 +1618,26 @@ holds the rest):
   is in memory, as before. `linux-test`'s first boot makes `/etc/motd` and
   `/data/answer` and lists `/`; the second reads them back, lists `/` (the
   same eight entries), and removes them.
+- The Linux personality's job control: `^Z` stops the foreground job, and
+  `fg`, `bg` and `kill -CONT` continue it. A stop signal left to its default
+  action (`SIGSTOP`, and `SIGTSTP`, `SIGTTIN`, `SIGTTOU` unless caught) stops
+  the whole process. Its threads running in user space are suspended where
+  they are (`ThreadSuspend`). A thread whose call is being answered is held,
+  and given the answer once the process continues. One waiting in a call goes
+  on waiting. While a process is stopped, only `SIGKILL` acts on it.
+  `SIGCONT` continues it whatever its action, and drops pending stops; a
+  stop drops a pending `SIGCONT`. The parent gets `SIGCHLD` (unless
+  `SA_NOCLDSTOP`) and `wait4` reports the change (`WUNTRACED`,
+  `WCONTINUED`). A background process that reads the terminal is stopped
+  by `SIGTTIN`; if it ignores or blocks that signal, its read fails with
+  `EIO`. A thread suspended while its foreign system call waited unanswered
+  now makes that call again on resume: the kernel points it back at the
+  `syscall` or `svc` instruction. Before, it carried on past the call with no
+  answer. `linux-test` types `^Z` at a sleeping job, then lists it with
+  `jobs` and brings it back with `fg`. It stops another and lets `bg` and
+  `wait` finish it. It starts a background `read`, which `jobs` shows
+  stopped for terminal input until `fg` lets it read what is typed. Last, it
+  stops a job spinning in user space and ends it with `kill -9`.
 - Interrupt and exception entries clear the direction flag. User code may be
   interrupted mid-way through a backward copy, with the flag set; the kernel's own
   copies need it clear, and without the `cld` they ran backwards, wrecking saved
@@ -1690,7 +1710,7 @@ system's is on the system disk), a boot record written atomically (two
 copies), certificate chains and revocation for the update server (the updater
 pins one key), apps that provide services, a package store on a
 filesystem rather than fixed disk slots, a Linux process's
-threads on more than one CPU, `munmap` returning pages, stopping jobs (`^Z`),
+threads on more than one CPU, `munmap` returning pages,
 and a handled signal reaching a process
 that spins without system calls (it is taken at the next one), and
 fixed-address (non-PIE) Linux executables, which are linked at 4 MiB, where
