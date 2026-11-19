@@ -1013,6 +1013,8 @@ fn linux_test(img: &Image) -> Result<(), String> {
         "linux: > assembled by as, linked by ld",
         // gcc: driver, cc1, as, collect2 and ld, and its program running.
         "linux: > compiled by gcc: 42",
+        // vfork: what the child wrote in the memory it borrowed.
+        "linux: > vfork shared: 42",
         // A program far larger than a page, loaded from its file.
         "linux: > ran a program of more than 200000 bytes",
         // Threads (clone, futexes) in pigz, and zlib loaded by musl: what

@@ -1864,6 +1864,21 @@ holds the rest):
   AArch64 a 256 MiB one, which left no spare RAM). `linux-test` has gcc
   compile and link a C program, which prints `compiled by gcc: 42`, on
   both ISAs.
+- The Linux personality's `vfork` shares the parent's memory, as Linux's
+  does: the child is a process of its own (descriptors, signals) with a
+  thread in its parent's address space, nothing copied, and what it
+  writes before it execs or ends, the parent sees. Each process names the
+  process whose memory it uses (itself, but for a vfork child), and every
+  reach into memory (pages, mappings, the break, faults, loading) goes
+  through it. At `execve` the child takes back memory of its own; at
+  `_exit` it leaves the parent's as it is. A vfork child whose parent's
+  memory goes (the parent killed, or another of its threads exec'ing) is
+  killed with it. `clone` with `CLONE_VFORK` (musl's `posix_spawn`, so
+  make and gcc running their tools) is the same, and so spawns without
+  copying the parent's pages. `linux-test` has tcc build a program whose
+  vfork child sets a variable on the stack they share and exits, and the
+  parent prints it (`vfork shared: 42`; a copy would print 1), on both
+  ISAs.
 - Interrupt and exception entries clear the direction flag. User code may be
   interrupted mid-way through a backward copy, with the flag set; the kernel's own
   copies need it clear, and without the `cld` they ran backwards, wrecking saved

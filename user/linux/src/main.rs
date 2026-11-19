@@ -732,6 +732,10 @@ struct Proc {
     report: Report,
     /// A `vfork` child that has yet to exec or end: its parent waits.
     vfork: bool,
+    /// The process whose memory (address space, pages, mappings, break)
+    /// this one uses: itself, but for a `vfork` child, which borrows its
+    /// parent's until it execs or ends ([`State::mem`]).
+    mem: u8,
     /// Slots used of its span.
     cursor: u64,
     cwd: u16,
@@ -915,12 +919,20 @@ impl State {
         sys(Syscall::Retype, SPARE_BLOCKS + k as u64, msg).map(drop).map_err(|_| ENOMEM)
     }
 
+    /// The process whose memory process `i` uses (see [`Proc::mem`]):
+    /// what every reach into a process's memory goes through.
+    fn mem(&self, i: usize) -> usize {
+        self.procs[i].mem as usize
+    }
+
     fn is_present(&self, i: usize, va: u64) -> bool {
+        let i = self.mem(i);
         let k = ((va - CHILD) / PAGE) as usize;
         self.procs[i].present[k / 64] & (1 << (k % 64)) != 0
     }
 
     fn is_code(&self, i: usize, va: u64) -> bool {
+        let i = self.mem(i);
         let k = ((va - CHILD) / PAGE) as usize;
         self.procs[i].code[k / 64] & (1 << (k % 64)) != 0
     }
@@ -928,6 +940,7 @@ impl State {
     /// Whether `va` is in process `i`'s window, in an anonymous mapping's
     /// page not yet made (see [`Proc::reserved`]).
     fn is_reserved(&self, i: usize, va: u64) -> bool {
+        let i = self.mem(i);
         if !(CHILD..CHILD_END).contains(&va) {
             return false;
         }
@@ -936,6 +949,7 @@ impl State {
     }
 
     fn set_reserved(&mut self, i: usize, va: u64, on: bool) {
+        let i = self.mem(i);
         let k = ((va - CHILD) / PAGE) as usize;
         let w = &mut self.procs[i].reserved[k / 64];
         if on { *w |= 1 << (k % 64) } else { *w &= !(1 << (k % 64)) }
@@ -955,6 +969,7 @@ impl State {
     /// Where byte `va` of process `i` is here, if it is mapped, and
     /// whether it is the process's own (writable) page.
     fn locate(&self, i: usize, va: u64) -> Option<(*mut u8, bool)> {
+        let i = self.mem(i);
         if !(CHILD..CHILD_END).contains(&va) {
             return None;
         }
@@ -1045,6 +1060,7 @@ impl State {
     }
 
     fn map_page(&mut self, i: usize, va: u64, code: Option<&[u8]>) -> Result<(), u64> {
+        let i = self.mem(i);
         if !(CHILD..CHILD_END).contains(&va) {
             return Err(EFAULT);
         }
@@ -1101,6 +1117,7 @@ impl State {
     /// unmapped from it and from the mirror, its frame kept to be used
     /// again ([`State::map_private`]).
     fn unmap_private(&mut self, i: usize, va: u64) {
+        let i = self.mem(i);
         if !self.is_present(i, va) {
             return;
         }
@@ -1118,6 +1135,7 @@ impl State {
     /// Whether process `i` has anything at page `va`: a page of its own, a
     /// reserved one, a bundle file's, or a library's span.
     fn taken(&self, i: usize, va: u64) -> bool {
+        let i = self.mem(i);
         let p = &self.procs[i];
         self.is_present(i, va)
             || self.is_reserved(i, va)
@@ -1146,6 +1164,7 @@ impl State {
     /// Maps the bundle file's page in `file_slot` at `va` in process `i`
     /// (read-only, or executable).
     fn map_shared(&mut self, i: usize, va: u64, file_slot: u64, flags: u64) -> Result<(), u64> {
+        let i = self.mem(i);
         let p = &mut self.procs[i];
         if p.cursor + 1 > PROC_SPAN {
             return Err(ENOMEM);
@@ -1163,6 +1182,7 @@ impl State {
     /// not on each it has (cc1's code alone is some 7000 pages). Whether
     /// it is now mapped (or was, by another of its threads meanwhile).
     fn take_shared(&mut self, i: usize, va: u64) -> bool {
+        let i = self.mem(i);
         let page = va & !(PAGE - 1);
         if !(CHILD..CHILD_END).contains(&page) || self.is_present(i, page) {
             return false;
@@ -1191,6 +1211,7 @@ impl State {
     /// read from the file into one of its own, code into pages of code
     /// ([`State::map_code`]).
     fn load(&mut self, i: usize, src: Src, base: u64) -> Result<(u64, u64, u64, u64), &'static str> {
+        let i = self.mem(i);
         let elf = src.elf().map_err(|_| "not an ELF executable")?;
         if elf.machine != MACHINE {
             return Err("not for this machine");
@@ -1271,6 +1292,7 @@ impl State {
     /// the tree, each read from the file (zeros past its bytes) into a
     /// page of process `i`'s own at `base` on.
     fn load_pages(&mut self, i: usize, ino: u16, seg: &Segment, base: u64, lo: u64, hi: u64) -> Result<(), &'static str> {
+        let i = self.mem(i);
         for page in (lo..hi).step_by(PAGE as usize) {
             let mut buf = [0u8; PAGE as usize];
             let (from, to) = (page.max(seg.vaddr), (page + PAGE).min(seg.vaddr + seg.file_size));
@@ -1321,6 +1343,7 @@ impl State {
         p.stopped = false;
         p.report = Report::None;
         p.vfork = false;
+        p.mem = i as u8;
         p.cursor = 0;
         p.cwd = ROOT;
         p.fds = [0; MAX_FDS];
@@ -1394,7 +1417,7 @@ impl State {
     /// Readies task `t`'s thread: at `entry` with stack `top`, or with
     /// another task's registers (`fork`, `clone`). Not yet started.
     fn configure(&mut self, t: usize, entry: u64, top: u64, from: Option<usize>) -> Result<(), &'static str> {
-        let (th, i) = (self.tasks[t].thread, self.tasks[t].proc as usize);
+        let (th, i) = (self.tasks[t].thread, self.mem(self.tasks[t].proc as usize));
         let made = |r: Result<[u64; 4], u64>, what| r.map(drop).map_err(|_| what);
         made(sys(Syscall::ThreadSetVSpace, th, [space_slot(i), 0, 0, 0]), "set address space")?;
         made(sys(Syscall::ThreadConfigure, th, [entry, top, 0, 5]), "configure the thread")?;
@@ -1411,8 +1434,15 @@ impl State {
         (0..MAX_TASKS).filter(move |&t| self.tasks[t].used && self.tasks[t].proc as usize == i)
     }
 
-    /// Destroys process `i`'s address space, thread and pages.
+    /// Destroys process `i`'s address space, thread and pages (its own,
+    /// not memory it borrows). A `vfork` child still borrowing them is
+    /// killed first, as it has nothing left to run in.
     fn unmake_space(&mut self, i: usize) {
+        for c in 0..MAX_PROCS {
+            if c != i && self.procs[c].used && !self.procs[c].zombie && self.mem(c) == i {
+                self.exit(c, signal::SIGKILL);
+            }
+        }
         for s in slot_base(i)..slot_base(i) + self.procs[i].cursor {
             let _ = syscall(Syscall::CapDelete, s, [0; 4]);
         }
@@ -1878,7 +1908,7 @@ fn answer(st: &mut State, t: usize, call: Sys, a: [u64; 6]) -> Out {
         Sys::Clone if a[0] & CLONE_VFORK != 0 => vfork(st, t, a[1]),
         // A process sharing its parent's memory without vfork's wait: a
         // copy, on the stack it was given.
-        Sys::Clone if a[0] & CLONE_VM != 0 => r(fork_on(st, t, a[1])),
+        Sys::Clone if a[0] & CLONE_VM != 0 => r(fork_on(st, t, a[1], false)),
         Sys::Clone => r(fork(st, t)),
         Sys::Execve => match execve(st, t, a[0], a[1], a[2]) {
             Ok(()) => Out::Gone,
@@ -2425,6 +2455,7 @@ fn readlinkat(st: &mut State, i: usize, a: [u64; 6]) -> Result<u64, u64> {
 }
 
 fn brk(st: &mut State, i: usize, want: u64) -> u64 {
+    let i = st.mem(i);
     let p = &st.procs[i];
     let (start, cur) = (p.brk_start, p.brk);
     if want <= start || want > start + BRK_MAX {
@@ -2451,6 +2482,7 @@ fn mmap(st: &mut State, i: usize, a: [u64; 6]) -> Result<u64, u64> {
     if flags & MAP_ANONYMOUS == 0 {
         return mmap_file(st, i, addr, len, a[2], flags & MAP_FIXED != 0, a[4], a[5]);
     }
+    let i = st.mem(i);
     let at = if flags & MAP_FIXED != 0 { addr } else { st.place(i, len)? };
     if at % PAGE != 0 || at < CHILD || at + len > STACK_TOP - STACK_PAGES * PAGE {
         return Err(ENOMEM);
@@ -2475,6 +2507,7 @@ fn munmap(st: &mut State, i: usize, addr: u64, len: u64) -> Result<u64, u64> {
         return Err(EINVAL);
     }
     let end = addr.checked_add(len.next_multiple_of(PAGE)).ok_or(EINVAL)?;
+    let i = st.mem(i);
     for va in (addr.max(CHILD)..end.min(CHILD_END)).step_by(PAGE as usize) {
         st.set_reserved(i, va, false);
         st.unmap_private(i, va);
@@ -2553,6 +2586,7 @@ fn mmap_file(st: &mut State, i: usize, addr: u64, len: u64, prot: u64, fixed: bo
     if off % PAGE != 0 {
         return Err(EINVAL);
     }
+    let i = st.mem(i);
     let p = &st.procs[i];
     if fixed && p.libs[..p.nlibs].iter().any(|&(s, e, ino)| ino == o.ino && s <= addr && addr + len <= e) {
         return Ok(addr);
@@ -2645,32 +2679,29 @@ fn mmap_file(st: &mut State, i: usize, addr: u64, len: u64, prot: u64, fixed: bo
 /// `fork`: a new process with a copy of task `t`'s process's own pages,
 /// its descriptors and directory, and one thread, with `t`'s registers (0
 /// in the result).
-/// `vfork`, or `clone` with `CLONE_VFORK`: a `fork` (onto stack `sp`, if
-/// not 0) whose parent waits until the child has exec'd or ended, as
-/// Linux's does. Linux's child borrows its parent's memory meanwhile;
-/// this one has a copy, so the wait is what is the same (what the child
-/// writes before it execs, its parent does not see, which a program
-/// keeping to what vfork allows does not rely on).
+/// `vfork`, or `clone` with `CLONE_VFORK`: a new process (onto stack
+/// `sp`, if not 0) with a thread of its own in its parent's memory, which
+/// it borrows, as Linux's does: what it writes there before it execs (or
+/// ends) its parent sees, and its parent waits until then.
 fn vfork(st: &mut State, t: usize, sp: u64) -> Out {
-    match fork_on(st, t, sp) {
-        Ok(pid) => {
-            // The child runs once this server next waits: not yet.
-            if let Some(c) = st.procs.iter().position(|p| p.used && p.pid as u64 == pid) {
-                st.procs[c].vfork = true;
-            }
-            Out::Block(Blocked::Vfork { pid: pid as u32 })
-        }
+    match fork_on(st, t, sp, true) {
+        // The child runs once this server next waits: not yet.
+        Ok(pid) => Out::Block(Blocked::Vfork { pid: pid as u32 }),
         Err(e) => Out::Ret(err(e)),
     }
 }
 
 fn fork(st: &mut State, t: usize) -> Result<u64, u64> {
-    fork_on(st, t, 0)
+    fork_on(st, t, 0, false)
 }
 
-/// `fork`, the child's stack pointer `sp` (if not 0).
-fn fork_on(st: &mut State, t: usize, sp: u64) -> Result<u64, u64> {
+/// `fork`, the child's stack pointer `sp` (if not 0); with `borrow`, a
+/// `vfork`: the child's thread in the parent's memory, not a copy.
+fn fork_on(st: &mut State, t: usize, sp: u64, borrow: bool) -> Result<u64, u64> {
     let i = st.tasks[t].proc as usize;
+    // The memory copied, or borrowed: the parent's (itself perhaps a
+    // vfork child's, borrowed).
+    let m = st.mem(i);
     let c = st.new_proc(st.procs[i].pid).ok_or(EAGAIN)?;
     let Some(ct) = st.new_task(c, Some(st.procs[c].pid)) else {
         st.procs[c].used = false;
@@ -2682,16 +2713,24 @@ fn fork_on(st: &mut State, t: usize, sp: u64) -> Result<u64, u64> {
         st.tasks[ct].used = false;
         Err(e)
     };
-    if st.make_space(c, ct).is_err() {
+    if borrow {
+        // Its thread only, in its own span (from 1, as a space's would be).
+        st.procs[c].mem = m as u8;
+        st.procs[c].vfork = true;
+        st.procs[c].cursor = 1;
+        if st.make_thread(ct).is_err() {
+            return fail(st, ENOMEM);
+        }
+    } else if st.make_space(c, ct).is_err() {
         return fail(st, ENOMEM);
     }
     for k in 0..CHILD_PAGES {
-        if st.procs[i].present[k / 64] & (1 << (k % 64)) == 0 {
+        if borrow || st.procs[m].present[k / 64] & (1 << (k % 64)) == 0 {
             continue;
         }
         let va = CHILD + k as u64 * PAGE;
-        let from = va - CHILD + MIRROR + i as u64 * SPAN;
-        if st.is_code(i, va) {
+        let from = va - CHILD + MIRROR + m as u64 * SPAN;
+        if st.is_code(m, va) {
             // SAFETY: a whole page mapped in the mirror.
             let bytes = unsafe { core::slice::from_raw_parts(from as *const u8, PAGE as usize) };
             if st.map_code(c, va, bytes).is_err() {
@@ -2706,11 +2745,13 @@ fn fork_on(st: &mut State, t: usize, sp: u64) -> Result<u64, u64> {
         // SAFETY: both are whole pages mapped in the mirrors.
         unsafe { core::ptr::copy_nonoverlapping(from as *const u8, to as *mut u8, PAGE as usize) };
     }
-    st.procs[c].reserved = st.procs[i].reserved;
-    (st.procs[c].shared, st.procs[c].nshared) = (st.procs[i].shared, st.procs[i].nshared);
-    (st.procs[c].libs, st.procs[c].nlibs) = (st.procs[i].libs, st.procs[i].nlibs);
+    if !borrow {
+        st.procs[c].reserved = st.procs[m].reserved;
+        (st.procs[c].shared, st.procs[c].nshared) = (st.procs[m].shared, st.procs[m].nshared);
+        (st.procs[c].libs, st.procs[c].nlibs) = (st.procs[m].libs, st.procs[m].nlibs);
+    }
     let (fds, cloexec, cwd) = (st.procs[i].fds, st.procs[i].cloexec, st.procs[i].cwd);
-    let (b0, b1) = (st.procs[i].brk_start, st.procs[i].brk);
+    let (b0, b1) = (st.procs[m].brk_start, st.procs[m].brk);
     for &f in fds.iter().filter(|&&f| f != 0) {
         st.files[f as usize - 1].refs += 1;
     }
@@ -2796,6 +2837,7 @@ fn execve(st: &mut State, t: usize, path: u64, argv: u64, envp: u64) -> Result<(
     // Past here there is no going back: the old program is gone (and a
     // vfork parent goes on).
     st.procs[i].vfork = false;
+    st.procs[i].mem = i as u8;
     st.unmake_space(i);
     for k in 0..MAX_TASKS {
         if k != t && st.tasks[k].used && st.tasks[k].proc as usize == i {
@@ -3901,6 +3943,16 @@ const RUNS: &[(&[&str], u32)] = &[
             "sh",
             "-c",
             r#"cd /tmp/cc && printf '#include <stdio.h>\nint main(void) { printf("compiled by gcc: %%d\\n", 6 * 7); return 0; }\n' > g.c && gcc -o g g.c && ./g"#,
+        ],
+        0,
+    ),
+    // vfork: the child borrows its parent's memory, so what it writes
+    // before it ends (here, on the stack they share) its parent sees.
+    (
+        &[
+            "sh",
+            "-c",
+            r#"cd /tmp/cc && printf 'int printf(const char *, ...); int vfork(void); void _exit(int);\nint main(void) { volatile int x = 1; if (vfork() == 0) { x = 42; _exit(0); } printf("vfork shared: %%d\\n", x); return 0; }\n' > vf.c && tcc -o vf vf.c && ./vf"#,
         ],
         0,
     ),
