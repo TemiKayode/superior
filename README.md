@@ -1772,6 +1772,26 @@ holds the rest):
   mmaptest is now built as one (xtask checks it is `ET_EXEC`), and first
   checks it runs at its linked address (an absolute one against the
   program counter), on both ISAs.
+- The Linux personality runs glibc programs. xtask takes Debian 12's
+  glibc 2.36 (its dynamic linker and C library) and GNU hello, linked
+  against them alone, from the snapshot archive, pinned by hash, and puts
+  them where Debian does (`/lib64/ld-linux-x86-64.so.2` or
+  `/lib/ld-linux-aarch64.so.1`, `/lib/<triple>-linux-gnu/libc.so.6`,
+  `/usr/bin/hello`), in slots from 8192, past the processes' (the
+  personality's CSpace is now 2^14 slots, and a component may be given
+  24 capabilities, not 16). glibc's dynamic linker reserves a library's
+  span with an anonymous mapping and maps its code over it, fixed, from
+  the file: a mapping of a bundle file that cannot be written is now the
+  file's own pages, shared (executable if asked), up to the file's end,
+  where before it was a copy, never executable. A program now starts with
+  its stack pointer at `argc` on a 16-byte boundary on x86-64 too, as
+  Linux starts one (`REGS_SET` after the thread is configured, which
+  starts it 8 below), which glibc relies on. `pread64` is answered. And a
+  page fault on a page the process has, again at the same address, is now
+  the access refused (`SIGSEGV`) rather than tried again forever.
+  `linux-test` runs hello, printing `Hello, world!`, on both ISAs; without
+  the shared mapping it is killed on AArch64, and without the stack's
+  alignment on x86-64.
 - Interrupt and exception entries clear the direction flag. User code may be
   interrupted mid-way through a backward copy, with the flag set; the kernel's own
   copies need it clear, and without the `cld` they ran backwards, wrecking saved

@@ -536,6 +536,89 @@ fn alpine_files(arch: Arch) -> Result<Vec<(String, Vec<u8>)>, String> {
     Ok(out)
 }
 
+/// Where the Linux personality's glibc programs come from: Debian 12
+/// (bookworm), from the snapshot archive, so the URLs stay.
+const DEBIAN: &str = "https://snapshot.debian.org/archive/debian/20261115T000000Z/pool/main";
+
+/// Debian's packages, for each ISA: (Debian's name for the ISA, package's
+/// path in the pool, its SHA-256, and the files taken from it with their
+/// names in the bundle). glibc 2.36's dynamic linker and C library, and
+/// GNU hello, linked against them alone.
+type DebianPackage = (&'static str, &'static str, &'static str, &'static [(&'static str, &'static str)]);
+const DEBIAN_PACKAGES: [DebianPackage; 4] = [
+    (
+        "amd64",
+        "g/glibc/libc6_2.36-9+deb12u14",
+        "ba4f88f73dbc3ae9055f3c20f4523bfdbaf1ad13ff95e258924f77d20b4fbedf",
+        &[("./lib/x86_64-linux-gnu/ld-linux-x86-64.so.2", "ld-glibc"), ("./lib/x86_64-linux-gnu/libc.so.6", "libc")],
+    ),
+    ("amd64", "h/hello/hello_2.10-3", "2e6e2f1a0007dc43bc91c273fd36e91e40a4f1c2765a03eca68b70a42103878a", &[("./usr/bin/hello", "hello")]),
+    (
+        "arm64",
+        "g/glibc/libc6_2.36-9+deb12u14",
+        "01f4330719fd4f65580e16ea5a0527f372fca750e8f588d26deaf09f2d3b1cf4",
+        &[("./lib/aarch64-linux-gnu/ld-linux-aarch64.so.1", "ld-glibc"), ("./lib/aarch64-linux-gnu/libc.so.6", "libc")],
+    ),
+    ("arm64", "h/hello/hello_2.10-3", "f7b20d304db0f3a18da28eb2000de2b0205eaa340c1d0fecec3b7c50acc932dc", &[("./usr/bin/hello", "hello")]),
+];
+
+/// glibc's dynamic linker and C library and GNU hello, as Debian builds
+/// them for `arch`, unmodified, with their names in the bundle: each
+/// package downloaded once and checked against its pinned hash every time.
+fn debian_files(arch: Arch) -> Result<Vec<(String, Vec<u8>)>, String> {
+    let isa = if arch == Arch::X86_64 { "amd64" } else { "arm64" };
+    let dir = root().join("target/linux/debian");
+    let mut out = Vec::new();
+    for &(_, path, sha256, files) in DEBIAN_PACKAGES.iter().filter(|p| p.0 == isa) {
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let package = path.rsplit('/').next().unwrap();
+        let deb = dir.join(format!("{package}_{isa}.deb"));
+        if !deb.exists() {
+            println!("== fetching Debian's {package} ({isa})");
+            let url = format!("{DEBIAN}/{path}_{isa}.deb");
+            run(Command::new("curl").args(["-sSfL", "-o"]).arg(&deb).arg(&url))?;
+        }
+        let bytes = std::fs::read(&deb).map_err(|e| format!("reading {}: {e}", deb.display()))?;
+        let hash: String = superior_objects::crypto::sha2::sha256(&bytes).iter().map(|b| format!("{b:02x}")).collect();
+        if hash != sha256 {
+            return Err(format!("{} is not Debian's {package}: delete it to fetch it again", deb.display()));
+        }
+        // A .deb is an ar archive; the files are in its data.tar.xz.
+        let data = ar_member(&bytes, "data.tar.xz").ok_or_else(|| format!("{} has no data.tar.xz", deb.display()))?;
+        let to = dir.join(isa).join(package);
+        std::fs::create_dir_all(&to).map_err(|e| e.to_string())?;
+        let tar = to.join("data.tar.xz");
+        std::fs::write(&tar, data).map_err(|e| format!("writing {}: {e}", tar.display()))?;
+        let mut cmd = Command::new("tar");
+        cmd.arg("-xJf").arg(&tar).arg("-C").arg(&to);
+        for (file, _) in files {
+            cmd.arg(file);
+        }
+        run(&mut cmd)?;
+        for (file, name) in files {
+            let path = to.join(file);
+            out.push((name.to_string(), std::fs::read(&path).map_err(|e| format!("reading {}: {e}", path.display()))?));
+        }
+    }
+    Ok(out)
+}
+
+/// The member of a Unix ar archive named `name`.
+fn ar_member<'a>(ar: &'a [u8], name: &str) -> Option<&'a [u8]> {
+    let mut at = ar.strip_prefix(b"!<arch>\n".as_slice()).map(|_| 8)?;
+    while at + 60 <= ar.len() {
+        let header = &ar[at..at + 60];
+        let size: usize = std::str::from_utf8(&header[48..58]).ok()?.trim().parse().ok()?;
+        let member = std::str::from_utf8(&header[..16]).ok()?.trim_end().trim_end_matches('/');
+        let body = ar.get(at + 60..at + 60 + size)?;
+        if member == name {
+            return Some(body);
+        }
+        at += 60 + size + size % 2;
+    }
+    None
+}
+
 /// What the Linux test types into the shell on the terminal, after the
 /// batch runs: each step's bytes, what must then appear, and whether the
 /// prompt must come back after it.
@@ -729,6 +812,9 @@ fn linux_test(img: &Image) -> Result<(), String> {
         "linux: > smptest said 0",
         "linux: > mapped and unmapped 25 MiB",
         "linux: > mmaptest said 0",
+        // glibc's dynamic linker and C library, Debian's, in GNU hello.
+        "linux: > Hello, world!",
+        "linux: > hello said 0",
         // Threads (clone, futexes) in pigz, and zlib loaded by musl: what
         // two threads compressed BusyBox's gzip takes back unchanged.
         " started thread ",
@@ -1145,6 +1231,7 @@ fn bundle(arch: Arch, manifest: &str, driver: &str) -> Result<PathBuf, String> {
     // The Linux programs the personality runs (`file` in its manifest).
     if manifest.starts_with("linux") {
         files.extend(alpine_files(arch)?);
+        files.extend(debian_files(arch)?);
         // Linux programs of our own (the first boot's runs use them).
         for name in ["fptest", "smptest", "mmaptest"] {
             let package = format!("superior-linux-{name}");

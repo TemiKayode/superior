@@ -58,14 +58,16 @@
 //! a service apps may use (nothing else is offered to them).
 //!
 //! Slots are in the component's own CSpace, a CNode of [`CSPACE_SLOTS`]
-//! (more, up to 256 nameable here, after a `cspace` directive).
+//! (more after a `cspace` directive, up to 2^16 nameable here).
 //! Parsing checks everything that can be checked without the bundle:
 //! unique names, slots in range and not reused, every `uses` matching
 //! some `provides`, and every lazy component providing something (or it
 //! could never start).
 
 pub const MAX_COMPONENTS: usize = 16;
-pub const MAX_CAPS: usize = 16;
+/// Capabilities a component is given (the Linux personality, with its ten
+/// files, has 17).
+pub const MAX_CAPS: usize = 24;
 /// Every component's CSpace size, in bits and slots.
 pub const CSPACE_BITS: u8 = 6;
 pub const CSPACE_SLOTS: usize = 1 << CSPACE_BITS;

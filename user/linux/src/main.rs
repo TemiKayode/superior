@@ -35,7 +35,8 @@
 //! in-memory tree with `/bin` (BusyBox and a link per applet), the
 //! interpreter, pigz, fptest, smptest and mmaptest (`user/linux-fptest`,
 //! `user/linux-smptest`, `user/linux-mmaptest`, for the test) in
-//! `/usr/bin` and zlib in `/lib`, `/tmp`,
+//! `/usr/bin` and zlib in `/lib`; glibc's dynamic linker and C library
+//! where Debian puts them, and GNU hello, linked against them; `/tmp`,
 //! `/dev/null`; pipes; the console. They last as long as this server,
 //! but for what is made outside them, which is the filesystem server's
 //! (this component's container there: the root, with `/home`), and so on
@@ -50,8 +51,9 @@
 //! filesystem server (its buffer frame in [`remote::BUF`]). The
 //! bundle's files' pages from 16: musl's, mmaptest's from 177, pigz's
 //! from 180, smptest's
-//! from 213, zlib's from 216, fptest's from 250, BusyBox's from 252 (`file`
-//! in the manifest). Process `i` owns the
+//! from 213, zlib's from 216, fptest's from 250, BusyBox's from 252, and
+//! glibc's dynamic linker's from 8192, hello's from 8256 and glibc's from
+//! 8320 (`file` in the manifest). Process `i` owns the
 //! slots from `PROC_SLOTS + i * PROC_SPAN`: its address space, then its
 //! threads (each with a badged fault endpoint) and pages as made.
 //!
@@ -128,6 +130,11 @@ const SMPTEST_FILE: u64 = 213;
 const LIBZ_FILE: u64 = 216;
 const FPTEST_FILE: u64 = 250;
 const PROGRAM_FILE: u64 = 252;
+/// glibc's dynamic linker, GNU hello and glibc, past the processes' slots.
+const GLIBC_LD_FILE: u64 = 8192;
+const HELLO_FILE: u64 = 8256;
+const LIBC_FILE: u64 = 8320;
+const LIBC_PAGES: u64 = 512;
 const STATE_SLOTS: u64 = 512;
 const STATE_PAGES: u64 = 32;
 const POOL_SLOTS: u64 = STATE_SLOTS + STATE_PAGES;
@@ -158,6 +165,15 @@ const LIBZ_VA: u64 = USER_BASE + 0x1_5800_0000;
 const FPTEST_VA: u64 = USER_BASE + 0x1_5c00_0000;
 const SMPTEST_VA: u64 = USER_BASE + 0x1_5d00_0000;
 const MMAPTEST_VA: u64 = USER_BASE + 0x1_5e00_0000;
+const LIBC_VA: u64 = USER_BASE + 0x1_7000_0000;
+const GLIBC_LD_VA: u64 = USER_BASE + 0x1_7400_0000;
+const HELLO_VA: u64 = USER_BASE + 0x1_7500_0000;
+/// Where Debian puts glibc.
+const LIBC_PATH: &[u8] = if cfg!(target_arch = "x86_64") {
+    b"/lib/x86_64-linux-gnu/libc.so.6"
+} else {
+    b"/lib/aarch64-linux-gnu/libc.so.6"
+};
 
 /// A process's address space: everything inside [`CHILD`, `CHILD_END`),
 /// in the kernel's low user window (from 64 KiB), so a fixed-address
@@ -242,6 +258,7 @@ enum Sys {
     Fstat,
     Fstatat,
     Lseek,
+    Pread,
     Mmap,
     Munmap,
     Brk,
@@ -344,6 +361,7 @@ fn decode(nr: u64, a: [u64; 6]) -> (Sys, [u64; 6]) {
         5 => Sys::Fstat,
         6 => return (Sys::Fstatat, [cwd, a[0], a[1], AT_SYMLINK_NOFOLLOW, 0, 0]),
         8 => Sys::Lseek,
+        17 => Sys::Pread,
         9 => Sys::Mmap,
         10 | 28 | 131 | 273 | 90..=94 | 268 | 260 | 280 | 105 | 106 | 24 => Sys::Zero,
         7 => Sys::Poll,
@@ -458,6 +476,7 @@ fn decode(nr: u64, a: [u64; 6]) -> (Sys, [u64; 6]) {
         59 => Sys::Pipe2,
         61 => Sys::Getdents64,
         62 => Sys::Lseek,
+        67 => Sys::Pread,
         63 => Sys::Read,
         64 => Sys::Write,
         66 => Sys::Writev,
@@ -669,6 +688,9 @@ struct Task {
     /// Where to write 0 and wake a futex when it ends
     /// (`CLONE_CHILD_CLEARTID`, `set_tid_address`).
     clear_tid: u64,
+    /// The address its last page fault was at, if it was tried again (0
+    /// once it makes a system call).
+    last_fault: u64,
 }
 
 /// A file from the bundle: its bytes (mapped here) and its first page's
@@ -1130,6 +1152,7 @@ impl State {
             suspended: false,
             frozen: false,
             clear_tid: 0,
+            last_fault: 0,
         };
         Some(t)
     }
@@ -1270,15 +1293,9 @@ impl State {
             (31, execfn),
         ];
         let words = 1 + argv.n + 1 + envp.n + 1 + 2 * (aux.len() + 1);
-        let mut sp = (top - 8 * words as u64) & !15;
-        // x86-64 threads start as if called (8 below a 16-byte boundary);
-        // the interpreter realigns its stack itself.
-        let thread_top = if cfg!(target_arch = "x86_64") {
-            sp -= 8;
-            sp + 8
-        } else {
-            sp
-        };
+        // At argc, on a 16-byte boundary, as Linux starts a program (glibc's
+        // dynamic linker relies on it; musl's realigns its stack itself).
+        let sp = (top - 8 * words as u64) & !15;
         let mut words = [0u64; 1 + 32 + 1 + 32 + 1 + 36];
         let mut n = 0;
         let mut w = |v: u64| {
@@ -1301,7 +1318,15 @@ impl State {
                 return Err("stack");
             }
         }
-        self.start(t, start, thread_top, None)
+        self.configure(t, start, sp, None)?;
+        if cfg!(target_arch = "x86_64") {
+            // An x86-64 thread starts as if called, 8 below its stack's
+            // top: put the stack pointer (Linux's register 15) at argc,
+            // and the entry (16) back.
+            let th = self.tasks[t].thread;
+            sys(Syscall::ThreadRegisters, th, [REGS_SET, 15, sp, start]).map_err(|_| "set the stack pointer")?;
+        }
+        sys(Syscall::ThreadResume, self.tasks[t].thread, [0; 4]).map(drop).map_err(|_| "start the thread")
     }
 
     /// Process `i` ends with wait status `status`: its descriptors are
@@ -1556,6 +1581,7 @@ fn answer(st: &mut State, t: usize, call: Sys, a: [u64; 6]) -> Out {
         Sys::Fstat => r(fstat(st, i, a[0], a[1])),
         Sys::Fstatat => r(fstatat(st, i, a)),
         Sys::Lseek => r(lseek(st, i, a[0], a[1] as i64, a[2])),
+        Sys::Pread => r(pread(st, i, a[0], a[1], a[2], a[3])),
         Sys::Getdents64 => r(getdents(st, i, a[0], a[1], a[2])),
         Sys::Ioctl => r(ioctl(st, i, a[0], a[1], a[2])),
         Sys::Sigaction => r(st.sigaction(i, a[0], a[1], a[2])),
@@ -1823,6 +1849,28 @@ fn lseek(st: &mut State, i: usize, fd: u64, off: i64, whence: u64) -> Result<u64
     let to = base.checked_add(off).filter(|&t| t >= 0).ok_or(EINVAL)?;
     st.files[f].off = to as u64;
     Ok(to as u64)
+}
+
+/// `pread64`: a file's bytes from `off`, its offset left as it is (up to
+/// a page at a time, as `read`).
+fn pread(st: &mut State, i: usize, fd: u64, buf: u64, len: u64, off: u64) -> Result<u64, u64> {
+    let f = st.file(i, fd).ok_or(EBADF)?;
+    let o = st.files[f];
+    if o.kind != FileKind::Node {
+        return Err(ESPIPE);
+    }
+    if st.fs.kind(o.ino) == Kind::Dir {
+        return Err(EISDIR);
+    }
+    if o.flags & O_ACCMODE == O_WRONLY {
+        return Err(EBADF);
+    }
+    if (off as i64) < 0 {
+        return Err(EINVAL);
+    }
+    let mut tmp = [0u8; 4096];
+    let n = st.fs.read(o.ino, off, &mut tmp[..len.min(4096) as usize]);
+    st.put(i, buf, &tmp[..n]).map(|_| n as u64)
 }
 
 fn getdents(st: &mut State, i: usize, fd: u64, buf: u64, count: u64) -> Result<u64, u64> {
@@ -2140,7 +2188,7 @@ fn mmap(st: &mut State, i: usize, a: [u64; 6]) -> Result<u64, u64> {
         return Err(EINVAL);
     }
     if flags & MAP_ANONYMOUS == 0 {
-        return mmap_file(st, i, addr, len, flags & MAP_FIXED != 0, a[4], a[5]);
+        return mmap_file(st, i, addr, len, a[2], flags & MAP_FIXED != 0, a[4], a[5]);
     }
     let at = if flags & MAP_FIXED != 0 { addr } else { st.place(i, len)? };
     if at % PAGE != 0 || at < CHILD || at + len > STACK_TOP - STACK_PAGES * PAGE {
@@ -2178,9 +2226,15 @@ fn munmap(st: &mut State, i: usize, addr: u64, len: u64) -> Result<u64, u64> {
 /// process chooses not, is a library musl's dynamic linker is loading: it
 /// is loaded as the program loader loads one (code and read-only data the
 /// file's own pages, shared; data a copy), and the linker's mappings of
-/// its segments into that span after are already there. Anything else is
-/// a copy of the file's bytes in pages of the process's own.
-fn mmap_file(st: &mut State, i: usize, addr: u64, len: u64, fixed: bool, fd: u64, off: u64) -> Result<u64, u64> {
+/// its segments into that span after are already there. Any other
+/// mapping of a bundle file that cannot be written (code, read-only data)
+/// is the file's own pages, shared, as glibc's dynamic linker maps a
+/// library's code over the span it reserved for it. Anything else is a
+/// copy of the file's bytes in pages of the process's own.
+#[allow(clippy::too_many_arguments)]
+fn mmap_file(st: &mut State, i: usize, addr: u64, len: u64, prot: u64, fixed: bool, fd: u64, off: u64) -> Result<u64, u64> {
+    const PROT_WRITE: u64 = 2;
+    const PROT_EXEC: u64 = 4;
     let f = st.file(i, fd).ok_or(EBADF)?;
     let o = st.files[f];
     if o.kind != FileKind::Node || st.fs.kind(o.ino) == Kind::Dir {
@@ -2211,6 +2265,32 @@ fn mmap_file(st: &mut State, i: usize, addr: u64, len: u64, fixed: bool, fd: u64
     let at = if fixed { addr } else { reserve(st)? };
     if at % PAGE != 0 || at < CHILD || at + len > STACK_TOP - STACK_PAGES * PAGE {
         return Err(ENOMEM);
+    }
+    // What was there goes (MAP_FIXED): pages of its own, reserved ones.
+    for page in (at..at + len).step_by(PAGE as usize) {
+        st.set_reserved(i, page, false);
+    }
+    if let Some(k) = st.fs.image(o.ino).filter(|_| prot & PROT_WRITE == 0) {
+        let Img { bytes, slot } = st.images[k];
+        // Up to the file's end, as Linux maps it (past it, an access faults).
+        let n = len.min((bytes.len() as u64).saturating_sub(off));
+        if n > 0 && st.procs[i].nshared < st.procs[i].shared.len() {
+            for page in (at..at + len).step_by(PAGE as usize) {
+                st.unmap_private(i, page);
+            }
+            let run = Shared {
+                start: at,
+                end: at + n,
+                ptr: bytes.as_ptr() as u64 + off,
+                slot: slot + off / PAGE,
+                flags: if prot & PROT_EXEC != 0 { MAP_EXEC } else { 0 },
+            };
+            let p = &mut st.procs[i];
+            p.shared[p.nshared] = run;
+            p.nshared += 1;
+            st.map_run(i, run)?;
+            return Ok(at);
+        }
     }
     let mut buf = [0u8; PAGE as usize];
     for page in (at..at + len).step_by(PAGE as usize) {
@@ -2743,11 +2823,18 @@ fn run(st: &mut State, argv: &[&str], env: &[&str], interactive: bool) -> Result
         // A first touch of an anonymous mapping's page: made, and the
         // access tried again; or another thread made it first.
         let page_fault = r.status == 0 && FaultKind::from_u64(kind) == Some(FaultKind::PageFault);
-        let made = |st: &State| (CHILD..CHILD_END).contains(&nr) && st.is_present(i, nr & !(PAGE - 1));
+        // Made by another thread meanwhile, unless it faults there again:
+        // then it is the access that is refused (say, running code in a
+        // page of its own, which is never executable).
+        let made = |st: &State| {
+            (CHILD..CHILD_END).contains(&nr) && st.is_present(i, nr & !(PAGE - 1)) && st.tasks[t].last_fault != nr
+        };
         if page_fault && (made(st) || st.take_reserved(i, nr)) {
+            st.tasks[t].last_fault = nr;
             syscall(Syscall::Reply, 0, [FaultReply::Retry as u64, 0, 0, 0]);
             continue;
         }
+        st.tasks[t].last_fault = 0;
         if r.status != 0 || FaultKind::from_u64(kind) != Some(FaultKind::ForeignSyscall) {
             st.flush();
             let (what, signal) = match FaultKind::from_u64(kind) {
@@ -3364,6 +3451,9 @@ const RUNS: &[(&[&str], u32)] = &[
     // Memory unmapped is given back and used again: far more mapped,
     // touched and unmapped than a process has (mmaptest, of our own).
     (&["sh", "-c", "mmaptest && echo mmaptest said $?"], 0),
+    // A program linked against glibc (Debian's GNU hello): glibc's
+    // dynamic linker loads its C library.
+    (&["sh", "-c", "hello && echo hello said $?"], 0),
     // A program with a library of its own: pigz, with zlib, which musl's
     // dynamic linker loads. BusyBox's gzip checks what it wrote.
     (&["sh", "-c", "seq 1 10000 > /tmp/n && pigz -p 2 -b 32 -k /tmp/n && ls /tmp && gzip -dc /tmp/n.gz | md5sum && md5sum < /tmp/n"], 0),
@@ -3478,6 +3568,11 @@ fn setup() -> Result<&'static mut State, &'static str> {
     let libz = map_file(LIBZ_FILE, LIBZ_VA, FPTEST_FILE - LIBZ_FILE);
     let fptest = map_file(FPTEST_FILE, FPTEST_VA, PROGRAM_FILE - FPTEST_FILE);
     let program = map_file(PROGRAM_FILE, PROGRAM_VA, STATE_SLOTS - PROGRAM_FILE);
+    let glibc_ld = map_file(GLIBC_LD_FILE, GLIBC_LD_VA, HELLO_FILE - GLIBC_LD_FILE);
+    let hello = map_file(HELLO_FILE, HELLO_VA, LIBC_FILE - HELLO_FILE);
+    let libc = map_file(LIBC_FILE, LIBC_VA, LIBC_PAGES);
+    // glibc's dynamic linker is where hello says it is.
+    let glibc_ld_path = Elf::parse(hello).ok().and_then(|e| e.interpreter()).unwrap_or(b"");
     st.next_pid = 1;
     // The restorer page, executable in every process.
     sys(Syscall::Retype, FS_BLOCK, [ObjectType::Frame as u64, 0, TRAMPOLINE_SLOT, 0]).map_err(|_| "no memory")?;
@@ -3487,7 +3582,7 @@ fn setup() -> Result<&'static mut State, &'static str> {
     st.trampoline = Shared { start: TRAMPOLINE, end: TRAMPOLINE + PAGE, ptr: TRAMPOLINE_VA, slot: TRAMPOLINE_SLOT, flags: MAP_EXEC };
     let interp_path = Elf::parse(program).ok().and_then(|e| e.interpreter()).ok_or("BusyBox is not dynamically linked")?;
     // Where each file is: BusyBox first (the runs' programs are its).
-    let files: [(&[u8], &'static [u8], u64); 7] = [
+    let files: [(&[u8], &'static [u8], u64); MAX_IMAGES] = [
         (b"/bin/busybox", program, PROGRAM_FILE),
         (interp_path, interp, INTERP_FILE),
         (b"/usr/bin/pigz", pigz, PIGZ_FILE),
@@ -3495,8 +3590,11 @@ fn setup() -> Result<&'static mut State, &'static str> {
         (b"/usr/bin/fptest", fptest, FPTEST_FILE),
         (b"/usr/bin/smptest", smptest, SMPTEST_FILE),
         (b"/usr/bin/mmaptest", mmaptest, MMAPTEST_FILE),
+        (glibc_ld_path, glibc_ld, GLIBC_LD_FILE),
+        (LIBC_PATH, libc, LIBC_FILE),
+        (b"/usr/bin/hello", hello, HELLO_FILE),
     ];
-    let mut tree = [(&b""[..], &b""[..]); 7];
+    let mut tree = [(&b""[..], &b""[..]); MAX_IMAGES];
     let mut n = 0;
     for (path, bytes, slot) in files {
         if !bytes.is_empty() {
