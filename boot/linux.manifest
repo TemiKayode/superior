@@ -4,7 +4,9 @@
 # linked, position-independent executable, with musl's dynamic linker
 # (also its C library) as its interpreter. Both come from the bundle as
 # files, copied into the personality's own memory, with pigz and the zlib
-# it links to (a threaded program, and a library musl loads). Shell
+# it links to (a threaded program, and a library musl loads), and fptest
+# (a Linux program of our own: its floating-point registers kept across
+# a signal handler, user/linux-fptest). Shell
 # scripts run with processes (fork, execve, wait4), pipes and an
 # in-memory file tree. Each process is an address space and its threads,
 # made from one of seven blocks cut from the untyped memory in slot 0, and
@@ -53,7 +55,7 @@ component linux
   image linux
   priority 10
   # Its CNode (2^13 slots: a 1024-slot span per process, the state's and
-  # files' pages, the files), address space, image, stack, the four files,
+  # files' pages, the files), address space, image, stack, the five files,
   # the 8 MiB block and the 4 MiB one.
   memory 24
   cspace 13
@@ -63,7 +65,8 @@ component linux
   file ld-musl 16
   file pigz 180
   file libz 216
-  file busybox 250
+  file fptest 250
+  file busybox 252
   untyped 22 5
   untyped 23 0
   control 1

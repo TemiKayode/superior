@@ -15,9 +15,13 @@
 //! `siginfo` and `ucontext` as its arguments, returning to the restorer
 //! musl gives (`SA_RESTORER`) or to this server's own (a page at
 //! [`TRAMPOLINE`] in every process), which calls `rt_sigreturn` to take
-//! the frame back. Not yet in the frame: the FPU and SIMD registers (a
-//! handler that uses them leaves them changed for the code it
-//! interrupted), and an alternate signal stack.
+//! the frame back. The floating-point and SIMD registers go in the frame
+//! too, as Linux puts them: on x86-64 an `fxsave` area above the frame,
+//! which `uc_mcontext.fpstate` points to; on AArch64 an `fpsimd_context`
+//! record in `uc_mcontext.__reserved`. So a handler that uses them leaves
+//! them as they were for the code it interrupted, and one that changes
+//! them in the frame changes them for it. Not yet: an alternate signal
+//! stack, and on x86-64 the AVX (`xsave`) state above SSE.
 //!
 //! Job control: a stop signal whose action is the default (`SIGSTOP`,
 //! and `SIGTSTP`, `SIGTTIN`, `SIGTTOU` unless caught) stops the whole
@@ -108,10 +112,24 @@ pub const SP: usize = if cfg!(target_arch = "x86_64") { 15 } else { 31 };
 const PC: usize = if cfg!(target_arch = "x86_64") { 16 } else { 32 };
 /// The `ucontext` the handler gets: its size, and where its registers
 /// (`uc_mcontext`'s general registers) and signal mask are in it.
-const UC_LEN: u64 = if cfg!(target_arch = "x86_64") { 304 } else { 528 };
+/// AArch64's has an `fpsimd_context` record (and an empty one ending the
+/// list) in `__reserved`, which Linux makes 4096 bytes; these are all a
+/// handler or `rt_sigreturn` reads.
+const UC_LEN: u64 = if cfg!(target_arch = "x86_64") { 304 } else { UC_FP + FP_RECORD + 16 };
 const UC_REGS: u64 = if cfg!(target_arch = "x86_64") { 40 } else { 184 };
 const UC_MASK: u64 = if cfg!(target_arch = "x86_64") { 296 } else { 40 };
+/// x86-64: `uc_mcontext.fpstate`, the pointer to the `fxsave` area;
+/// AArch64: `__reserved`, where the `fpsimd_context` record is.
+const UC_FP: u64 = if cfg!(target_arch = "x86_64") { 224 } else { 464 };
+/// AArch64's `fpsimd_context`: its magic and size (header included), the
+/// state's words (`REGS_FP_GET`'s) following the 8-byte header.
+const FPSIMD_MAGIC: u32 = 0x4650_8001;
+const FP_RECORD: u64 = 8 + 8 * FP_WORDS as u64;
 const INFO_LEN: u64 = 128;
+/// The floating-point and SIMD state, in `REGS_FP_GET`'s words.
+const FP_WORDS: usize = REGS_FP_WORDS as usize;
+/// x86-64's `fxsave` area: its size and alignment.
+const FXSAVE_LEN: u64 = 512;
 /// The instruction that made a system call, to make it again.
 pub const SYSCALL_LEN: u64 = if cfg!(target_arch = "x86_64") { 2 } else { 4 };
 
@@ -128,6 +146,27 @@ fn regs(th: u64) -> Option<[u64; COUNT]> {
 fn set_regs(th: u64, r: &[u64; COUNT]) -> Option<()> {
     for k in (0..COUNT).step_by(2) {
         sys(Syscall::ThreadRegisters, th, [REGS_SET, k as u64, r[k], r[k + 1]]).ok()?;
+    }
+    Some(())
+}
+
+/// The thread's floating-point and SIMD state, as bytes in Linux's frame
+/// layout.
+fn fp_state(th: u64) -> Option<[u8; 8 * FP_WORDS]> {
+    let mut b = [0; 8 * FP_WORDS];
+    for k in (0..FP_WORDS).step_by(4) {
+        let m = sys(Syscall::ThreadRegisters, th, [REGS_FP_GET, k as u64, 0, 0]).ok()?;
+        for (n, w) in m.iter().enumerate().take(FP_WORDS - k) {
+            b[8 * (k + n)..8 * (k + n + 1)].copy_from_slice(&w.to_le_bytes());
+        }
+    }
+    Some(b)
+}
+
+fn set_fp_state(th: u64, b: &[u8; 8 * FP_WORDS]) -> Option<()> {
+    let word = |k: usize| if k < FP_WORDS { u64::from_le_bytes(b[8 * k..8 * k + 8].try_into().unwrap()) } else { 0 };
+    for k in (0..FP_WORDS).step_by(2) {
+        sys(Syscall::ThreadRegisters, th, [REGS_FP_SET, k as u64, word(k), word(k + 1)]).ok()?;
     }
     Some(())
 }
@@ -341,14 +380,19 @@ impl State {
         uc[UC_MASK as usize..UC_MASK as usize + 8].copy_from_slice(&old_mask.to_le_bytes());
         let mut info = [0u8; INFO_LEN as usize];
         info[..4].copy_from_slice(&sig.to_le_bytes());
+        let fp = fp_state(th)?;
 
         if cfg!(target_arch = "x86_64") {
-            // Below the red zone: the return address (the restorer), the
+            // Below the red zone: the fxsave area (64-byte aligned, as
+            // Linux has it), then the return address (the restorer), the
             // ucontext and the siginfo, the return address 8 below a
             // 16-byte boundary, as after a call.
-            let frame = ((r[SP] - 128 - (8 + UC_LEN + INFO_LEN)) & !15) - 8;
+            let fpstate = (r[SP] - 128 - FXSAVE_LEN) & !63;
+            let frame = ((fpstate - (8 + UC_LEN + INFO_LEN)) & !15) - 8;
             let (ucp, infop) = (frame + 8, frame + 8 + UC_LEN);
-            let ok = self.copy_out(i, frame, &restorer.to_le_bytes())
+            uc[UC_FP as usize..UC_FP as usize + 8].copy_from_slice(&fpstate.to_le_bytes());
+            let ok = self.copy_out(i, fpstate, &fp)
+                && self.copy_out(i, frame, &restorer.to_le_bytes())
                 && self.copy_out(i, ucp, &uc)
                 && self.copy_out(i, infop, &info);
             if !ok {
@@ -359,6 +403,10 @@ impl State {
             set_regs(th, &r)?;
             Some((a.handler, 0))
         } else {
+            let at = UC_FP as usize;
+            uc[at..at + 4].copy_from_slice(&FPSIMD_MAGIC.to_le_bytes());
+            uc[at + 4..at + 8].copy_from_slice(&(FP_RECORD as u32).to_le_bytes());
+            uc[at + 8..at + FP_RECORD as usize].copy_from_slice(&fp);
             // The siginfo, the ucontext and a frame record (the
             // interrupted frame pointer and pc).
             let frame = (r[SP] - (INFO_LEN + UC_LEN + 16)) & !15;
@@ -395,6 +443,25 @@ impl State {
             *v = word(UC_REGS + 8 * k as u64);
         }
         set_regs(th, &r)?;
+        // The floating-point and SIMD state, where the frame has it (as
+        // the handler may have changed it). Without it (x86-64: a null
+        // `fpstate`; AArch64: no record) it stays as it is.
+        let mut fp = [0u8; 8 * FP_WORDS];
+        let found = if cfg!(target_arch = "x86_64") {
+            let at = word(UC_FP);
+            at != 0 && self.copy_in(i, at, &mut fp)
+        } else {
+            let at = UC_FP as usize;
+            let head = word(UC_FP);
+            let found = head as u32 == FPSIMD_MAGIC && (head >> 32) == FP_RECORD;
+            if found {
+                fp.copy_from_slice(&uc[at + 8..at + FP_RECORD as usize]);
+            }
+            found
+        };
+        if found {
+            set_fp_state(th, &fp)?;
+        }
         self.tasks[t].mask = word(UC_MASK) & !UNBLOCKABLE;
         Some((r[PC], r[RESULT]))
     }

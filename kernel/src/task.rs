@@ -912,8 +912,8 @@ fn raise_fault(k: &mut Kernel, cur: Tid, kind: FaultKind, addr: u64, pc: u64, co
 /// its value. See the `REGS_*` constants.
 fn thread_registers(k: &mut Kernel, cur: Tid, f: &Args) -> Result<(), u64> {
     use superior_objects::abi::{
-        REGS_FOREIGN, REGS_FORK_FROM, REGS_GET, REGS_SET, REGS_SET_TLS, REGS_SYSCALL, REGS_SYSCALL_MORE,
-        REGS_TLS,
+        REGS_FOREIGN, REGS_FORK_FROM, REGS_FP_GET, REGS_FP_SET, REGS_GET, REGS_SET, REGS_SET_TLS, REGS_SYSCALL,
+        REGS_SYSCALL_MORE, REGS_TLS,
     };
     let t = thread_cap(k, cur, f.a0)? as usize;
     let r = k.frames[t].foreign_syscall();
@@ -950,6 +950,24 @@ fn thread_registers(k: &mut Kernel, cur: Tid, f: &Args) -> Result<(), u64> {
             }
             k.frames[t] = frame;
             k.preempted[t] = true;
+            [0; 4]
+        }
+        // Its state as saved when it entered the kernel, which is what it
+        // resumes with.
+        REGS_FP_GET => {
+            let fp = &k.fp[t];
+            let at = |n: u64| f.a2.checked_add(n).and_then(|i| fp.word(i)).unwrap_or(0);
+            [at(0), at(1), at(2), at(3)]
+        }
+        REGS_FP_SET => {
+            if !k.in_fault[t] && !thread_inactive(k, t as Tid) {
+                return Err(Error::IllegalOperation.code());
+            }
+            for (n, v) in [(0, f.a3), (1, f.a4)] {
+                if let Some(i) = f.a2.checked_add(n) {
+                    k.fp[t].set_word(i, v);
+                }
+            }
             [0; 4]
         }
         REGS_FORK_FROM => {

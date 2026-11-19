@@ -861,6 +861,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "superior-linux-fptest"
+version = "0.1.0"
+
+[[package]]
 name = "superior-list"
 version = "0.1.0"
 dependencies = [

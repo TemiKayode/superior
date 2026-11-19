@@ -1638,6 +1638,22 @@ holds the rest):
   `wait` finish it. It starts a background `read`, which `jobs` shows
   stopped for terminal input until `fg` lets it read what is typed. Last, it
   stops a job spinning in user space and ends it with `kill -9`.
+- The Linux personality's signal frames hold the floating-point and SIMD
+  registers. A handler that uses them now leaves them as they were for the
+  code it interrupted. The registers go where Linux puts them. On x86-64
+  that is a 64-byte-aligned `fxsave` area above the frame, which
+  `uc_mcontext.fpstate` points to. On AArch64 it is an `fpsimd_context`
+  record in `__reserved`, ended by an empty one. `rt_sigreturn` loads them
+  back from there, so a handler that edits them in the frame changes them
+  for the code it returns to. The kernel's `ThreadRegisters` reads and writes
+  a stopped thread's saved state in that layout (`REGS_FP_GET`,
+  `REGS_FP_SET`). On x86-64 it keeps only the MXCSR bits the CPU has, so
+  `fxrstor` cannot fault. The x86-64 AVX (`xsave`) state is not in the frame
+  yet. `linux-test` now runs fptest (`user/linux-fptest`), a Linux program of
+  our own written in assembly, with no C library. It puts a value in
+  `xmm0`/`d0` and rounds toward zero, then sends itself `SIGUSR1`; its
+  handler clears both. Once the handler returns, the value and the rounding
+  mode must be as they were. With the restore taken out, it fails.
 - Interrupt and exception entries clear the direction flag. User code may be
   interrupted mid-way through a backward copy, with the flag set; the kernel's own
   copies need it clear, and without the `cld` they ran backwards, wrecking saved

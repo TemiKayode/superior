@@ -81,6 +81,35 @@ pub struct FpState {
 impl FpState {
     /// Linux's initial state: all zero (round to nearest, no traps).
     pub const INITIAL: FpState = FpState { q: [0; 32], fpsr: 0, fpcr: 0 };
+
+    /// Word `i` of Linux's `fpsimd_context` body: `fpsr` and `fpcr`, then
+    /// each `v` register's low and high halves.
+    pub fn word(&self, i: u64) -> Option<u64> {
+        match i {
+            0 => Some(self.fpsr & 0xffff_ffff | self.fpcr << 32),
+            1..=64 => {
+                let q = self.q[(i as usize - 1) / 2];
+                Some(if i % 2 == 1 { q as u64 } else { (q >> 64) as u64 })
+            }
+            _ => None,
+        }
+    }
+
+    /// Sets word `i`. An index past the last is ignored.
+    pub fn set_word(&mut self, i: u64, v: u64) {
+        match i {
+            0 => (self.fpsr, self.fpcr) = (v & 0xffff_ffff, v >> 32),
+            1..=64 => {
+                let q = &mut self.q[(i as usize - 1) / 2];
+                *q = if i % 2 == 1 {
+                    *q & !(u64::MAX as u128) | v as u128
+                } else {
+                    *q & u64::MAX as u128 | (v as u128) << 64
+                };
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Whether each CPU lets user code use the FP/SIMD registers.

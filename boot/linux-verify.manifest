@@ -54,7 +54,7 @@ component linux
   file ld-musl 16
   file pigz 180
   file libz 216
-  file busybox 250
+  file busybox 252
   untyped 22 5
   untyped 23 0
   control 1

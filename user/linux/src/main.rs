@@ -33,7 +33,8 @@
 //! `exit` ends a thread (clearing its `CLONE_CHILD_CLEARTID` word and
 //! waking its joiner), `exit_group` the process. Files ([`fs`]): an
 //! in-memory tree with `/bin` (BusyBox and a link per applet), the
-//! interpreter, pigz in `/usr/bin` and zlib in `/lib`, `/tmp`,
+//! interpreter, pigz and fptest (`user/linux-fptest`, for the test) in
+//! `/usr/bin` and zlib in `/lib`, `/tmp`,
 //! `/dev/null`; pipes; the console. They last as long as this server,
 //! but for what is made outside them, which is the filesystem server's
 //! (this component's container there: the root, with `/home`), and so on
@@ -47,7 +48,8 @@
 //! manager's control endpoint, 2 the endpoint faults arrive on, 6 the
 //! filesystem server (its buffer frame in [`remote::BUF`]). The
 //! bundle's files' pages from 16: musl's, pigz's from 180, zlib's from
-//! 216, BusyBox's from 250 (`file` in the manifest). Process `i` owns the
+//! 216, fptest's from 250, BusyBox's from 252 (`file` in the manifest;
+//! a file's first slot is below 256). Process `i` owns the
 //! slots from `PROC_SLOTS + i * PROC_SPAN`: its address space, then its
 //! threads (each with a badged fault endpoint) and pages as made.
 //!
@@ -72,8 +74,8 @@ mod tty;
 use fs::{FileKind, Fs, Kind, MAX_FILES, MAX_IMAGES, MAX_PIPES, Open, PIPE_BUF, Pipe, ROOT};
 use signal::{Action, Next, SA_RESTART, SIGCHLD, SIGPIPE, SIGSEGV, SYSCALL_LEN, TRAMPOLINE, TRAMPOLINE_CODE};
 use superior_objects::abi::{
-    Error, FaultKind, FaultReply, MAP_EXEC, MAP_WRITE, ObjectType, REGS_COUNT, REGS_FOREIGN, REGS_FORK_FROM, REGS_GET,
-    REGS_SET, REGS_SET_TLS, REGS_SYSCALL, REGS_SYSCALL_MORE, REGS_TLS, Syscall, TICK_HZ,
+    Error, FaultKind, FaultReply, MAP_EXEC, MAP_WRITE, ObjectType, REGS_COUNT, REGS_FOREIGN, REGS_FORK_FROM, REGS_FP_GET,
+    REGS_FP_SET, REGS_FP_WORDS, REGS_GET, REGS_SET, REGS_SET_TLS, REGS_SYSCALL, REGS_SYSCALL_MORE, REGS_TLS, Syscall, TICK_HZ,
 };
 use superior_objects::elf::{Elf, Machine};
 use superior_sys::{USER_BASE, print_line, syscall};
@@ -100,11 +102,13 @@ const NTFN: u64 = 1001;
 const NTFN_UART: u64 = 1002;
 const NTFN_TIMER: u64 = 1003;
 /// The bundle's files (`file` in the manifest), their first slots: musl's
-/// dynamic linker, BusyBox, pigz and zlib.
+/// dynamic linker, BusyBox, pigz, zlib and fptest (if there: not on the
+/// second boot).
 const INTERP_FILE: u64 = 16;
 const PIGZ_FILE: u64 = 180;
 const LIBZ_FILE: u64 = 216;
-const PROGRAM_FILE: u64 = 250;
+const FPTEST_FILE: u64 = 250;
+const PROGRAM_FILE: u64 = 252;
 const STATE_SLOTS: u64 = 512;
 const STATE_PAGES: u64 = 32;
 const POOL_SLOTS: u64 = STATE_SLOTS + STATE_PAGES;
@@ -130,6 +134,7 @@ const POOL_VA: u64 = USER_BASE + 0x1_3000_0000;
 const TRAMPOLINE_VA: u64 = USER_BASE + 0x1_4000_0000;
 const PIGZ_VA: u64 = USER_BASE + 0x1_5000_0000;
 const LIBZ_VA: u64 = USER_BASE + 0x1_5800_0000;
+const FPTEST_VA: u64 = USER_BASE + 0x1_5c00_0000;
 
 /// A process's address space: everything inside [`CHILD`, `CHILD_END`).
 const CHILD: u64 = USER_BASE + 0x40_0000_0000;
@@ -2791,6 +2796,10 @@ const RUNS: &[(&[&str], u32)] = &[
     (&["sh", "-c", "sleep 30 & kill $!; wait $!; echo status after kill $?"], 0),
     (&["sh", "-c", "yes | head -n 3 | wc -l"], 0),
     (&["sh", "-c", "sleep 1 && echo slept"], 0),
+    // A handler that changes the floating-point and SIMD registers leaves
+    // them as they were for the code it interrupted (they are in the
+    // signal frame): a program of our own, no C library.
+    (&["sh", "-c", "fptest && echo fptest said $?"], 0),
     // A program with a library of its own: pigz, with zlib, which musl's
     // dynamic linker loads. BusyBox's gzip checks what it wrote.
     (&["sh", "-c", "seq 1 10000 > /tmp/n && pigz -p 2 -b 32 -k /tmp/n && ls /tmp && gzip -dc /tmp/n.gz | md5sum && md5sum < /tmp/n"], 0),
@@ -2880,7 +2889,8 @@ fn setup() -> Result<&'static mut State, &'static str> {
     let st = unsafe { &mut *(STATE_VA as *mut State) };
     let interp = map_file(INTERP_FILE, INTERP_VA, PIGZ_FILE - INTERP_FILE);
     let pigz = map_file(PIGZ_FILE, PIGZ_VA, LIBZ_FILE - PIGZ_FILE);
-    let libz = map_file(LIBZ_FILE, LIBZ_VA, PROGRAM_FILE - LIBZ_FILE);
+    let libz = map_file(LIBZ_FILE, LIBZ_VA, FPTEST_FILE - LIBZ_FILE);
+    let fptest = map_file(FPTEST_FILE, FPTEST_VA, PROGRAM_FILE - FPTEST_FILE);
     let program = map_file(PROGRAM_FILE, PROGRAM_VA, STATE_SLOTS - PROGRAM_FILE);
     st.next_pid = 1;
     // The restorer page, executable in every process.
@@ -2891,13 +2901,14 @@ fn setup() -> Result<&'static mut State, &'static str> {
     st.trampoline = Shared { start: TRAMPOLINE, end: TRAMPOLINE + PAGE, ptr: TRAMPOLINE_VA, slot: TRAMPOLINE_SLOT, flags: MAP_EXEC };
     let interp_path = Elf::parse(program).ok().and_then(|e| e.interpreter()).ok_or("BusyBox is not dynamically linked")?;
     // Where each file is: BusyBox first (the runs' programs are its).
-    let files: [(&[u8], &'static [u8], u64); 4] = [
+    let files: [(&[u8], &'static [u8], u64); 5] = [
         (b"/bin/busybox", program, PROGRAM_FILE),
         (interp_path, interp, INTERP_FILE),
         (b"/usr/bin/pigz", pigz, PIGZ_FILE),
         (b"/lib/libz.so.1", libz, LIBZ_FILE),
+        (b"/usr/bin/fptest", fptest, FPTEST_FILE),
     ];
-    let mut tree = [(&b""[..], &b""[..]); 4];
+    let mut tree = [(&b""[..], &b""[..]); 5];
     let mut n = 0;
     for (path, bytes, slot) in files {
         if !bytes.is_empty() {

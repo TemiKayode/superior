@@ -1,0 +1,13 @@
+[package]
+name = "superior-linux-fptest"
+description = "A Linux program for the Linux personality's test: its floating-point and SIMD registers are as they were after a signal handler that changed them."
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "superior-linux-fptest"
+test = false
+bench = false

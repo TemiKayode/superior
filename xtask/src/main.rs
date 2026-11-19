@@ -710,6 +710,8 @@ fn linux_test(img: &Image) -> Result<(), String> {
         "linux: > status after kill 143",
         "linux: sh -c yes | head -n 3 | wc -l exited with status 0",
         "linux: > slept",
+        "linux: > fp registers kept across a handler",
+        "linux: > fptest said 0",
         // Threads (clone, futexes) in pigz, and zlib loaded by musl: what
         // two threads compressed BusyBox's gzip takes back unchanged.
         " started thread ",
@@ -998,6 +1000,10 @@ fn bundle(arch: Arch, manifest: &str, driver: &str) -> Result<PathBuf, String> {
     // The Linux programs the personality runs (`file` in its manifest).
     if manifest.starts_with("linux") {
         files.extend(alpine_files(arch)?);
+        // A Linux program of our own (the first boot's runs use it).
+        let path = user_program("superior-linux-fptest", arch)?;
+        let bytes = std::fs::read(&path).map_err(|e| format!("reading {}: {e}", path.display()))?;
+        files.push(("fptest".to_string(), bytes));
     }
     // Icon images (`icon NAME.pam` in a manifest), by their file names.
     let mut icons: Vec<_> = std::fs::read_dir(root().join("boot/icons"))

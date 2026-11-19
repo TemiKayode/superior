@@ -257,6 +257,29 @@ impl FpState {
         b[25] = 0x1f;
         FpState(b)
     };
+
+    /// Word `i` of the `fxsave` area.
+    pub fn word(&self, i: u64) -> Option<u64> {
+        let at = usize::try_from(i).ok().filter(|&i| i < 64)? * 8;
+        Some(u64::from_le_bytes(self.0[at..at + 8].try_into().unwrap()))
+    }
+
+    /// Sets word `i`; MXCSR (word 3's low half) keeps only the bits the
+    /// CPU has (its mask, the high half, which stays), so `fxrstor` cannot
+    /// fault. An index past the last is ignored.
+    pub fn set_word(&mut self, i: u64, v: u64) {
+        let Some(at) = usize::try_from(i).ok().filter(|&i| i < 64).map(|i| i * 8) else { return };
+        let v = if i == 3 {
+            let mask = match u32::from_le_bytes(self.0[28..32].try_into().unwrap()) {
+                0 => 0xffbf,
+                m => m,
+            };
+            (v as u32 & mask) as u64 | (mask as u64) << 32
+        } else {
+            v
+        };
+        self.0[at..at + 8].copy_from_slice(&v.to_le_bytes());
+    }
 }
 
 /// Whether each CPU lets user code use the FPU (CR0.TS clear).
