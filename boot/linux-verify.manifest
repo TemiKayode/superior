@@ -78,8 +78,9 @@ component linux
   file pigz 180
   file libz 216
   file busybox 252
-  untyped 22 5
   untyped 23 0
+  # The rest of RAM, for the spare blocks (slots 920 on).
+  untyped spare 920
   control 1
   # Its files on the disk (the root, but for /bin, /usr, /lib, /dev, /tmp).
   uses fs 6

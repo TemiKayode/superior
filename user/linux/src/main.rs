@@ -44,14 +44,14 @@
 //! Slots: 0 the untyped memory everything is made from, cut into eight
 //! blocks (slots 8 to 15): seven for processes, revoked when one exits or
 //! execs, and one for this server's state and the files' pages (from
-//! [`STATE_SLOTS`]). 5 more untyped memory, cut into spare blocks (from
+//! [`STATE_SLOTS`]). From 920 the rest of RAM, cut into spare blocks (from
 //! [`SPARE_BLOCKS`]) lent to a process that outgrows its own. 1 the
 //! manager's control endpoint, 2 the endpoint faults arrive on, 6 the
 //! filesystem server (its buffer frame in [`remote::BUF`]). The
 //! bundle's files' pages from 16: musl's, mmaptest's from 177, pigz's
 //! from 180, smptest's
-//! from 213, zlib's from 216, fptest's from 250, BusyBox's from 252 (`file` in the manifest;
-//! a file's first slot is below 256). Process `i` owns the
+//! from 213, zlib's from 216, fptest's from 250, BusyBox's from 252 (`file`
+//! in the manifest). Process `i` owns the
 //! slots from `PROC_SLOTS + i * PROC_SPAN`: its address space, then its
 //! threads (each with a badged fault endpoint) and pages as made.
 //!
@@ -69,7 +69,7 @@
 //! kept and used (zeroed) for the next pages it makes, and `mmap` puts a
 //! mapping in the lowest free space, so freed space is used again too.
 //!
-//! Sockets ([`sock`]): IPv4 TCP and UDP, each the network server's (slot
+//! Sockets ([`sock`]): TCP, UDP and ping, over IPv4 and IPv6, each the network server's (slot
 //! 7, its buffer frame in [`sock::BUF`]); a call waiting on one is tried
 //! again every tick.
 //!
@@ -101,8 +101,11 @@ macro_rules! say {
 const UNTYPED: u64 = 0;
 const CONTROL: u64 = 1;
 const EP: u64 = 2;
-/// More untyped memory: the spare blocks.
-const UNTYPED_SPARE: u64 = 5;
+/// The rest of RAM (`untyped spare` in the manifest): blocks in slots
+/// from here, the first empty one after the last; the spare blocks are
+/// cut from them.
+const UNTYPED_SPARE: u64 = 920;
+const UNTYPED_SPARE_COUNT: u64 = 32;
 /// Each process's block, then the state's and files' (`FS_BLOCK`).
 const BLOCKS: u64 = 8;
 const BLOCK_BITS: u64 = 20;
@@ -313,6 +316,8 @@ enum Sys {
     Connect,
     Sendto,
     Recvfrom,
+    Sendmsg,
+    Recvmsg,
     Shutdown,
     Getsockname,
     Getpeername,
@@ -373,6 +378,8 @@ fn decode(nr: u64, a: [u64; 6]) -> (Sys, [u64; 6]) {
         288 => Sys::Accept,
         44 => Sys::Sendto,
         45 => Sys::Recvfrom,
+        46 => Sys::Sendmsg,
+        47 => Sys::Recvmsg,
         48 => Sys::Shutdown,
         49 => Sys::Bind,
         50 => Sys::Listen,
@@ -472,6 +479,8 @@ fn decode(nr: u64, a: [u64; 6]) -> (Sys, [u64; 6]) {
         205 => Sys::Getpeername,
         206 => Sys::Sendto,
         207 => Sys::Recvfrom,
+        211 => Sys::Sendmsg,
+        212 => Sys::Recvmsg,
         208 => Sys::Setsockopt,
         209 => Sys::Getsockopt,
         210 => Sys::Shutdown,
@@ -1483,6 +1492,8 @@ fn answer(st: &mut State, t: usize, call: Sys, a: [u64; 6]) -> Out {
         | Sys::Connect
         | Sys::Sendto
         | Sys::Recvfrom
+        | Sys::Sendmsg
+        | Sys::Recvmsg
         | Sys::Shutdown
         | Sys::Getsockname
         | Sys::Getpeername
@@ -1941,7 +1952,7 @@ fn read(st: &mut State, i: usize, fd: u64, buf: u64, len: u64) -> Out {
             pipe.take(&mut tmp[..want])
         }
         FileKind::Socket => match sock::recv(o.pipe as usize, &mut tmp[..want], false) {
-            Ok((n, _)) => n,
+            Ok(got) => got.n,
             Err(sock::EAGAIN) if o.flags & O_NONBLOCK == 0 => return Out::Block(Blocked::Read { fd, buf, len }),
             Err(e) => return Out::Ret(err(e)),
         },
@@ -1987,7 +1998,7 @@ fn write(st: &mut State, i: usize, fd: u64, buf: u64, len: u64) -> Out {
             n as u64
         }
         FileKind::PipeWrite => st.pipes[o.pipe as usize].put(&tmp[..n]) as u64,
-        FileKind::Socket => match sock::send(o.pipe as usize, &tmp[..n], 0) {
+        FileKind::Socket => match sock::send(o.pipe as usize, &tmp[..n], None) {
             Ok(w) => w as u64,
             Err(sock::EAGAIN) if o.flags & O_NONBLOCK == 0 => return Out::Block(Blocked::Write { fd, buf, len }),
             Err(EPIPE) => {
@@ -2829,27 +2840,31 @@ fn sock_of(st: &State, i: usize, fd: u64) -> Result<(usize, u32), u64> {
     Ok((o.pipe as usize, o.flags))
 }
 
-/// The address word ([`superior_objects::interfaces::net::addr`]) of the
-/// `sockaddr_in` at `addr`.
-fn sockaddr(st: &State, i: usize, addr: u64, len: u64) -> Result<u64, u64> {
+/// The address in the `sockaddr_in` or `sockaddr_in6` at `addr`.
+fn sockaddr(st: &State, i: usize, addr: u64, len: u64) -> Result<sock::Addr, u64> {
     const EAFNOSUPPORT: u64 = 97;
-    let mut b = [0u8; 16];
-    if len < 16 {
-        return Err(EINVAL);
+    let mut b = [0u8; 24];
+    let n = (len as usize).min(b.len());
+    if n < 2 || !st.copy_in(i, addr, &mut b[..n]) {
+        return Err(if n < 2 { EINVAL } else { EFAULT });
     }
-    if !st.copy_in(i, addr, &mut b) {
-        return Err(EFAULT);
+    let port = u16::from_be_bytes([b[2], b[3]]);
+    match u16::from_le_bytes([b[0], b[1]]) as u64 {
+        sock::AF_INET if n >= 16 => Ok(sock::Addr::v4([b[4], b[5], b[6], b[7]], port)),
+        sock::AF_INET6 if n >= 24 => {
+            let mut ip = [0u8; 16];
+            ip.copy_from_slice(&b[8..24]);
+            Ok(sock::Addr { ip, port })
+        }
+        sock::AF_INET | sock::AF_INET6 => Err(EINVAL),
+        _ => Err(EAFNOSUPPORT),
     }
-    if u16::from_le_bytes([b[0], b[1]]) as u64 != sock::AF_INET {
-        return Err(EAFNOSUPPORT);
-    }
-    let ip = u32::from_be_bytes([b[4], b[5], b[6], b[7]]) as u64;
-    Ok(ip << 16 | u16::from_be_bytes([b[2], b[3]]) as u64)
 }
 
-/// Address word `word` as a `sockaddr_in` at `addr` (if any), cut to the
-/// length at `lenp`, which then says 16.
-fn put_sockaddr(st: &mut State, i: usize, word: u64, addr: u64, lenp: u64) -> Result<(), u64> {
+/// `a` as socket `k`'s family's address at `addr` (if any): a
+/// `sockaddr_in`, or a `sockaddr_in6` (an IPv4 address mapped), cut to
+/// the length at `lenp`, which then says its whole length.
+fn put_sockaddr(st: &mut State, i: usize, k: usize, a: sock::Addr, addr: u64, lenp: u64) -> Result<(), u64> {
     if addr == 0 {
         return Ok(());
     }
@@ -2857,13 +2872,23 @@ fn put_sockaddr(st: &mut State, i: usize, word: u64, addr: u64, lenp: u64) -> Re
     if !st.copy_in(i, lenp, &mut l) {
         return Err(EFAULT);
     }
-    let mut b = [0u8; 16];
-    b[..2].copy_from_slice(&(sock::AF_INET as u16).to_le_bytes());
-    b[2..4].copy_from_slice(&(word as u16).to_be_bytes());
-    b[4..8].copy_from_slice(&((word >> 16) as u32).to_be_bytes());
-    let n = (u32::from_le_bytes(l) as usize).min(16);
+    let mut b = [0u8; 28];
+    let len = match a.ipv4() {
+        Some(ip) if sock::get(k).family == sock::AF_INET => {
+            b[..2].copy_from_slice(&(sock::AF_INET as u16).to_le_bytes());
+            b[4..8].copy_from_slice(&ip);
+            16
+        }
+        _ => {
+            b[..2].copy_from_slice(&(sock::AF_INET6 as u16).to_le_bytes());
+            b[8..24].copy_from_slice(&a.ip);
+            28
+        }
+    };
+    b[2..4].copy_from_slice(&a.port.to_be_bytes());
+    let n = (u32::from_le_bytes(l) as usize).min(len);
     st.put(i, addr, &b[..n])?;
-    st.put(i, lenp, &16u32.to_le_bytes()).map(|_| ())
+    st.put(i, lenp, &(len as u32).to_le_bytes()).map(|_| ())
 }
 
 /// A new socket's descriptor in process `i`.
@@ -2879,26 +2904,77 @@ fn new_socket(st: &mut State, i: usize, k: usize, ty: u64) -> Result<u64, u64> {
     })
 }
 
-/// The socket calls: IPv4 TCP and UDP over the network server
-/// ([`sock`]). One that must wait, on a descriptor without `O_NONBLOCK`
-/// (or a send or receive without `MSG_DONTWAIT`), waits.
+/// A `msghdr`'s fields: the name and its length's address, the `iovec`s
+/// and their count.
+struct Msg {
+    name: u64,
+    namelen: u64,
+    iov: u64,
+    iovlen: u64,
+}
+
+fn msghdr(st: &State, i: usize, at: u64) -> Result<Msg, u64> {
+    let w = |o: u64| st.word(i, at + o).ok_or(EFAULT);
+    Ok(Msg { name: w(0)?, namelen: at + 8, iov: w(16)?, iovlen: w(24)?.min(64) })
+}
+
+/// The `iovec`s' bytes, gathered into `out` (as many as fit).
+fn gather(st: &State, i: usize, iov: u64, cnt: u64, out: &mut [u8]) -> Result<usize, u64> {
+    let mut n = 0;
+    for k in 0..cnt {
+        let (base, len) = (st.word(i, iov + 16 * k).ok_or(EFAULT)?, st.word(i, iov + 16 * k + 8).ok_or(EFAULT)?);
+        let take = (len as usize).min(out.len() - n);
+        if !st.copy_in(i, base, &mut out[n..n + take]) {
+            return Err(EFAULT);
+        }
+        n += take;
+    }
+    Ok(n)
+}
+
+/// `data` scattered into the `iovec`s.
+fn scatter(st: &mut State, i: usize, iov: u64, cnt: u64, mut data: &[u8]) -> Result<(), u64> {
+    for k in 0..cnt {
+        if data.is_empty() {
+            break;
+        }
+        let (base, len) = (st.word(i, iov + 16 * k).ok_or(EFAULT)?, st.word(i, iov + 16 * k + 8).ok_or(EFAULT)?);
+        let n = (len as usize).min(data.len());
+        st.put(i, base, &data[..n])?;
+        data = &data[n..];
+    }
+    Ok(())
+}
+
+/// The socket calls: TCP, UDP and ping sockets over IPv4 and IPv6, the
+/// network server's ([`sock`]). One that must wait, on a descriptor
+/// without `O_NONBLOCK` (or a send or receive without `MSG_DONTWAIT`),
+/// waits.
 fn net_call(st: &mut State, i: usize, call: Sys, a: [u64; 6]) -> Out {
     const EPROTONOSUPPORT: u64 = 93;
     const EAFNOSUPPORT: u64 = 97;
+    const SOCK_RAW: u64 = 3;
     const MSG_PEEK: u64 = 2;
+    const MSG_TRUNC: u64 = 0x20;
     const MSG_DONTWAIT: u64 = 0x40;
     const MSG_NOSIGNAL: u64 = 0x4000;
     let r = |v: Result<u64, u64>| Out::Ret(v.unwrap_or_else(err));
     if call == Sys::Socket {
-        if a[0] != sock::AF_INET {
+        if a[0] != sock::AF_INET && a[0] != sock::AF_INET6 {
             return Out::Ret(err(EAFNOSUPPORT));
         }
-        let stream = match (a[1] & 0xf, a[2]) {
-            (sock::SOCK_STREAM, 0 | 6) => true,
-            (sock::SOCK_DGRAM, 0 | 17) => false,
+        let icmp = if a[0] == sock::AF_INET { 1 } else { 58 };
+        let proto = match (a[1] & 0xf, a[2]) {
+            (sock::SOCK_STREAM, 0 | 6) => sock::Proto::Tcp,
+            (sock::SOCK_DGRAM, 0 | 17) => sock::Proto::Udp,
+            // A ping socket, as Linux gives unprivileged programs.
+            (sock::SOCK_DGRAM, p) if p == icmp => sock::Proto::Echo,
+            // Raw sockets are for the privileged: ping falls back to the
+            // kind above.
+            (SOCK_RAW, _) => return Out::Ret(err(EPERM)),
             _ => return Out::Ret(err(EPROTONOSUPPORT)),
         };
-        return r(sock::socket(stream).and_then(|k| new_socket(st, i, k, a[1])));
+        return r(sock::socket(a[0], proto).and_then(|k| new_socket(st, i, k, a[1])));
     }
     let (k, flags) = match sock_of(st, i, a[0]) {
         Ok(s) => s,
@@ -2906,7 +2982,7 @@ fn net_call(st: &mut State, i: usize, call: Sys, a: [u64; 6]) -> Out {
     };
     let wait = |dontwait: bool, e: u64| e == sock::EAGAIN && flags & O_NONBLOCK == 0 && !dontwait;
     match call {
-        Sys::Bind => r(sockaddr(st, i, a[1], a[2]).and_then(|w| sock::bind(k, w as u16)).map(|_| 0)),
+        Sys::Bind => r(sockaddr(st, i, a[1], a[2]).and_then(|w| sock::bind(k, w.port)).map(|_| 0)),
         Sys::Listen => r(sock::listen(k).map(|_| 0)),
         Sys::Connect => match sockaddr(st, i, a[1], a[2]).and_then(|w| sock::connect(k, w)) {
             Ok(()) => Out::Ret(0),
@@ -2915,37 +2991,50 @@ fn net_call(st: &mut State, i: usize, call: Sys, a: [u64; 6]) -> Out {
         },
         Sys::Accept => match sock::accept(k) {
             Ok(c) => {
-                let peer = sock::get(c).peer;
+                let peer = sock::get(c).peer.unwrap_or(sock::Addr::NONE);
                 match new_socket(st, i, c, a[3]) {
-                    Ok(fd) => match put_sockaddr(st, i, peer, a[1], a[2]) {
-                        Ok(()) => Out::Ret(fd),
-                        Err(e) => Out::Ret(err(e)),
-                    },
+                    Ok(fd) => r(put_sockaddr(st, i, c, peer, a[1], a[2]).map(|_| fd)),
                     Err(e) => Out::Ret(err(e)),
                 }
             }
             Err(e) if wait(false, e) => Out::Block(Blocked::Net { call, a }),
             Err(e) => Out::Ret(err(e)),
         },
-        Sys::Sendto => {
+        // `sendto(fd, buf, len, flags, addr, addrlen)`, or `sendmsg(fd,
+        // msg, flags)`.
+        Sys::Sendto | Sys::Sendmsg => {
             let mut tmp = [0u8; 4096];
-            let n = a[2].min(tmp.len() as u64) as usize;
-            if !st.copy_in(i, a[1], &mut tmp[..n]) {
-                return Out::Ret(err(EFAULT));
-            }
-            let to = if a[4] != 0 && !sock::get(k).stream {
-                match sockaddr(st, i, a[4], a[5]) {
-                    Ok(w) => w,
+            let (n, name, namelen, mflags) = if call == Sys::Sendto {
+                let n = a[2].min(tmp.len() as u64) as usize;
+                if !st.copy_in(i, a[1], &mut tmp[..n]) {
+                    return Out::Ret(err(EFAULT));
+                }
+                (n, a[4], a[5], a[3])
+            } else {
+                let m = match msghdr(st, i, a[1]) {
+                    Ok(m) => m,
+                    Err(e) => return Out::Ret(err(e)),
+                };
+                let n = match gather(st, i, m.iov, m.iovlen, &mut tmp) {
+                    Ok(n) => n,
+                    Err(e) => return Out::Ret(err(e)),
+                };
+                let len = st.word(i, m.namelen).unwrap_or(0) as u32 as u64;
+                (n, m.name, len, a[2])
+            };
+            let to = if name != 0 && sock::get(k).proto != sock::Proto::Tcp {
+                match sockaddr(st, i, name, namelen) {
+                    Ok(w) => Some(w),
                     Err(e) => return Out::Ret(err(e)),
                 }
             } else {
-                0
+                None
             };
             match sock::send(k, &tmp[..n], to) {
                 Ok(w) => Out::Ret(w as u64),
-                Err(e) if wait(a[3] & MSG_DONTWAIT != 0, e) => Out::Block(Blocked::Net { call, a }),
+                Err(e) if wait(mflags & MSG_DONTWAIT != 0, e) => Out::Block(Blocked::Net { call, a }),
                 Err(EPIPE) => {
-                    if a[3] & MSG_NOSIGNAL == 0 {
+                    if mflags & MSG_NOSIGNAL == 0 {
                         st.post(i, SIGPIPE);
                     }
                     Out::Ret(err(EPIPE))
@@ -2953,21 +3042,49 @@ fn net_call(st: &mut State, i: usize, call: Sys, a: [u64; 6]) -> Out {
                 Err(e) => Out::Ret(err(e)),
             }
         }
-        Sys::Recvfrom => {
+        // `recvfrom(fd, buf, len, flags, addr, addrlen)`, or
+        // `recvmsg(fd, msg, flags)`: no control messages.
+        Sys::Recvfrom | Sys::Recvmsg => {
             let mut tmp = [0u8; 4096];
-            let n = a[2].min(tmp.len() as u64) as usize;
-            match sock::recv(k, &mut tmp[..n], a[3] & MSG_PEEK != 0) {
-                Ok((n, from)) => r(st.put(i, a[1], &tmp[..n]).and_then(|_| put_sockaddr(st, i, from, a[4], a[5])).map(|_| n as u64)),
-                Err(e) if wait(a[3] & MSG_DONTWAIT != 0, e) => Out::Block(Blocked::Net { call, a }),
-                Err(e) => Out::Ret(err(e)),
+            let (want, mflags, msg) = if call == Sys::Recvfrom {
+                (a[2], a[3], None)
+            } else {
+                let m = match msghdr(st, i, a[1]) {
+                    Ok(m) => m,
+                    Err(e) => return Out::Ret(err(e)),
+                };
+                let mut total = 0u64;
+                for c in 0..m.iovlen {
+                    total = total.saturating_add(st.word(i, m.iov + 16 * c + 8).unwrap_or(0));
+                }
+                (total, a[2], Some(m))
+            };
+            let n = want.min(tmp.len() as u64) as usize;
+            let got = match sock::recv(k, &mut tmp[..n], mflags & MSG_PEEK != 0) {
+                Ok(g) => g,
+                Err(e) if wait(mflags & MSG_DONTWAIT != 0, e) => return Out::Block(Blocked::Net { call, a }),
+                Err(e) => return Out::Ret(err(e)),
+            };
+            let data = &tmp[..got.n];
+            r(match msg {
+                None => st.put(i, a[1], data).and_then(|_| put_sockaddr(st, i, k, got.from, a[4], a[5])),
+                Some(m) => scatter(st, i, m.iov, m.iovlen, data)
+                    .and_then(|_| put_sockaddr(st, i, k, got.from, m.name, m.namelen))
+                    .and_then(|_| st.put(i, a[1] + 40, &0u64.to_le_bytes()))
+                    .and_then(|_| {
+                        let f = if got.full > got.n { MSG_TRUNC as u32 } else { 0 };
+                        st.put(i, a[1] + 48, &f.to_le_bytes())
+                    })
+                    .map(|_| ()),
             }
+            .map(|_| got.n as u64))
         }
         Sys::Shutdown => r(sock::shutdown(k, a[1]).map(|_| 0)),
         Sys::Getsockname => {
             let w = sock::name(k);
-            r(put_sockaddr(st, i, w, a[1], a[2]).map(|_| 0))
+            r(put_sockaddr(st, i, k, w, a[1], a[2]).map(|_| 0))
         }
-        Sys::Getpeername => r(sock::peer(k).and_then(|w| put_sockaddr(st, i, w, a[1], a[2])).map(|_| 0)),
+        Sys::Getpeername => r(sock::peer(k).and_then(|w| put_sockaddr(st, i, k, w, a[1], a[2])).map(|_| 0)),
         // Options are taken and do nothing.
         Sys::Setsockopt => Out::Ret(0),
         Sys::Getsockopt => {
@@ -2976,7 +3093,9 @@ fn net_call(st: &mut State, i: usize, call: Sys, a: [u64; 6]) -> Out {
             const SO_ERROR: u64 = 4;
             let v = match (a[1], a[2]) {
                 (SOL_SOCKET, SO_ERROR) => sock::take_error(k),
-                (SOL_SOCKET, SO_TYPE) => if sock::get(k).stream { sock::SOCK_STREAM } else { sock::SOCK_DGRAM },
+                (SOL_SOCKET, SO_TYPE) => {
+                    if sock::get(k).proto == sock::Proto::Tcp { sock::SOCK_STREAM } else { sock::SOCK_DGRAM }
+                }
                 _ => 0,
             };
             r(st.put(i, a[3], &(v as u32).to_le_bytes()).and_then(|_| st.put(i, a[4], &4u32.to_le_bytes())).map(|_| 0))
@@ -3189,7 +3308,7 @@ const APPLETS: &[&str] = &[
     "sh", "ash", "echo", "cat", "ls", "wc", "seq", "mkdir", "rmdir", "rm", "touch", "true", "false", "uname", "awk",
     "sort", "head", "tail", "grep", "tr", "env", "pwd", "test", "[", "basename", "dirname", "cp", "mv", "ln", "printf",
     "expr", "cut", "uniq", "sed", "xargs", "find", "stat", "readlink", "sleep", "yes", "tee", "od", "stty",
-    "kill", "gzip", "md5sum", "nproc", "wget", "nc",
+    "kill", "gzip", "md5sum", "nproc", "wget", "nc", "ping", "ping6",
 ];
 
 /// What the test runs, and the exit status each must end with. They share
@@ -3242,6 +3361,13 @@ const RUNS: &[(&[&str], u32)] = &[
     (&["sh", "-c", "echo echoed over TCP | nc 10.0.3.2 47002"], 0),
     (&["sh", "-c", "echo echoed over UDP | nc -u -w 2 10.0.3.2 47001"], 0),
     (&["nc", "-l", "-p", "8080", "-e", "echo", "served from Linux"], 0),
+    // Ping sockets (ICMP echo), and IPv6: the host (QEMU's gateway at
+    // fd00:3::2) pinged, a page fetched and TCP and UDP echoed over it.
+    (&["ping", "-c", "1", "10.0.3.2"], 0),
+    (&["ping6", "-c", "1", "fd00:3::2"], 0),
+    (&["sh", "-c", "wget -q -O - http://[fd00:3::2]:47081/hello6"], 0),
+    (&["sh", "-c", "echo echoed over TCP and IPv6 | nc fd00:3::2 47002"], 0),
+    (&["sh", "-c", "echo echoed over UDP and IPv6 | nc -u -w 2 fd00:3::2 47001"], 0),
 ];
 
 /// The second boot's runs (`arg 1`, boot/linux-verify.manifest): what the
@@ -3299,9 +3425,15 @@ fn setup() -> Result<&'static mut State, &'static str> {
     for b in 0..8 {
         sys(Syscall::Retype, UNTYPED, [ObjectType::Untyped as u64, BLOCK_BITS, BLOCKS + b, 0]).map_err(|_| "no memory")?;
     }
+    // From the first blocks of the rest of RAM with room for them.
+    let mut from = UNTYPED_SPARE;
     for k in 0..SPARES as u64 {
-        sys(Syscall::Retype, UNTYPED_SPARE, [ObjectType::Untyped as u64, BLOCK_BITS, SPARE_BLOCKS + k, 0])
-            .map_err(|_| "no spare memory")?;
+        while sys(Syscall::Retype, from, [ObjectType::Untyped as u64, BLOCK_BITS, SPARE_BLOCKS + k, 0]).is_err() {
+            from += 1;
+            if from == UNTYPED_SPARE + UNTYPED_SPARE_COUNT {
+                return Err("no spare memory");
+            }
+        }
     }
     sys(Syscall::Retype, FS_BLOCK, [ObjectType::Endpoint as u64, 0, EP, 0]).map_err(|_| "no endpoint")?;
     sys(Syscall::Retype, FS_BLOCK, [ObjectType::Notification as u64, 0, NTFN, 0]).map_err(|_| "no notification")?;

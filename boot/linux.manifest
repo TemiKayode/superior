@@ -14,7 +14,7 @@
 # made from one of seven blocks cut from the untyped memory in slot 0, and
 # revoked when it exits or execs; the eighth block holds the
 # personality's state and the files' pages. A process that outgrows its
-# block is lent one of four more, cut from the untyped memory in slot 5.
+# block is lent one of four more, cut from the rest of RAM (untyped spare).
 # The root (with /home) is the filesystem server's, on a disk the test
 # makes empty; what the runs leave there, boot/linux-verify.manifest reads
 # back. Sockets are the network server's: the runs fetch a page over HTTP
@@ -95,8 +95,9 @@ component linux
   file libz 216
   file fptest 250
   file busybox 252
-  untyped 22 5
   untyped 23 0
+  # The rest of RAM, for the spare blocks (slots 920 on).
+  untyped spare 920
   control 1
   # Its files on the disk (the root, but for /bin, /usr, /lib, /dev, /tmp).
   uses fs 6

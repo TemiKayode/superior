@@ -153,7 +153,7 @@ pub const MAX_SHARED_PAGES: u8 = 16;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CapSpec<'a> {
     pub kind: CapKind<'a>,
-    pub slot: u8,
+    pub slot: u16,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -361,10 +361,10 @@ impl<'a> Manifest<'a> {
             };
             // Slots past the usual CSpace are for a component whose
             // `cspace` directive, earlier, made it larger.
-            let slots = (1usize << c.cspace_bits).min(256);
-            let slot = |w: &'a str| -> Result<u8, ParseError<'a>> {
+            let slots = (1usize << c.cspace_bits).min(1 << 16);
+            let slot = |w: &'a str| -> Result<u16, ParseError<'a>> {
                 match w.parse::<usize>() {
-                    Ok(s) if s < slots => Ok(s as u8),
+                    Ok(s) if s < slots => Ok(s as u16),
                     _ => Err(err("slot out of range", w)),
                 }
             };

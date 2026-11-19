@@ -1727,6 +1727,29 @@ holds the rest):
   xtask, BusyBox's `wget` fetching a page over HTTP, `nc` having a line
   echoed over TCP and over UDP, and `nc -l -e` serving a connection the
   host makes in through QEMU's forwarding, on both ISAs.
+- The Linux personality's sockets do IPv6 and ping, and `sendmsg` and
+  `recvmsg`. Addresses are kept as IPv6's 16 bytes, an IPv4 one in its
+  mapped form, which the network server takes for either family: datagrams
+  go out with `SEND6` and come in with `RECV6`, connections are made with
+  `TCP_CONNECT6`, and a peer's address comes from `TCP_PEER`. An `AF_INET6`
+  socket gives `sockaddr_in6` (IPv4 peers mapped), an `AF_INET` one
+  `sockaddr_in`. A ping socket (`SOCK_DGRAM` with `IPPROTO_ICMP` or
+  `IPPROTO_ICMPV6`, what Linux gives unprivileged programs; a raw socket is
+  `EPERM`, so BusyBox's ping falls back to it) is the server's ICMP echo
+  socket. The program's echo request goes to the server as its payload and
+  sequence number, and each reply gets an echo reply header made here, with
+  the identifier the request had. `sendmsg` gathers the `iovec`s and
+  `recvmsg` scatters into them, with the sender's address and `MSG_TRUNC`
+  but no control messages (so ping6 shows no hop limit). `linux-test` pings
+  QEMU's gateway over IPv4 and IPv6 (ping6 receives with `recvmsg`: without
+  it, it fails), fetches a page from `[fd00:3::2]` and has TCP and UDP
+  echoed over IPv6, on both ISAs.
+- The Linux personality's four spare 1 MiB blocks come from the rest of RAM
+  (`untyped spare`, slots 920 on) rather than its own 16 MiB, where its
+  image, CNode, address space and bundle files must fit below the 8 MiB
+  block of process blocks: on AArch64, with larger files, they no longer
+  did. For that, manifest slots may now go up to the component's CSpace
+  size (16 bits) instead of stopping at 255.
 - Interrupt and exception entries clear the direction flag. User code may be
   interrupted mid-way through a backward copy, with the flag set; the kernel's own
   copies need it clear, and without the `cld` they ran backwards, wrecking saved

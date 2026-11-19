@@ -767,6 +767,18 @@ fn linux_test(img: &Image) -> Result<(), String> {
         "linux: > echoed over UDP",
         "nc -u -w 2 10.0.3.2 47001 exited with status 0",
         "linux: nc -l -p 8080 -e echo served from Linux exited with status 0",
+        // Ping sockets, and IPv6.
+        "linux: > 1 packets transmitted, 1 packets received, 0% packet loss",
+        "linux: ping -c 1 10.0.3.2 exited with status 0",
+        "linux: > 64 bytes from fd00:3::2: seq=0",
+        "linux: > 1 packets transmitted, 1 packets received, 0% packet loss",
+        "linux: ping6 -c 1 fd00:3::2 exited with status 0",
+        "linux: > hello over HTTP and IPv6",
+        "wget -q -O - http://[fd00:3::2]:47081/hello6 exited with status 0",
+        "linux: > echoed over TCP and IPv6",
+        "nc fd00:3::2 47002 exited with status 0",
+        "linux: > echoed over UDP and IPv6",
+        "nc -u -w 2 fd00:3::2 47001 exited with status 0",
         // The terminal session (its steps were checked as it ran).
         "linux: running sh (pid ",
         "linux: sh exited with status 0",
@@ -851,24 +863,29 @@ fn linux_net_servers(
     use std::net::{TcpListener, TcpStream, UdpSocket};
     use std::sync::atomic::{AtomicU64, Ordering};
     let mut threads = vec![tcp_echo_server(stop.clone(), Arc::new(AtomicU64::new(0)))?];
-    let udp = UdpSocket::bind(("127.0.0.1", ECHO_PORT)).map_err(|e| format!("binding the echo port {ECHO_PORT}: {e}"))?;
-    udp.set_read_timeout(Some(Duration::from_millis(200))).map_err(|e| e.to_string())?;
-    let s = stop.clone();
-    threads.push(std::thread::spawn(move || {
-        let mut buf = [0u8; 2048];
-        while !s.load(Ordering::Relaxed) {
-            if let Ok((n, from)) = udp.recv_from(&mut buf) {
-                let _ = udp.send_to(&buf[..n], from);
+    // IPv4 and IPv6 (QEMU passes the guest's to fd00:3::2 to ::1).
+    let mut https = Vec::new();
+    for host in ["127.0.0.1", "::1"] {
+        let udp = UdpSocket::bind((host, ECHO_PORT)).map_err(|e| format!("binding the echo port {ECHO_PORT} on {host}: {e}"))?;
+        udp.set_read_timeout(Some(Duration::from_millis(200))).map_err(|e| e.to_string())?;
+        let s = stop.clone();
+        threads.push(std::thread::spawn(move || {
+            let mut buf = [0u8; 2048];
+            while !s.load(Ordering::Relaxed) {
+                if let Ok((n, from)) = udp.recv_from(&mut buf) {
+                    let _ = udp.send_to(&buf[..n], from);
+                }
             }
-        }
-    }));
-    let http = TcpListener::bind(("127.0.0.1", LINUX_HTTP_PORT))
-        .map_err(|e| format!("binding the HTTP port {LINUX_HTTP_PORT}: {e}"))?;
-    http.set_nonblocking(true).map_err(|e| e.to_string())?;
+        }));
+        let http = TcpListener::bind((host, LINUX_HTTP_PORT))
+            .map_err(|e| format!("binding the HTTP port {LINUX_HTTP_PORT} on {host}: {e}"))?;
+        http.set_nonblocking(true).map_err(|e| e.to_string())?;
+        https.push(http);
+    }
     let s = stop.clone();
     threads.push(std::thread::spawn(move || {
         while !s.load(Ordering::Relaxed) {
-            let Ok((mut c, _)) = http.accept() else {
+            let Some((mut c, _)) = https.iter().find_map(|h| h.accept().ok()) else {
                 std::thread::sleep(Duration::from_millis(20));
                 continue;
             };
@@ -882,7 +899,13 @@ fn linux_net_servers(
                     _ => break,
                 }
             }
-            let body = if req.starts_with(b"GET /hello ") { "hello over HTTP\n" } else { "" };
+            let body = if req.starts_with(b"GET /hello ") {
+                "hello over HTTP\n"
+            } else if req.starts_with(b"GET /hello6 ") {
+                "hello over HTTP and IPv6\n"
+            } else {
+                ""
+            };
             let status = if body.is_empty() { "404 Not Found" } else { "200 OK" };
             let _ = write!(
                 c,
