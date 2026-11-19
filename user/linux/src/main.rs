@@ -69,6 +69,10 @@
 //! kept and used (zeroed) for the next pages it makes, and `mmap` puts a
 //! mapping in the lowest free space, so freed space is used again too.
 //!
+//! Sockets ([`sock`]): IPv4 TCP and UDP, each the network server's (slot
+//! 7, its buffer frame in [`sock::BUF`]); a call waiting on one is tried
+//! again every tick.
+//!
 //! Not yet: `vfork`'s kind of `clone` (memory shared without
 //! `CLONE_THREAD`), fixed-address (non-PIE) executables.
 
@@ -78,10 +82,11 @@
 mod fs;
 mod remote;
 mod signal;
+mod sock;
 mod tty;
 
 use fs::{FileKind, Fs, Kind, MAX_FILES, MAX_IMAGES, MAX_PIPES, Open, PIPE_BUF, Pipe, ROOT};
-use signal::{Action, Next, SA_RESTART, SIGCHLD, SIGPIPE, SIGSEGV, SYSCALL_LEN, TRAMPOLINE, TRAMPOLINE_CODE};
+use signal::{Action, Next, SA_RESTART, SIGALRM, SIGCHLD, SIGPIPE, SIGSEGV, SYSCALL_LEN, TRAMPOLINE, TRAMPOLINE_CODE};
 use superior_objects::abi::{
     Error, FaultKind, FaultReply, MAP_EXEC, MAP_WRITE, ObjectType, REGS_COUNT, REGS_FOREIGN, REGS_FORK_FROM, REGS_FP_GET,
     REGS_BARRIER, REGS_FP_SET, REGS_FP_WORDS, REGS_GET, REGS_SET, REGS_SET_TLS, REGS_SYSCALL, REGS_SYSCALL_MORE, REGS_TLS, Syscall, TICK_HZ,
@@ -299,6 +304,20 @@ enum Sys {
     Futex,
     SchedGetaffinity,
     Membarrier,
+    Setitimer,
+    /// Sockets ([`sock`]); `accept` is `accept4` with no flags.
+    Socket,
+    Bind,
+    Listen,
+    Accept,
+    Connect,
+    Sendto,
+    Recvfrom,
+    Shutdown,
+    Getsockname,
+    Getpeername,
+    Setsockopt,
+    Getsockopt,
     Unsupported(u64),
 }
 
@@ -347,6 +366,20 @@ fn decode(nr: u64, a: [u64; 6]) -> (Sys, [u64; 6]) {
         204 => Sys::SchedGetaffinity,
         218 => Sys::SetTidAddress,
         324 => Sys::Membarrier,
+        38 => Sys::Setitimer,
+        41 => Sys::Socket,
+        42 => Sys::Connect,
+        43 => return (Sys::Accept, [a[0], a[1], a[2], 0, 0, 0]),
+        288 => Sys::Accept,
+        44 => Sys::Sendto,
+        45 => Sys::Recvfrom,
+        48 => Sys::Shutdown,
+        49 => Sys::Bind,
+        50 => Sys::Listen,
+        51 => Sys::Getsockname,
+        52 => Sys::Getpeername,
+        54 => Sys::Setsockopt,
+        55 => Sys::Getsockopt,
         40 => Sys::Sendfile,
         56 => Sys::Clone,
         57 | 58 => Sys::Fork,
@@ -428,6 +461,20 @@ fn decode(nr: u64, a: [u64; 6]) -> (Sys, [u64; 6]) {
         98 => Sys::Futex,
         123 => Sys::SchedGetaffinity,
         283 => Sys::Membarrier,
+        103 => Sys::Setitimer,
+        198 => Sys::Socket,
+        200 => Sys::Bind,
+        201 => Sys::Listen,
+        202 => return (Sys::Accept, [a[0], a[1], a[2], 0, 0, 0]),
+        242 => Sys::Accept,
+        203 => Sys::Connect,
+        204 => Sys::Getsockname,
+        205 => Sys::Getpeername,
+        206 => Sys::Sendto,
+        207 => Sys::Recvfrom,
+        208 => Sys::Setsockopt,
+        209 => Sys::Getsockopt,
+        210 => Sys::Shutdown,
         172 => Sys::Getpid,
         178 => Sys::Gettid,
         113 => Sys::ClockGettime,
@@ -505,6 +552,9 @@ enum Blocked {
     /// Its process stopped as its call was answered: the answer, given
     /// once it continues.
     Stopped { value: u64 },
+    /// A socket call (`connect`, `accept`, `sendto`, `recvfrom`), made
+    /// again until it can be answered.
+    Net { call: Sys, a: [u64; 6] },
 }
 
 /// What a process's parent has yet to hear from `wait4`.
@@ -575,6 +625,10 @@ struct Proc {
     /// Libraries loaded by `mmap` ([`mmap_file`]): their span and inode.
     libs: [(u64, u64, u16); 4],
     nlibs: usize,
+    /// `setitimer`'s real-time timer: the tick `SIGALRM` is due (0: none),
+    /// and the ticks between one and the next (0: once).
+    alarm: u64,
+    alarm_every: u64,
 }
 
 /// A thread: Linux's task. Every process has one or more; they share its
@@ -1020,6 +1074,7 @@ impl State {
         p.present = [0; CHILD_PAGES / 64];
         p.reserved = [0; CHILD_PAGES / 64];
         p.frames = [0; PROC_SPAN as usize];
+        (p.alarm, p.alarm_every) = (0, 0);
         (p.pgid, p.sid) = (pid, pid);
         p.pending = 0;
         p.actions = [Action { handler: 0, flags: 0, restorer: 0, mask: 0 }; 64];
@@ -1315,6 +1370,7 @@ impl State {
             match o.kind {
                 FileKind::PipeRead => self.pipes[o.pipe as usize].readers -= 1,
                 FileKind::PipeWrite => self.pipes[o.pipe as usize].writers -= 1,
+                FileKind::Socket => sock::close(o.pipe as usize),
                 _ => {}
             }
             o.kind = FileKind::Closed;
@@ -1420,6 +1476,19 @@ fn answer(st: &mut State, t: usize, call: Sys, a: [u64; 6]) -> Out {
         // for the global kind every process's. The global and private
         // expedited kinds (and registering for the latter) are what it
         // offers.
+        Sys::Socket
+        | Sys::Bind
+        | Sys::Listen
+        | Sys::Accept
+        | Sys::Connect
+        | Sys::Sendto
+        | Sys::Recvfrom
+        | Sys::Shutdown
+        | Sys::Getsockname
+        | Sys::Getpeername
+        | Sys::Setsockopt
+        | Sys::Getsockopt => net_call(st, i, call, a),
+        Sys::Setitimer => r(setitimer(st, i, a[0], a[1], a[2])),
         Sys::Membarrier => match a[0] {
             0 => Ret(0b1_1001),
             1 => {
@@ -1693,6 +1762,7 @@ fn fstat(st: &mut State, i: usize, fd: u64, buf: u64) -> Result<u64, u64> {
     let s = match o.kind {
         FileKind::Node => stat_bytes(mode_of(st.fs.kind(o.ino)), o.ino as u64, st.fs.size(o.ino)),
         FileKind::Console | FileKind::Tty => stat_bytes(0o20620, 0, 0),
+        FileKind::Socket => stat_bytes(0o140777, 0, 0),
         _ => stat_bytes(0o10600, 0, st.pipes[o.pipe as usize].len as u64),
     };
     st.put(i, buf, &s[..STAT_LEN])
@@ -1870,6 +1940,11 @@ fn read(st: &mut State, i: usize, fd: u64, buf: u64, len: u64) -> Out {
             }
             pipe.take(&mut tmp[..want])
         }
+        FileKind::Socket => match sock::recv(o.pipe as usize, &mut tmp[..want], false) {
+            Ok((n, _)) => n,
+            Err(sock::EAGAIN) if o.flags & O_NONBLOCK == 0 => return Out::Block(Blocked::Read { fd, buf, len }),
+            Err(e) => return Out::Ret(err(e)),
+        },
         _ => return Out::Ret(err(EBADF)),
     };
     Out::Ret(st.put(i, buf, &tmp[..n]).map_or_else(err, |_| n as u64))
@@ -1896,7 +1971,7 @@ fn write(st: &mut State, i: usize, fd: u64, buf: u64, len: u64) -> Out {
             room.min(len as usize)
         }
         FileKind::Node if o.flags & O_ACCMODE == 0 => return Out::Ret(err(EBADF)),
-        FileKind::Console | FileKind::Tty | FileKind::Node => len.min(tmp.len() as u64) as usize,
+        FileKind::Console | FileKind::Tty | FileKind::Node | FileKind::Socket => len.min(tmp.len() as u64) as usize,
         _ => return Out::Ret(err(EBADF)),
     };
     if !st.copy_in(i, buf, &mut tmp[..n]) {
@@ -1912,6 +1987,15 @@ fn write(st: &mut State, i: usize, fd: u64, buf: u64, len: u64) -> Out {
             n as u64
         }
         FileKind::PipeWrite => st.pipes[o.pipe as usize].put(&tmp[..n]) as u64,
+        FileKind::Socket => match sock::send(o.pipe as usize, &tmp[..n], 0) {
+            Ok(w) => w as u64,
+            Err(sock::EAGAIN) if o.flags & O_NONBLOCK == 0 => return Out::Block(Blocked::Write { fd, buf, len }),
+            Err(EPIPE) => {
+                st.post(i, SIGPIPE);
+                err(EPIPE)
+            }
+            Err(e) => err(e),
+        },
         _ => match st.fs.kind(o.ino) {
             Kind::Null => n as u64,
             _ => {
@@ -2302,6 +2386,15 @@ fn finish(st: &mut State, t: usize, pc: u64, value: u64, place: Option<u64>) {
 /// acts on signals: a thread waiting in a call is interrupted for a
 /// handler, and any process a signal ends is ended. Until nothing moves.
 fn wake(st: &mut State) {
+    // Timers due: SIGALRM.
+    let now = superior_sys::ticks();
+    for i in 0..MAX_PROCS {
+        let p = &mut st.procs[i];
+        if p.used && !p.zombie && p.alarm != 0 && now >= p.alarm {
+            p.alarm = if p.alarm_every != 0 { now + p.alarm_every } else { 0 };
+            st.post(i, SIGALRM);
+        }
+    }
     loop {
         let mut moved = false;
         for t in 0..MAX_TASKS {
@@ -2344,6 +2437,7 @@ fn wake(st: &mut State) {
                 Blocked::Wait { pid, status, options } => wait4(st, i, pid, status, options),
                 Blocked::Sleep { until } if now >= until => Out::Ret(0),
                 Blocked::Poll { fds, n, until } => poll(st, i, fds, n, until),
+                Blocked::Net { call, a } => net_call(st, i, call, a),
                 Blocked::Futex { until, .. } if now >= until => Out::Ret(err(ETIMEDOUT)),
                 Blocked::Sleep { .. } | Blocked::Suspend | Blocked::Futex { .. } => Out::Block(blocked),
             };
@@ -2405,8 +2499,20 @@ fn wake(st: &mut State) {
             Blocked::Poll { until, .. } | Blocked::Futex { until, .. } if until != u64::MAX => Some(until),
             _ => None,
         })
+        .chain(st.procs.iter().filter(|p| p.used && !p.zombie && p.alarm != 0).map(|p| p.alarm))
         .min();
     let ticks = next.map_or(0, |until| until.saturating_sub(superior_sys::ticks()).max(1));
+    // A call waiting on a socket: tried again every tick (this server
+    // waits on its one notification, not the sockets').
+    let on_socket = sock::any_open()
+        && st.tasks.iter().any(|t| {
+            t.used
+                && matches!(
+                    t.blocked,
+                    Blocked::Read { .. } | Blocked::Write { .. } | Blocked::Writev { .. } | Blocked::Poll { .. } | Blocked::Net { .. }
+                )
+        });
+    let ticks = if on_socket { 1 } else { ticks };
     syscall(Syscall::TimerSignal, NTFN_TIMER, [ticks, 0, 0, 0]);
 }
 
@@ -2693,6 +2799,12 @@ fn poll(st: &mut State, i: usize, fds: u64, n: u64, until: u64) -> Out {
                             0
                         }
                     }
+                    FileKind::Socket => {
+                        let k = o.pipe as usize;
+                        (if sock::readable(k) { POLLIN } else { 0 })
+                            | (if sock::writable(k) { POLLOUT } else { 0 })
+                            | if sock::failed(k) { POLLERR } else { 0 }
+                    }
                     _ => POLLIN | POLLOUT,
                 },
             }
@@ -2706,6 +2818,207 @@ fn poll(st: &mut State, i: usize, fds: u64, n: u64, until: u64) -> Out {
         return Out::Ret(ready);
     }
     Out::Block(Blocked::Poll { fds, n, until })
+}
+
+/// Descriptor `fd`'s socket, and its file's flags.
+fn sock_of(st: &State, i: usize, fd: u64) -> Result<(usize, u32), u64> {
+    let o = st.files[st.file(i, fd).ok_or(EBADF)?];
+    if o.kind != FileKind::Socket {
+        return Err(sock::NOT_A_SOCKET);
+    }
+    Ok((o.pipe as usize, o.flags))
+}
+
+/// The address word ([`superior_objects::interfaces::net::addr`]) of the
+/// `sockaddr_in` at `addr`.
+fn sockaddr(st: &State, i: usize, addr: u64, len: u64) -> Result<u64, u64> {
+    const EAFNOSUPPORT: u64 = 97;
+    let mut b = [0u8; 16];
+    if len < 16 {
+        return Err(EINVAL);
+    }
+    if !st.copy_in(i, addr, &mut b) {
+        return Err(EFAULT);
+    }
+    if u16::from_le_bytes([b[0], b[1]]) as u64 != sock::AF_INET {
+        return Err(EAFNOSUPPORT);
+    }
+    let ip = u32::from_be_bytes([b[4], b[5], b[6], b[7]]) as u64;
+    Ok(ip << 16 | u16::from_be_bytes([b[2], b[3]]) as u64)
+}
+
+/// Address word `word` as a `sockaddr_in` at `addr` (if any), cut to the
+/// length at `lenp`, which then says 16.
+fn put_sockaddr(st: &mut State, i: usize, word: u64, addr: u64, lenp: u64) -> Result<(), u64> {
+    if addr == 0 {
+        return Ok(());
+    }
+    let mut l = [0u8; 4];
+    if !st.copy_in(i, lenp, &mut l) {
+        return Err(EFAULT);
+    }
+    let mut b = [0u8; 16];
+    b[..2].copy_from_slice(&(sock::AF_INET as u16).to_le_bytes());
+    b[2..4].copy_from_slice(&(word as u16).to_be_bytes());
+    b[4..8].copy_from_slice(&((word >> 16) as u32).to_be_bytes());
+    let n = (u32::from_le_bytes(l) as usize).min(16);
+    st.put(i, addr, &b[..n])?;
+    st.put(i, lenp, &16u32.to_le_bytes()).map(|_| ())
+}
+
+/// A new socket's descriptor in process `i`.
+fn new_socket(st: &mut State, i: usize, k: usize, ty: u64) -> Result<u64, u64> {
+    let flags = O_RDWR | ty as u32 & O_NONBLOCK;
+    let Some(f) = st.new_file(FileKind::Socket, 0, k as u8, flags) else {
+        sock::close(k);
+        return Err(ENFILE);
+    };
+    st.new_fd(i, f, 0, ty as u32 & O_CLOEXEC != 0).inspect_err(|_| {
+        st.files[f].kind = FileKind::Closed;
+        sock::close(k);
+    })
+}
+
+/// The socket calls: IPv4 TCP and UDP over the network server
+/// ([`sock`]). One that must wait, on a descriptor without `O_NONBLOCK`
+/// (or a send or receive without `MSG_DONTWAIT`), waits.
+fn net_call(st: &mut State, i: usize, call: Sys, a: [u64; 6]) -> Out {
+    const EPROTONOSUPPORT: u64 = 93;
+    const EAFNOSUPPORT: u64 = 97;
+    const MSG_PEEK: u64 = 2;
+    const MSG_DONTWAIT: u64 = 0x40;
+    const MSG_NOSIGNAL: u64 = 0x4000;
+    let r = |v: Result<u64, u64>| Out::Ret(v.unwrap_or_else(err));
+    if call == Sys::Socket {
+        if a[0] != sock::AF_INET {
+            return Out::Ret(err(EAFNOSUPPORT));
+        }
+        let stream = match (a[1] & 0xf, a[2]) {
+            (sock::SOCK_STREAM, 0 | 6) => true,
+            (sock::SOCK_DGRAM, 0 | 17) => false,
+            _ => return Out::Ret(err(EPROTONOSUPPORT)),
+        };
+        return r(sock::socket(stream).and_then(|k| new_socket(st, i, k, a[1])));
+    }
+    let (k, flags) = match sock_of(st, i, a[0]) {
+        Ok(s) => s,
+        Err(e) => return Out::Ret(err(e)),
+    };
+    let wait = |dontwait: bool, e: u64| e == sock::EAGAIN && flags & O_NONBLOCK == 0 && !dontwait;
+    match call {
+        Sys::Bind => r(sockaddr(st, i, a[1], a[2]).and_then(|w| sock::bind(k, w as u16)).map(|_| 0)),
+        Sys::Listen => r(sock::listen(k).map(|_| 0)),
+        Sys::Connect => match sockaddr(st, i, a[1], a[2]).and_then(|w| sock::connect(k, w)) {
+            Ok(()) => Out::Ret(0),
+            Err(sock::EINPROGRESS) if flags & O_NONBLOCK == 0 => Out::Block(Blocked::Net { call, a }),
+            Err(e) => Out::Ret(err(e)),
+        },
+        Sys::Accept => match sock::accept(k) {
+            Ok(c) => {
+                let peer = sock::get(c).peer;
+                match new_socket(st, i, c, a[3]) {
+                    Ok(fd) => match put_sockaddr(st, i, peer, a[1], a[2]) {
+                        Ok(()) => Out::Ret(fd),
+                        Err(e) => Out::Ret(err(e)),
+                    },
+                    Err(e) => Out::Ret(err(e)),
+                }
+            }
+            Err(e) if wait(false, e) => Out::Block(Blocked::Net { call, a }),
+            Err(e) => Out::Ret(err(e)),
+        },
+        Sys::Sendto => {
+            let mut tmp = [0u8; 4096];
+            let n = a[2].min(tmp.len() as u64) as usize;
+            if !st.copy_in(i, a[1], &mut tmp[..n]) {
+                return Out::Ret(err(EFAULT));
+            }
+            let to = if a[4] != 0 && !sock::get(k).stream {
+                match sockaddr(st, i, a[4], a[5]) {
+                    Ok(w) => w,
+                    Err(e) => return Out::Ret(err(e)),
+                }
+            } else {
+                0
+            };
+            match sock::send(k, &tmp[..n], to) {
+                Ok(w) => Out::Ret(w as u64),
+                Err(e) if wait(a[3] & MSG_DONTWAIT != 0, e) => Out::Block(Blocked::Net { call, a }),
+                Err(EPIPE) => {
+                    if a[3] & MSG_NOSIGNAL == 0 {
+                        st.post(i, SIGPIPE);
+                    }
+                    Out::Ret(err(EPIPE))
+                }
+                Err(e) => Out::Ret(err(e)),
+            }
+        }
+        Sys::Recvfrom => {
+            let mut tmp = [0u8; 4096];
+            let n = a[2].min(tmp.len() as u64) as usize;
+            match sock::recv(k, &mut tmp[..n], a[3] & MSG_PEEK != 0) {
+                Ok((n, from)) => r(st.put(i, a[1], &tmp[..n]).and_then(|_| put_sockaddr(st, i, from, a[4], a[5])).map(|_| n as u64)),
+                Err(e) if wait(a[3] & MSG_DONTWAIT != 0, e) => Out::Block(Blocked::Net { call, a }),
+                Err(e) => Out::Ret(err(e)),
+            }
+        }
+        Sys::Shutdown => r(sock::shutdown(k, a[1]).map(|_| 0)),
+        Sys::Getsockname => {
+            let w = sock::name(k);
+            r(put_sockaddr(st, i, w, a[1], a[2]).map(|_| 0))
+        }
+        Sys::Getpeername => r(sock::peer(k).and_then(|w| put_sockaddr(st, i, w, a[1], a[2])).map(|_| 0)),
+        // Options are taken and do nothing.
+        Sys::Setsockopt => Out::Ret(0),
+        Sys::Getsockopt => {
+            const SOL_SOCKET: u64 = 1;
+            const SO_TYPE: u64 = 3;
+            const SO_ERROR: u64 = 4;
+            let v = match (a[1], a[2]) {
+                (SOL_SOCKET, SO_ERROR) => sock::take_error(k),
+                (SOL_SOCKET, SO_TYPE) => if sock::get(k).stream { sock::SOCK_STREAM } else { sock::SOCK_DGRAM },
+                _ => 0,
+            };
+            r(st.put(i, a[3], &(v as u32).to_le_bytes()).and_then(|_| st.put(i, a[4], &4u32.to_le_bytes())).map(|_| 0))
+        }
+        _ => Out::Ret(err(ENOSYS)),
+    }
+}
+
+/// `setitimer` for the real-time timer (`ITIMER_REAL`): `SIGALRM` after
+/// the time in `new` (0: none), then every interval; what was left
+/// written to `old`. To the tick.
+fn setitimer(st: &mut State, i: usize, which: u64, new: u64, old: u64) -> Result<u64, u64> {
+    if which != 0 {
+        return Err(EINVAL);
+    }
+    let now = superior_sys::ticks();
+    let to_ticks = |sec: u64, usec: u64| sec.saturating_mul(TICK_HZ).saturating_add((usec * TICK_HZ).div_ceil(1_000_000));
+    let timeval = |t: u64| [t / TICK_HZ, t % TICK_HZ * (1_000_000 / TICK_HZ)];
+    let p = &st.procs[i];
+    let left = if p.alarm != 0 { p.alarm.saturating_sub(now).max(1) } else { 0 };
+    let was = [timeval(p.alarm_every), timeval(left)];
+    if new != 0 {
+        let mut w = [0u64; 4];
+        for (k, v) in w.iter_mut().enumerate() {
+            *v = st.word(i, new + 8 * k as u64).ok_or(EFAULT)?;
+        }
+        if w[1] >= 1_000_000 || w[3] >= 1_000_000 {
+            return Err(EINVAL);
+        }
+        let (every, first) = (to_ticks(w[0], w[1]), to_ticks(w[2], w[3]));
+        let p = &mut st.procs[i];
+        p.alarm = if first != 0 { now + first } else { 0 };
+        p.alarm_every = every;
+    }
+    if old != 0 {
+        let mut b = [0u8; 32];
+        for (k, v) in was.iter().flatten().enumerate() {
+            b[8 * k..8 * k + 8].copy_from_slice(&v.to_le_bytes());
+        }
+        st.put(i, old, &b)?;
+    }
+    Ok(0)
 }
 
 /// The process `pid` names for `getpgid` and `getsid` (0: the caller).
@@ -2876,7 +3189,7 @@ const APPLETS: &[&str] = &[
     "sh", "ash", "echo", "cat", "ls", "wc", "seq", "mkdir", "rmdir", "rm", "touch", "true", "false", "uname", "awk",
     "sort", "head", "tail", "grep", "tr", "env", "pwd", "test", "[", "basename", "dirname", "cp", "mv", "ln", "printf",
     "expr", "cut", "uniq", "sed", "xargs", "find", "stat", "readlink", "sleep", "yes", "tee", "od", "stty",
-    "kill", "gzip", "md5sum", "nproc",
+    "kill", "gzip", "md5sum", "nproc", "wget", "nc",
 ];
 
 /// What the test runs, and the exit status each must end with. They share
@@ -2922,6 +3235,13 @@ const RUNS: &[(&[&str], u32)] = &[
     (&["sh", "-c", "mkdir -p /home/docs/old && cd /home/docs && cp /tmp/n.gz . && echo first > note && echo second >> note && ln -s note link && mv old new && ls && pwd && cat link"], 0),
     (&["sh", "-c", "echo boot >> /home/boots; wc -l < /home/boots"], 0),
     (&["sh", "-c", "mkdir -p /etc /data && echo hello from the disk > /etc/motd && echo 42 > /data/answer && ls /"], 0),
+    // Sockets, the network server's: a page over HTTP from the host
+    // (BusyBox's wget), TCP and UDP echoed by it (nc), and a connection
+    // from it, accepted and served.
+    (&["sh", "-c", "wget -q -O - http://10.0.3.2:47081/hello"], 0),
+    (&["sh", "-c", "echo echoed over TCP | nc 10.0.3.2 47002"], 0),
+    (&["sh", "-c", "echo echoed over UDP | nc -u -w 2 10.0.3.2 47001"], 0),
+    (&["nc", "-l", "-p", "8080", "-e", "echo", "served from Linux"], 0),
 ];
 
 /// The second boot's runs (`arg 1`, boot/linux-verify.manifest): what the
@@ -3041,6 +3361,13 @@ fn setup() -> Result<&'static mut State, &'static str> {
     // call.
     sys(Syscall::Retype, FS_BLOCK, [ObjectType::Frame as u64, 0, remote::BUF, 0]).map_err(|_| "no memory for files")?;
     sys(Syscall::FrameMap, remote::BUF, [remote::BUF_VA, 1, 0, 0]).map_err(|_| "no room for files")?;
+    // The network server's, likewise.
+    sys(Syscall::Retype, FS_BLOCK, [ObjectType::Frame as u64, 0, sock::BUF, 0]).map_err(|_| "no memory for sockets")?;
+    sys(Syscall::FrameMap, sock::BUF, [sock::BUF_VA, 1, 0, 0]).map_err(|_| "no room for sockets")?;
+    for k in 0..sock::MAX as u64 {
+        sys(Syscall::Retype, FS_BLOCK, [ObjectType::Frame as u64, 0, sock::STASH + k, 0]).map_err(|_| "no memory for sockets")?;
+        sys(Syscall::FrameMap, sock::STASH + k, [sock::STASH_VA + k * PAGE, 1, 0, 0]).map_err(|_| "no room for sockets")?;
+    }
     if st.fs.mount() {
         say!("linux: the root is on the filesystem server, /bin, /usr, /lib, /dev and /tmp in memory over it");
     } else {

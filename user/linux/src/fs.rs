@@ -27,7 +27,7 @@ use superior_objects::interfaces::fs as server;
 
 pub const MAX_INODES: usize = 256;
 pub const FILE_BLOCKS: usize = 16;
-pub const POOL_PAGES: usize = 216;
+pub const POOL_PAGES: usize = 200;
 /// The filesystem server's longest name.
 pub const NAME_MAX: usize = server::MAX_NAME;
 /// Bytes of a path on the server, as it is given it.
@@ -793,6 +793,8 @@ pub enum FileKind {
     PipeWrite,
     /// The terminal ([`crate::tty`]).
     Tty,
+    /// A socket ([`crate::sock`]), its number in `pipe`.
+    Socket,
 }
 
 /// An open-file description, shared by the descriptors `dup` and `fork`

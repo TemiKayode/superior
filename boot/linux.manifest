@@ -17,10 +17,11 @@
 # block is lent one of four more, cut from the untyped memory in slot 5.
 # The root (with /home) is the filesystem server's, on a disk the test
 # makes empty; what the runs leave there, boot/linux-verify.manifest reads
-# back.
+# back. Sockets are the network server's: the runs fetch a page over HTTP
+# from the host, have TCP and UDP echoed, and serve a connection from it.
 
 # The disk under the root: PCI, its driver and the filesystem server, as
-# boot/fs.manifest has them. The personality is component 3 here and in
+# boot/fs.manifest has them. The personality is component 5 here and in
 # boot/linux-verify.manifest, so both boots see the same container.
 
 component pcibus
@@ -53,6 +54,29 @@ component fs
   untyped 19 2
   cspace 8
 
+# The network under the personality's sockets, as boot/net.manifest has
+# it. Before the personality: its 16 MiB block is aligned to its size, and
+# after it there would be no room left in the manager's memory.
+
+component virtio-net
+  image virtio-net
+  priority 11
+  uses pci 0
+  provides nic 1
+  notification 2
+  untyped 16 3
+
+component net
+  image net
+  priority 10
+  uses nic 0
+  provides net 1
+  memory 22
+  untyped 21 2
+  state 17
+  shared 13 18
+  cspace 9
+
 component linux
   image linux
   priority 10
@@ -76,6 +100,8 @@ component linux
   control 1
   # Its files on the disk (the root, but for /bin, /usr, /lib, /dev, /tmp).
   uses fs 6
+  # Sockets: the network server's.
+  uses net 7
   # The terminal: the serial console's UART and its interrupt.
   device uart 3
   device uart-irq 4

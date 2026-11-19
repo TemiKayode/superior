@@ -666,10 +666,19 @@ fn drive_linux(img: &Image, script: &[(&str, &str, bool)]) -> Result<String, Str
 /// typed into ([`LINUX_SESSION`]). Then `boot/linux-verify.manifest` on
 /// the same disk reads back what the first boot left under `/home`.
 fn linux_test(img: &Image) -> Result<(), String> {
+    use std::sync::atomic::{AtomicBool, Ordering};
     println!("== Linux personality test on {}", img.path.display());
     let disk = linux_disk();
     std::fs::write(&disk, vec![0u8; 16 << 20]).map_err(|e| format!("writing {}: {e}", disk.display()))?;
-    let out = drive_linux(img, LINUX_SESSION)?;
+    let stop = Arc::new(AtomicBool::new(false));
+    let (servers, served) = linux_net_servers(stop.clone())?;
+    let out = drive_linux(img, LINUX_SESSION);
+    stop.store(true, Ordering::Relaxed);
+    servers.into_iter().for_each(|s| _ = s.join());
+    let out = out?;
+    if !served.lock().unwrap().contains("served from Linux") {
+        return Err("Linux personality test: the connection to the guest's nc was not served".into());
+    }
     let isa = if img.arch == Arch::X86_64 { "x86_64" } else { "aarch64" };
     let interp = format!("interpreter /lib/ld-musl-{isa}.so.1)");
     let machine = format!("linux: > Linux {isa}");
@@ -749,6 +758,15 @@ fn linux_test(img: &Image) -> Result<(), String> {
         "linux: > tmp",
         "linux: > usr",
         "&& echo 42 > /data/answer && ls / exited with status 0",
+        // Sockets over the network server: a page fetched from the host,
+        // TCP and UDP echoed by it, and its connection in served.
+        "linux: > hello over HTTP",
+        "wget -q -O - http://10.0.3.2:47081/hello exited with status 0",
+        "linux: > echoed over TCP",
+        "nc 10.0.3.2 47002 exited with status 0",
+        "linux: > echoed over UDP",
+        "nc -u -w 2 10.0.3.2 47001 exited with status 0",
+        "linux: nc -l -p 8080 -e echo served from Linux exited with status 0",
         // The terminal session (its steps were checked as it ran).
         "linux: running sh (pid ",
         "linux: sh exited with status 0",
@@ -816,6 +834,79 @@ fn linux_test(img: &Image) -> Result<(), String> {
     }
     println!("== Linux personality test passed ({})", img.arch.name());
     Ok(())
+}
+
+/// The port the Linux personality test's guest fetches a page over HTTP
+/// from (on the gateway, which QEMU passes to the host's loopback).
+const LINUX_HTTP_PORT: u16 = 47081;
+
+/// The host's side of the Linux personality's sockets, until `stop`: a
+/// page over HTTP, the TCP and UDP echoes, and a client that connects in
+/// (through QEMU's forwarding to the guest's port 8080) until it is
+/// answered; what it was answered with.
+fn linux_net_servers(
+    stop: Arc<std::sync::atomic::AtomicBool>,
+) -> Result<(Vec<std::thread::JoinHandle<()>>, Arc<Mutex<String>>), String> {
+    use std::io::Read;
+    use std::net::{TcpListener, TcpStream, UdpSocket};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let mut threads = vec![tcp_echo_server(stop.clone(), Arc::new(AtomicU64::new(0)))?];
+    let udp = UdpSocket::bind(("127.0.0.1", ECHO_PORT)).map_err(|e| format!("binding the echo port {ECHO_PORT}: {e}"))?;
+    udp.set_read_timeout(Some(Duration::from_millis(200))).map_err(|e| e.to_string())?;
+    let s = stop.clone();
+    threads.push(std::thread::spawn(move || {
+        let mut buf = [0u8; 2048];
+        while !s.load(Ordering::Relaxed) {
+            if let Ok((n, from)) = udp.recv_from(&mut buf) {
+                let _ = udp.send_to(&buf[..n], from);
+            }
+        }
+    }));
+    let http = TcpListener::bind(("127.0.0.1", LINUX_HTTP_PORT))
+        .map_err(|e| format!("binding the HTTP port {LINUX_HTTP_PORT}: {e}"))?;
+    http.set_nonblocking(true).map_err(|e| e.to_string())?;
+    let s = stop.clone();
+    threads.push(std::thread::spawn(move || {
+        while !s.load(Ordering::Relaxed) {
+            let Ok((mut c, _)) = http.accept() else {
+                std::thread::sleep(Duration::from_millis(20));
+                continue;
+            };
+            let _ = c.set_nonblocking(false);
+            let _ = c.set_read_timeout(Some(Duration::from_secs(5)));
+            let mut req = Vec::new();
+            let mut buf = [0u8; 1024];
+            while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                match c.read(&mut buf) {
+                    Ok(n) if n > 0 => req.extend_from_slice(&buf[..n]),
+                    _ => break,
+                }
+            }
+            let body = if req.starts_with(b"GET /hello ") { "hello over HTTP\n" } else { "" };
+            let status = if body.is_empty() { "404 Not Found" } else { "200 OK" };
+            let _ = write!(
+                c,
+                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+        }
+    }));
+    let served = Arc::new(Mutex::new(String::new()));
+    let (s, got) = (stop.clone(), served.clone());
+    threads.push(std::thread::spawn(move || {
+        while !s.load(Ordering::Relaxed) && got.lock().unwrap().is_empty() {
+            std::thread::sleep(Duration::from_millis(500));
+            let Ok(mut c) = TcpStream::connect(("127.0.0.1", 47004)) else { continue };
+            let _ = c.set_read_timeout(Some(Duration::from_secs(2)));
+            let mut text = String::new();
+            let _ = c.read_to_string(&mut text);
+            if !text.is_empty() {
+                println!("\n== the guest's nc answered: {text:?}");
+                *got.lock().unwrap() = text;
+            }
+        }
+    }));
+    Ok((threads, served))
 }
 
 /// Linux's `driver` source, unmodified: downloaded once, and checked
@@ -1277,7 +1368,7 @@ fn image_sealed(
         disk,
         writable: fs || matches!(manifest, "ab" | "update" | "packages" | "linux" | "linux-verify"),
         driver,
-        net: matches!(manifest, "net" | "tcp" | "update" | "suspend") || linux_nic(manifest).is_some(),
+        net: matches!(manifest, "net" | "tcp" | "update" | "suspend" | "linux" | "linux-verify") || linux_nic(manifest).is_some(),
         linux_nic: linux_nic(manifest).map(|l| l.1),
         radio: manifest == "wifi",
         avx: manifest.starts_with("linux"),

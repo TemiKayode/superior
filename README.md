@@ -1704,6 +1704,29 @@ holds the rest):
   `EFAULT`. With `munmap` doing nothing again, it fails. A component's
   manifest may now name 16 capabilities, up from 12: the Linux component's
   seven bundle files took it past the old limit.
+- Linux programs have sockets: IPv4 TCP and UDP, each a socket of the
+  network server's (`user/linux/src/sock.rs`). `socket`, `bind`, `listen`,
+  `accept`/`accept4`, `connect`, `sendto`, `recvfrom`, `shutdown`,
+  `getsockname`, `getpeername`, `getsockopt` (`SO_ERROR`, `SO_TYPE`) and
+  `setsockopt` (taken, doing nothing) are answered, and `read`, `write`,
+  `poll` and `fstat` work on sockets as on other files, with `O_NONBLOCK`,
+  `MSG_DONTWAIT` and `MSG_PEEK`. Calls go to the server with a frame of
+  the personality's lent. The server never blocks, so what has arrived is
+  fetched into a page per socket (16 sockets; the pages come from the
+  in-memory files' pool, now 200 pages), and `poll` can say a socket is readable
+  without losing anything; a listening socket's next connection is
+  accepted from the server early for the same reason. The personality
+  waits on one notification only, so a call waiting on a socket is tried
+  again every tick while any socket is open. `setitimer`'s real-time timer
+  (`SIGALRM`, which BusyBox's `wget` sets) is answered too. Not yet: IPv6,
+  `sendmsg`/`recvmsg`, raw and ICMP sockets (`ping`), and socket options
+  that do anything. `boot/linux.manifest` now has the virtio-net driver
+  and the network server, before the personality: its 16 MiB block is
+  aligned to its size, and after it the manager's 32 MiB would be full.
+  `linux-test` gives the machine a network and runs, against servers in
+  xtask, BusyBox's `wget` fetching a page over HTTP, `nc` having a line
+  echoed over TCP and over UDP, and `nc -l -e` serving a connection the
+  host makes in through QEMU's forwarding, on both ISAs.
 - Interrupt and exception entries clear the direction flag. User code may be
   interrupted mid-way through a backward copy, with the flag set; the kernel's own
   copies need it clear, and without the `cld` they ran backwards, wrecking saved
