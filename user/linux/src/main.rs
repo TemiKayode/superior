@@ -35,8 +35,9 @@
 //! in-memory tree with `/bin` (BusyBox and a link per applet), the
 //! interpreter, pigz in `/usr/bin` and zlib in `/lib`, `/tmp`,
 //! `/dev/null`; pipes; the console. They last as long as this server,
-//! but for `/home`, which is the filesystem server's tree (this
-//! component's container there), so what is written there is on the disk.
+//! but for what is made outside them, which is the filesystem server's
+//! (this component's container there: the root, with `/home`), and so on
+//! its disk.
 //!
 //! Slots: 0 the untyped memory everything is made from, cut into eight
 //! blocks (slots 8 to 15): seven for processes, revoked when one exits or
@@ -58,8 +59,8 @@
 //!
 //! Not yet: more than one CPU for a process's threads, `vfork`'s kind of
 //! `clone` (memory shared without `CLONE_THREAD`), returning `munmap`'d
-//! pages, stopping and continuing jobs (`^Z`), the rest of the tree on
-//! the filesystem server, fixed-address (non-PIE) executables.
+//! pages, stopping and continuing jobs (`^Z`), fixed-address (non-PIE)
+//! executables.
 
 #![no_std]
 #![no_main]
@@ -2703,6 +2704,7 @@ const RUNS: &[(&[&str], u32)] = &[
     // Files on the filesystem server, for the second boot to find.
     (&["sh", "-c", "mkdir -p /home/docs/old && cd /home/docs && cp /tmp/n.gz . && echo first > note && echo second >> note && ln -s note link && mv old new && ls && pwd && cat link"], 0),
     (&["sh", "-c", "echo boot >> /home/boots; wc -l < /home/boots"], 0),
+    (&["sh", "-c", "mkdir -p /etc /data && echo hello from the disk > /etc/motd && echo 42 > /data/answer && ls /"], 0),
 ];
 
 /// The second boot's runs (`arg 1`, boot/linux-verify.manifest): what the
@@ -2710,6 +2712,7 @@ const RUNS: &[(&[&str], u32)] = &[
 const VERIFY_RUNS: &[(&[&str], u32)] = &[
     (&["sh", "-c", "echo boot >> /home/boots; wc -l < /home/boots"], 0),
     (&["sh", "-c", "cd /home/docs && ls && cat note && readlink link && gzip -dc n.gz | md5sum && cd / && rm -r /home/docs && ls /home"], 0),
+    (&["sh", "-c", "cat /etc/motd /data/answer && ls / && rm -r /data /etc && ls /"], 0),
 ];
 
 /// Then a shell on the terminal, until it exits (the test types into it).
@@ -2811,13 +2814,14 @@ fn setup() -> Result<&'static mut State, &'static str> {
         }
     }
     st.fs.init(POOL_VA, &tree[..n], APPLETS);
-    // /home on the filesystem server, through a frame lent with each call.
+    // The root on the filesystem server, through a frame lent with each
+    // call.
     sys(Syscall::Retype, FS_BLOCK, [ObjectType::Frame as u64, 0, remote::BUF, 0]).map_err(|_| "no memory for files")?;
     sys(Syscall::FrameMap, remote::BUF, [remote::BUF_VA, 1, 0, 0]).map_err(|_| "no room for files")?;
     if st.fs.mount() {
-        say!("linux: /home is on the filesystem server");
+        say!("linux: the root is on the filesystem server, /bin, /usr, /lib, /dev and /tmp in memory over it");
     } else {
-        say!("linux: no filesystem server; /home is in memory");
+        say!("linux: no filesystem server; every file is in memory");
     }
     Ok(st)
 }

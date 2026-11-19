@@ -1,20 +1,25 @@
 //! The personality's files: an in-memory tree (directories, files,
 //! symbolic links, the programs from the bundle, `/dev/null`, the
-//! terminal), with the filesystem server's tree under `/home`; pipes; and
-//! the open-file descriptions processes share through their descriptors.
+//! terminal) laid over the filesystem server's tree; pipes; and the
+//! open-file descriptions processes share through their descriptors.
 //!
 //! Everything lives in pages this server maps at start (all zero is a
 //! valid empty state). A file's data is up to [`FILE_BLOCKS`] pages from a
 //! pool; directories hold no entries of their own: an inode names its
 //! parent, and a directory's entries are the inodes that name it.
 //!
-//! Under `/home` ([`Fs::mount`]) the files are the server's ([`remote`]):
-//! a name looked up there becomes an inode here, marked remote, holding
-//! the server's handle and the size, and its path is the names up to
-//! `/home`. So walking paths, the working directory and `getcwd` are as
-//! for the rest; reads, writes and changes go to the server, and a
-//! directory's entries are listed from it. Such inodes no descriptor or
-//! directory needs are let go when inodes run short ([`Fs::evict`]).
+//! The root is the server's ([`Fs::mount`], [`remote`]): what is made
+//! there (`/home`, `/etc`, anything) is on its disk. What the system
+//! starts with stays here, in memory, laid over it: `/bin`, `/usr`, `/lib`
+//! (the bundle's programs and libraries), `/dev`, and `/tmp`, as a
+//! `tmpfs`. A name looked up in a directory of the server's becomes an
+//! inode here, marked remote, holding the server's handle and the size,
+//! its path the names up to the root. So walking paths, the working
+//! directory and `getcwd` are as for the rest; reads, writes and changes
+//! go to the server, and a directory's entries are listed from it (the
+//! root's after its own, a name it has hiding the server's). Such inodes
+//! no descriptor or directory needs are let go when inodes run short
+//! ([`Fs::evict`]).
 
 use crate::remote;
 use core::cell::Cell;
@@ -25,8 +30,11 @@ pub const FILE_BLOCKS: usize = 16;
 pub const POOL_PAGES: usize = 216;
 /// The filesystem server's longest name.
 pub const NAME_MAX: usize = server::MAX_NAME;
-/// Bytes of a path under `/home`, as the server is given it.
+/// Bytes of a path on the server, as it is given it.
 const PATH_MAX: usize = 1024;
+/// Where a remote directory's listing goes on to the server's entries,
+/// after the ones of its own here (the root's).
+const SERVER_POS: u64 = 1 << 20;
 pub const PIPE_BUF: usize = 4096;
 pub const MAX_PIPES: usize = 8;
 pub const MAX_FILES: usize = 64;
@@ -102,7 +110,7 @@ pub struct Fs {
     /// length).
     pub pool: u64,
     pub images: [(u64, u64); MAX_IMAGES],
-    /// `/home`'s inode when it is the server's (0 until it is).
+    /// The root's inode once it is the server's (0 until then).
     pub mount: u16,
     /// The entries the buffer holds from the server's last `READDIR`, if
     /// no call since: the directory's handle, the position asked for, the
@@ -138,7 +146,6 @@ impl Fs {
             }
         }
         let _ = self.create(ROOT, b"tmp", Kind::Dir);
-        let _ = self.create(ROOT, b"home", Kind::Dir);
         if let Ok(dev) = self.create(ROOT, b"dev", Kind::Dir) {
             let _ = self.create(dev, b"null", Kind::Null);
             let _ = self.create(dev, b"tty", Kind::Tty);
@@ -161,14 +168,20 @@ impl Fs {
         Err(EINVAL)
     }
 
-    /// Makes `/home` the filesystem server's tree (its root made if this
-    /// is the first time); whether the server answered.
+    /// Lays the tree here over the filesystem server's (its root made if
+    /// this is the first time), with a `/home` there; whether the server
+    /// answered. If not, `/home` is made here.
     pub fn mount(&mut self) -> bool {
-        let Some(home) = self.cached(ROOT, b"home") else { return false };
-        let Ok((handle, _, _)) = remote::open(b"", server::CREATE) else { return false };
-        let n = &mut self.inodes[home as usize];
+        let Ok((handle, _, _)) = remote::open(b"", server::CREATE) else {
+            let _ = self.create(ROOT, b"home", Kind::Dir);
+            return false;
+        };
+        let n = &mut self.inodes[ROOT as usize];
         (n.remote, n.handle) = (true, handle);
-        self.mount = home;
+        self.mount = ROOT;
+        if self.lookup(ROOT, b"home").is_none() {
+            let _ = self.create(ROOT, b"home", Kind::Dir);
+        }
         true
     }
 
@@ -408,13 +421,33 @@ impl Fs {
         match pos {
             0 => return Some(make(1, dir as u64, Kind::Dir, b".")),
             1 => return Some(make(2, self.inodes[dir as usize].parent as u64, Kind::Dir, b"..")),
-            _ if self.is_remote(dir) => return self.remote_entry(dir, pos - 2).map(|(ino, kind, name, len)| make(pos + 1, ino, kind, &name[..len])),
             _ => {}
         }
-        (pos.saturating_sub(2) as usize..MAX_INODES).find_map(|i| {
+        // Its own entries here (in a remote directory, those that are not
+        // the server's: the root's).
+        let remote = self.is_remote(dir);
+        let own = |i: usize| {
             let n = &self.inodes[i];
-            (i >= 2 && n.kind != Kind::Free && n.parent == dir).then(|| make(i as u64 + 3, i as u64, n.kind, self.name(i as u16)))
-        })
+            i >= 2 && n.kind != Kind::Free && n.parent == dir && !(remote && n.remote)
+        };
+        if pos < SERVER_POS {
+            let found = (pos.saturating_sub(2) as usize..MAX_INODES)
+                .find(|&i| own(i))
+                .map(|i| make(i as u64 + 3, i as u64, self.inodes[i].kind, self.name(i as u16)));
+            if found.is_some() || !remote {
+                return found;
+            }
+        }
+        // Then the server's, but for those hidden by its own.
+        let mut k = pos.saturating_sub(SERVER_POS);
+        loop {
+            let (ino, kind, name, len) = self.remote_entry(dir, k)?;
+            let hidden = self.cached(dir, &name[..len]).is_some_and(|i| !self.is_remote(i));
+            if !hidden {
+                return Some(make(SERVER_POS + k + 1, ino, kind, &name[..len]));
+            }
+            k += 1;
+        }
     }
 
     /// Remote directory `dir`'s entry `k` (from 0): its inode number (the

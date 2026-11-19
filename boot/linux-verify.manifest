@@ -1,11 +1,11 @@
 # The Linux personality test, second boot (cargo xtask linux-test).
 #
 # boot/linux.manifest with the personality's arg 1: on the same disk, it
-# runs only what reads back the files the first boot left under /home,
+# runs only what reads back the files the first boot left on the disk,
 # then stops.
 
 
-# The disk under /home: PCI, its driver and the filesystem server, as
+# The disk under the root: PCI, its driver and the filesystem server, as
 # boot/fs.manifest has them. The personality is component 3 here and in
 # boot/linux-verify.manifest, so both boots see the same container.
 
@@ -58,7 +58,7 @@ component linux
   untyped 22 5
   untyped 23 0
   control 1
-  # Its files under /home.
+  # Its files on the disk (the root, but for /bin, /usr, /lib, /dev, /tmp).
   uses fs 6
   # The terminal: the serial console's UART and its interrupt.
   device uart 3

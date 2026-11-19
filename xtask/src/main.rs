@@ -634,8 +634,8 @@ fn drive_linux(img: &Image, script: &[(&str, &str, bool)]) -> Result<String, Str
 /// Boots `boot/linux.manifest`: the Linux personality runs Alpine's
 /// programs, unmodified and dynamically linked against musl. BusyBox
 /// first, a run at a time: commands, shell scripts with processes, pipes
-/// and files, signals; pigz, compressing with threads; files under
-/// `/home`, on the filesystem server; then the shell on the terminal,
+/// and files, signals; pigz, compressing with threads; files under `/`
+/// and `/home`, on the filesystem server; then the shell on the terminal,
 /// typed into ([`LINUX_SESSION`]). Then `boot/linux-verify.manifest` on
 /// the same disk reads back what the first boot left under `/home`.
 fn linux_test(img: &Image) -> Result<(), String> {
@@ -647,7 +647,7 @@ fn linux_test(img: &Image) -> Result<(), String> {
     let interp = format!("interpreter /lib/ld-musl-{isa}.so.1)");
     let machine = format!("linux: > Linux {isa}");
     let steps = [
-        "linux: /home is on the filesystem server",
+        "linux: the root is on the filesystem server, /bin, /usr, /lib, /dev and /tmp in memory over it",
         "linux: running busybox echo hello from Linux (",
         &interp,
         "linux: > hello from Linux",
@@ -706,6 +706,16 @@ fn linux_test(img: &Image) -> Result<(), String> {
         "&& mv old new && ls && pwd && cat link exited with status 0",
         "linux: > 1",
         "echo boot >> /home/boots; wc -l < /home/boots exited with status 0",
+        // The root: the server's, with this tree's own laid over it.
+        "linux: > bin",
+        "linux: > data",
+        "linux: > dev",
+        "linux: > etc",
+        "linux: > home",
+        "linux: > lib",
+        "linux: > tmp",
+        "linux: > usr",
+        "&& echo 42 > /data/answer && ls / exited with status 0",
         // The terminal session (its steps were checked as it ran).
         "linux: running sh (pid ",
         "linux: sh exited with status 0",
@@ -719,12 +729,12 @@ fn linux_test(img: &Image) -> Result<(), String> {
             return Err(format!("Linux personality test: log contains {bad:?}"));
         }
     }
-    // The second boot, on the same disk: what the first left under /home.
+    // The second boot, on the same disk: what the first left on it.
     let verify = image_with(false, img.arch, "linux-verify")?;
     println!("== Linux personality test, second boot: {}", verify.path.display());
     let out = run_to_exit(&verify, Duration::from_secs(300))?;
     let steps = [
-        "linux: /home is on the filesystem server",
+        "linux: the root is on the filesystem server, /bin, /usr, /lib, /dev and /tmp in memory over it",
         "linux: > 2",
         "echo boot >> /home/boots; wc -l < /home/boots exited with status 0",
         "linux: > link",
@@ -737,6 +747,23 @@ fn linux_test(img: &Image) -> Result<(), String> {
         "linux: > 72d4ff27a28afbc066d5804999d5a504  -",
         "linux: > boots",
         "&& rm -r /home/docs && ls /home exited with status 0",
+        "linux: > hello from the disk",
+        "linux: > 42",
+        "linux: > bin",
+        "linux: > data",
+        "linux: > dev",
+        "linux: > etc",
+        "linux: > home",
+        "linux: > lib",
+        "linux: > tmp",
+        "linux: > usr",
+        "linux: > bin",
+        "linux: > dev",
+        "linux: > home",
+        "linux: > lib",
+        "linux: > tmp",
+        "linux: > usr",
+        "cat /etc/motd /data/answer && ls / && rm -r /data /etc && ls / exited with status 0",
         "[cm] linux asked to shut down (pass)",
     ];
     check_log("Linux personality test (second boot)", &out, &steps)?;

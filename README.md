@@ -1608,6 +1608,16 @@ holds the rest):
   (`boot/linux-verify.manifest`, the personality's `arg 1`) counts a second
   boot, lists the files, reads the note through the link and decompresses
   the copy to the same MD5, then removes them, on both ISAs.
+- The Linux personality's root on the filesystem server: `/` is now the
+  server's container root, `/home` a directory there, so anything made
+  outside what the system starts with (`/etc`, `/data`, ...) is on the
+  disk. The personality's own tree is laid over it: `/bin`, `/usr` and
+  `/lib` (the bundle's programs and libraries), `/dev`, and `/tmp` as a
+  `tmpfs`, which hide a server entry of the same name. Listing `/` gives
+  those first, then the server's. Without a filesystem server every file
+  is in memory, as before. `linux-test`'s first boot makes `/etc/motd` and
+  `/data/answer` and lists `/`; the second reads them back, lists `/` (the
+  same eight entries), and removes them.
 - Interrupt and exception entries clear the direction flag. User code may be
   interrupted mid-way through a backward copy, with the flag set; the kernel's own
   copies need it clear, and without the `cld` they ran backwards, wrecking saved
@@ -1679,8 +1689,7 @@ system bundle's rollback floor in the TPM too (the boot bundle's is; the
 system's is on the system disk), a boot record written atomically (two
 copies), certificate chains and revocation for the update server (the updater
 pins one key), apps that provide services, a package store on a
-filesystem rather than fixed disk slots, the rest of the Linux personality's
-tree on the filesystem server (`/home` is there; the rest is in its memory), a Linux process's
+filesystem rather than fixed disk slots, a Linux process's
 threads on more than one CPU, `munmap` returning pages, stopping jobs (`^Z`),
 and a handled signal reaching a process
 that spins without system calls (it is taken at the next one), and
