@@ -79,7 +79,7 @@ a { color: var(--accent); }
 </main>
 
 <script>
-const UPDATED = "2026-11-18";
+const UPDATED = "2026-11-19";
 // l2: what of the task must be proven on the second reference laptop (Arm, AArch64), if anything.
 // s: done | part | open | hold (paused, not counted). ev: the evidence (commit and test) for done items, or what is left.
 const PHASES = [
@@ -210,6 +210,6 @@ for (const p of PHASES) {
 }
 const total = all.done + all.part + all.open;
 document.getElementById("summary").innerHTML =
-  `<span><b>${all.done}</b> of <b>${total}</b> tasks done</span><span><b>${all.part}</b> in progress</span>${all.hold ? `<span><b>${all.hold}</b> paused</span>` : ""}<span><b>${needL2}</b> need laptop 2</span><span>Current phase <b>P1 Core runtime and drivers</b></span>`;
+  `<span><b>${all.done}</b> of <b>${total}</b> tasks done</span><span><b>${all.part}</b> in progress</span>${all.hold ? `<span><b>${all.hold}</b> paused</span>` : ""}<span><b>${needL2}</b> need laptop 2</span><span>Current phase <b>P3 Compatibility</b></span>`;
 document.getElementById("updated").textContent = UPDATED;
 </script>
