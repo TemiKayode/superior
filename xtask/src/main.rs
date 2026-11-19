@@ -561,9 +561,10 @@ const LINUX_SESSION: &[(&str, &str, bool)] = &[
     ("\x1a", "Stopped", true),
     ("bg; wait; echo waited\n", "\nwaited", true),
     // A background job reading the terminal is stopped (SIGTTIN), and
-    // reads once brought to the foreground.
+    // reads once brought to the foreground. (A moment first: the job may
+    // still be starting on the other CPU.)
     ("sh -c 'read x; echo read $x' &\n", "", true),
-    ("jobs\n", "Stopped", true),
+    ("sleep 1; jobs\n", "Stopped", true),
     ("fg\n", "read x;", false),
     ("hello\n", "\nread hello", true),
     // A job stopped while running in user space (suspended where it
@@ -715,6 +716,8 @@ fn linux_test(img: &Image) -> Result<(), String> {
         "linux: > slept",
         "linux: > fp registers kept across a handler",
         "linux: > fptest said 0",
+        "linux: > two threads ran at once",
+        "linux: > smptest said 0",
         // Threads (clone, futexes) in pigz, and zlib loaded by musl: what
         // two threads compressed BusyBox's gzip takes back unchanged.
         " started thread ",
@@ -751,6 +754,10 @@ fn linux_test(img: &Image) -> Result<(), String> {
     ];
     if let Err(step) = find_in_order(&out, &steps) {
         return Err(format!("Linux personality test: missing (in order) {step:?}"));
+    }
+    let cpus = format!("linux: > cpus {}", cpus());
+    if !out.contains(&cpus) {
+        return Err(format!("Linux personality test: missing {cpus:?}"));
     }
     // On x86-64 the CPU has AVX: its state is in the frame too.
     let ymm = "linux: > ymm registers kept across a handler";
@@ -1008,10 +1015,12 @@ fn bundle(arch: Arch, manifest: &str, driver: &str) -> Result<PathBuf, String> {
     // The Linux programs the personality runs (`file` in its manifest).
     if manifest.starts_with("linux") {
         files.extend(alpine_files(arch)?);
-        // A Linux program of our own (the first boot's runs use it).
-        let path = user_program("superior-linux-fptest", arch)?;
-        let bytes = std::fs::read(&path).map_err(|e| format!("reading {}: {e}", path.display()))?;
-        files.push(("fptest".to_string(), bytes));
+        // Linux programs of our own (the first boot's runs use them).
+        for name in ["fptest", "smptest"] {
+            let path = user_program(&format!("superior-linux-{name}"), arch)?;
+            let bytes = std::fs::read(&path).map_err(|e| format!("reading {}: {e}", path.display()))?;
+            files.push((name.to_string(), bytes));
+        }
     }
     // Icon images (`icon NAME.pam` in a manifest), by their file names.
     let mut icons: Vec<_> = std::fs::read_dir(root().join("boot/icons"))

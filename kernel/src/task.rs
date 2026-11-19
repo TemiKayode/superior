@@ -710,7 +710,7 @@ pub fn handle_syscall(frame: &mut UserFrame) -> Exit {
         Some(Syscall::FrameMapInto) => frame_map_into(k, cur, &a),
         Some(Syscall::Ticks) => {
             let ticks = k.stats.ticks;
-            k.ipc.set_msg_of(cur, [ticks, 0, 0, 0]);
+            k.ipc.set_msg_of(cur, [ticks, smp::online() as u64, 0, 0]);
             Ok(())
         }
         Some(Syscall::Random) => {
@@ -912,8 +912,8 @@ fn raise_fault(k: &mut Kernel, cur: Tid, kind: FaultKind, addr: u64, pc: u64, co
 /// its value. See the `REGS_*` constants.
 fn thread_registers(k: &mut Kernel, cur: Tid, f: &Args) -> Result<(), u64> {
     use superior_objects::abi::{
-        REGS_FOREIGN, REGS_FORK_FROM, REGS_FP_GET, REGS_FP_SET, REGS_GET, REGS_SET, REGS_SET_TLS, REGS_SYSCALL,
-        REGS_SYSCALL_MORE, REGS_TLS,
+        REGS_BARRIER, REGS_FOREIGN, REGS_FORK_FROM, REGS_FP_GET, REGS_FP_SET, REGS_GET, REGS_SET, REGS_SET_TLS,
+        REGS_SYSCALL, REGS_SYSCALL_MORE, REGS_TLS,
     };
     let t = thread_cap(k, cur, f.a0)? as usize;
     let r = k.frames[t].foreign_syscall();
@@ -967,6 +967,15 @@ fn thread_registers(k: &mut Kernel, cur: Tid, f: &Args) -> Result<(), u64> {
                 if let Some(i) = f.a2.checked_add(n) {
                     k.fp[t].set_word(i, v);
                 }
+            }
+            [0; 4]
+        }
+        // Every other CPU with the address space loaded answers a
+        // shootdown (from an interrupt, after the user code it ran: a
+        // barrier), and this one is in the kernel.
+        REGS_BARRIER => {
+            if let Some(space) = space_of(k, t as Tid) {
+                smp::shootdown(space.root_pa(), false);
             }
             [0; 4]
         }

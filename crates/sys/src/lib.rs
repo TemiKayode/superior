@@ -92,6 +92,11 @@ pub fn ticks() -> u64 {
     syscall(Syscall::Ticks, 0, [0; MSG_WORDS]).msg[0]
 }
 
+/// How many CPUs are online (`Ticks`' second word; at least 1).
+pub fn cpus() -> u64 {
+    syscall(Syscall::Ticks, 0, [0; MSG_WORDS]).msg[1].max(1)
+}
+
 /// The time of day (`Time`): seconds since 1970-01-01 00:00 UTC; `None`
 /// where the machine has no real-time clock (or the kernel no `Time`, as
 /// on seL4).

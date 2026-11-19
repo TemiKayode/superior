@@ -33,7 +33,8 @@
 //! `exit` ends a thread (clearing its `CLONE_CHILD_CLEARTID` word and
 //! waking its joiner), `exit_group` the process. Files ([`fs`]): an
 //! in-memory tree with `/bin` (BusyBox and a link per applet), the
-//! interpreter, pigz and fptest (`user/linux-fptest`, for the test) in
+//! interpreter, pigz, fptest and smptest (`user/linux-fptest`,
+//! `user/linux-smptest`, for the test) in
 //! `/usr/bin` and zlib in `/lib`, `/tmp`,
 //! `/dev/null`; pipes; the console. They last as long as this server,
 //! but for what is made outside them, which is the filesystem server's
@@ -47,8 +48,8 @@
 //! [`SPARE_BLOCKS`]) lent to a process that outgrows its own. 1 the
 //! manager's control endpoint, 2 the endpoint faults arrive on, 6 the
 //! filesystem server (its buffer frame in [`remote::BUF`]). The
-//! bundle's files' pages from 16: musl's, pigz's from 180, zlib's from
-//! 216, fptest's from 250, BusyBox's from 252 (`file` in the manifest;
+//! bundle's files' pages from 16: musl's, pigz's from 180, smptest's
+//! from 213, zlib's from 216, fptest's from 250, BusyBox's from 252 (`file` in the manifest;
 //! a file's first slot is below 256). Process `i` owns the
 //! slots from `PROC_SLOTS + i * PROC_SPAN`: its address space, then its
 //! threads (each with a badged fault endpoint) and pages as made.
@@ -59,7 +60,11 @@
 //! group, so `^C` interrupts a job and `^Z` stops one (job control:
 //! [`signal`]); `poll` and `nanosleep` wait on it and on the timer.
 //!
-//! Not yet: more than one CPU for a process's threads, `vfork`'s kind of
+//! A process's threads run on any CPU, at once: `sched_getaffinity`
+//! gives every CPU online, and `membarrier` has each CPU in the address
+//! space pass a barrier (`REGS_BARRIER`).
+//!
+//! Not yet: `vfork`'s kind of
 //! `clone` (memory shared without `CLONE_THREAD`), returning `munmap`'d
 //! pages, fixed-address (non-PIE) executables.
 
@@ -75,7 +80,7 @@ use fs::{FileKind, Fs, Kind, MAX_FILES, MAX_IMAGES, MAX_PIPES, Open, PIPE_BUF, P
 use signal::{Action, Next, SA_RESTART, SIGCHLD, SIGPIPE, SIGSEGV, SYSCALL_LEN, TRAMPOLINE, TRAMPOLINE_CODE};
 use superior_objects::abi::{
     Error, FaultKind, FaultReply, MAP_EXEC, MAP_WRITE, ObjectType, REGS_COUNT, REGS_FOREIGN, REGS_FORK_FROM, REGS_FP_GET,
-    REGS_FP_SET, REGS_FP_WORDS, REGS_GET, REGS_SET, REGS_SET_TLS, REGS_SYSCALL, REGS_SYSCALL_MORE, REGS_TLS, Syscall, TICK_HZ,
+    REGS_BARRIER, REGS_FP_SET, REGS_FP_WORDS, REGS_GET, REGS_SET, REGS_SET_TLS, REGS_SYSCALL, REGS_SYSCALL_MORE, REGS_TLS, Syscall, TICK_HZ,
 };
 use superior_objects::elf::{Elf, Machine};
 use superior_sys::{USER_BASE, print_line, syscall};
@@ -102,10 +107,11 @@ const NTFN: u64 = 1001;
 const NTFN_UART: u64 = 1002;
 const NTFN_TIMER: u64 = 1003;
 /// The bundle's files (`file` in the manifest), their first slots: musl's
-/// dynamic linker, BusyBox, pigz, zlib and fptest (if there: not on the
-/// second boot).
+/// dynamic linker, BusyBox, pigz, zlib, fptest and smptest (the last two
+/// if there: not on the second boot).
 const INTERP_FILE: u64 = 16;
 const PIGZ_FILE: u64 = 180;
+const SMPTEST_FILE: u64 = 213;
 const LIBZ_FILE: u64 = 216;
 const FPTEST_FILE: u64 = 250;
 const PROGRAM_FILE: u64 = 252;
@@ -135,6 +141,7 @@ const TRAMPOLINE_VA: u64 = USER_BASE + 0x1_4000_0000;
 const PIGZ_VA: u64 = USER_BASE + 0x1_5000_0000;
 const LIBZ_VA: u64 = USER_BASE + 0x1_5800_0000;
 const FPTEST_VA: u64 = USER_BASE + 0x1_5c00_0000;
+const SMPTEST_VA: u64 = USER_BASE + 0x1_5d00_0000;
 
 /// A process's address space: everything inside [`CHILD`, `CHILD_END`).
 const CHILD: u64 = USER_BASE + 0x40_0000_0000;
@@ -1329,20 +1336,35 @@ fn answer(st: &mut State, t: usize, call: Sys, a: [u64; 6]) -> Out {
             Ret(st.tasks[t].tid as u64)
         }
         Sys::Futex => futex(st, t, a),
-        // One CPU, and every thread stopped in here or between calls: a
-        // barrier is already had. The global and private expedited kinds
-        // (and registering for the latter) are what it offers.
+        // The process's other threads may be running on other CPUs: each
+        // CPU in its address space passes a barrier (`REGS_BARRIER`), and
+        // for the global kind every process's. The global and private
+        // expedited kinds (and registering for the latter) are what it
+        // offers.
         Sys::Membarrier => match a[0] {
             0 => Ret(0b1_1001),
-            1 | 8 | 16 => Ret(0),
+            1 => {
+                for p in 0..MAX_PROCS {
+                    if let Some(u) = st.tasks.iter().position(|u| u.used && u.proc as usize == p) {
+                        barrier(st.tasks[u].thread);
+                    }
+                }
+                Ret(0)
+            }
+            8 => {
+                barrier(st.tasks[t].thread);
+                Ret(0)
+            }
+            16 => Ret(0),
             _ => Ret(err(EINVAL)),
         },
         Sys::SchedGetaffinity => {
-            // One CPU, as far as programs need to know.
+            // Every CPU online: a process's threads run on any of them.
             if a[1] < 8 {
                 return Ret(err(EINVAL));
             }
-            r(st.put(i, a[2], &1u64.to_le_bytes()).map(|_| 8))
+            let mask = (1u64 << superior_sys::cpus().min(64)).wrapping_sub(1);
+            r(st.put(i, a[2], &mask.to_le_bytes()).map(|_| 8))
         }
         Sys::Read => read(st, i, a[0], a[1], a[2]),
         Sys::Write => write(st, i, a[0], a[1], a[2]),
@@ -2306,6 +2328,11 @@ fn wake(st: &mut State) {
     syscall(Syscall::TimerSignal, NTFN_TIMER, [ticks, 0, 0, 0]);
 }
 
+/// A memory barrier on every CPU running in thread `th`'s address space.
+fn barrier(th: u64) {
+    let _ = sys(Syscall::ThreadRegisters, th, [REGS_BARRIER, 0, 0, 0]);
+}
+
 /// `clone` for a thread: a new task in task `t`'s process, starting where
 /// `t` returns, with 0 as its result, the stack `a[1]` and, as `a[0]`'s
 /// flags say, its thread pointer (`a[4]`), its id written for the parent
@@ -2767,7 +2794,7 @@ const APPLETS: &[&str] = &[
     "sh", "ash", "echo", "cat", "ls", "wc", "seq", "mkdir", "rmdir", "rm", "touch", "true", "false", "uname", "awk",
     "sort", "head", "tail", "grep", "tr", "env", "pwd", "test", "[", "basename", "dirname", "cp", "mv", "ln", "printf",
     "expr", "cut", "uniq", "sed", "xargs", "find", "stat", "readlink", "sleep", "yes", "tee", "od", "stty",
-    "kill", "gzip", "md5sum",
+    "kill", "gzip", "md5sum", "nproc",
 ];
 
 /// What the test runs, and the exit status each must end with. They share
@@ -2800,6 +2827,9 @@ const RUNS: &[(&[&str], u32)] = &[
     // them as they were for the code it interrupted (they are in the
     // signal frame): a program of our own, no C library.
     (&["sh", "-c", "fptest && echo fptest said $?"], 0),
+    // A process's threads on two CPUs at once (smptest, of our own), and
+    // as many CPUs as there are online for programs that ask.
+    (&["sh", "-c", "smptest && echo smptest said $? && echo cpus $(nproc)"], 0),
     // A program with a library of its own: pigz, with zlib, which musl's
     // dynamic linker loads. BusyBox's gzip checks what it wrote.
     (&["sh", "-c", "seq 1 10000 > /tmp/n && pigz -p 2 -b 32 -k /tmp/n && ls /tmp && gzip -dc /tmp/n.gz | md5sum && md5sum < /tmp/n"], 0),
@@ -2888,7 +2918,8 @@ fn setup() -> Result<&'static mut State, &'static str> {
     // is its empty variant), and this is its only reference.
     let st = unsafe { &mut *(STATE_VA as *mut State) };
     let interp = map_file(INTERP_FILE, INTERP_VA, PIGZ_FILE - INTERP_FILE);
-    let pigz = map_file(PIGZ_FILE, PIGZ_VA, LIBZ_FILE - PIGZ_FILE);
+    let pigz = map_file(PIGZ_FILE, PIGZ_VA, SMPTEST_FILE - PIGZ_FILE);
+    let smptest = map_file(SMPTEST_FILE, SMPTEST_VA, LIBZ_FILE - SMPTEST_FILE);
     let libz = map_file(LIBZ_FILE, LIBZ_VA, FPTEST_FILE - LIBZ_FILE);
     let fptest = map_file(FPTEST_FILE, FPTEST_VA, PROGRAM_FILE - FPTEST_FILE);
     let program = map_file(PROGRAM_FILE, PROGRAM_VA, STATE_SLOTS - PROGRAM_FILE);
@@ -2901,14 +2932,15 @@ fn setup() -> Result<&'static mut State, &'static str> {
     st.trampoline = Shared { start: TRAMPOLINE, end: TRAMPOLINE + PAGE, ptr: TRAMPOLINE_VA, slot: TRAMPOLINE_SLOT, flags: MAP_EXEC };
     let interp_path = Elf::parse(program).ok().and_then(|e| e.interpreter()).ok_or("BusyBox is not dynamically linked")?;
     // Where each file is: BusyBox first (the runs' programs are its).
-    let files: [(&[u8], &'static [u8], u64); 5] = [
+    let files: [(&[u8], &'static [u8], u64); 6] = [
         (b"/bin/busybox", program, PROGRAM_FILE),
         (interp_path, interp, INTERP_FILE),
         (b"/usr/bin/pigz", pigz, PIGZ_FILE),
         (b"/lib/libz.so.1", libz, LIBZ_FILE),
         (b"/usr/bin/fptest", fptest, FPTEST_FILE),
+        (b"/usr/bin/smptest", smptest, SMPTEST_FILE),
     ];
-    let mut tree = [(&b""[..], &b""[..]); 5];
+    let mut tree = [(&b""[..], &b""[..]); 6];
     let mut n = 0;
     for (path, bytes, slot) in files {
         if !bytes.is_empty() {

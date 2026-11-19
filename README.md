@@ -1575,9 +1575,8 @@ holds the rest):
   first and requeues; `exit` ends one thread, clearing its
   `CLONE_CHILD_CLEARTID` word and waking the futex there for
   `pthread_join`, and `exit_group` the process. `gettid`,
-  `set_tid_address`, `tkill`, `sched_getaffinity` (one CPU) and
-  `membarrier` (already satisfied, on one CPU with every call serialised
-  here) are answered. Programs are found by path in a table of bundle
+  `set_tid_address`, `tkill`, `sched_getaffinity` and `membarrier` are
+  answered. Programs are found by path in a table of bundle
   files (BusyBox, musl, pigz, zlib); `mmap` of a library from its start
   loads it as the program loader would (code shared, data a copy), and
   the linker's own fixed mappings of its segments then find them there.
@@ -1670,6 +1669,23 @@ holds the rest):
   has AVX. There fptest also puts a value in `ymm0`'s upper half and its
   handler runs `vzeroall`; afterwards the value must be back. With the AVX
   restore taken out, it fails.
+- A Linux process's threads run on more than one CPU at once, as any
+  threads do on Superior. The kernel's scheduler already ran each one on
+  whichever CPU was free; now the personality says so. `sched_getaffinity`
+  gives every CPU online, so `nproc` and musl's `sysconf` count them. The
+  kernel's `Ticks` gives the count as its second word. `membarrier` no
+  longer assumes one CPU: the kernel's new `REGS_BARRIER` makes every CPU
+  with the thread's address space loaded answer a shootdown interrupt
+  (a barrier after the user code it was running) before it returns. The
+  global kind does that for every process. `linux-test` runs smptest
+  (`user/linux-smptest`), another Linux program of our own in assembly. It
+  starts a second thread, and while that one spins on the other CPU it makes
+  the barriers. Then the two hand a word back and forth 2000 times each
+  way, spinning without system calls. On one CPU each hand-over waits out a
+  20 ms time slice, so that takes over 80 seconds and smptest fails; on two
+  it is done at once. The test also checks `nproc` says 2. The terminal
+  session now waits a second before `jobs` checks that a background `read`
+  stopped, since the job may still be starting on the other CPU.
 - Interrupt and exception entries clear the direction flag. User code may be
   interrupted mid-way through a backward copy, with the flag set; the kernel's own
   copies need it clear, and without the `cld` they ran backwards, wrecking saved
@@ -1741,8 +1757,7 @@ system bundle's rollback floor in the TPM too (the boot bundle's is; the
 system's is on the system disk), a boot record written atomically (two
 copies), certificate chains and revocation for the update server (the updater
 pins one key), apps that provide services, a package store on a
-filesystem rather than fixed disk slots, a Linux process's
-threads on more than one CPU, `munmap` returning pages,
+filesystem rather than fixed disk slots, `munmap` returning pages,
 and a handled signal reaching a process
 that spins without system calls (it is taken at the next one), and
 fixed-address (non-PIE) Linux executables, which are linked at 4 MiB, where

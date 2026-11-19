@@ -150,8 +150,9 @@ pub enum Syscall {
     /// Writes `r8` to I/O port `rsi` (in the range of the I/O-port
     /// capability in `rdi`, Write right), `rdx` bytes wide (1, 2 or 4).
     IoPortOut = 29,
-    /// Timer ticks since boot ([`TICK_HZ`] a second), in message word 0.
-    /// Supervisors use it to count restarts per unit of time.
+    /// Timer ticks since boot ([`TICK_HZ`] a second), in message word 0,
+    /// and how many CPUs are online in word 1. Supervisors use the ticks to
+    /// count restarts per unit of time.
     Ticks = 33,
     /// The message a device writes to raise the MSI vector in IRQ
     /// capability `rdi`: the address in message word 0, the data in word 1.
@@ -537,6 +538,10 @@ pub const REGS_FP_GET: u64 = 8;
 pub const REGS_FP_SET: u64 = 9;
 /// How many words [`REGS_FP_GET`] numbers.
 pub const REGS_FP_WORDS: u64 = if cfg!(target_arch = "x86_64") { 104 } else { 65 };
+/// A memory barrier on every CPU running in the thread's address space:
+/// returns once each has passed one (Linux's `membarrier`). The thread
+/// may be running; it is only how the address space is named.
+pub const REGS_BARRIER: u64 = 10;
 
 /// [`Syscall::FrameMapInto`] flags.
 pub const MAP_WRITE: u64 = 1;
