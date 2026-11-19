@@ -27,7 +27,7 @@ use superior_objects::interfaces::fs as server;
 
 pub const MAX_INODES: usize = 256;
 pub const FILE_BLOCKS: usize = 16;
-pub const POOL_PAGES: usize = 200;
+pub const POOL_PAGES: usize = 196;
 /// The filesystem server's longest name.
 pub const NAME_MAX: usize = server::MAX_NAME;
 /// Bytes of a path on the server, as it is given it.
@@ -120,7 +120,7 @@ pub struct Fs {
 }
 
 /// Files from the bundle at most.
-pub const MAX_IMAGES: usize = 10;
+pub const MAX_IMAGES: usize = 13;
 
 impl Fs {
     /// Makes the tree: each of `images` (the bundle's files) at its path,
@@ -151,6 +151,15 @@ impl Fs {
             let _ = self.create(dev, b"tty", Kind::Tty);
             let _ = self.create(dev, b"console", Kind::Tty);
         }
+    }
+
+    /// Adds a file (or, with `link`, a symbolic link to `data`) at
+    /// `path`, making the directories on the way: what the toolchain's
+    /// archive holds.
+    pub fn add(&mut self, path: &[u8], data: &[u8], link: bool) -> Result<(), u64> {
+        let (dir, name) = self.make_dirs_for(path)?;
+        let ino = self.create(dir, name, if link { Kind::Symlink } else { Kind::File })?;
+        self.write(ino, 0, data).map(drop)
     }
 
     fn make_dirs_for<'a>(&mut self, path: &'a [u8]) -> Result<(u16, &'a [u8]), u64> {

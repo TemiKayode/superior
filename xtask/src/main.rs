@@ -536,6 +536,119 @@ fn alpine_files(arch: Arch) -> Result<Vec<(String, Vec<u8>)>, String> {
     Ok(out)
 }
 
+/// The toolchain the Linux personality runs: tcc (Alpine 3.22's, the first
+/// with it, in community), which compiles, assembles and links C, and
+/// make, with musl's headers and start files (Alpine 3.18's, as its musl).
+/// (Alpine's repository, package, its SHA-256, and the files taken: to a
+/// bundle file of the name given, or, for a name starting with `/`, into
+/// the toolchain's archive at that path.)
+type ToolPackage = (&'static str, &'static str, &'static str, &'static [(&'static str, &'static str)]);
+const TOOLCHAIN_X86_64: [ToolPackage; 6] = [
+    ("v3.22/community", "tcc-0.9.27_git20250106-r0", "db4720f2f9c6c5cf46812d52af151cbeaa95c0e4676aa956b3e57b2c3ad9802a", &[("usr/bin/tcc", "tcc")]),
+    ("v3.22/community", "tcc-libs-0.9.27_git20250106-r0", "f0d06346af0ffd0d4bca073d56b51e6baaa2825b82996a58ddf6a31dba5df2d0", &[("usr/lib/libtcc.so", "libtcc")]),
+    ("v3.22/community", "tcc-libs-static-0.9.27_git20250106-r0", "2aab7f70b8f8918ebe431f9b77193a6f43b72c9206b0e5c7b35fe3975e64f3a9", TCC_RUNTIME),
+    ("v3.22/community", "tcc-dev-0.9.27_git20250106-r0", "5bd123d6b22a9e39c5e26a79759573c47243dd1d04bcdc26ce8275ca35fd91f7", TCC_HEADERS),
+    ("v3.18/main", "make-4.4.1-r1", "139e1d308ed231bd6c3b35db9c8bee88f732609817524663dfeb7ecc3d7445c8", &[("usr/bin/make", "make")]),
+    ("v3.18/main", "musl-dev-1.2.4-r3", "d288f1cae4a503826df1ecff8d4c3818b8c765d3e4c63d397fddd3b52de3c17b", MUSL_DEV),
+];
+const TOOLCHAIN_AARCH64: [ToolPackage; 6] = [
+    ("v3.22/community", "tcc-0.9.27_git20250106-r0", "556e5a32cb2b7270c0007039143a905160b7dbadd3deca7e3710c760623a50dc", &[("usr/bin/tcc", "tcc")]),
+    ("v3.22/community", "tcc-libs-0.9.27_git20250106-r0", "93e9707704d398f88c2292d115db22f5a10a98d87e0fbf466940e06ca4a386fb", &[("usr/lib/libtcc.so", "libtcc")]),
+    ("v3.22/community", "tcc-libs-static-0.9.27_git20250106-r0", "5dc97008751c0770cad9ad94c29cc5bf2a19e555fd37313b3eb256aabe973245", TCC_RUNTIME),
+    ("v3.22/community", "tcc-dev-0.9.27_git20250106-r0", "b51ebbadc4f91f1c102f183bad9b60aac3d26bf22f22e66ce2b3e68f72c516de", TCC_HEADERS),
+    ("v3.18/main", "make-4.4.1-r1", "e38ee3a4189d098a3b35b937670fb2e5a2e0e1712c5c74924cc474aaeaf44977", &[("usr/bin/make", "make")]),
+    ("v3.18/main", "musl-dev-1.2.4-r3", "2965901b73567405ce95f396884b8e01558dc0ab4232b6d68e5a87f2c84e046c", MUSL_DEV),
+];
+const TCC_RUNTIME: &[(&str, &str)] = &[("usr/lib/tcc/libtcc1.a", "/usr/lib/tcc/libtcc1.a")];
+const TCC_HEADERS: &[(&str, &str)] = &[
+    ("usr/lib/tcc/include/stdarg.h", "/usr/lib/tcc/include/stdarg.h"),
+    ("usr/lib/tcc/include/stddef.h", "/usr/lib/tcc/include/stddef.h"),
+    ("usr/lib/tcc/include/stdbool.h", "/usr/lib/tcc/include/stdbool.h"),
+    ("usr/lib/tcc/include/float.h", "/usr/lib/tcc/include/float.h"),
+    ("usr/lib/tcc/include/tccdefs.h", "/usr/lib/tcc/include/tccdefs.h"),
+];
+/// Enough of musl's headers for `stdio.h`, and its start files.
+const MUSL_DEV: &[(&str, &str)] = &[
+    ("usr/include/stdio.h", "/usr/include/stdio.h"),
+    ("usr/include/features.h", "/usr/include/features.h"),
+    ("usr/include/bits/alltypes.h", "/usr/include/bits/alltypes.h"),
+    ("usr/lib/crt1.o", "/usr/lib/crt1.o"),
+    ("usr/lib/crti.o", "/usr/lib/crti.o"),
+    ("usr/lib/crtn.o", "/usr/lib/crtn.o"),
+];
+
+/// The toolchain's bundle files: tcc, its library, make, and `tools`, an
+/// archive (ustar) of the rest, with `/usr/lib/libc.so` linked to musl's
+/// dynamic linker (its C library) as Alpine has it. Each package
+/// downloaded once and checked against its pinned hash every time.
+fn toolchain_files(arch: Arch) -> Result<Vec<(String, Vec<u8>)>, String> {
+    let (isa, packages) = match arch {
+        Arch::X86_64 => ("x86_64", &TOOLCHAIN_X86_64),
+        Arch::Aarch64 => ("aarch64", &TOOLCHAIN_AARCH64),
+    };
+    let dir = root().join("target/linux/alpine");
+    let mut out = Vec::new();
+    let mut archive = Vec::new();
+    for &(repo, package, sha256, files) in packages {
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let apk = dir.join(format!("{package}-{isa}.apk"));
+        if !apk.exists() {
+            println!("== fetching Alpine's {package} ({isa})");
+            let url = format!("https://dl-cdn.alpinelinux.org/alpine/{repo}/{isa}/{package}.apk");
+            run(Command::new("curl").args(["-sSfL", "-o"]).arg(&apk).arg(&url))?;
+        }
+        let bytes = std::fs::read(&apk).map_err(|e| format!("reading {}: {e}", apk.display()))?;
+        let hash: String = superior_objects::crypto::sha2::sha256(&bytes).iter().map(|b| format!("{b:02x}")).collect();
+        if hash != sha256 {
+            return Err(format!("{} is not Alpine's {package}: delete it to fetch it again", apk.display()));
+        }
+        let to = dir.join(isa).join(package);
+        std::fs::create_dir_all(&to).map_err(|e| e.to_string())?;
+        let mut tar = Command::new("tar");
+        tar.arg("-xzf").arg(&apk).arg("-C").arg(&to);
+        files.iter().for_each(|(file, _)| _ = tar.arg(file));
+        run(&mut tar)?;
+        for (file, name) in files {
+            let path = to.join(file);
+            let data = std::fs::read(&path).map_err(|e| format!("reading {}: {e}", path.display()))?;
+            match name.strip_prefix('/') {
+                Some(at) => ustar_entry(&mut archive, at, &data, None)?,
+                None => out.push((name.to_string(), data)),
+            }
+        }
+    }
+    ustar_entry(&mut archive, "usr/lib/libc.so", &[], Some(&format!("/lib/ld-musl-{isa}.so.1")))?;
+    archive.extend([0u8; 1024]);
+    out.push(("tools".to_string(), archive));
+    Ok(out)
+}
+
+/// Appends a ustar entry to `archive`: a file holding `data`, or a
+/// symbolic link to `link`.
+fn ustar_entry(archive: &mut Vec<u8>, name: &str, data: &[u8], link: Option<&str>) -> Result<(), String> {
+    let mut h = [0u8; 512];
+    let mut put = |at: usize, s: &[u8]| h[at..at + s.len()].copy_from_slice(s);
+    if name.len() >= 100 || link.is_some_and(|l| l.len() >= 100) {
+        return Err(format!("{name}: too long a name for the toolchain's archive"));
+    }
+    put(0, name.as_bytes());
+    put(100, b"0000755\0");
+    put(108, b"0000000\0");
+    put(116, b"0000000\0");
+    put(124, format!("{:011o}\0", data.len()).as_bytes());
+    put(136, b"00000000000\0");
+    put(148, b"        ");
+    put(156, if link.is_some() { b"2" } else { b"0" });
+    put(157, link.unwrap_or("").as_bytes());
+    put(257, b"ustar\x0000");
+    let sum: u32 = h.iter().map(|&b| b as u32).sum();
+    h[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+    archive.extend(h);
+    archive.extend(data);
+    archive.resize(archive.len().next_multiple_of(512), 0);
+    Ok(())
+}
+
 /// Where the Linux personality's glibc programs come from: Debian 12
 /// (bookworm), from the snapshot archive, so the URLs stay.
 const DEBIAN: &str = "https://snapshot.debian.org/archive/debian/20261115T000000Z/pool/main";
@@ -815,6 +928,10 @@ fn linux_test(img: &Image) -> Result<(), String> {
         // glibc's dynamic linker and C library, Debian's, in GNU hello.
         "linux: > Hello, world!",
         "linux: > hello said 0",
+        // tcc, driven by make, compiling, assembling and linking a C
+        // program against musl, and the program it made running.
+        "linux: > tcc -o hi hi.c",
+        "linux: > built by tcc: 42",
         // Threads (clone, futexes) in pigz, and zlib loaded by musl: what
         // two threads compressed BusyBox's gzip takes back unchanged.
         " started thread ",
@@ -1232,6 +1349,7 @@ fn bundle(arch: Arch, manifest: &str, driver: &str) -> Result<PathBuf, String> {
     if manifest.starts_with("linux") {
         files.extend(alpine_files(arch)?);
         files.extend(debian_files(arch)?);
+        files.extend(toolchain_files(arch)?);
         // Linux programs of our own (the first boot's runs use them).
         for name in ["fptest", "smptest", "mmaptest"] {
             let package = format!("superior-linux-{name}");

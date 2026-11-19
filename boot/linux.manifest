@@ -9,7 +9,9 @@
 # across a signal handler, user/linux-fptest), smptest (two of its
 # threads running at once, user/linux-smptest) and mmaptest (memory it
 # unmaps used again, user/linux-mmaptest). From Debian, glibc's dynamic
-# linker and C library and GNU hello, linked against them. Shell
+# linker and C library and GNU hello, linked against them. A toolchain:
+# tcc (compiler, assembler and linker) and make, with musl's headers and
+# start files (tools, an archive unpacked into the tree). Shell
 # scripts run with processes (fork, execve, wait4), pipes and an
 # in-memory file tree. Each process is an address space and its threads,
 # made from one of seven blocks cut from the untyped memory in slot 0, and
@@ -83,7 +85,8 @@ component linux
   priority 10
   # Its CNode (2^14 slots: a 1024-slot span per process, the state's and
   # files' pages, the files, glibc's past the processes' from 8192),
-  # address space, image, stack, the ten files and the 8 MiB block.
+  # the toolchain's from 8832), address space, image, stack, the
+  # fourteen files and the 8 MiB block.
   memory 24
   cspace 14
   vspace 20
@@ -99,6 +102,10 @@ component linux
   file ld-glibc 8192
   file busybox 252
   file libc 8320
+  file tcc 8832
+  file make 8864
+  file libtcc 8960
+  file tools 9088
   untyped 23 0
   # The rest of RAM, for the spare blocks (slots 920 on).
   untyped spare 920

@@ -1792,6 +1792,21 @@ holds the rest):
   `linux-test` runs hello, printing `Hello, world!`, on both ISAs; without
   the shared mapping it is killed on AArch64, and without the stack's
   alignment on x86-64.
+- The Linux personality runs a toolchain: make has tcc compile, assemble
+  and link a C program against musl, and the program runs. xtask takes
+  Alpine's tcc (3.22, community) and its library, runtime and headers,
+  and make and enough of musl-dev (`stdio.h`, the start files) from 3.18,
+  pinned by hash. tcc, make and libtcc are bundle files (slots from 8832);
+  the rest is `tools`, a ustar archive xtask builds, which the personality
+  unpacks into the tree, `/usr/lib/libc.so` a link to musl's dynamic
+  linker as Alpine has it. A program in a file of the tree (one tcc made)
+  can now be run: `execve` reads it (up to 128 KiB) into a buffer cut from
+  the rest of RAM, and each segment's pages are copies, code in pages that
+  are executable and never writable (copied as code on `fork`). `clone`
+  with `CLONE_VM` (posix_spawn's, as make runs tcc) is a fork onto the
+  stack given. `linux-test` runs `make` building `hi.c` and `./hi`
+  printing `built by tcc: 42`, on both ISAs; the second boot's CSpace is
+  2^14 slots too, for the buffer's.
 - Interrupt and exception entries clear the direction flag. User code may be
   interrupted mid-way through a backward copy, with the flag set; the kernel's own
   copies need it clear, and without the `cld` they ran backwards, wrecking saved
