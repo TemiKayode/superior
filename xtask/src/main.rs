@@ -544,7 +544,7 @@ fn alpine_files(arch: Arch) -> Result<Vec<(String, Vec<u8>)>, String> {
 /// bundle file of the name given, or, for a name starting with `/`, into
 /// the toolchain's archive at that path.)
 type ToolPackage = (&'static str, &'static str, &'static str, &'static [(&'static str, &'static str)]);
-const TOOLCHAIN_X86_64: [ToolPackage; 14] = [
+const TOOLCHAIN_X86_64: [ToolPackage; 19] = [
     ("v3.22/community", "tcc-0.9.27_git20250106-r0", "db4720f2f9c6c5cf46812d52af151cbeaa95c0e4676aa956b3e57b2c3ad9802a", &[("usr/bin/tcc", "tcc")]),
     ("v3.22/community", "tcc-libs-0.9.27_git20250106-r0", "f0d06346af0ffd0d4bca073d56b51e6baaa2825b82996a58ddf6a31dba5df2d0", &[("usr/lib/libtcc.so", "libtcc")]),
     ("v3.22/community", "tcc-libs-static-0.9.27_git20250106-r0", "2aab7f70b8f8918ebe431f9b77193a6f43b72c9206b0e5c7b35fe3975e64f3a9", TCC_RUNTIME),
@@ -559,8 +559,13 @@ const TOOLCHAIN_X86_64: [ToolPackage; 14] = [
     ("v3.18/main", "mpfr4-4.2.0_p12-r0", "f06c43c2352b35510625b4b624b85eccd8e07bb1c6d93d37681c3b1fc821f061", MPFR),
     ("v3.18/main", "mpc1-1.3.1-r1", "34d68badb2d45d16221c5e5029133d100a9a66b3899e334a11e19e50d3925685", MPC),
     ("v3.18/main", "isl26-0.26-r1", "25847e5374469cc46dc419904c10ccd87e4f59fa879fb50ddba37651c201bfcc", ISL),
+    ("v3.18/main", "links-2.29-r1", "caaeef16d8b78b3c3f49bed8f00e381fd79bb95282374cef9e25281757295c3f", LINKS),
+    ("v3.18/main", "libcrypto3-3.1.8-r0", "153652a07bd2bbf3ccb68d45241f23f1985659c201c9b2ac8defb07033e9086a", LIBCRYPTO),
+    ("v3.18/main", "libssl3-3.1.8-r0", "bf43d9ce52524ff80d9f2f0a169ed3183c735f0c18522df2196a15ecd6fa17ed", LIBSSL),
+    ("v3.18/main", "libevent-2.1.12-r6", "53079cb4aefcc8a05bdbdbc1e0890b98494d9bc6ce9dffa90d94f37f06ea4102", LIBEVENT),
+    ("v3.18/main", "libbz2-1.0.8-r5", "4308508dc2c73a2d8d265d4a6ed5fc388adb481178bcf469a09d3f65261b2e7a", LIBBZ2),
 ];
-const TOOLCHAIN_AARCH64: [ToolPackage; 14] = [
+const TOOLCHAIN_AARCH64: [ToolPackage; 19] = [
     ("v3.22/community", "tcc-0.9.27_git20250106-r0", "556e5a32cb2b7270c0007039143a905160b7dbadd3deca7e3710c760623a50dc", &[("usr/bin/tcc", "tcc")]),
     ("v3.22/community", "tcc-libs-0.9.27_git20250106-r0", "93e9707704d398f88c2292d115db22f5a10a98d87e0fbf466940e06ca4a386fb", &[("usr/lib/libtcc.so", "libtcc")]),
     ("v3.22/community", "tcc-libs-static-0.9.27_git20250106-r0", "5dc97008751c0770cad9ad94c29cc5bf2a19e555fd37313b3eb256aabe973245", TCC_RUNTIME),
@@ -575,6 +580,11 @@ const TOOLCHAIN_AARCH64: [ToolPackage; 14] = [
     ("v3.18/main", "mpfr4-4.2.0_p12-r0", "2dd2a525c899871cfca477b982d35d33d09833a06c893a67719d133e62a872eb", MPFR),
     ("v3.18/main", "mpc1-1.3.1-r1", "5569656bc1cde66a32a437e488bb4f56faeaa2151ef2bf354858fa347f6d9c16", MPC),
     ("v3.18/main", "isl26-0.26-r1", "d0832299b2008052681471e7c907e357556fb752c365252a727cfd879c791076", ISL),
+    ("v3.18/main", "links-2.29-r1", "f332828e0c3f74078e1eb20d500edd7ba5f44fd74df045ba35262a1882965430", LINKS),
+    ("v3.18/main", "libcrypto3-3.1.8-r0", "877615578c6da0dd8c35f70b432c97945ff892af4df9172a698bb7ae4e57485f", LIBCRYPTO),
+    ("v3.18/main", "libssl3-3.1.8-r0", "5901f5d6f033a70c99b2748ed150805f852447e51d89526e2ee4369d67efffb0", LIBSSL),
+    ("v3.18/main", "libevent-2.1.12-r6", "10a4ba4f39321f31471641d62fc4a18a89a2ff93b69ec6e9ab4efda009d96770", LIBEVENT),
+    ("v3.18/main", "libbz2-1.0.8-r5", "76674b200330aa13d1aa9f0d1084e04fa173b51a05f75c376001557b200d92b2", LIBBZ2),
 ];
 /// gcc: the driver (its own name on AArch64, `gcc` a link to it), cc1,
 /// collect2 and libgcc.a as bundle files; its start files, headers and
@@ -614,6 +624,12 @@ const GMP: &[(&str, &str)] = &[("usr/lib/libgmp.so.10.4.1", "libgmp")];
 const MPFR: &[(&str, &str)] = &[("usr/lib/libmpfr.so.6.2.0", "libmpfr")];
 const MPC: &[(&str, &str)] = &[("usr/lib/libmpc.so.3.3.1", "libmpc")];
 const ISL: &[(&str, &str)] = &[("usr/lib/libisl.so.23.3.0", "libisl")];
+/// links, a text browser, and its libraries.
+const LINKS: &[(&str, &str)] = &[("usr/bin/links", "links")];
+const LIBCRYPTO: &[(&str, &str)] = &[("lib/libcrypto.so.3", "libcrypto")];
+const LIBSSL: &[(&str, &str)] = &[("lib/libssl.so.3", "libssl")];
+const LIBEVENT: &[(&str, &str)] = &[("usr/lib/libevent-2.1.so.7.0.1", "libevent")];
+const LIBBZ2: &[(&str, &str)] = &[("usr/lib/libbz2.so.1.0.8", "libbz2")];
 /// as and ld and the libraries they load. Each package has as and ld
 /// once, the other names hard links to them: in `/usr/bin` on x86-64, in
 /// the target's own directory on AArch64.
@@ -1015,6 +1031,8 @@ fn linux_test(img: &Image) -> Result<(), String> {
         "linux: > compiled by gcc: 42",
         // vfork: what the child wrote in the memory it borrowed.
         "linux: > vfork shared: 42",
+        // epoll: nothing ready, then a blocking wait woken by a write.
+        "linux: > epoll: 0 ready, then 1, data 7",
         // A program far larger than a page, loaded from its file.
         "linux: > ran a program of more than 200000 bytes",
         // Threads (clone, futexes) in pigz, and zlib loaded by musl: what
@@ -1063,6 +1081,13 @@ fn linux_test(img: &Image) -> Result<(), String> {
         "linux: ping6 -c 1 fd00:3::2 exited with status 0",
         "linux: > hello over HTTP and IPv6",
         "wget -q -O - http://[fd00:3::2]:47081/hello6 exited with status 0",
+        // A browser: links fetches the host's page and renders it as text
+        // (heading centered, list items bulleted).
+        "linux: >                                 A page for links",
+        "linux: >    Fetched over HTTP and rendered by links on Superior.",
+        "linux: >      * first item",
+        "linux: >      * second item",
+        "links -dump http://10.0.3.2:47081/page.html exited with status 0",
         "linux: > echoed over TCP and IPv6",
         "nc fd00:3::2 47002 exited with status 0",
         "linux: > echoed over UDP and IPv6",
@@ -1139,6 +1164,10 @@ fn linux_test(img: &Image) -> Result<(), String> {
 /// The port the Linux personality test's guest fetches a page over HTTP
 /// from (on the gateway, which QEMU passes to the host's loopback).
 const LINUX_HTTP_PORT: u16 = 47081;
+/// The page the Linux test's browser (links) fetches and renders.
+const LINUX_PAGE: &str = "<html><head><title>Superior</title></head><body>\
+<h1>A page for links</h1><p>Fetched over HTTP and <b>rendered by links</b> on Superior.</p>\
+<ul><li>first item</li><li>second item</li></ul></body></html>\n";
 
 /// The host's side of the Linux personality's sockets, until `stop`: a
 /// page over HTTP, the TCP and UDP echoes, and a client that connects in
@@ -1191,13 +1220,16 @@ fn linux_net_servers(
                 "hello over HTTP\n"
             } else if req.starts_with(b"GET /hello6 ") {
                 "hello over HTTP and IPv6\n"
+            } else if req.starts_with(b"GET /page.html ") {
+                LINUX_PAGE
             } else {
                 ""
             };
             let status = if body.is_empty() { "404 Not Found" } else { "200 OK" };
+            let kind = if body == LINUX_PAGE { "text/html" } else { "text/plain" };
             let _ = write!(
                 c,
-                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                "HTTP/1.1 {status}\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
             );
         }

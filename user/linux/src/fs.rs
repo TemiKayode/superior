@@ -127,7 +127,7 @@ pub struct Fs {
 }
 
 /// Files from the bundle at most.
-pub const MAX_IMAGES: usize = 29;
+pub const MAX_IMAGES: usize = 34;
 
 impl Fs {
     /// Makes the tree: each of `images` (the bundle's files) at its path,
@@ -861,6 +861,8 @@ pub enum FileKind {
     Tty,
     /// A socket ([`crate::sock`]), its number in `pipe`.
     Socket,
+    /// An epoll instance, its number in `pipe` (`State::epolls`).
+    Epoll,
 }
 
 /// An open-file description, shared by the descriptors `dup` and `fork`

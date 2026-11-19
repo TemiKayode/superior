@@ -104,7 +104,6 @@ macro_rules! say {
     ($($t:tt)*) => { print_line(format_args!($($t)*)) };
 }
 
-const UNTYPED: u64 = 0;
 const CONTROL: u64 = 1;
 const EP: u64 = 2;
 /// The rest of RAM (`untyped spare` in the manifest): blocks in slots
@@ -112,7 +111,8 @@ const EP: u64 = 2;
 /// cut from them.
 const UNTYPED_SPARE: u64 = 920;
 const UNTYPED_SPARE_COUNT: u64 = 32;
-/// Each process's block, then the state's and files' (`FS_BLOCK`).
+/// Each process's block, then the state's and files' (`FS_BLOCK`), cut
+/// from the rest of RAM (the component's own memory holds its files).
 const BLOCKS: u64 = 8;
 const BLOCK_BITS: u64 = 20;
 /// Blocks lent to processes that outgrow their own, one at a time (1 MiB
@@ -180,14 +180,21 @@ const LIBMPFR_FILE: u64 = 20736;
 const LIBMPC_FILE: u64 = 20912;
 const LIBISL_FILE: u64 = 20960;
 const LIBGCC_S_FILE: u64 = 21504;
-const GCC_END: u64 = 21552;
+/// links, a text browser, and what it links to: OpenSSL's libssl and
+/// libcrypto, libevent and libbz2.
+const LINKS_FILE: u64 = 21552;
+const LIBCRYPTO_FILE: u64 = 22128;
+const LIBSSL_FILE: u64 = 23216;
+const LIBEVENT_FILE: u64 = 23376;
+const LIBBZ2_FILE: u64 = 23472;
+const LINKS_END: u64 = 23504;
 const STATE_SLOTS: u64 = 512;
 const STATE_PAGES: u64 = 128;
 const POOL_SLOTS: u64 = STATE_SLOTS + STATE_PAGES;
 /// The signal restorer's page ([`signal::TRAMPOLINE`]).
 const TRAMPOLINE_SLOT: u64 = 1000;
-const PROC_SLOTS: u64 = 22528;
-const PROC_SPAN: u64 = 6144;
+const PROC_SLOTS: u64 = 23552;
+const PROC_SPAN: u64 = 5888;
 /// A frame of a process's that `munmap` gave back ([`Proc::frames`]).
 const FREE: u16 = u16::MAX;
 const MAX_PROCS: usize = 7;
@@ -235,6 +242,11 @@ const LIBMPC_VA: u64 = USER_BASE + 0x1_8700_0000;
 const LIBISL_VA: u64 = USER_BASE + 0x1_8800_0000;
 const LIBGCC_S_VA: u64 = USER_BASE + 0x1_8900_0000;
 const CC1_VA: u64 = USER_BASE + 0x1_9000_0000;
+const LINKS_VA: u64 = USER_BASE + 0x1_9400_0000;
+const LIBCRYPTO_VA: u64 = USER_BASE + 0x1_9600_0000;
+const LIBSSL_VA: u64 = USER_BASE + 0x1_9700_0000;
+const LIBEVENT_VA: u64 = USER_BASE + 0x1_9800_0000;
+const LIBBZ2_VA: u64 = USER_BASE + 0x1_9900_0000;
 /// Where Alpine puts gcc's own files: under its target's name.
 const CC1_PATH: &[u8] = if cfg!(target_arch = "x86_64") {
     b"/usr/libexec/gcc/x86_64-alpine-linux-musl/12.2.1/cc1"
@@ -280,7 +292,7 @@ const MACHINE: Machine = if cfg!(target_arch = "x86_64") { Machine::X86_64 } els
 const PLATFORM: &str = if cfg!(target_arch = "x86_64") { "x86_64" } else { "aarch64" };
 
 // Linux error numbers (and those in `fs`).
-use fs::{EBADF, EEXIST, EINVAL, EISDIR, ENFILE, ENOENT, ENOTDIR, EPIPE};
+use fs::{EBADF, EEXIST, EINVAL, EISDIR, ENFILE, ENOENT, ENOSPC, ENOTDIR, EPIPE};
 const EPERM: u64 = 1;
 const ESRCH: u64 = 3;
 const EINTR: u64 = 4;
@@ -386,6 +398,13 @@ enum Sys {
     Prlimit,
     Getrlimit,
     Getrusage,
+    /// `epoll_create`, `epoll_create1`.
+    EpollCreate,
+    EpollCtl,
+    /// `epoll_wait`, `epoll_pwait` (the mask not applied): a timeout in
+    /// milliseconds in a[3]; `epoll_pwait2`: a[5] 1, a timespec's address
+    /// in a[4].
+    EpollWait,
     Sysinfo,
     Times,
     /// Answered with `ENOSYS` without a word: callers expect it.
@@ -548,6 +567,10 @@ fn decode(nr: u64, a: [u64; 6]) -> (Sys, [u64; 6]) {
         302 => Sys::Prlimit,
         318 => Sys::Getrandom,
         332 | 334 | 157 => Sys::Quiet,
+        213 | 291 => Sys::EpollCreate,
+        233 => Sys::EpollCtl,
+        232 | 281 => return (Sys::EpollWait, [a[0], a[1], a[2], a[3], 0, 0]),
+        441 => return (Sys::EpollWait, [a[0], a[1], a[2], 0, a[3], 1]),
         n => Sys::Unsupported(n),
     };
     #[cfg(target_arch = "aarch64")]
@@ -638,6 +661,10 @@ fn decode(nr: u64, a: [u64; 6]) -> (Sys, [u64; 6]) {
         261 => Sys::Prlimit,
         278 => Sys::Getrandom,
         291 | 293 | 167 => Sys::Quiet,
+        20 => Sys::EpollCreate,
+        21 => Sys::EpollCtl,
+        22 => return (Sys::EpollWait, [a[0], a[1], a[2], a[3], 0, 0]),
+        441 => return (Sys::EpollWait, [a[0], a[1], a[2], 0, a[3], 1]),
         n => Sys::Unsupported(n),
     };
     (s, a)
@@ -674,6 +701,9 @@ enum Blocked {
     Suspend,
     /// `poll`: until a descriptor is ready, or the tick `until`.
     Poll { fds: u64, n: u64, until: u64 },
+    /// `epoll_wait`: until a descriptor epoll instance `fd` watches is
+    /// ready, or the tick `until`.
+    EpollWait { fd: u64, events: u64, max: u64, until: u64 },
     /// `vfork` (or `clone` with `CLONE_VFORK`): until child `pid` has
     /// exec'd or ended.
     Vfork { pid: u32 },
@@ -762,11 +792,11 @@ struct Proc {
     /// ([`State::take_shared`]).
     mapped: [u64; CHILD_PAGES / 64],
     /// The runs of bundle-file pages it maps (code, read-only data; the
-    /// restorer page first).
-    shared: [Shared; 24],
+    /// restorer page first; links and its six libraries have some 24).
+    shared: [Shared; 48],
     nshared: usize,
     /// Libraries loaded by `mmap` ([`mmap_file`]): their span and inode.
-    libs: [(u64, u64, u16); 8],
+    libs: [(u64, u64, u16); 16],
     nlibs: usize,
     /// `setitimer`'s real-time timer: the tick `SIGALRM` is due (0: none),
     /// and the ticks between one and the next (0: once).
@@ -828,6 +858,7 @@ struct State {
     fs: Fs,
     files: [Open; MAX_FILES],
     pipes: [Pipe; MAX_PIPES],
+    epolls: [Epoll; MAX_EPOLLS],
     procs: [Proc; MAX_PROCS],
     /// The arguments and environment of the program being started, here
     /// for their size ([`State::exec`]).
@@ -1667,6 +1698,7 @@ impl State {
                 FileKind::PipeRead => self.pipes[o.pipe as usize].readers -= 1,
                 FileKind::PipeWrite => self.pipes[o.pipe as usize].writers -= 1,
                 FileKind::Socket => sock::close(o.pipe as usize),
+                FileKind::Epoll => self.epolls[o.pipe as usize].used = false,
                 _ => {}
             }
             o.kind = FileKind::Closed;
@@ -1855,6 +1887,22 @@ fn answer(st: &mut State, t: usize, call: Sys, a: [u64; 6]) -> Out {
             None => Ret(err(ESRCH)),
         },
         Sys::Nanosleep => nanosleep(st, i, a[1], a[2]),
+        Sys::EpollCreate => r(epoll_create(st, i, a[0])),
+        Sys::EpollCtl => r(epoll_ctl(st, i, a[0], a[1], a[2], a[3])),
+        Sys::EpollWait => {
+            let until = if a[5] == 0 {
+                let ms = a[3] as i32;
+                if ms < 0 { u64::MAX } else { superior_sys::ticks() + (ms as u64 * TICK_HZ).div_ceil(1000) }
+            } else if a[4] == 0 {
+                u64::MAX
+            } else {
+                match (st.word(i, a[4]), st.word(i, a[4] + 8)) {
+                    (Some(sec), Some(ns)) => superior_sys::ticks() + sec * TICK_HZ + (ns * TICK_HZ).div_ceil(1_000_000_000),
+                    _ => return Ret(err(EFAULT)),
+                }
+            };
+            epoll_wait(st, i, a[0], a[1], a[2], until)
+        }
         Sys::Poll => {
             let ms = a[2] as i32;
             let until = if ms < 0 { u64::MAX } else { superior_sys::ticks() + (ms as u64 * TICK_HZ).div_ceil(1000) };
@@ -2995,6 +3043,7 @@ fn wake(st: &mut State) {
                 Blocked::Wait { pid, status, options } => wait4(st, i, pid, status, options),
                 Blocked::Sleep { until } if now >= until => Out::Ret(0),
                 Blocked::Poll { fds, n, until } => poll(st, i, fds, n, until),
+                Blocked::EpollWait { fd, events, max, until } => epoll_wait(st, i, fd, events, max, until),
                 Blocked::Net { call, a } => net_call(st, i, call, a),
                 Blocked::Vfork { pid } if st.procs.iter().any(|p| p.used && !p.zombie && p.pid == pid && p.vfork) => Out::Block(blocked),
                 Blocked::Vfork { pid } => Out::Ret(pid as u64),
@@ -3062,7 +3111,7 @@ fn wake(st: &mut State) {
         .filter(|t| t.used)
         .filter_map(|t| match t.blocked {
             Blocked::Sleep { until } => Some(until),
-            Blocked::Poll { until, .. } | Blocked::Futex { until, .. } if until != u64::MAX => Some(until),
+            Blocked::Poll { until, .. } | Blocked::EpollWait { until, .. } | Blocked::Futex { until, .. } if until != u64::MAX => Some(until),
             _ => None,
         })
         .chain(st.procs.iter().filter(|p| p.used && !p.zombie && p.alarm != 0).map(|p| p.alarm))
@@ -3075,7 +3124,12 @@ fn wake(st: &mut State) {
             t.used
                 && matches!(
                     t.blocked,
-                    Blocked::Read { .. } | Blocked::Write { .. } | Blocked::Writev { .. } | Blocked::Poll { .. } | Blocked::Net { .. }
+                    Blocked::Read { .. }
+                        | Blocked::Write { .. }
+                        | Blocked::Writev { .. }
+                        | Blocked::Poll { .. }
+                        | Blocked::EpollWait { .. }
+                        | Blocked::Net { .. }
                 )
         });
     let ticks = if on_socket { 1 } else { ticks };
@@ -3304,6 +3358,16 @@ fn run(st: &mut State, argv: &[&str], env: &[&str], interactive: bool) -> Result
                 Some(FaultKind::DivideError) => ("arithmetic fault", 8),
                 _ => ("general protection fault", 11),
             };
+            // A handler the program set for it, and not blocked: entered,
+            // at the faulting instruction (OpenSSL tries instructions so,
+            // catching SIGILL, to learn the CPU's features).
+            let handler = st.procs[i].actions[signal as usize - 1].handler;
+            if handler > signal::SIG_IGN && st.tasks[t].mask & signal::bit(signal) == 0 {
+                if let Some((at, v)) = st.enter_handler(t, signal, pc, None) {
+                    syscall(Syscall::Reply, 0, [FaultReply::ResumeAt as u64, at, v, 0]);
+                    continue;
+                }
+            }
             say!("linux: pid {} killed: {what} at pc {pc:#x}, address {nr:#x}", st.procs[i].pid);
             st.exit(i, signal);
             wake(st);
@@ -3336,12 +3400,192 @@ fn run(st: &mut State, argv: &[&str], env: &[&str], interactive: bool) -> Result
 /// `poll`: which of the `n` descriptors in the `pollfd`s at `fds` are
 /// ready to read (`POLLIN`) or write (`POLLOUT`), or hung up; waits for
 /// one until tick `until` (`u64::MAX`: no limit).
+/// epoll instances, and what each watches.
+const MAX_EPOLLS: usize = 16;
+const MAX_WATCHED: usize = 64;
+const EPOLLONESHOT: u32 = 1 << 30;
+const EPOLL_CLOEXEC: u64 = 0o2000000;
+/// The size of a `struct epoll_event`: packed on x86-64 (events, then
+/// the data at 4), not on AArch64 (the data at 8).
+const EPOLL_EVENT: u64 = if cfg!(target_arch = "x86_64") { 12 } else { 16 };
+const EPOLL_DATA: usize = if cfg!(target_arch = "x86_64") { 4 } else { 8 };
+
+/// An epoll instance: the descriptors it watches, each with the open file
+/// it named when added (a descriptor closed, or now naming another file,
+/// is dropped), the events wanted and the data given back.
+#[derive(Clone, Copy)]
+struct Epoll {
+    used: bool,
+    n: usize,
+    watched: [Watched; MAX_WATCHED],
+}
+
+#[derive(Clone, Copy)]
+struct Watched {
+    fd: u32,
+    file: u8,
+    events: u32,
+    data: u64,
+}
+
+/// `epoll_create1` (and `epoll_create`, whose size is only checked):
+/// a new instance, watching nothing.
+fn epoll_create(st: &mut State, i: usize, flags: u64) -> Result<u64, u64> {
+    let k = st.epolls.iter().position(|e| !e.used).ok_or(ENFILE)?;
+    let f = st.new_file(FileKind::Epoll, 0, k as u8, 0).ok_or(ENFILE)?;
+    st.epolls[k].used = true;
+    st.epolls[k].n = 0;
+    st.new_fd(i, f, 0, flags & EPOLL_CLOEXEC != 0).inspect_err(|_| {
+        st.files[f].kind = FileKind::Closed;
+        st.epolls[k].used = false;
+    })
+}
+
+/// The epoll instance descriptor `epfd` names.
+fn epoll_of(st: &State, i: usize, epfd: u64) -> Result<usize, u64> {
+    let f = st.file(i, epfd).ok_or(EBADF)?;
+    match st.files[f] {
+        o if o.kind == FileKind::Epoll => Ok(o.pipe as usize),
+        _ => Err(EINVAL),
+    }
+}
+
+/// `epoll_ctl`: `fd` added to (1), removed from (2) or changed in (3)
+/// what instance `epfd` watches, with the `struct epoll_event` at `ev`.
+fn epoll_ctl(st: &mut State, i: usize, epfd: u64, op: u64, fd: u64, ev: u64) -> Result<u64, u64> {
+    const ADD: u64 = 1;
+    const DEL: u64 = 2;
+    const MOD: u64 = 3;
+    let k = epoll_of(st, i, epfd)?;
+    let f = st.file(i, fd).ok_or(EBADF)?;
+    // A file on the disk is always ready: Linux refuses to watch one.
+    if fd == epfd || st.files[f].kind == FileKind::Node {
+        return Err(if fd == epfd { EINVAL } else { EPERM });
+    }
+    let mut e = [0u8; 16];
+    if op != DEL && !st.copy_in(i, ev, &mut e[..EPOLL_EVENT as usize]) {
+        return Err(EFAULT);
+    }
+    let events = u32::from_le_bytes([e[0], e[1], e[2], e[3]]);
+    let data = u64::from_le_bytes(e[EPOLL_DATA..EPOLL_DATA + 8].try_into().unwrap_or([0; 8]));
+    let ep = &mut st.epolls[k];
+    let at = ep.watched[..ep.n].iter().position(|w| w.fd as u64 == fd && w.file as usize == f);
+    match (op, at) {
+        (ADD, Some(_)) => Err(EEXIST),
+        (ADD, None) if ep.n == MAX_WATCHED => Err(ENOSPC),
+        (ADD, None) => {
+            ep.watched[ep.n] = Watched { fd: fd as u32, file: f as u8, events, data };
+            ep.n += 1;
+            Ok(0)
+        }
+        (MOD, Some(w)) => {
+            (ep.watched[w].events, ep.watched[w].data) = (events, data);
+            Ok(0)
+        }
+        (DEL, Some(w)) => {
+            ep.watched[w] = ep.watched[ep.n - 1];
+            ep.n -= 1;
+            Ok(0)
+        }
+        (MOD | DEL, None) => Err(ENOENT),
+        _ => Err(EINVAL),
+    }
+}
+
+/// `epoll_wait`: up to `max` of what instance `epfd` watches that is
+/// ready, written to `events`; or, if none is, a wait until one is or the
+/// tick `until`. Level-triggered (`EPOLLET` is taken as level: a program
+/// that reads until `EAGAIN`, as one using it must, sees no difference);
+/// `EPOLLONESHOT` turns a descriptor off once reported.
+fn epoll_wait(st: &mut State, i: usize, epfd: u64, events: u64, max: u64, until: u64) -> Out {
+    if max == 0 || max > MAX_WATCHED as u64 * 4 {
+        return Out::Ret(err(EINVAL));
+    }
+    let k = match epoll_of(st, i, epfd) {
+        Ok(k) => k,
+        Err(e) => return Out::Ret(err(e)),
+    };
+    // Descriptors closed, or naming another file now, are dropped.
+    let mut w = 0;
+    while w < st.epolls[k].n {
+        let x = st.epolls[k].watched[w];
+        if st.file(i, x.fd as u64) != Some(x.file as usize) {
+            let ep = &mut st.epolls[k];
+            ep.watched[w] = ep.watched[ep.n - 1];
+            ep.n -= 1;
+            continue;
+        }
+        w += 1;
+    }
+    let mut got = 0;
+    for w in 0..st.epolls[k].n {
+        if got == max {
+            break;
+        }
+        let x = st.epolls[k].watched[w];
+        let ready = readiness(st, x.file as usize) as u32 & (x.events | POLLERR as u32 | POLLHUP as u32);
+        if ready == 0 {
+            continue;
+        }
+        let mut e = [0u8; 16];
+        e[..4].copy_from_slice(&ready.to_le_bytes());
+        e[EPOLL_DATA..EPOLL_DATA + 8].copy_from_slice(&x.data.to_le_bytes());
+        if !st.copy_out(i, events + got * EPOLL_EVENT, &e[..EPOLL_EVENT as usize]) {
+            return Out::Ret(err(EFAULT));
+        }
+        if x.events & EPOLLONESHOT != 0 {
+            st.epolls[k].watched[w].events = 0;
+        }
+        got += 1;
+    }
+    if got > 0 || superior_sys::ticks() >= until {
+        return Out::Ret(got);
+    }
+    Out::Block(Blocked::EpollWait { fd: epfd, events, max, until })
+}
+
+/// `poll`'s (and epoll's) readiness bits.
+const POLLIN: u16 = 1;
+const POLLOUT: u16 = 4;
+const POLLERR: u16 = 8;
+const POLLHUP: u16 = 0x10;
+const POLLNVAL: u16 = 0x20;
+
+/// Which of `POLLIN`, `POLLOUT`, `POLLERR` and `POLLHUP` open file `f`
+/// is now: what `poll` and `epoll_wait` report (epoll's bits are the
+/// same).
+fn readiness(st: &State, f: usize) -> u16 {
+    let o = st.files[f];
+    match o.kind {
+        FileKind::Tty => (if st.tty.readable() { POLLIN } else { 0 }) | POLLOUT,
+        FileKind::PipeRead => {
+            let pipe = &st.pipes[o.pipe as usize];
+            (if pipe.len > 0 { POLLIN } else { 0 }) | if pipe.writers == 0 { POLLHUP } else { 0 }
+        }
+        FileKind::PipeWrite => {
+            let pipe = &st.pipes[o.pipe as usize];
+            if pipe.readers == 0 {
+                POLLERR
+            } else if (pipe.len as usize) < PIPE_BUF {
+                POLLOUT
+            } else {
+                0
+            }
+        }
+        FileKind::Socket => {
+            let k = o.pipe as usize;
+            (if sock::readable(k) { POLLIN } else { 0 })
+                | (if sock::writable(k) { POLLOUT } else { 0 })
+                | if sock::failed(k) { POLLERR } else { 0 }
+        }
+        // An epoll instance is readable when something it watches is
+        // ready (one instance inside another is not followed further).
+        FileKind::Epoll => 0,
+        _ => POLLIN | POLLOUT,
+    }
+}
+
 fn poll(st: &mut State, i: usize, fds: u64, n: u64, until: u64) -> Out {
-    const POLLIN: u16 = 1;
-    const POLLOUT: u16 = 4;
-    const POLLERR: u16 = 8;
-    const POLLHUP: u16 = 0x10;
-    const POLLNVAL: u16 = 0x20;
     if n > 64 {
         return Out::Ret(err(EINVAL));
     }
@@ -3357,32 +3601,9 @@ fn poll(st: &mut State, i: usize, fds: u64, n: u64, until: u64) -> Out {
         let revents = if fd < 0 {
             0
         } else {
-            match st.file(i, fd as u64).map(|f| st.files[f]) {
+            match st.file(i, fd as u64) {
                 None => POLLNVAL,
-                Some(o) => match o.kind {
-                    FileKind::Tty => (if st.tty.readable() { POLLIN } else { 0 }) | POLLOUT,
-                    FileKind::PipeRead => {
-                        let pipe = &st.pipes[o.pipe as usize];
-                        (if pipe.len > 0 { POLLIN } else { 0 }) | if pipe.writers == 0 { POLLHUP } else { 0 }
-                    }
-                    FileKind::PipeWrite => {
-                        let pipe = &st.pipes[o.pipe as usize];
-                        if pipe.readers == 0 {
-                            POLLERR
-                        } else if (pipe.len as usize) < PIPE_BUF {
-                            POLLOUT
-                        } else {
-                            0
-                        }
-                    }
-                    FileKind::Socket => {
-                        let k = o.pipe as usize;
-                        (if sock::readable(k) { POLLIN } else { 0 })
-                            | (if sock::writable(k) { POLLOUT } else { 0 })
-                            | if sock::failed(k) { POLLERR } else { 0 }
-                    }
-                    _ => POLLIN | POLLOUT,
-                },
+                Some(f) => readiness(st, f),
             }
         } & (events | POLLERR | POLLHUP | POLLNVAL);
         ready += (revents != 0) as u64;
@@ -3956,6 +4177,16 @@ const RUNS: &[(&[&str], u32)] = &[
         ],
         0,
     ),
+    // epoll: a pipe watched, nothing ready at first, then a wait that
+    // blocks until a child writes to it, with the data given back.
+    (
+        &[
+            "sh",
+            "-c",
+            r#"cd /tmp/cc && printf 'int printf(const char *, ...); int pipe(int *); int fork(void); int usleep(unsigned); void _exit(int); long write(int, const void *, unsigned long); int epoll_create1(int); int epoll_ctl(int, int, int, void *); int epoll_wait(int, void *, int, int);\n#ifdef __x86_64__\n#define OFF 4\n#else\n#define OFF 8\n#endif\nint main(void) { int p[2]; unsigned char ev[16] = {1}, out[64]; pipe(p); int e = epoll_create1(0); ev[OFF] = 7; epoll_ctl(e, 1, p[0], ev); int n0 = epoll_wait(e, out, 4, 0); if (fork() == 0) { usleep(200000); write(p[1], "x", 1); _exit(0); } int n1 = epoll_wait(e, out, 4, 5000); printf("epoll: %%d ready, then %%d, data %%d\\n", n0, n1, out[OFF]); return 0; }\n' > ep.c && tcc -o ep ep.c && ./ep"#,
+        ],
+        0,
+    ),
     // A program larger than a page many times over, read from its file
     // as it is loaded.
     (
@@ -3985,6 +4216,8 @@ const RUNS: &[(&[&str], u32)] = &[
     (&["ping", "-c", "1", "10.0.3.2"], 0),
     (&["ping6", "-c", "1", "fd00:3::2"], 0),
     (&["sh", "-c", "wget -q -O - http://[fd00:3::2]:47081/hello6"], 0),
+    // A browser: links fetches a page from the host and renders it.
+    (&["sh", "-c", "links -dump http://10.0.3.2:47081/page.html"], 0),
     (&["sh", "-c", "echo echoed over TCP and IPv6 | nc fd00:3::2 47002"], 0),
     (&["sh", "-c", "echo echoed over UDP and IPv6 | nc -u -w 2 fd00:3::2 47001"], 0),
 ];
@@ -4041,11 +4274,17 @@ pub extern "C" fn _start(arg: u64) -> ! {
 /// Cuts the memory into blocks, maps the state and the files' pool, and
 /// makes the file tree.
 fn setup() -> Result<&'static mut State, &'static str> {
-    for b in 0..8 {
-        sys(Syscall::Retype, UNTYPED, [ObjectType::Untyped as u64, BLOCK_BITS, BLOCKS + b, 0]).map_err(|_| "no memory")?;
-    }
-    // From the first blocks of the rest of RAM with room for them.
+    // From the first blocks of the rest of RAM with room for them: the
+    // processes' and the files' blocks,
     let mut from = UNTYPED_SPARE;
+    for b in 0..8 {
+        while sys(Syscall::Retype, from, [ObjectType::Untyped as u64, BLOCK_BITS, BLOCKS + b, 0]).is_err() {
+            from += 1;
+            if from == UNTYPED_SPARE + UNTYPED_SPARE_COUNT {
+                return Err("no memory");
+            }
+        }
+    }
     // This server's state.
     while sys(Syscall::Retype, from, [ObjectType::Untyped as u64, STATE_BLOCK_BITS, STATE_BLOCK, 0]).is_err() {
         from += 1;
@@ -4128,7 +4367,12 @@ fn setup() -> Result<&'static mut State, &'static str> {
     let libmpfr = map_file(LIBMPFR_FILE, LIBMPFR_VA, LIBMPC_FILE - LIBMPFR_FILE);
     let libmpc = map_file(LIBMPC_FILE, LIBMPC_VA, LIBISL_FILE - LIBMPC_FILE);
     let libisl = map_file(LIBISL_FILE, LIBISL_VA, LIBGCC_S_FILE - LIBISL_FILE);
-    let libgcc_s = map_file(LIBGCC_S_FILE, LIBGCC_S_VA, GCC_END - LIBGCC_S_FILE);
+    let libgcc_s = map_file(LIBGCC_S_FILE, LIBGCC_S_VA, LINKS_FILE - LIBGCC_S_FILE);
+    let links = map_file(LINKS_FILE, LINKS_VA, LIBCRYPTO_FILE - LINKS_FILE);
+    let libcrypto = map_file(LIBCRYPTO_FILE, LIBCRYPTO_VA, LIBSSL_FILE - LIBCRYPTO_FILE);
+    let libssl = map_file(LIBSSL_FILE, LIBSSL_VA, LIBEVENT_FILE - LIBSSL_FILE);
+    let libevent = map_file(LIBEVENT_FILE, LIBEVENT_VA, LIBBZ2_FILE - LIBEVENT_FILE);
+    let libbz2 = map_file(LIBBZ2_FILE, LIBBZ2_VA, LINKS_END - LIBBZ2_FILE);
     // glibc's dynamic linker is where hello says it is.
     let glibc_ld_path = Elf::parse(hello).ok().and_then(|e| e.interpreter()).unwrap_or(b"");
     st.next_pid = 1;
@@ -4170,6 +4414,11 @@ fn setup() -> Result<&'static mut State, &'static str> {
         (b"/usr/lib/libmpc.so.3", libmpc, LIBMPC_FILE),
         (b"/usr/lib/libisl.so.23", libisl, LIBISL_FILE),
         (b"/usr/lib/libgcc_s.so.1", libgcc_s, LIBGCC_S_FILE),
+        (b"/usr/bin/links", links, LINKS_FILE),
+        (b"/lib/libcrypto.so.3", libcrypto, LIBCRYPTO_FILE),
+        (b"/lib/libssl.so.3", libssl, LIBSSL_FILE),
+        (b"/usr/lib/libevent-2.1.so.7", libevent, LIBEVENT_FILE),
+        (b"/usr/lib/libbz2.so.1", libbz2, LIBBZ2_FILE),
     ];
     let mut tree = [(&b""[..], &b""[..]); MAX_IMAGES];
     let mut n = 0;

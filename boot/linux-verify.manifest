@@ -68,18 +68,17 @@ component linux
   priority 10
   # Its CNode (2^16 slots: the state's and files' pages, the files, from
   # 9216 the buffer a program in a file of the tree is read into, and a
-  # 6144-slot span per process from 22528), address space, image, stack,
-  # the four files, the 8 MiB block and the 4 MiB one.
+  # 5888-slot span per process from 23552), address space, image, stack,
+  # the four files (its processes' memory is cut from the rest of RAM).
   memory 24
   cspace 16
   vspace 20
-  # The files before the blocks, smallest first: memory is handed out in
-  # order, and each block is aligned to its size.
+  # The files, smallest first: memory is handed out in order, and each
+  # block is aligned to its size.
   file ld-musl 16
   file pigz 180
   file libz 216
   file busybox 252
-  untyped 23 0
   # The rest of RAM, for the spare blocks (slots 920 on).
   untyped spare 920
   control 1

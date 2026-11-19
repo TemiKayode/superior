@@ -88,14 +88,15 @@ component linux
   priority 10
   # Its CNode (2^16 slots: the state's and files' pages, the files,
   # glibc's from 8192, the toolchain's from 8832, the buffer at 9216,
-  # binutils' from 9472, gcc's from 11072, and a 6144-slot span per
-  # process from 22528), address space, image, stack, the thirty files
-  # (copied into its memory, 64 MiB for them) and the 8 MiB block.
+  # binutils' from 9472, gcc's from 11072, links' from 21552, and a
+  # 5888-slot span per process from 23552), address space, image, stack,
+  # the thirty-five files (copied into its memory, 64 MiB for them; its
+  # processes' memory is cut from the rest of RAM).
   memory 26
   cspace 16
   vspace 20
-  # The files before the blocks, smallest first: memory is handed out in
-  # order, and each block is aligned to its size.
+  # The files, smallest first: memory is handed out in order, and each
+  # block is aligned to its size.
   file ld-musl 16
   file mmaptest 177
   file pigz 180
@@ -126,7 +127,11 @@ component linux
   file libmpc 20912
   file libisl 20960
   file libgcc-s 21504
-  untyped 23 0
+  file links 21552
+  file libcrypto 22128
+  file libssl 23216
+  file libevent 23376
+  file libbz2 23472
   # The rest of RAM, for the spare blocks (slots 920 on).
   untyped spare 920
   control 1

@@ -1879,6 +1879,37 @@ holds the rest):
   vfork child sets a variable on the stack they share and exits, and the
   parent prints it (`vfork shared: 42`; a copy would print 1), on both
   ISAs.
+- The Linux personality runs a browser: links, a text one, fetches a page
+  over HTTP and renders it. xtask adds Alpine 3.18's links 2.29 with
+  OpenSSL 3.1's libssl and libcrypto, libevent and libbz2, pinned by hash,
+  and the test's HTTP server serves a small HTML page (`text/html`). For
+  the room: links' files are from slot 21552 and a process's span is 5888
+  slots from 23552; a process may map 48 runs and 16 libraries (links and
+  its libraries have some 24 runs); and the personality's eight 1 MiB
+  blocks (its processes' and its files') are cut from the rest of RAM, so
+  the 64 MiB of its own holds its thirty-five files (the manifests' 8 MiB
+  `untyped` is gone). `linux-test` runs `links -dump` on the page, which
+  prints its heading centered, its paragraph and its list bulleted, on
+  both ISAs.
+- The Linux personality has epoll, and delivers the signals of faults.
+  `epoll_create` and `epoll_create1` make an instance (an open file of
+  its own kind, up to 16, each watching up to 64 descriptors);
+  `epoll_ctl` adds, changes and removes descriptors (a file on the disk
+  refused, as Linux refuses it); `epoll_wait`, `epoll_pwait` and
+  `epoll_pwait2` report what is ready, with each descriptor's data, or
+  wait until something is or the timeout (tried again as `poll` is).
+  `poll` and epoll share one account of what a file is ready for. A
+  descriptor closed, or naming another file now, is dropped; it is
+  level-triggered (`EPOLLET` taken as level), and `EPOLLONESHOT` turns a
+  descriptor off once reported; `struct epoll_event` is packed on x86-64
+  only, as Linux has it. links' libevent now uses it. A fault (an invalid
+  instruction, a page fault, an arithmetic one) now enters the handler a
+  program set for its signal, if it is not blocked, at the faulting
+  instruction, rather than ending the process: OpenSSL on AArch64 tries
+  reading the cycle counter with a handler for `SIGILL` set, which ended
+  links before. `linux-test` has a program find nothing ready on a pipe,
+  then wait until a child writes to it (`epoll: 0 ready, then 1, data
+  7`), on both ISAs.
 - Interrupt and exception entries clear the direction flag. User code may be
   interrupted mid-way through a backward copy, with the flag set; the kernel's own
   copies need it clear, and without the `cld` they ran backwards, wrecking saved

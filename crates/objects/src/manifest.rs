@@ -66,8 +66,8 @@
 
 pub const MAX_COMPONENTS: usize = 16;
 /// Capabilities a component is given (the Linux personality, with its
-/// thirty files, has 37).
-pub const MAX_CAPS: usize = 40;
+/// thirty-five files, has 42).
+pub const MAX_CAPS: usize = 48;
 /// Every component's CSpace size, in bits and slots.
 pub const CSPACE_BITS: u8 = 6;
 pub const CSPACE_SLOTS: usize = 1 << CSPACE_BITS;
