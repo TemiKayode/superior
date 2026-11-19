@@ -127,6 +127,9 @@ struct Image {
     /// A virtio network device standing in for a Wi-Fi radio: its frames
     /// go over UDP to the test's access point (the Wi-Fi test).
     radio: bool,
+    /// x86-64: a CPU with AVX (QEMU's "max"), whose state the Linux
+    /// personality's signal frames carry (the Linux tests).
+    avx: bool,
     /// A USB keyboard on an xHCI controller, typed on through QEMU's
     /// monitor (the keyboard test).
     keyboard: bool,
@@ -749,6 +752,11 @@ fn linux_test(img: &Image) -> Result<(), String> {
     if let Err(step) = find_in_order(&out, &steps) {
         return Err(format!("Linux personality test: missing (in order) {step:?}"));
     }
+    // On x86-64 the CPU has AVX: its state is in the frame too.
+    let ymm = "linux: > ymm registers kept across a handler";
+    if img.arch == Arch::X86_64 && !out.contains(ymm) {
+        return Err(format!("Linux personality test: missing {ymm:?}"));
+    }
     for bad in ["[fail]", "could not", "panic", "[fault]", "not implemented", "killed"] {
         if out.contains(bad) {
             return Err(format!("Linux personality test: log contains {bad:?}"));
@@ -1261,6 +1269,7 @@ fn image_sealed(
         net: matches!(manifest, "net" | "tcp" | "update" | "suspend") || linux_nic(manifest).is_some(),
         linux_nic: linux_nic(manifest).map(|l| l.1),
         radio: manifest == "wifi",
+        avx: manifest.starts_with("linux"),
         keyboard: matches!(manifest, "keyboard" | "input" | "windows" | "cursor" | "toolkit" | "panel" | "resize" | "widgets" | "notes"),
         xhci: false,
         mouse: matches!(manifest, "input" | "windows" | "cursor" | "toolkit" | "panel" | "resize" | "widgets" | "notes"),
@@ -1373,6 +1382,7 @@ fn sel4_image() -> Result<Image, String> {
         net: false,
         linux_nic: None,
         radio: false,
+        avx: false,
         keyboard: false,
         xhci: false,
         mouse: false,
@@ -1740,6 +1750,8 @@ fn qemu_command(img: &Image) -> Command {
             if img.radio {
                 // A CPU with random instructions, for the entropy pool.
                 q.args(["-cpu", "qemu64,+rdrand,+rdseed"]);
+            } else if img.avx {
+                q.args(["-cpu", "max"]);
             }
         }
         Arch::Aarch64 => {

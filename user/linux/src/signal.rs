@@ -16,12 +16,12 @@
 //! musl gives (`SA_RESTORER`) or to this server's own (a page at
 //! [`TRAMPOLINE`] in every process), which calls `rt_sigreturn` to take
 //! the frame back. The floating-point and SIMD registers go in the frame
-//! too, as Linux puts them: on x86-64 an `fxsave` area above the frame,
-//! which `uc_mcontext.fpstate` points to; on AArch64 an `fpsimd_context`
-//! record in `uc_mcontext.__reserved`. So a handler that uses them leaves
-//! them as they were for the code it interrupted, and one that changes
-//! them in the frame changes them for it. Not yet: an alternate signal
-//! stack, and on x86-64 the AVX (`xsave`) state above SSE.
+//! too, as Linux puts them: on x86-64 an `xsave` area above the frame
+//! (with AVX: else just its `fxsave` part), which `uc_mcontext.fpstate`
+//! points to; on AArch64 an `fpsimd_context` record in
+//! `uc_mcontext.__reserved`. So a handler that uses them leaves them as
+//! they were for the code it interrupted, and one that changes them in the
+//! frame changes them for it. Not yet: an alternate signal stack.
 //!
 //! Job control: a stop signal whose action is the default (`SIGSTOP`,
 //! and `SIGTSTP`, `SIGTTIN`, `SIGTTOU` unless caught) stops the whole
@@ -130,6 +130,32 @@ const INFO_LEN: u64 = 128;
 const FP_WORDS: usize = REGS_FP_WORDS as usize;
 /// x86-64's `fxsave` area: its size and alignment.
 const FXSAVE_LEN: u64 = 512;
+/// x86-64's `xsave` area with AVX (all of `REGS_FP_GET`'s words), and how
+/// Linux marks a frame that has it: `_fpx_sw_bytes` in the `fxsave` area's
+/// software bytes (its first magic, the size with the second magic, the
+/// state's bits and the area's size), the second magic just after the
+/// area, and `UC_FP_XSTATE` in `uc_flags`.
+const XSAVE_LEN: u64 = 8 * FP_WORDS as u64;
+const SW_BYTES: usize = 464;
+const XSTATE_MAGIC1: u32 = 0x4650_5853;
+const XSTATE_MAGIC2: u32 = 0x4650_5845;
+const XFEATURES: u64 = 0b111;
+const UC_FP_XSTATE: u64 = 1;
+
+/// x86-64: whether threads' floating-point state includes AVX (the kernel
+/// turns on XSAVE, and saves it, where the CPU has AVX).
+#[cfg(target_arch = "x86_64")]
+fn xsave() -> bool {
+    #[allow(unused_unsafe)]
+    // SAFETY: CPUID is always there on x86-64.
+    let leaf1 = unsafe { core::arch::x86_64::__cpuid(1) };
+    leaf1.ecx & 1 << 27 != 0 && leaf1.ecx & 1 << 28 != 0
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn xsave() -> bool {
+    false
+}
 /// The instruction that made a system call, to make it again.
 pub const SYSCALL_LEN: u64 = if cfg!(target_arch = "x86_64") { 2 } else { 4 };
 
@@ -380,18 +406,31 @@ impl State {
         uc[UC_MASK as usize..UC_MASK as usize + 8].copy_from_slice(&old_mask.to_le_bytes());
         let mut info = [0u8; INFO_LEN as usize];
         info[..4].copy_from_slice(&sig.to_le_bytes());
-        let fp = fp_state(th)?;
+        let mut fp = fp_state(th)?;
 
         if cfg!(target_arch = "x86_64") {
-            // Below the red zone: the fxsave area (64-byte aligned, as
-            // Linux has it), then the return address (the restorer), the
-            // ucontext and the siginfo, the return address 8 below a
-            // 16-byte boundary, as after a call.
-            let fpstate = (r[SP] - 128 - FXSAVE_LEN) & !63;
+            // Below the red zone: the xsave area (64-byte aligned, as
+            // Linux has it) and its second magic, or the fxsave area
+            // alone, then the return address (the restorer), the ucontext
+            // and the siginfo, the return address 8 below a 16-byte
+            // boundary, as after a call.
+            let xs = xsave();
+            let (len, area) = if xs { (XSAVE_LEN, XSAVE_LEN + 4) } else { (FXSAVE_LEN, FXSAVE_LEN) };
+            fp[SW_BYTES..FXSAVE_LEN as usize].fill(0);
+            if xs {
+                let sw = &mut fp[SW_BYTES..];
+                sw[..4].copy_from_slice(&XSTATE_MAGIC1.to_le_bytes());
+                sw[4..8].copy_from_slice(&(area as u32).to_le_bytes());
+                sw[8..16].copy_from_slice(&XFEATURES.to_le_bytes());
+                sw[16..20].copy_from_slice(&(XSAVE_LEN as u32).to_le_bytes());
+                uc[..8].copy_from_slice(&UC_FP_XSTATE.to_le_bytes());
+            }
+            let fpstate = (r[SP] - 128 - area) & !63;
             let frame = ((fpstate - (8 + UC_LEN + INFO_LEN)) & !15) - 8;
             let (ucp, infop) = (frame + 8, frame + 8 + UC_LEN);
             uc[UC_FP as usize..UC_FP as usize + 8].copy_from_slice(&fpstate.to_le_bytes());
-            let ok = self.copy_out(i, fpstate, &fp)
+            let ok = self.copy_out(i, fpstate, &fp[..len as usize])
+                && (!xs || self.copy_out(i, fpstate + len, &XSTATE_MAGIC2.to_le_bytes()))
                 && self.copy_out(i, frame, &restorer.to_le_bytes())
                 && self.copy_out(i, ucp, &uc)
                 && self.copy_out(i, infop, &info);
@@ -445,11 +484,29 @@ impl State {
         set_regs(th, &r)?;
         // The floating-point and SIMD state, where the frame has it (as
         // the handler may have changed it). Without it (x86-64: a null
-        // `fpstate`; AArch64: no record) it stays as it is.
+        // `fpstate`; AArch64: no record) it stays as it is. On x86-64 an
+        // `fxsave` area without Linux's `xsave` marks (both magics, the
+        // sizes) leaves AVX in its initial state, as Linux does.
         let mut fp = [0u8; 8 * FP_WORDS];
         let found = if cfg!(target_arch = "x86_64") {
             let at = word(UC_FP);
-            at != 0 && self.copy_in(i, at, &mut fp)
+            let found = at != 0 && self.copy_in(i, at, &mut fp[..FXSAVE_LEN as usize]);
+            if found && xsave() {
+                let sw = |o: usize| u32::from_le_bytes(fp[SW_BYTES + o..SW_BYTES + o + 4].try_into().unwrap()) as u64;
+                let mut magic2 = [0u8; 4];
+                let full = sw(0) == XSTATE_MAGIC1 as u64
+                    && sw(4) == XSAVE_LEN + 4
+                    && sw(16) == XSAVE_LEN
+                    && self.copy_in(i, at + XSAVE_LEN, &mut magic2)
+                    && u32::from_le_bytes(magic2) == XSTATE_MAGIC2
+                    && self.copy_in(i, at + FXSAVE_LEN, &mut fp[FXSAVE_LEN as usize..]);
+                if !full {
+                    // x87 and SSE from the area.
+                    fp[FXSAVE_LEN as usize..].fill(0);
+                    fp[FXSAVE_LEN as usize] = 0b11;
+                }
+            }
+            found
         } else {
             let at = UC_FP as usize;
             let head = word(UC_FP);

@@ -240,17 +240,33 @@ pub fn ram_sleep_restart_cpus(before: usize) -> usize {
 static FS_LOADED: [core::sync::atomic::AtomicU64; superior_objects::ipc::MAX_CPUS] =
     [const { core::sync::atomic::AtomicU64::new(u64::MAX) }; superior_objects::ipc::MAX_CPUS];
 
-/// A thread's x87, MMX and SSE registers in `fxsave` form (only foreign
-/// threads have any: Superior's own code is built without them).
-#[repr(C, align(16))]
+/// A thread's x87, MMX, SSE and AVX registers in `xsave` form (only
+/// foreign threads have any: Superior's own code is built without them):
+/// the `fxsave` area, the `xsave` header and the upper halves of
+/// `ymm0`-`ymm15`. Without AVX (see [`fp_cpu_init`]) only the `fxsave`
+/// area is used, and the rest stays 0.
+#[repr(C, align(64))]
 #[derive(Clone, Copy)]
-pub struct FpState([u8; 512]);
+pub struct FpState([u8; XSAVE_LEN]);
+
+/// The `xsave` area's size with x87, SSE and AVX state (standard form).
+const XSAVE_LEN: usize = 832;
+/// XCR0, where Superior turns XSAVE on: x87, SSE and AVX state.
+const XFEATURES: u64 = 0b111;
+/// The header's first word, `XSTATE_BV`, and how many words the header
+/// has (all but the first must be 0 for `xrstor`).
+const XSTATE_BV: usize = 64;
+const HEADER_WORDS: usize = 8;
+
+/// Whether threads' state is saved with `xsave` (AVX on): the same on
+/// every CPU.
+static XSAVE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 impl FpState {
     /// Linux's initial state: x87 control word 0x37f and MXCSR 0x1f80,
     /// every exception masked.
     pub const INITIAL: FpState = {
-        let mut b = [0; 512];
+        let mut b = [0; XSAVE_LEN];
         b[0] = 0x7f;
         b[1] = 0x03;
         b[24] = 0x80;
@@ -258,27 +274,49 @@ impl FpState {
         FpState(b)
     };
 
-    /// Word `i` of the `fxsave` area.
+    /// Word `i` of the `xsave` area.
     pub fn word(&self, i: u64) -> Option<u64> {
-        let at = usize::try_from(i).ok().filter(|&i| i < 64)? * 8;
+        let at = usize::try_from(i).ok().filter(|&i| i < XSAVE_LEN / 8)? * 8;
         Some(u64::from_le_bytes(self.0[at..at + 8].try_into().unwrap()))
     }
 
-    /// Sets word `i`; MXCSR (word 3's low half) keeps only the bits the
-    /// CPU has (its mask, the high half, which stays), so `fxrstor` cannot
-    /// fault. An index past the last is ignored.
+    /// Sets word `i`, keeping what `xrstor` (or `fxrstor`) would fault on
+    /// out: MXCSR (word 3's low half) keeps only the bits the CPU has (its
+    /// mask, the high half, which stays); `XSTATE_BV` only the state turned
+    /// on, and the rest of the header stays 0. An index past the last is
+    /// ignored.
     pub fn set_word(&mut self, i: u64, v: u64) {
-        let Some(at) = usize::try_from(i).ok().filter(|&i| i < 64).map(|i| i * 8) else { return };
-        let v = if i == 3 {
-            let mask = match u32::from_le_bytes(self.0[28..32].try_into().unwrap()) {
-                0 => 0xffbf,
-                m => m,
-            };
-            (v as u32 & mask) as u64 | (mask as u64) << 32
-        } else {
-            v
+        let Some(i) = usize::try_from(i).ok().filter(|&i| i < XSAVE_LEN / 8) else { return };
+        let v = match i {
+            3 => {
+                let mask = match u32::from_le_bytes(self.0[28..32].try_into().unwrap()) {
+                    0 => 0xffbf,
+                    m => m,
+                };
+                (v as u32 & mask) as u64 | (mask as u64) << 32
+            }
+            XSTATE_BV if XSAVE.load(core::sync::atomic::Ordering::Relaxed) => v & XFEATURES,
+            _ if (XSTATE_BV..XSTATE_BV + HEADER_WORDS).contains(&i) => 0,
+            _ => v,
         };
-        self.0[at..at + 8].copy_from_slice(&v.to_le_bytes());
+        self.0[i * 8..i * 8 + 8].copy_from_slice(&v.to_le_bytes());
+    }
+}
+
+/// Whether the CPU has AVX, saved by `xsave` where Linux puts it (the
+/// upper halves at 576, 256 bytes).
+fn has_avx() -> bool {
+    use core::arch::x86_64::{__cpuid, __cpuid_count};
+    #[allow(unused_unsafe)]
+    // SAFETY: CPUID is always there on x86-64; leaf 0xd is there with
+    // XSAVE.
+    unsafe {
+        let leaf1 = __cpuid(1);
+        if leaf1.ecx & 1 << 26 == 0 || leaf1.ecx & 1 << 28 == 0 {
+            return false;
+        }
+        let avx = __cpuid_count(0xd, 2);
+        avx.eax == 256 && avx.ebx == 576
     }
 }
 
@@ -286,20 +324,28 @@ impl FpState {
 static FP_ON: [core::sync::atomic::AtomicBool; superior_objects::ipc::MAX_CPUS] =
     [const { core::sync::atomic::AtomicBool::new(false) }; superior_objects::ipc::MAX_CPUS];
 
-/// SSE on (CR4.OSFXSR, unmasked SIMD exceptions as #XM), but CR0.TS set:
-/// any FPU instruction traps (#NM) until a foreign thread runs.
+/// SSE on (CR4.OSFXSR, unmasked SIMD exceptions as #XM), and AVX where
+/// the CPU has it (CR4.OSXSAVE, XCR0 [`XFEATURES`]: threads' state is then
+/// saved with `xsave`), but CR0.TS set: any FPU instruction traps (#NM)
+/// until a foreign thread runs.
 pub fn fp_cpu_init(cpu: usize) {
     use x86_64::registers::control::{Cr0, Cr0Flags, Cr4, Cr4Flags};
-    // SAFETY: these bits only decide whether FPU and SSE instructions work
-    // or trap; the kernel uses none.
+    let avx = has_avx();
+    // SAFETY: these bits only decide whether FPU, SSE and AVX instructions
+    // work or trap, and which state `xsave` saves; the kernel uses none.
     unsafe {
         Cr4::update(|f| f.insert(Cr4Flags::OSFXSR | Cr4Flags::OSXMMEXCPT_ENABLE));
+        if avx {
+            Cr4::update(|f| f.insert(Cr4Flags::OSXSAVE));
+            core::arch::asm!("xsetbv", in("ecx") 0, in("eax") XFEATURES as u32, in("edx") 0, options(nostack));
+        }
         Cr0::update(|f| {
             f.remove(Cr0Flags::EMULATE_COPROCESSOR);
             f.insert(Cr0Flags::MONITOR_COPROCESSOR | Cr0Flags::NUMERIC_ERROR | Cr0Flags::TASK_SWITCHED);
         });
     }
     FP_ON[cpu].store(false, core::sync::atomic::Ordering::Relaxed);
+    XSAVE.store(avx, core::sync::atomic::Ordering::Relaxed);
 }
 
 /// Lets user code use the FPU (`on`, for a foreign thread), or makes it
@@ -320,17 +366,34 @@ pub fn fp_enable(on: bool) {
     }
 }
 
-/// Saves the FPU and SSE registers into `s` (the FPU on: `fp_enable`).
+/// Saves the FPU, SSE and AVX registers into `s` (the FPU on:
+/// `fp_enable`).
 pub fn fp_save(s: &mut FpState) {
-    // SAFETY: `s` is 512 writable bytes, 16-byte aligned.
-    unsafe { core::arch::asm!("fxsave64 [{}]", in(reg) s as *mut FpState, options(nostack)) };
+    let p = s as *mut FpState;
+    // SAFETY: `s` is `XSAVE_LEN` writable bytes, 64-byte aligned; `xsave`
+    // only with XSAVE on.
+    unsafe {
+        if XSAVE.load(core::sync::atomic::Ordering::Relaxed) {
+            core::arch::asm!("xsave64 [{}]", in(reg) p, in("eax") XFEATURES as u32, in("edx") 0, options(nostack));
+        } else {
+            core::arch::asm!("fxsave64 [{}]", in(reg) p, options(nostack));
+        }
+    }
 }
 
-/// Loads the FPU and SSE registers from `s` (the FPU on).
+/// Loads the FPU, SSE and AVX registers from `s` (the FPU on).
 pub fn fp_restore(s: &FpState) {
-    // SAFETY: as in `fp_save`, reading; a state from `fp_save` or
-    // `INITIAL` has no reserved MXCSR bit set.
-    unsafe { core::arch::asm!("fxrstor64 [{}]", in(reg) s as *const FpState, options(nostack)) };
+    let p = s as *const FpState;
+    // SAFETY: as in `fp_save`, reading; a state from `fp_save`, `INITIAL`
+    // or `set_word` has no reserved MXCSR bit set and a header `xrstor`
+    // takes.
+    unsafe {
+        if XSAVE.load(core::sync::atomic::Ordering::Relaxed) {
+            core::arch::asm!("xrstor64 [{}]", in(reg) p, in("eax") XFEATURES as u32, in("edx") 0, options(nostack));
+        } else {
+            core::arch::asm!("fxrstor64 [{}]", in(reg) p, options(nostack));
+        }
+    }
 }
 
 /// The user thread pointer as the thread left it, if user code can change

@@ -1493,7 +1493,8 @@ holds the rest):
   thread comes back with every register as it was but the result, its thread
   pointer kept per thread (the FS base, set for it with `REGS_SET_TLS`, as
   `arch_prctl` asks; `TPIDR_EL0`, which it sets itself), and its FPU and SIMD
-  registers its own: a foreign thread's `fxsave` area (AArch64: Q0-Q31, FPSR
+  registers its own: a foreign thread's `xsave` area (x87, SSE and AVX; its
+  `fxsave` part where the CPU has no AVX; AArch64: Q0-Q31, FPSR
   and FPCR) is saved on every entry and restored on every return, and for every
   other thread the FPU stays off (CR0.TS, CPACR_EL1), since Superior's own code
   uses none. The personality loads a program as Linux does: the
@@ -1648,12 +1649,27 @@ holds the rest):
   for the code it returns to. The kernel's `ThreadRegisters` reads and writes
   a stopped thread's saved state in that layout (`REGS_FP_GET`,
   `REGS_FP_SET`). On x86-64 it keeps only the MXCSR bits the CPU has, so
-  `fxrstor` cannot fault. The x86-64 AVX (`xsave`) state is not in the frame
-  yet. `linux-test` now runs fptest (`user/linux-fptest`), a Linux program of
+  `fxrstor` cannot fault. `linux-test` now runs fptest (`user/linux-fptest`), a Linux program of
   our own written in assembly, with no C library. It puts a value in
   `xmm0`/`d0` and rounds toward zero, then sends itself `SIGUSR1`; its
   handler clears both. Once the handler returns, the value and the rounding
   mode must be as they were. With the restore taken out, it fails.
+- On x86-64 the AVX registers are kept too, in the thread's state and in the
+  Linux personality's signal frames. Where the CPU has AVX, the kernel turns
+  on XSAVE (CR4.OSXSAVE, XCR0 for x87, SSE and AVX) and saves each foreign
+  thread's state with `xsave` and `xrstor`. Elsewhere it uses `fxsave` as
+  before. `REGS_FP_GET` and `REGS_FP_SET` now number the whole 832-byte area,
+  `fxsave` part, header and the upper halves of `ymm0`-`ymm15`. Setting the
+  header keeps only the x87, SSE and AVX bits of `XSTATE_BV` and zeroes the
+  rest, so `xrstor` cannot fault. The frame is Linux's: the `xsave` area,
+  marked in the `fxsave` part's software bytes (`FP_XSTATE_MAGIC1`, the sizes,
+  the features), with `FP_XSTATE_MAGIC2` just after it and `UC_FP_XSTATE` in
+  `uc_flags`. `rt_sigreturn` takes AVX from a frame with those marks; from a
+  plain `fxsave` frame it loads x87 and SSE and leaves AVX in its initial
+  state, as Linux does. The Linux tests boot x86-64 QEMU with `-cpu max`, which
+  has AVX. There fptest also puts a value in `ymm0`'s upper half and its
+  handler runs `vzeroall`; afterwards the value must be back. With the AVX
+  restore taken out, it fails.
 - Interrupt and exception entries clear the direction flag. User code may be
   interrupted mid-way through a backward copy, with the flag set; the kernel's own
   copies need it clear, and without the `cld` they ran backwards, wrecking saved

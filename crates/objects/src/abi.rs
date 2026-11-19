@@ -522,18 +522,21 @@ pub const REGS_SET: u64 = 7;
 /// How many registers [`REGS_GET`] numbers.
 pub const REGS_COUNT: u64 = if cfg!(target_arch = "x86_64") { 18 } else { 34 };
 /// Four words of the thread's floating-point and SIMD state from word
-/// `rdx`, as Linux's signal frame has it (x86-64: the 512-byte `fxsave`
-/// area; AArch64: `fpsimd_context`'s body, `fpsr` and `fpcr` in word 0's
+/// `rdx`, as Linux's signal frame has it (x86-64: the 832-byte `xsave`
+/// area, the `fxsave` area, header and AVX upper halves, which are 0 where
+/// the CPU has no AVX; AArch64: `fpsimd_context`'s body, `fpsr` and `fpcr` in word 0's
 /// low and high halves, then `v0`-`v31`); past the last, 0. For a signal
 /// handler's frame.
 pub const REGS_FP_GET: u64 = 8;
 /// Sets words `rdx` and `rdx + 1` (in [`REGS_FP_GET`]'s order) to `r8`
 /// and `r9`, of a thread as [`REGS_SET`] allows. On x86-64 MXCSR bits the
-/// CPU does not have are dropped (and its mask word is kept); on AArch64
+/// CPU does not have are dropped (and its mask word is kept), and of the
+/// `xsave` header only `XSTATE_BV`'s x87, SSE and AVX bits are taken (with
+/// AVX); on AArch64
 /// `fpsr` and `fpcr` are 32 bits. An index past the last is ignored.
 pub const REGS_FP_SET: u64 = 9;
 /// How many words [`REGS_FP_GET`] numbers.
-pub const REGS_FP_WORDS: u64 = if cfg!(target_arch = "x86_64") { 64 } else { 65 };
+pub const REGS_FP_WORDS: u64 = if cfg!(target_arch = "x86_64") { 104 } else { 65 };
 
 /// [`Syscall::FrameMapInto`] flags.
 pub const MAP_WRITE: u64 = 1;

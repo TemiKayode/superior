@@ -10,6 +10,10 @@
 //! signal frame. If they are, and the handler ran, it says so and exits 0;
 //! else it exits 1.
 //!
+//! On x86-64 with AVX (CPUID's OSXSAVE and AVX bits) it also puts a value
+//! in `ymm0`'s upper half, which the handler clears (`vzeroall`), and says
+//! so too if that is as it was (the `xsave` state in the frame).
+//!
 //! All code addresses it takes are relative to the program counter, so as
 //! a static PIE it has nothing to relocate.
 
@@ -36,9 +40,22 @@ core::arch::global_asm!(
     "syscall",
     "test rax, rax",
     "jnz fp_fail",
-    // The value, and rounding toward zero.
+    // AVX? (rbx is not needed by anyone above us.)
+    "mov eax, 1",
+    "cpuid",
+    "and ecx, 0x18000000",
+    "cmp ecx, 0x18000000",
+    "sete byte ptr [rip + fp_avx]",
+    // The value, and rounding toward zero; with AVX, another in ymm0's
+    // upper half.
     "mov rax, 0x0123456789abcdef",
     "movq xmm0, rax",
+    "cmp byte ptr [rip + fp_avx], 1",
+    "jne 2f",
+    "mov rax, 0x0fedcba987654321",
+    "movq xmm1, rax",
+    "vinsertf128 ymm0, ymm0, xmm1, 1",
+    "2:",
     "mov dword ptr [rsp + 32], 0x7f80",
     "ldmxcsr [rsp + 32]",
     // kill(getpid(), SIGUSR1)
@@ -58,11 +75,27 @@ core::arch::global_asm!(
     "jne fp_fail",
     "cmp qword ptr [rip + fp_ran], 1",
     "jne fp_fail",
+    "cmp byte ptr [rip + fp_avx], 1",
+    "jne 3f",
+    "vextractf128 xmm1, ymm0, 1",
+    "movq rax, xmm1",
+    "mov rcx, 0x0fedcba987654321",
+    "cmp rax, rcx",
+    "jne fp_fail",
+    "3:",
     "mov edi, 1",
     "lea rsi, [rip + fp_msg]",
     "mov edx, 35",
     "mov eax, 1",
     "syscall",
+    "cmp byte ptr [rip + fp_avx], 1",
+    "jne 4f",
+    "mov edi, 1",
+    "lea rsi, [rip + fp_ymm_msg]",
+    "mov edx, 36",
+    "mov eax, 1",
+    "syscall",
+    "4:",
     "xor edi, edi",
     "jmp fp_exit",
     "fp_fail:",
@@ -72,6 +105,10 @@ core::arch::global_asm!(
     "syscall",
     "fp_handler:",
     "pxor xmm0, xmm0",
+    "cmp byte ptr [rip + fp_avx], 1",
+    "jne 5f",
+    "vzeroall",
+    "5:",
     "mov dword ptr [rsp - 8], 0x1f80",
     "ldmxcsr [rsp - 8]",
     "mov qword ptr [rip + fp_ran], 1",
@@ -81,9 +118,11 @@ core::arch::global_asm!(
     "syscall",
     ".section .rodata",
     "fp_msg: .ascii \"fp registers kept across a handler\\n\"",
+    "fp_ymm_msg: .ascii \"ymm registers kept across a handler\\n\"",
     ".section .bss",
     ".balign 8",
     "fp_ran: .quad 0",
+    "fp_avx: .byte 0",
 );
 
 #[cfg(target_arch = "aarch64")]
