@@ -6,8 +6,8 @@
 //! be signed with. A missing one is embedded empty. SUPERIOR_MIN_VERSION is
 //! the oldest bundle version the kernel boots (0 if unset).
 //!
-//! On AArch64 the kernel is linked at a fixed physical address by
-//! `link-aarch64.ld`.
+//! On AArch64 the kernel is linked in the high half, loaded at a fixed
+//! physical address, by `link-aarch64.ld`.
 
 use std::{env, fs, path::PathBuf};
 

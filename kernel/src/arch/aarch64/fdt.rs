@@ -18,13 +18,13 @@ const MAX_SIZE: u64 = 4 << 20;
 
 fn be32(addr: u64) -> u32 {
     // SAFETY: callers bounds-check against the tree, which lies in RAM
-    // identity-mapped for the kernel.
-    u32::from_be(unsafe { core::ptr::read_unaligned(addr as *const u32) })
+    // the kernel maps.
+    u32::from_be(unsafe { core::ptr::read_unaligned(super::vm::phys_ptr(addr) as *const u32) })
 }
 
 fn byte(addr: u64) -> u8 {
     // SAFETY: as in `be32`.
-    unsafe { core::ptr::read(addr as *const u8) }
+    unsafe { core::ptr::read(super::vm::phys_ptr(addr)) }
 }
 
 /// Whether a device tree header is at `dtb`, which must lie in the RAM the

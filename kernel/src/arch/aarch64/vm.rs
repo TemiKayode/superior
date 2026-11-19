@@ -1,15 +1,18 @@
 //! Address spaces, page tables and the user ELF loader for AArch64.
 //!
-//! The kernel's tables, built in `_start` before the MMU is on, identity-map
-//! the first GiB (devices) and the second (RAM) with 1 GiB blocks that only
-//! EL1 can touch. Every address space is a top-level table whose entry 0 is
-//! the kernel's (so the kernel is mapped everywhere and switching address
-//! space needs no kernel remapping) and whose entry [`USER_L0_INDEX`] is its
-//! own user window: the same 512 GiB at the same address as on x86-64.
+//! The kernel's tables, built in `_start` before the MMU is on, map the
+//! first GiB of physical memory (devices) and the second (RAM) with 1 GiB
+//! blocks that only EL1 can touch, at [`KERNEL_OFFSET`] above where they
+//! are. The kernel runs there, in the high half (TTBR1), which every
+//! address space shares; the identity map the same tables give through
+//! TTBR0 is only for the jump there at boot. An address space is a
+//! top-level table for the low half (TTBR0), all of it user space: its
+//! entry [`USER_L0_INDEX`] is the user window, the same 512 GiB at the same
+//! address as on x86-64, and entry 0 the low one ([`LOW_BASE`]).
 //!
 //! Page tables and user pages are retyped from untyped memory in the root
-//! CNode, never from a kernel heap. The kernel reaches any physical page
-//! through its identity map.
+//! CNode, never from a kernel heap. The kernel reaches any physical page at
+//! [`phys_ptr`].
 
 use crate::memory::{MapError, TablePool};
 use superior_objects::elf::{Elf, Machine};
@@ -18,10 +21,29 @@ pub const USER_L0_INDEX: usize = 224;
 pub const USER_BASE: u64 = (USER_L0_INDEX as u64) << 39; // 0x7000_0000_0000
 pub const USER_END: u64 = USER_BASE + (1 << 39);
 pub const USER_STACK_TOP: u64 = USER_BASE + 0x8000_0000;
+
+/// The low user window: the first 512 GiB but its first 64 KiB (as
+/// Linux's `mmap_min_addr`, so a null pointer always faults), where
+/// fixed-address programs are linked (4 MiB, usually). Like the window at
+/// [`USER_BASE`], each address space has its own.
+pub const LOW_BASE: u64 = 0x1_0000;
+pub const LOW_END: u64 = 1 << 39;
+
+/// Whether `va` is in a user window.
+pub fn is_user(va: u64) -> bool {
+    (LOW_BASE..LOW_END).contains(&va) || (USER_BASE..USER_END).contains(&va)
+}
+
+/// Whether `va..end` lies inside one user window (`end` may be its end).
+pub fn is_user_range(va: u64, end: u64) -> bool {
+    va <= end && (LOW_BASE <= va && end <= LOW_END || USER_BASE <= va && end <= USER_END)
+}
 /// The root task's stack: 128 KiB (the Component Manager keeps its state,
 /// manifests included, on it).
 const USER_STACK_PAGES: u64 = 32;
 const PAGE: u64 = 4096;
+/// Where the kernel sees physical address 0: the start of the high half.
+pub const KERNEL_OFFSET: u64 = 0xffff_0000_0000_0000;
 /// The kernel maps RAM only in the second GiB.
 pub const KERNEL_RAM: core::ops::Range<u64> = 0x4000_0000..0x8000_0000;
 
@@ -44,9 +66,18 @@ pub const KERNEL_DEVICE_BLOCK: u64 = VALID | ATTR_DEVICE | AF | PXN | UXN;
 pub const KERNEL_RAM_BLOCK: u64 = 0x4000_0000 | VALID | ATTR_NORMAL | SH_INNER | AF | UXN;
 /// Attribute 0: Device-nGnRE; attribute 1: Normal, write-back, allocating.
 pub const MAIR: u64 = 0xff04;
-/// T0SZ = 16 (48-bit VAs), inner/outer write-back walks, inner shareable,
-/// 4 KiB granule, TTBR1 walks disabled (EPD1), T1SZ = 16, IPS = 40 bits.
-pub const TCR: u64 = 16 | (1 << 8) | (1 << 10) | (3 << 12) | (16 << 16) | (1 << 23) | (2 << 32);
+/// T0SZ and T1SZ = 16 (48-bit VAs in each half), inner/outer write-back
+/// walks, inner shareable, 4 KiB granules, IPS = 40 bits.
+pub const TCR: u64 = 16
+    | (1 << 8)
+    | (1 << 10)
+    | (3 << 12)
+    | (16 << 16)
+    | (1 << 24)
+    | (1 << 26)
+    | (3 << 28)
+    | (2 << 30)
+    | (2 << 32);
 /// MMU, D- and I-caches, SP alignment checks at EL1 and EL0; EL0 may use
 /// `dc zva`, read CTR_EL0, do cache maintenance; `wfe` from EL0 is allowed
 /// but `wfi` traps (nTWI clear). Bits 11, 20, 22, 23, 28, 29 are RES1.
@@ -115,8 +146,8 @@ pub fn current_root() -> u64 {
 /// Loads the kernel's own tables (no user window), dropping what the TLB
 /// held of the previous ones.
 pub fn load_kernel_root() {
-    let l0 = core::ptr::addr_of!(KERNEL_L0) as u64;
-    // SAFETY: the kernel's tables map the kernel as every space does.
+    let l0 = core::ptr::addr_of!(KERNEL_L0) as u64 - KERNEL_OFFSET;
+    // SAFETY: the kernel runs in the high half, the same in every space.
     unsafe { core::arch::asm!("msr ttbr0_el1, {}", "isb", in(reg) l0, options(nostack)) };
     flush_tlb();
 }
@@ -171,20 +202,20 @@ pub fn map_device(pa: u64) -> bool {
 }
 
 /// The kernel's pointer to physical address `pa`: RAM and devices (those
-/// [`map_device`] has mapped) are identity-mapped.
+/// [`map_device`] has mapped) are at [`KERNEL_OFFSET`] above it.
 pub fn phys_ptr(pa: u64) -> *mut u8 {
-    pa as *mut u8
+    (pa + KERNEL_OFFSET) as *mut u8
 }
 
 pub fn zero_frame(pa: u64) {
-    // SAFETY: the kernel identity-maps RAM, and the caller owns the frame.
-    unsafe { core::ptr::write_bytes(pa as *mut u8, 0, PAGE as usize) };
+    // SAFETY: the kernel maps RAM, and the caller owns the frame.
+    unsafe { core::ptr::write_bytes(phys_ptr(pa), 0, PAGE as usize) };
 }
 
 /// # Safety
-/// `pa` must be a page-table frame, identity-mapped.
+/// `pa` must be a page-table frame.
 unsafe fn table(pa: u64) -> &'static mut [u64; 512] {
-    unsafe { &mut *(pa as *mut [u64; 512]) }
+    unsafe { &mut *(phys_ptr(pa) as *mut [u64; 512]) }
 }
 
 /// An address space: the physical address of its top-level table.
@@ -198,14 +229,10 @@ impl AddressSpace {
     }
 
     /// Builds an address space whose top-level table is the frame at `pa`
-    /// (owned by the caller, zeroed here).
+    /// (owned by the caller, zeroed here): nothing of the kernel's, which
+    /// is in the other half.
     pub fn new_in(pa: u64) -> Result<Self, &'static str> {
         zero_frame(pa);
-        // SAFETY: a fresh table frame; KERNEL_L0 is set up at boot.
-        unsafe {
-            let kernel = &*core::ptr::addr_of!(KERNEL_L0);
-            table(pa)[0] = kernel.0[0];
-        }
         dsb();
         Ok(AddressSpace(pa))
     }
@@ -326,7 +353,7 @@ impl AddressSpace {
                 let hi = (page_va + PAGE).min(vaddr + seg.file_size);
                 if lo < hi {
                     let src = &bytes[(lo - vaddr) as usize..(hi - vaddr) as usize];
-                    let dst = (pa + (lo - page_va)) as *mut u8;
+                    let dst = phys_ptr(pa + (lo - page_va));
                     // SAFETY: dst..dst+len lies within the frame just mapped.
                     unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), dst, src.len()) };
                 }
@@ -377,7 +404,7 @@ impl AddressSpace {
         mut f: impl FnMut(*mut u8, usize, usize),
     ) -> Result<(), ()> {
         let end = va.checked_add(len as u64).ok_or(())?;
-        if va < USER_BASE || end > USER_END {
+        if !is_user_range(va, end) {
             return Err(());
         }
         let mut done = 0usize;
@@ -389,7 +416,7 @@ impl AddressSpace {
             }
             let in_page = (cur % PAGE) as usize;
             let n = (PAGE as usize - in_page).min(len - done);
-            f((pa + in_page as u64) as *mut u8, done, n);
+            f(phys_ptr(pa + in_page as u64), done, n);
             done += n;
         }
         Ok(())
@@ -405,7 +432,7 @@ impl AddressSpace {
         // SAFETY: reading TTBR0 has no side effect.
         unsafe { core::arch::asm!("mrs {}, ttbr0_el1", out(reg) cur, options(nostack, nomem)) };
         if cur != self.0 {
-            // SAFETY: every address space maps the kernel identically.
+            // SAFETY: the kernel is in the high half, not in any space.
             unsafe {
                 core::arch::asm!("msr ttbr0_el1, {}", "isb", in(reg) self.0, options(nostack))
             };
@@ -425,7 +452,7 @@ impl AddressSpace {
         executable: bool,
         pool: &mut TablePool,
     ) -> Result<(), MapError> {
-        debug_assert!(va.is_multiple_of(PAGE) && (USER_BASE..USER_END).contains(&va));
+        debug_assert!(va.is_multiple_of(PAGE) && is_user(va));
         debug_assert!(!(writable && executable));
         if executable && is_ram(pa) {
             // The loader wrote the code through its own mapping.
@@ -439,7 +466,7 @@ impl AddressSpace {
         for (i, chunk) in data.chunks(PAGE as usize).enumerate() {
             let pa = self.ensure_page(va + i as u64 * PAGE, false, false)?;
             // SAFETY: the frame was just mapped and is PAGE bytes long.
-            unsafe { core::ptr::copy_nonoverlapping(chunk.as_ptr(), pa as *mut u8, chunk.len()) };
+            unsafe { core::ptr::copy_nonoverlapping(chunk.as_ptr(), phys_ptr(pa), chunk.len()) };
         }
         Ok(())
     }
@@ -459,7 +486,8 @@ impl AddressSpace {
 /// invalidate the instruction cache.
 fn sync_icache(pa: u64) {
     const LINE: u64 = 64;
-    for a in (pa..pa + PAGE).step_by(LINE as usize) {
+    let va = phys_ptr(pa) as u64;
+    for a in (va..va + PAGE).step_by(LINE as usize) {
         // SAFETY: cleaning a cache line changes no memory contents.
         unsafe { core::arch::asm!("dc cvau, {}", in(reg) a, options(nostack)) };
     }

@@ -22,6 +22,23 @@ pub const USER_PML4_INDEX: usize = 224;
 pub const USER_BASE: u64 = (USER_PML4_INDEX as u64) << 39; // 0x7000_0000_0000
 pub const USER_END: u64 = USER_BASE + (1 << 39);
 pub const USER_STACK_TOP: u64 = USER_BASE + 0x8000_0000;
+
+/// The low user window: the first 512 GiB but its first 64 KiB (as
+/// Linux's `mmap_min_addr`, so a null pointer always faults), where
+/// fixed-address programs are linked (4 MiB, usually). Like the window at
+/// [`USER_BASE`], each address space has its own.
+pub const LOW_BASE: u64 = 0x1_0000;
+pub const LOW_END: u64 = 1 << 39;
+
+/// Whether `va` is in a user window.
+pub fn is_user(va: u64) -> bool {
+    (LOW_BASE..LOW_END).contains(&va) || (USER_BASE..USER_END).contains(&va)
+}
+
+/// Whether `va..end` lies inside one user window (`end` may be its end).
+pub fn is_user_range(va: u64, end: u64) -> bool {
+    va <= end && (LOW_BASE <= va && end <= LOW_END || USER_BASE <= va && end <= USER_END)
+}
 /// The root task's stack: 128 KiB (the Component Manager keeps its state,
 /// manifests included, on it).
 const USER_STACK_PAGES: u64 = 32;
@@ -120,7 +137,10 @@ impl AddressSpace {
         if !kernel[USER_PML4_INDEX].is_unused() {
             return Err("kernel already uses the user PML4 slot");
         }
-        for i in 0..512 {
+        // All but the user windows: the low one (entry 0) is where the
+        // bootloader identity-mapped what it needed, which the kernel only
+        // uses on its own tables (a CPU starting).
+        for i in 1..512 {
             if i != USER_PML4_INDEX {
                 new[i] = kernel[i].clone();
             }
@@ -274,7 +294,7 @@ impl AddressSpace {
         mut f: impl FnMut(*mut u8, usize, usize),
     ) -> Result<(), ()> {
         let end = va.checked_add(len as u64).ok_or(())?;
-        if va < USER_BASE || end > USER_END {
+        if !is_user_range(va, end) {
             return Err(());
         }
         let mapper = self.mapper();
@@ -386,7 +406,7 @@ impl AddressSpace {
         pool: &mut TablePool,
     ) -> Result<(), MapError> {
         debug_assert!(!(writable && executable));
-        debug_assert!(va.is_multiple_of(PAGE) && (USER_BASE..USER_END).contains(&va));
+        debug_assert!(va.is_multiple_of(PAGE) && is_user(va));
         let mut mapper = self.mapper();
         let page = Page::<Size4KiB>::containing_address(VirtAddr::new(va));
         if mapper.translate_page(page).is_ok() {

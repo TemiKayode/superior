@@ -159,8 +159,11 @@ const FPTEST_VA: u64 = USER_BASE + 0x1_5c00_0000;
 const SMPTEST_VA: u64 = USER_BASE + 0x1_5d00_0000;
 const MMAPTEST_VA: u64 = USER_BASE + 0x1_5e00_0000;
 
-/// A process's address space: everything inside [`CHILD`, `CHILD_END`).
-const CHILD: u64 = USER_BASE + 0x40_0000_0000;
+/// A process's address space: everything inside [`CHILD`, `CHILD_END`),
+/// in the kernel's low user window (from 64 KiB), so a fixed-address
+/// program, linked at 4 MiB, is loaded where it is linked: where a
+/// position-independent one goes ([`PROGRAM_BASE`]).
+const CHILD: u64 = 0x1_0000;
 const SPAN: u64 = 0x400_0000;
 const CHILD_END: u64 = CHILD + SPAN;
 const PROGRAM_BASE: u64 = CHILD + 0x40_0000;
@@ -1005,18 +1008,24 @@ impl State {
         Ok(())
     }
 
-    /// Loads a position-independent image (the file whose pages are in
-    /// slots from `file_slot`) at `base` in process `i`: (entry, program
-    /// headers' address, their count, the image's end). Pages that are
-    /// written get a copy; the rest are the file's own, shared.
+    /// Loads an image (the file whose pages are in slots from
+    /// `file_slot`) in process `i`: a position-independent one at `base`, a
+    /// fixed-address program where it is linked (as the program, below the
+    /// mapping area, only). (entry, program headers' address, their count,
+    /// the image's end). Pages that are written get a copy; the rest are
+    /// the file's own, shared.
     fn load(&mut self, i: usize, image: &'static [u8], file_slot: u64, base: u64) -> Result<(u64, u64, u64, u64), &'static str> {
         let elf = Elf::parse(image).map_err(|_| "not an ELF executable")?;
         if elf.machine != MACHINE {
             return Err("not for this machine");
         }
-        if !elf.pie {
-            return Err("a fixed-address executable (not position-independent)");
-        }
+        let (base, limit) = match (elf.pie, base) {
+            (true, _) => (base, CHILD_END),
+            (false, PROGRAM_BASE) => (0, MMAP_BASE),
+            (false, _) => return Err("a fixed-address library or interpreter"),
+        };
+        let (phoff, phnum) = elf.program_headers();
+        let mut phdr = base + phoff;
         let mut end = 0;
         for seg in elf.segments() {
             let seg = seg.map_err(|_| "a bad segment")?;
@@ -1024,6 +1033,15 @@ impl State {
                 continue;
             }
             let (lo, hi) = (seg.vaddr & !(PAGE - 1), (seg.vaddr + seg.mem_size).next_multiple_of(PAGE));
+            if base + lo < CHILD || hi.checked_add(base).is_none_or(|h| h > limit) {
+                return Err("a segment outside the process's space");
+            }
+            // The program headers' address: where the segment holding
+            // them puts them (in a position-independent image, at their
+            // offset).
+            if (seg.file_offset..seg.file_offset + seg.file_size).contains(&phoff) {
+                phdr = base + seg.vaddr + (phoff - seg.file_offset);
+            }
             end = end.max(hi);
             if seg.writable {
                 for page in (lo..hi).step_by(PAGE as usize) {
@@ -1058,8 +1076,7 @@ impl State {
                 self.map_run(i, run).map_err(|_| "out of memory")?;
             }
         }
-        let (phoff, phnum) = elf.program_headers();
-        Ok((base + elf.entry, base + phoff, phnum as u64, base + end))
+        Ok((base + elf.entry, phdr, phnum as u64, base + end))
     }
 
     // ---- processes ---------------------------------------------------

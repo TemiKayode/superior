@@ -20,12 +20,12 @@ impl Write for Pl011 {
             return Ok(());
         }
         for b in s.bytes() {
-            // SAFETY: PL011 registers, identity-mapped as device memory.
+            // SAFETY: PL011 registers, mapped as device memory.
             unsafe {
-                while core::ptr::read_volatile((base + FR) as *const u32) & FR_TXFF != 0 {
+                while core::ptr::read_volatile(super::vm::phys_ptr(base + FR) as *const u32) & FR_TXFF != 0 {
                     core::hint::spin_loop();
                 }
-                core::ptr::write_volatile((base + DR) as *mut u32, b as u32);
+                core::ptr::write_volatile(super::vm::phys_ptr(base + DR) as *mut u32, b as u32);
             }
         }
         Ok(())

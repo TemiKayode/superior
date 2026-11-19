@@ -1027,6 +1027,9 @@ fn lde_objects(arch: Arch, driver: &str) -> Result<(), String> {
 /// kernel loads it into its user window and relocates it. User programs
 /// build in their own target directory, since on AArch64 they need flags
 /// the kernel must not get.
+/// Linux programs of our own built as fixed-address executables.
+const FIXED_ADDRESS: &[&str] = &["superior-linux-mmaptest"];
+
 fn user_program(package: &str, arch: Arch) -> Result<PathBuf, String> {
     println!("== building {package} ({})", arch.name());
     let mut build = cargo();
@@ -1035,7 +1038,18 @@ fn user_program(package: &str, arch: Arch) -> Result<PathBuf, String> {
     // Loaders read only program headers: leave debug information out, so
     // the boot bundle stays small.
     build.env("CARGO_PROFILE_RELEASE_STRIP", "debuginfo");
-    if arch == Arch::Aarch64 {
+    if FIXED_ADDRESS.contains(&package) {
+        // Not position-independent: linked at 4 MiB, as Linux's linkers
+        // place an executable.
+        let var = match arch {
+            Arch::X86_64 => "CARGO_TARGET_X86_64_UNKNOWN_NONE_RUSTFLAGS",
+            Arch::Aarch64 => "CARGO_TARGET_AARCH64_UNKNOWN_NONE_SOFTFLOAT_RUSTFLAGS",
+        };
+        build.env(
+            var,
+            "-C relocation-model=static -C link-arg=--no-pie -C link-arg=--image-base=0x400000 -C link-arg=-zmax-page-size=4096",
+        );
+    } else if arch == Arch::Aarch64 {
         // x86_64-unknown-none is static-pie by default; this target is not.
         // Segments aligned to 4 KiB pages, not 64 KiB: the loader counts the
         // gaps against a component's image pages.
@@ -1133,8 +1147,14 @@ fn bundle(arch: Arch, manifest: &str, driver: &str) -> Result<PathBuf, String> {
         files.extend(alpine_files(arch)?);
         // Linux programs of our own (the first boot's runs use them).
         for name in ["fptest", "smptest", "mmaptest"] {
-            let path = user_program(&format!("superior-linux-{name}"), arch)?;
+            let package = format!("superior-linux-{name}");
+            let path = user_program(&package, arch)?;
             let bytes = std::fs::read(&path).map_err(|e| format!("reading {}: {e}", path.display()))?;
+            // ET_EXEC (2), not ET_DYN, if it is to be fixed-address.
+            let fixed = bytes.get(16..18) == Some(&[2, 0][..]);
+            if fixed != FIXED_ADDRESS.contains(&package.as_str()) {
+                return Err(format!("{package} is {}a fixed-address executable", if fixed { "" } else { "not " }));
+            }
             files.push((name.to_string(), bytes));
         }
     }

@@ -70,18 +70,18 @@ pub fn fault_irq() -> Option<u32> {
 }
 
 fn r32(off: u64) -> u32 {
-    // SAFETY: the SMMU's registers lie in the kernel's device identity map.
-    unsafe { ((REGS.load(Ordering::Relaxed) + off) as *const u32).read_volatile() }
+    // SAFETY: the SMMU's registers lie in the kernel's device map.
+    unsafe { (vm::phys_ptr(REGS.load(Ordering::Relaxed) + off) as *const u32).read_volatile() }
 }
 
 fn w32(off: u64, v: u32) {
     // SAFETY: as in `r32`.
-    unsafe { ((REGS.load(Ordering::Relaxed) + off) as *mut u32).write_volatile(v) }
+    unsafe { (vm::phys_ptr(REGS.load(Ordering::Relaxed) + off) as *mut u32).write_volatile(v) }
 }
 
 fn w64(off: u64, v: u64) {
     // SAFETY: as in `r32`.
-    unsafe { ((REGS.load(Ordering::Relaxed) + off) as *mut u64).write_volatile(v) }
+    unsafe { (vm::phys_ptr(REGS.load(Ordering::Relaxed) + off) as *mut u64).write_volatile(v) }
 }
 
 fn dsb() {
@@ -103,7 +103,7 @@ fn command(dw0: u64, dw1: u64) {
     let slot = (prod & ((1 << CMDQ_LOG2) - 1)) as u64;
     // SAFETY: the queue page is ours, identity-mapped RAM.
     unsafe {
-        let e = (q + 16 * slot) as *mut u64;
+        let e = vm::phys_ptr(q + 16 * slot) as *mut u64;
         e.write_volatile(dw0);
         e.add(1).write_volatile(dw1);
     }
@@ -220,7 +220,7 @@ pub fn reserved_pages(sid: u16) -> impl Iterator<Item = u64> {
 /// translation through the tables at `root`, 39-bit inputs, 40-bit
 /// outputs, ASID = `domain`.
 pub fn init_space(header: u64, root: u64, domain: u16) {
-    let cd = header as *mut u64;
+    let cd = vm::phys_ptr(header) as *mut u64;
     let dw0 = 25 // T0SZ: 39-bit inputs
         | 1 << 8 // IR0: write-back
         | 1 << 10 // OR0: write-back
@@ -246,7 +246,7 @@ pub fn valid_sid(sid: u16) -> bool {
 }
 
 fn ste(sid: u16) -> *mut u64 {
-    (STRTAB.load(Ordering::Relaxed) + 64 * sid as u64) as *mut u64
+    vm::phys_ptr(STRTAB.load(Ordering::Relaxed) + 64 * sid as u64) as *mut u64
 }
 
 /// Translates stream `sid`'s DMA through the space whose context
@@ -310,7 +310,7 @@ pub fn take_faults(mut f: impl FnMut(u16, IoFault)) -> bool {
         let slot = (cons & ((1 << EVTQ_LOG2) - 1)) as u64;
         // SAFETY: the queue page is ours, identity-mapped RAM, and the SMMU
         // wrote this entry before moving PROD past it.
-        let e = unsafe { core::slice::from_raw_parts((q + 32 * slot) as *const u64, 4) };
+        let e = unsafe { core::slice::from_raw_parts(vm::phys_ptr(q + 32 * slot) as *const u64, 4) };
         let (dw0, dw1, addr) = unsafe {
             (
                 core::ptr::read_volatile(&e[0]),

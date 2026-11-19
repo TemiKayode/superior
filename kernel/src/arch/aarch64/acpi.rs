@@ -77,8 +77,8 @@ pub struct Machine {
 
 fn byte(a: u64) -> u8 {
     // SAFETY: callers check `a` lies in a table inside the kernel's RAM,
-    // which is identity-mapped.
-    unsafe { (a as *const u8).read_volatile() }
+    // which the kernel maps.
+    unsafe { super::vm::phys_ptr(a).read_volatile() }
 }
 
 fn le(a: u64, n: u64) -> u64 {
@@ -250,7 +250,7 @@ pub fn read(rsdp: u64) -> Result<Machine, &'static str> {
                 return Err("the DSDT's length or checksum is wrong");
             }
             // SAFETY: the DSDT, `len` bytes in the kernel's RAM.
-            let bytes = unsafe { core::slice::from_raw_parts(dsdt as *const u8, len as usize) };
+            let bytes = unsafe { core::slice::from_raw_parts(super::vm::phys_ptr(dsdt), len as usize) };
             m.window_count = crate::aml::root_windows(bytes, &mut m.windows).unwrap_or(0);
             m.routes = crate::aml::root_routes(bytes).map(|r| r.0);
         }

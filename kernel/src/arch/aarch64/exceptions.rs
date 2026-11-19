@@ -128,11 +128,11 @@ impl UserFrame {
     /// processor state only the condition flags (NZCV) are taken, so the
     /// thread stays at EL0 with its interrupts on. False if `v` is
     /// refused.
-    pub fn set_linux_reg(&mut self, i: u64, v: u64, user: core::ops::Range<u64>) -> bool {
+    pub fn set_linux_reg(&mut self, i: u64, v: u64, user: fn(u64) -> bool) -> bool {
         const NZCV: u64 = 0xf000_0000;
         match i {
             0..=30 => self.x[i as usize] = v,
-            31 | 32 if !user.contains(&v) => return false,
+            31 | 32 if !user(v) => return false,
             31 => self.sp = v,
             32 => self.elr = v,
             33 => self.spsr = self.spsr & !NZCV | v & NZCV,

@@ -1750,6 +1750,28 @@ holds the rest):
   block of process blocks: on AArch64, with larger files, they no longer
   did. For that, manifest slots may now go up to the component's CSpace
   size (16 bits) instead of stopping at 255.
+- The AArch64 kernel runs in the high half. It is linked at
+  `0xffff_0000_0000_0000` above its physical address (`link-aarch64.ld`),
+  loaded and entered at the physical one, and once its boot code has
+  turned the MMU on with the same tables in TTBR0 and TTBR1 it jumps up
+  there; physical memory is reached at that offset (`vm::phys_ptr`), as
+  on x86-64 at its own. An address space is then all user space: its
+  tables no longer carry the kernel's identity map.
+- Every address space has a second user window, the low one: the first
+  512 GiB but its first 64 KiB (`vm::LOW_BASE`, Linux's `mmap_min_addr`),
+  where fixed-address executables are linked. On x86-64 address spaces
+  leave out the bootloader's identity maps there (the kernel uses them
+  only on its own tables, for a starting CPU). Mapping frames, thread
+  entry points and stacks, `ResumeAt`, `REGS_SET` and thread pointers
+  take either window (`vm::is_user`).
+- The Linux personality runs fixed-address (non-PIE) executables. A
+  process's window is now in the low one, from 64 KiB, so a program
+  linked at 4 MiB, as Linux's linkers put one, is loaded where it is
+  linked, which is where a position-independent one goes; `AT_PHDR` is
+  where the segment holding the program headers puts them. `linux-test`'s
+  mmaptest is now built as one (xtask checks it is `ET_EXEC`), and first
+  checks it runs at its linked address (an absolute one against the
+  program counter), on both ISAs.
 - Interrupt and exception entries clear the direction flag. User code may be
   interrupted mid-way through a backward copy, with the flag set; the kernel's own
   copies need it clear, and without the `cld` they ran backwards, wrecking saved

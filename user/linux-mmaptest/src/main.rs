@@ -9,8 +9,11 @@
 //! fail with `EFAULT` (nothing is mapped there). Then it says so and exits
 //! 0; else it exits 1.
 //!
-//! All code addresses it takes are relative to the program counter, so as
-//! a static PIE it has nothing to relocate.
+//! It is a fixed-address executable (not position-independent), linked at
+//! 4 MiB as Linux's linkers put one (`cargo xtask` builds it so). First it
+//! checks it runs where it is linked: its entry's address as linked (an
+//! absolute one, from the instruction or a literal) must be where the
+//! program counter says it is; else it exits 2.
 
 #![no_std]
 #![no_main]
@@ -19,6 +22,10 @@
 core::arch::global_asm!(
     ".globl _start",
     "_start:",
+    "movabs rax, offset _start",
+    "lea rcx, [rip + _start]",
+    "cmp rax, rcx",
+    "jne mm_moved",
     // r12: maps made; r13: the first one's address.
     "xor r12d, r12d",
     "xor r13d, r13d",
@@ -79,6 +86,9 @@ core::arch::global_asm!(
     "syscall",
     "xor edi, edi",
     "jmp mm_exit",
+    "mm_moved:",
+    "mov edi, 2",
+    "jmp mm_exit",
     "mm_fail:",
     "mov edi, 1",
     "mm_exit:",
@@ -92,6 +102,10 @@ core::arch::global_asm!(
 core::arch::global_asm!(
     ".globl _start",
     "_start:",
+    "ldr x9, =_start",
+    "adr x10, _start",
+    "cmp x9, x10",
+    "b.ne mm_moved",
     // x19: maps made; x20: the first one's address.
     "mov x19, #0",
     "mov x20, #0",
@@ -150,6 +164,9 @@ core::arch::global_asm!(
     "mov x8, #64",
     "svc #0",
     "mov x0, #0",
+    "b mm_exit",
+    "mm_moved:",
+    "mov x0, #2",
     "b mm_exit",
     "mm_fail:",
     "mov x0, #1",

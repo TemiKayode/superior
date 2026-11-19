@@ -147,28 +147,28 @@ static ROUTES: Mutex<Routes> = Mutex::new(Routes {
 });
 
 fn write32(addr: u64, v: u32) {
-    // SAFETY: GIC registers, identity-mapped as device memory.
-    unsafe { core::ptr::write_volatile(addr as *mut u32, v) }
+    // SAFETY: GIC registers, mapped as device memory.
+    unsafe { core::ptr::write_volatile(super::vm::phys_ptr(addr) as *mut u32, v) }
 }
 
 fn read32(addr: u64) -> u32 {
     // SAFETY: as in `write32`.
-    unsafe { core::ptr::read_volatile(addr as *const u32) }
+    unsafe { core::ptr::read_volatile(super::vm::phys_ptr(addr) as *const u32) }
 }
 
 fn write64(addr: u64, v: u64) {
     // SAFETY: as in `write32`.
-    unsafe { core::ptr::write_volatile(addr as *mut u64, v) }
+    unsafe { core::ptr::write_volatile(super::vm::phys_ptr(addr) as *mut u64, v) }
 }
 
 fn read64(addr: u64) -> u64 {
     // SAFETY: as in `write32`.
-    unsafe { core::ptr::read_volatile(addr as *const u64) }
+    unsafe { core::ptr::read_volatile(super::vm::phys_ptr(addr) as *const u64) }
 }
 
 fn write8(addr: u64, v: u8) {
     // SAFETY: as in `write32`; priority registers are byte-accessible.
-    unsafe { core::ptr::write_volatile(addr as *mut u8, v) }
+    unsafe { core::ptr::write_volatile(super::vm::phys_ptr(addr), v) }
 }
 
 fn wait_rwp(ctlr: u64) {
@@ -178,8 +178,8 @@ fn wait_rwp(ctlr: u64) {
 }
 
 fn zero(pa: u64, bytes: u64) {
-    // SAFETY: freshly carved RAM, identity-mapped.
-    unsafe { core::ptr::write_bytes(pa as *mut u8, 0, bytes as usize) };
+    // SAFETY: freshly carved RAM.
+    unsafe { core::ptr::write_bytes(super::vm::phys_ptr(pa), 0, bytes as usize) };
 }
 
 fn dsb() {
@@ -285,7 +285,7 @@ fn init_its() {
     zero(prop, 1 << (LPI_ID_BITS - 1));
     for n in 0..MSI_COUNT as u64 {
         // SAFETY: inside the table just carved.
-        unsafe { ((prop + n) as *mut u8).write_volatile(0xa0 | 1) };
+        unsafe { super::vm::phys_ptr(prop + n).write_volatile(0xa0 | 1) };
     }
     zero(pend, 1 << 16);
     zero(cmdq, 4096);
@@ -351,7 +351,7 @@ fn command(routes: &mut Routes, cmds: &[[u64; 4]]) {
         for (i, w) in c.iter().enumerate() {
             // SAFETY: a slot of our one-page queue the ITS has consumed:
             // each batch is waited for before the next.
-            unsafe { ((at + 8 * i as u64) as *mut u64).write_volatile(*w) };
+            unsafe { (super::vm::phys_ptr(at + 8 * i as u64) as *mut u64).write_volatile(*w) };
         }
         routes.cmd_tail = (routes.cmd_tail + 32) % 4096;
     }

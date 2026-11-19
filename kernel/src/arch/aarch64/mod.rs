@@ -265,7 +265,9 @@ pub fn send_ipi(cpu: usize, ipi: Ipi) {
 pub fn start_secondaries() -> usize {
     let limit = platform().cpus.unwrap_or(MAX_CPUS).min(MAX_CPUS);
     for cpu in 1..limit {
-        let r = psci(PSCI_CPU_ON, cpu as u64, ap_start as *const () as u64, cpu as u64);
+        // Started with the MMU off, at its physical address.
+        let entry = ap_start as *const () as u64 - vm::KERNEL_OFFSET;
+        let r = psci(PSCI_CPU_ON, cpu as u64, entry, cpu as u64);
         if r != 0 {
             break;
         }
@@ -342,13 +344,16 @@ extern "C" {
 }
 
 // Boot: park secondary CPUs, set up the stack, zero .bss, build the
-// kernel's identity map (devices below 1 GiB, RAM in the second GiB, both
-// EL1-only) and turn on the MMU and caches before any Rust code runs. With
-// the MMU off every access is Device memory, where unaligned accesses fault.
+// kernel's map (devices below 1 GiB, RAM in the second GiB, both EL1-only),
+// turn on the MMU and caches and jump to the high half, where the kernel is
+// linked, before any Rust code runs. With the MMU off every access is
+// Device memory, where unaligned accesses fault. Until the jump the code
+// runs at its physical address (adrp gives physical addresses), which the
+// same tables map through TTBR0.
 //
 // MAIR: attribute 0 = Device-nGnRE, 1 = Normal write-back.
-// TCR: 48-bit VAs through TTBR0 with 4 KiB pages, inner-shareable
-// write-back walks, TTBR1 walks disabled, 40-bit physical addresses.
+// TCR: 48-bit VAs through TTBR0 and TTBR1 with 4 KiB pages,
+// inner-shareable write-back walks, 40-bit physical addresses.
 // SCTLR: MMU, caches, stack alignment checks; user mode may read the
 // cache type and use `dc zva`, and `wfi` from user mode traps.
 core::arch::global_asm!(
@@ -391,6 +396,7 @@ core::arch::global_asm!(
     "    ldr x3, ={tcr}",
     "    msr tcr_el1, x3",
     "    msr ttbr0_el1, x1",
+    "    msr ttbr1_el1, x1",
     "    isb",
     "    tlbi vmalle1",
     "    dsb ish",
@@ -398,10 +404,12 @@ core::arch::global_asm!(
     "    ldr x3, ={sctlr}",
     "    msr sctlr_el1, x3",
     "    isb",
+    "    ldr x3, ={offset}",
+    "    add sp, sp, x3",
     "    mov x0, x19",
     "    mov x1, x20",
-    "    bl {main}",
-    "    b 1b",
+    "    ldr x3, ={main}",
+    "    br x3",
     // A CPU started by PSCI, with its number in x0: its own stack (below
     // a page kept free for the first entry to user mode), the kernel's
     // tables (already built), the MMU on.
@@ -424,6 +432,7 @@ core::arch::global_asm!(
     "    adrp x1, {l0}",
     "    add x1, x1, :lo12:{l0}",
     "    msr ttbr0_el1, x1",
+    "    msr ttbr1_el1, x1",
     "    isb",
     "    tlbi vmalle1",
     "    dsb ish",
@@ -431,8 +440,11 @@ core::arch::global_asm!(
     "    ldr x3, ={sctlr}",
     "    msr sctlr_el1, x3",
     "    isb",
-    "    bl {ap_main}",
-    "    b 1b",
+    "    ldr x3, ={offset}",
+    "    add sp, sp, x3",
+    "    mov x0, x19",
+    "    ldr x3, ={ap_main}",
+    "    br x3",
     // Entered at EL2: EL1 gets the machine as if there were no EL2 (EL1
     // in AArch64, nothing trapped, the counter and timers, the GIC's
     // system registers, FP and SIMD, the PMU's counters, its own MIDR
@@ -493,6 +505,7 @@ core::arch::global_asm!(
     mair = const vm::MAIR,
     tcr = const vm::TCR,
     sctlr = const vm::SCTLR,
+    offset = const vm::KERNEL_OFFSET,
     main = sym kernel_main,
     ap_main = sym ap_main,
 );
@@ -555,7 +568,7 @@ extern "C" fn kernel_main(dtb: u64, from_el2: u64) -> ! {
 
     let mut ram = [(0u64, 0u64); fdt::MAX_RANGES];
     let n = fdt::memory(boot, &mut ram).expect("no usable device tree");
-    let kernel_end = core::ptr::addr_of!(__kernel_end) as u64;
+    let kernel_end = core::ptr::addr_of!(__kernel_end) as u64 - vm::KERNEL_OFFSET;
     // The device trees stay where they are: kept out of the RAM handed
     // out, in address order.
     let mut holes = [(boot, boot + fdt::size(boot)), (0, 0)];
@@ -614,16 +627,16 @@ extern "C" fn kernel_main(dtb: u64, from_el2: u64) -> ! {
 
 /// The log over USB, if an xHCI has a Debug Capability: found through
 /// ECAM (its first 16 buses), its registers mapped as device memory, its
-/// rings in pages of RAM (identity-mapped).
+/// rings in pages of RAM.
 fn dbc_init(p: &platform::Platform) {
     let Some(ecam) = p.ecam.filter(|&e| vm::map_device(e)) else { return };
-    let at = move |bus: u8, devfn: u8, off: u16| (ecam + ((bus as u64) << 20 | (devfn as u64) << 12 | (off as u64 & 0xffc))) as *mut u32;
+    let at = move |bus: u8, devfn: u8, off: u16| vm::phys_ptr(ecam + ((bus as u64) << 20 | (devfn as u64) << 12 | (off as u64 & 0xffc))) as *mut u32;
     // SAFETY: ECAM, mapped as device memory.
     let read = |bus, devfn, off| unsafe { core::ptr::read_volatile(at(bus, devfn, off)) };
     // SAFETY: as above.
     let write = |bus, devfn, off, v| unsafe { core::ptr::write_volatile(at(bus, devfn, off), v) };
-    let map = |pa: u64| vm::map_device(pa).then_some(pa);
-    let page = || crate::memory::user_page().map(|pa| (pa, pa as *mut u8));
+    let map = |pa: u64| vm::map_device(pa).then(|| vm::phys_ptr(pa) as u64);
+    let page = || crate::memory::user_page().map(|pa| (pa, vm::phys_ptr(pa)));
     crate::dbc::init(&crate::dbc::Pci { read: &read, write: &write, buses: 16, map: &map, page: &page }, "the PL011");
 }
 
@@ -786,7 +799,7 @@ pub fn rtc_seconds() -> Option<u64> {
     }
     // SAFETY: the PL031's data register (offset 0), read-only, at the
     // address the device tree gives.
-    Some(unsafe { core::ptr::read_volatile(base as *const u32) } as u64)
+    Some(unsafe { core::ptr::read_volatile(vm::phys_ptr(base) as *const u32) } as u64)
 }
 
 /// The TPM's TIS registers, if the device tree has one (QEMU's
@@ -805,7 +818,7 @@ pub fn tpm_base() -> Option<u64> {
             base += bus;
         }
     }
-    vm::map_device(base).then_some(base)
+    vm::map_device(base).then(|| vm::phys_ptr(base) as u64)
 }
 
 /// RNDR, if the CPU has it (FEAT_RNG: ID_AA64ISAR0_EL1 bits 63:60).

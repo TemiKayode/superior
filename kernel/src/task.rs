@@ -48,7 +48,7 @@
 //! CPU kicks any other that now has something better to run (see
 //! `crate::smp`).
 
-use crate::arch::vm::{self, AddressSpace, USER_BASE, USER_END};
+use crate::arch::vm::{self, AddressSpace};
 use crate::arch::{self, Args, Exit, UserFrame, iommu};
 use crate::iommu::IoFault;
 use crate::memory::{MapError, TablePool};
@@ -922,7 +922,7 @@ fn thread_registers(k: &mut Kernel, cur: Tid, f: &Args) -> Result<(), u64> {
         REGS_SYSCALL_MORE => [r[4], r[5], r[6], r[7]],
         REGS_SET_TLS => {
             // A non-canonical FS base would fault in the kernel.
-            if f.a2 != 0 && !(USER_BASE..USER_END).contains(&f.a2) {
+            if f.a2 != 0 && !vm::is_user(f.a2) {
                 return Err(Error::InvalidArgument.code());
             }
             k.tls[t] = f.a2;
@@ -943,7 +943,7 @@ fn thread_registers(k: &mut Kernel, cur: Tid, f: &Args) -> Result<(), u64> {
             let mut frame = k.frames[t];
             for (n, v) in [(0, f.a3), (1, f.a4)] {
                 if let Some(i) = f.a2.checked_add(n) {
-                    if !frame.set_linux_reg(i, v, USER_BASE..USER_END) {
+                    if !frame.set_linux_reg(i, v, vm::is_user) {
                         return Err(Error::InvalidArgument.code());
                     }
                 }
@@ -1638,7 +1638,7 @@ fn apply_fault_reply(k: &mut Kernel, t: Tid) -> bool {
         x if x == FaultReply::ResumeAt as u64 => {
             // Returning to an address outside the user window could fault
             // in the kernel (a non-canonical rip on x86-64).
-            if !(USER_BASE..USER_END).contains(&msg[1]) {
+            if !vm::is_user(msg[1]) {
                 return false;
             }
             k.frames[t as usize].resume_at(msg[1], msg[2]);
@@ -2100,7 +2100,7 @@ fn map_into(k: &mut Kernel, cur: Tid, slot: u64, va: u64, flags: u64, id: u16) -
     }
     // A large (device) frame is mapped as a run of pages from `va`.
     let end = va.checked_add(pages * 4096);
-    if !va.is_multiple_of(4096) || !(USER_BASE..USER_END).contains(&va) || end.is_none_or(|e| e > USER_END) {
+    if !va.is_multiple_of(4096) || !vm::is_user(va) || end.is_none_or(|e| !vm::is_user_range(va, e)) {
         return Err(Error::InvalidArgument.code());
     }
     if executable && pages > 1 {
@@ -2381,9 +2381,9 @@ fn thread_configure(k: &mut Kernel, cur: Tid, f: &Args) -> Result<(), u64> {
     }
     let (entry, stack_top, prio) = (f.a1, f.a2, f.a4);
     // Returning to a non-canonical address faults in the kernel: keep both
-    // addresses inside the user window.
-    if !(USER_BASE..USER_END).contains(&entry)
-        || !(USER_BASE + 16..=USER_END).contains(&stack_top)
+    // addresses inside a user window.
+    if !vm::is_user(entry)
+        || stack_top.checked_sub(16).is_none_or(|s| !vm::is_user_range(s, stack_top))
         || !stack_top.is_multiple_of(16)
     {
         return Err(Error::InvalidArgument.code());

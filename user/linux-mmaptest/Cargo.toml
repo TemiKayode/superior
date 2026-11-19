@@ -1,6 +1,6 @@
 [package]
 name = "superior-linux-mmaptest"
-description = "A Linux program for the Linux personality's test: memory it unmaps is given back and used again."
+description = "A Linux program for the Linux personality's test, linked at a fixed address: memory it unmaps is given back and used again."
 version.workspace = true
 license.workspace = true
 repository.workspace = true

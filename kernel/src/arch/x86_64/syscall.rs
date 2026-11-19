@@ -174,7 +174,7 @@ impl UserFrame {
     /// the arithmetic ones and the direction flag are taken (not the trap
     /// flag, the interrupt flag or the I/O privilege level). False if `v`
     /// is refused.
-    pub fn set_linux_reg(&mut self, i: u64, v: u64, user: core::ops::Range<u64>) -> bool {
+    pub fn set_linux_reg(&mut self, i: u64, v: u64, user: fn(u64) -> bool) -> bool {
         const TAKEN: u64 = 0x1 | 0x4 | 0x10 | 0x40 | 0x80 | 0x400 | 0x800;
         let r = match i {
             0 => &mut self.r8,
@@ -192,7 +192,7 @@ impl UserFrame {
             12 => &mut self.rdx,
             13 => &mut self.rax,
             14 => &mut self.rcx,
-            15 | 16 if !user.contains(&v) => return false,
+            15 | 16 if !user(v) => return false,
             15 => &mut self.rsp,
             16 => &mut self.rip,
             17 => {
