@@ -876,6 +876,8 @@ pub enum FileKind {
     Socket,
     /// An epoll instance, its number in `pipe` (`State::epolls`).
     Epoll,
+    /// A Unix domain socket ([`crate::unix`]), its number in `pipe`.
+    Unix,
 }
 
 /// An open-file description, shared by the descriptors `dup` and `fork`

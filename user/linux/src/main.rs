@@ -90,6 +90,7 @@ mod remote;
 mod signal;
 mod sock;
 mod tty;
+mod unix;
 
 use fs::{FileKind, Fs, Kind, MAX_FILES, MAX_IMAGES, MAX_PIPES, Open, PIPE_BUF, Pipe, ROOT};
 use signal::{Action, Next, SA_RESTART, SIGALRM, SIGCHLD, SIGPIPE, SIGSEGV, SYSCALL_LEN, TRAMPOLINE, TRAMPOLINE_CODE};
@@ -474,6 +475,7 @@ enum Sys {
     Getpeername,
     Setsockopt,
     Getsockopt,
+    Socketpair,
     Unsupported(u64),
 }
 
@@ -540,6 +542,7 @@ fn decode(nr: u64, a: [u64; 6]) -> (Sys, [u64; 6]) {
         52 => Sys::Getpeername,
         54 => Sys::Setsockopt,
         55 => Sys::Getsockopt,
+        53 => Sys::Socketpair,
         40 => Sys::Sendfile,
         56 => Sys::Clone,
         57 => Sys::Fork,
@@ -645,6 +648,7 @@ fn decode(nr: u64, a: [u64; 6]) -> (Sys, [u64; 6]) {
         212 => Sys::Recvmsg,
         208 => Sys::Setsockopt,
         209 => Sys::Getsockopt,
+        199 => Sys::Socketpair,
         210 => Sys::Shutdown,
         172 => Sys::Getpid,
         178 => Sys::Gettid,
@@ -917,6 +921,8 @@ struct State {
     input_mods: u8,
     input_buttons: u8,
     input_at: (i32, i32),
+    /// Unix domain sockets.
+    unix: [unix::Unix; unix::MAX_UNIX],
 }
 
 /// An input device's events, oldest first: (when, in ticks; type; code;
@@ -1813,20 +1819,50 @@ impl State {
         let fb = self.files[f].kind == FileKind::Node && self.fs.kind(self.files[f].ino) == Kind::Fb;
         self.procs[i].fds[fd] = 0;
         self.procs[i].cloexec &= !(1 << fd);
+        self.release(f);
+        if fb {
+            self.fb_show();
+        }
+    }
+
+    /// Drops a reference to open file `f` (a descriptor's, or a message's
+    /// in flight on a Unix socket), closing it with the last.
+    fn release(&mut self, f: usize) {
         let o = &mut self.files[f];
         o.refs -= 1;
         if o.refs == 0 {
-            match o.kind {
-                FileKind::PipeRead => self.pipes[o.pipe as usize].readers -= 1,
-                FileKind::PipeWrite => self.pipes[o.pipe as usize].writers -= 1,
-                FileKind::Socket => sock::close(o.pipe as usize),
-                FileKind::Epoll => self.epolls[o.pipe as usize].used = false,
+            let (kind, k) = (o.kind, o.pipe as usize);
+            o.kind = FileKind::Closed;
+            match kind {
+                FileKind::PipeRead => self.pipes[k].readers -= 1,
+                FileKind::PipeWrite => self.pipes[k].writers -= 1,
+                FileKind::Socket => sock::close(k),
+                FileKind::Epoll => self.epolls[k].used = false,
+                FileKind::Unix => self.unix_close(k),
                 _ => {}
             }
-            o.kind = FileKind::Closed;
         }
-        if fb {
-            self.fb_show();
+    }
+
+    /// Closes Unix socket `k`: its peer reads to the end of what it has,
+    /// then sees the end, and may no longer write; connections it had yet
+    /// to accept are closed, and descriptors in flight to it dropped.
+    fn unix_close(&mut self, k: usize) {
+        let u = &mut self.unix[k];
+        let (peer, nback, backlog, nrights) = (u.peer, u.nback as usize, u.backlog, u.nrights);
+        let rights = u.rights;
+        u.phase = unix::Phase::Free;
+        if peer != 0 {
+            let p = &mut self.unix[peer as usize - 1];
+            (p.peer, p.eof, p.broken) = (0, true, true);
+        }
+        for &s in &backlog[..nback] {
+            self.unix_close(s as usize - 1);
+        }
+        for r in &rights[..nrights] {
+            for &f in &r.files[..r.n as usize] {
+                self.release(f as usize);
+            }
         }
     }
 
@@ -1960,7 +1996,8 @@ fn answer(st: &mut State, t: usize, call: Sys, a: [u64; 6]) -> Out {
         | Sys::Getsockname
         | Sys::Getpeername
         | Sys::Setsockopt
-        | Sys::Getsockopt => net_call(st, i, call, a),
+        | Sys::Getsockopt
+        | Sys::Socketpair => net_call(st, i, call, a),
         Sys::Setitimer => r(setitimer(st, i, a[0], a[1], a[2])),
         Sys::Membarrier => match a[0] {
             0 => Ret(0b1_1001),
@@ -2286,7 +2323,7 @@ fn fstat(st: &mut State, i: usize, fd: u64, buf: u64) -> Result<u64, u64> {
     let s = match o.kind {
         FileKind::Node => stat_bytes(mode_of(st.fs.kind(o.ino)), o.ino as u64, st.fs.size(o.ino)),
         FileKind::Console | FileKind::Tty => stat_bytes(0o20620, 0, 0),
-        FileKind::Socket => stat_bytes(0o140777, 0, 0),
+        FileKind::Socket | FileKind::Unix => stat_bytes(0o140777, 0, 0),
         _ => stat_bytes(0o10600, 0, st.pipes[o.pipe as usize].len as u64),
     };
     st.put(i, buf, &s[..STAT_LEN])
@@ -2517,6 +2554,29 @@ fn read(st: &mut State, i: usize, fd: u64, buf: u64, len: u64) -> Out {
             }
             pipe.take(&mut tmp[..want])
         }
+        FileKind::Unix => {
+            let u = &mut st.unix[o.pipe as usize];
+            if u.phase != unix::Phase::Connected {
+                return Out::Ret(err(ENOTCONN));
+            }
+            if u.len == 0 {
+                if u.eof {
+                    return Out::Ret(0);
+                }
+                if o.flags & O_NONBLOCK != 0 {
+                    return Out::Ret(err(EAGAIN));
+                }
+                return Out::Block(Blocked::Read { fd, buf, len });
+            }
+            // Descriptors sent with what is read are closed.
+            let (n, rights) = u.take(&mut tmp[..want]);
+            if let Some(r) = rights {
+                for &f in &r.files[..r.n as usize] {
+                    st.release(f as usize);
+                }
+            }
+            n
+        }
         FileKind::Socket => match sock::recv(o.pipe as usize, &mut tmp[..want], false) {
             Ok(got) => got.n,
             Err(sock::EAGAIN) if o.flags & O_NONBLOCK == 0 => return Out::Block(Blocked::Read { fd, buf, len }),
@@ -2548,13 +2608,20 @@ fn write(st: &mut State, i: usize, fd: u64, buf: u64, len: u64) -> Out {
             room.min(len as usize)
         }
         FileKind::Node if o.flags & O_ACCMODE == 0 => return Out::Ret(err(EBADF)),
-        FileKind::Console | FileKind::Tty | FileKind::Node | FileKind::Socket => len.min(tmp.len() as u64) as usize,
+        FileKind::Console | FileKind::Tty | FileKind::Node | FileKind::Socket | FileKind::Unix => {
+            len.min(tmp.len() as u64) as usize
+        }
         _ => return Out::Ret(err(EBADF)),
     };
     if !st.copy_in(i, buf, &mut tmp[..n]) {
         return Out::Ret(err(EFAULT));
     }
     Out::Ret(match o.kind {
+        FileKind::Unix => match unix_send(st, i, o.pipe as usize, &tmp[..n], None, false) {
+            Ok(w) => w as u64,
+            Err(EAGAIN) if o.flags & O_NONBLOCK == 0 => return Out::Block(Blocked::Write { fd, buf, len }),
+            Err(e) => err(e),
+        },
         FileKind::Console => {
             st.output(&tmp[..n]);
             n as u64
@@ -3815,6 +3882,19 @@ fn readiness(st: &State, f: usize) -> u16 {
         // An epoll instance is readable when something it watches is
         // ready (one instance inside another is not followed further).
         FileKind::Epoll => 0,
+        FileKind::Unix => {
+            let u = &st.unix[o.pipe as usize];
+            match u.phase {
+                unix::Phase::Listening => if u.nback > 0 { POLLIN } else { 0 },
+                unix::Phase::Connected => {
+                    let room = u.peer != 0 && st.unix[u.peer as usize - 1].room() > 0;
+                    (if u.len > 0 || u.eof { POLLIN } else { 0 })
+                        | (if room { POLLOUT } else { 0 })
+                        | if u.broken { POLLHUP } else { 0 }
+                }
+                _ => POLLOUT | POLLHUP,
+            }
+        }
         FileKind::Node if st.fs.kind(o.ino) == Kind::Input => {
             if st.input[st.fs.size(o.ino) as usize & 1].len > 0 { POLLIN } else { 0 }
         }
@@ -3982,6 +4062,14 @@ fn net_call(st: &mut State, i: usize, call: Sys, a: [u64; 6]) -> Out {
     const MSG_DONTWAIT: u64 = 0x40;
     const MSG_NOSIGNAL: u64 = 0x4000;
     let r = |v: Result<u64, u64>| Out::Ret(v.unwrap_or_else(err));
+    if call == Sys::Socket && a[0] == unix::AF_UNIX || call == Sys::Socketpair {
+        return unix_socket(st, i, call, a);
+    }
+    if call != Sys::Socket {
+        if let Some(f) = st.file(i, a[0]).filter(|&f| st.files[f].kind == FileKind::Unix) {
+            return unix_call(st, i, f, call, a);
+        }
+    }
     if call == Sys::Socket {
         if a[0] != sock::AF_INET && a[0] != sock::AF_INET6 {
             return Out::Ret(err(EAFNOSUPPORT));
@@ -4124,6 +4212,422 @@ fn net_call(st: &mut State, i: usize, call: Sys, a: [u64; 6]) -> Out {
             r(st.put(i, a[3], &(v as u32).to_le_bytes()).and_then(|_| st.put(i, a[4], &4u32.to_le_bytes())).map(|_| 0))
         }
         _ => Out::Ret(err(ENOSYS)),
+    }
+}
+
+/// Unix socket errors.
+const ENOTCONN: u64 = 107;
+const EISCONN: u64 = 106;
+const ECONNREFUSED: u64 = 111;
+const EADDRINUSE: u64 = 98;
+const EOPNOTSUPP: u64 = 95;
+const MSG_DONTWAIT: u64 = 0x40;
+const MSG_NOSIGNAL: u64 = 0x4000;
+
+/// A `sockaddr_un`'s name: its path (to its first NUL), or, its first
+/// byte 0, an abstract name (the rest of the given length).
+fn sun_name(st: &State, i: usize, addr: u64, len: u64) -> Result<([u8; unix::NAME_MAX], usize), u64> {
+    let mut b = [0u8; 2 + unix::NAME_MAX];
+    let n = (len as usize).min(b.len());
+    if n < 3 {
+        return Err(EINVAL);
+    }
+    if !st.copy_in(i, addr, &mut b[..n]) {
+        return Err(EFAULT);
+    }
+    if u16::from_le_bytes([b[0], b[1]]) as u64 != unix::AF_UNIX {
+        return Err(EINVAL);
+    }
+    let path = &b[2..n];
+    let l = if path[0] == 0 { path.len() } else { path.iter().position(|&c| c == 0).unwrap_or(path.len()) };
+    let mut name = [0u8; unix::NAME_MAX];
+    name[..l].copy_from_slice(&path[..l]);
+    Ok((name, l))
+}
+
+/// Unix socket `k`'s name as a `sockaddr_un` at `addr` (if any), cut to
+/// the length at `lenp`, which then says its whole length.
+fn put_sun(st: &mut State, i: usize, k: Option<usize>, addr: u64, lenp: u64) -> Result<(), u64> {
+    if addr == 0 {
+        return Ok(());
+    }
+    let mut l = [0u8; 4];
+    if !st.copy_in(i, lenp, &mut l) {
+        return Err(EFAULT);
+    }
+    let mut b = [0u8; 3 + unix::NAME_MAX];
+    b[..2].copy_from_slice(&(unix::AF_UNIX as u16).to_le_bytes());
+    let mut len = 2;
+    if let Some(k) = k {
+        let name = st.unix[k].name();
+        b[2..2 + name.len()].copy_from_slice(name);
+        // A path's NUL counts; an abstract name has none.
+        len += name.len() + (name.first().is_some_and(|&c| c != 0)) as usize;
+    }
+    let n = (u32::from_le_bytes(l) as usize).min(len);
+    st.put(i, addr, &b[..n])?;
+    st.put(i, lenp, &(len as u32).to_le_bytes()).map(|_| ())
+}
+
+/// A free Unix socket, made by process `pid`.
+fn unix_new(st: &mut State, pid: u32) -> Result<usize, u64> {
+    let k = st.unix.iter().position(|u| u.phase == unix::Phase::Free).ok_or(ENFILE)?;
+    st.unix[k].reset(pid);
+    Ok(k)
+}
+
+/// A descriptor in process `i` for Unix socket `k`, with `ty`'s
+/// `SOCK_NONBLOCK` and `SOCK_CLOEXEC`; the socket closed if there is none.
+fn unix_fd(st: &mut State, i: usize, k: usize, ty: u64) -> Result<u64, u64> {
+    let Some(f) = st.new_file(FileKind::Unix, 0, k as u8, O_RDWR | ty as u32 & O_NONBLOCK) else {
+        st.unix_close(k);
+        return Err(ENFILE);
+    };
+    st.new_fd(i, f, 0, ty as u32 & O_CLOEXEC != 0).inspect_err(|_| st.release(f))
+}
+
+/// `socket(AF_UNIX, SOCK_STREAM, 0)` and `socketpair`.
+fn unix_socket(st: &mut State, i: usize, call: Sys, a: [u64; 6]) -> Out {
+    const EAFNOSUPPORT: u64 = 97;
+    const ESOCKTNOSUPPORT: u64 = 94;
+    if a[0] != unix::AF_UNIX {
+        return Out::Ret(err(EAFNOSUPPORT));
+    }
+    if a[1] & 0xf != sock::SOCK_STREAM {
+        return Out::Ret(err(ESOCKTNOSUPPORT));
+    }
+    let pid = st.procs[i].pid;
+    let one = |st: &mut State| unix_new(st, pid).and_then(|k| unix_fd(st, i, k, a[1]).map(|fd| (k, fd)));
+    if call == Sys::Socket {
+        return Out::Ret(one(st).map_or_else(err, |(_, fd)| fd));
+    }
+    let (k, fd) = match one(st) {
+        Ok(s) => s,
+        Err(e) => return Out::Ret(err(e)),
+    };
+    let (j, fd2) = match one(st) {
+        Ok(s) => s,
+        Err(e) => {
+            st.close(i, fd as usize);
+            return Out::Ret(err(e));
+        }
+    };
+    for (x, y) in [(k, j), (j, k)] {
+        st.unix[x].phase = unix::Phase::Connected;
+        st.unix[x].peer = y as u8 + 1;
+        st.unix[x].peer_pid = st.unix[y].pid;
+    }
+    let mut sv = [0u8; 8];
+    sv[..4].copy_from_slice(&(fd as u32).to_le_bytes());
+    sv[4..].copy_from_slice(&(fd2 as u32).to_le_bytes());
+    Out::Ret(st.put(i, a[3], &sv).map_or_else(err, |_| 0))
+}
+
+/// Puts `data` (and the open files `rights`, each then holding a
+/// reference) in Unix socket `k`'s peer's buffer: how many bytes, or
+/// `EAGAIN` if it is full. Writing to a peer gone is `EPIPE`, and
+/// `SIGPIPE` unless `nosignal`.
+fn unix_send(st: &mut State, i: usize, k: usize, data: &[u8], rights: Option<(u8, [u8; unix::RIGHTS_FDS])>, nosignal: bool) -> Result<usize, u64> {
+    let u = &st.unix[k];
+    if u.phase != unix::Phase::Connected {
+        return Err(ENOTCONN);
+    }
+    if u.peer == 0 || u.broken {
+        if !nosignal {
+            st.post(i, SIGPIPE);
+        }
+        return Err(EPIPE);
+    }
+    if data.is_empty() {
+        return Ok(0);
+    }
+    let p = u.peer as usize - 1;
+    if st.unix[p].room() == 0 {
+        return Err(EAGAIN);
+    }
+    let n = st.unix[p].put(data, rights).ok_or(EAGAIN)?;
+    if let Some((c, files)) = rights {
+        for &f in &files[..c as usize] {
+            st.files[f as usize].refs += 1;
+        }
+    }
+    Ok(n)
+}
+
+/// The open files a `msghdr`'s control messages (`SCM_RIGHTS`) send.
+fn rights_of(st: &State, i: usize, msg: u64) -> Result<Option<(u8, [u8; unix::RIGHTS_FDS])>, u64> {
+    let (control, len) = (st.word(i, msg + 32).ok_or(EFAULT)?, st.word(i, msg + 40).ok_or(EFAULT)?);
+    let mut out = [0u8; unix::RIGHTS_FDS];
+    let mut n = 0;
+    let mut at = 0;
+    while at + 16 <= len {
+        let clen = st.word(i, control + at).ok_or(EFAULT)?;
+        let kind = st.word(i, control + at + 8).ok_or(EFAULT)?;
+        if clen < 16 || at + clen > len {
+            return Err(EINVAL);
+        }
+        // SOL_SOCKET, SCM_RIGHTS.
+        if kind == 1 | 1 << 32 {
+            for c in 0..(clen - 16) / 4 {
+                let mut b = [0u8; 4];
+                if !st.copy_in(i, control + at + 16 + 4 * c, &mut b) {
+                    return Err(EFAULT);
+                }
+                let f = st.file(i, u32::from_le_bytes(b) as u64).ok_or(EBADF)?;
+                if n == unix::RIGHTS_FDS {
+                    return Err(EINVAL);
+                }
+                out[n] = f as u8;
+                n += 1;
+            }
+        }
+        at += (clen + 7) & !7;
+    }
+    Ok((n > 0).then_some((n as u8, out)))
+}
+
+/// Gives the open files that came with a message to process `i` as new
+/// descriptors, written as an `SCM_RIGHTS` control message to the
+/// `msghdr` at `msg`; those that do not fit are closed (`MSG_CTRUNC`).
+/// Its flags.
+fn give_rights(st: &mut State, i: usize, msg: u64, r: Option<unix::Rights>, cloexec: bool) -> Result<u32, u64> {
+    const MSG_CTRUNC: u32 = 8;
+    let (control, len) = (st.word(i, msg + 32).ok_or(EFAULT)?, st.word(i, msg + 40).ok_or(EFAULT)?);
+    let Some(r) = r else {
+        st.put(i, msg + 40, &0u64.to_le_bytes())?;
+        return Ok(0);
+    };
+    let files = &r.files[..r.n as usize];
+    let room = (len.saturating_sub(16) / 4) as usize;
+    let mut b = [0u8; 16 + 4 * unix::RIGHTS_FDS];
+    let mut n = 0;
+    for (c, &f) in files.iter().enumerate() {
+        let fd = if c < room { st.new_fd(i, f as usize, 0, cloexec).ok() } else { None };
+        match fd {
+            Some(fd) => {
+                b[16 + 4 * n..20 + 4 * n].copy_from_slice(&(fd as u32).to_le_bytes());
+                n += 1;
+            }
+            None => st.release(f as usize),
+        }
+    }
+    let flags = if n < files.len() { MSG_CTRUNC } else { 0 };
+    if n == 0 {
+        st.put(i, msg + 40, &0u64.to_le_bytes())?;
+        return Ok(flags);
+    }
+    let clen = 16 + 4 * n as u64;
+    b[..8].copy_from_slice(&clen.to_le_bytes());
+    b[8..16].copy_from_slice(&(1u64 | 1 << 32).to_le_bytes());
+    st.put(i, control, &b[..clen as usize])?;
+    st.put(i, msg + 40, &((clen + 7) & !7).to_le_bytes())?;
+    Ok(flags)
+}
+
+/// The socket calls on Unix socket file `f`.
+fn unix_call(st: &mut State, i: usize, f: usize, call: Sys, a: [u64; 6]) -> Out {
+    use unix::Phase;
+    const MSG_PEEK: u64 = 2;
+    const MSG_CMSG_CLOEXEC: u64 = 0x4000_0000;
+    let r = |v: Result<u64, u64>| Out::Ret(v.unwrap_or_else(err));
+    let (k, flags) = (st.files[f].pipe as usize, st.files[f].flags);
+    let wait = |dontwait: bool| flags & O_NONBLOCK == 0 && !dontwait;
+    let phase = st.unix[k].phase;
+    match call {
+        Sys::Bind => {
+            let (name, len) = match sun_name(st, i, a[1], a[2]) {
+                Ok(n) => n,
+                Err(e) => return Out::Ret(err(e)),
+            };
+            if phase != Phase::New || st.unix[k].name_len != 0 || len == 0 {
+                return Out::Ret(err(EINVAL));
+            }
+            if st.unix.iter().any(|u| u.phase != Phase::Free && u.name() == &name[..len]) {
+                return Out::Ret(err(EADDRINUSE));
+            }
+            let u = &mut st.unix[k];
+            u.name = name;
+            u.name_len = len as u8;
+            Out::Ret(0)
+        }
+        Sys::Listen => match phase {
+            Phase::New if st.unix[k].name_len != 0 => {
+                st.unix[k].phase = Phase::Listening;
+                Out::Ret(0)
+            }
+            Phase::Listening => Out::Ret(0),
+            _ => Out::Ret(err(EINVAL)),
+        },
+        Sys::Connect => {
+            match phase {
+                Phase::Connected => return Out::Ret(err(EISCONN)),
+                Phase::Listening => return Out::Ret(err(EINVAL)),
+                _ => {}
+            }
+            let (name, len) = match sun_name(st, i, a[1], a[2]) {
+                Ok(n) => n,
+                Err(e) => return Out::Ret(err(e)),
+            };
+            let Some(l) = st.unix.iter().position(|u| u.phase == Phase::Listening && u.name() == &name[..len]) else {
+                return Out::Ret(err(ECONNREFUSED));
+            };
+            if st.unix[l].nback as usize == unix::BACKLOG {
+                return if wait(false) { Out::Block(Blocked::Net { call, a }) } else { Out::Ret(err(EAGAIN)) };
+            }
+            let s = match unix_new(st, st.unix[l].pid) {
+                Ok(s) => s,
+                Err(e) => return Out::Ret(err(e)),
+            };
+            let (lname, lname_len) = (st.unix[l].name, st.unix[l].name_len);
+            for (x, y) in [(k, s), (s, k)] {
+                st.unix[x].phase = Phase::Connected;
+                st.unix[x].peer = y as u8 + 1;
+                st.unix[x].peer_pid = st.unix[y].pid;
+            }
+            st.unix[s].name = lname;
+            st.unix[s].name_len = lname_len;
+            let ln = &mut st.unix[l];
+            ln.backlog[ln.nback as usize] = s as u8 + 1;
+            ln.nback += 1;
+            Out::Ret(0)
+        }
+        Sys::Accept => {
+            if phase != Phase::Listening {
+                return Out::Ret(err(EINVAL));
+            }
+            let u = &mut st.unix[k];
+            if u.nback == 0 {
+                return if wait(false) { Out::Block(Blocked::Net { call, a }) } else { Out::Ret(err(EAGAIN)) };
+            }
+            let s = u.backlog[0] as usize - 1;
+            u.backlog.copy_within(1.., 0);
+            u.nback -= 1;
+            // Its peer, which connected, has most likely no name.
+            let peer = st.unix[s].peer;
+            let fd = match unix_fd(st, i, s, a[3]) {
+                Ok(fd) => fd,
+                Err(e) => return Out::Ret(err(e)),
+            };
+            let named = (peer != 0 && st.unix[peer as usize - 1].name_len != 0).then(|| peer as usize - 1);
+            r(put_sun(st, i, named, a[1], a[2]).map(|_| fd))
+        }
+        Sys::Sendto | Sys::Sendmsg => {
+            let mut tmp = [0u8; 4096];
+            let (n, rights, mflags) = if call == Sys::Sendto {
+                let n = a[2].min(tmp.len() as u64) as usize;
+                if !st.copy_in(i, a[1], &mut tmp[..n]) {
+                    return Out::Ret(err(EFAULT));
+                }
+                (n, None, a[3])
+            } else {
+                let m = match msghdr(st, i, a[1]) {
+                    Ok(m) => m,
+                    Err(e) => return Out::Ret(err(e)),
+                };
+                match gather(st, i, m.iov, m.iovlen, &mut tmp).and_then(|n| Ok((n, rights_of(st, i, a[1])?))) {
+                    Ok((n, rights)) => (n, rights, a[2]),
+                    Err(e) => return Out::Ret(err(e)),
+                }
+            };
+            match unix_send(st, i, k, &tmp[..n], rights, mflags & MSG_NOSIGNAL != 0) {
+                Ok(w) => Out::Ret(w as u64),
+                Err(EAGAIN) if wait(mflags & MSG_DONTWAIT != 0) => Out::Block(Blocked::Net { call, a }),
+                Err(e) => Out::Ret(err(e)),
+            }
+        }
+        Sys::Recvfrom | Sys::Recvmsg => {
+            if phase != Phase::Connected {
+                return Out::Ret(err(if phase == Phase::Listening { EINVAL } else { ENOTCONN }));
+            }
+            let mut tmp = [0u8; 4096];
+            let (want, mflags, msg) = if call == Sys::Recvfrom {
+                (a[2], a[3], None)
+            } else {
+                let m = match msghdr(st, i, a[1]) {
+                    Ok(m) => m,
+                    Err(e) => return Out::Ret(err(e)),
+                };
+                let mut total = 0u64;
+                for c in 0..m.iovlen {
+                    total = total.saturating_add(st.word(i, m.iov + 16 * c + 8).unwrap_or(0));
+                }
+                (total, a[2], Some(m))
+            };
+            let u = &mut st.unix[k];
+            if u.len == 0 && !u.eof {
+                return if wait(mflags & MSG_DONTWAIT != 0) { Out::Block(Blocked::Net { call, a }) } else { Out::Ret(err(EAGAIN)) };
+            }
+            let want = want.min(tmp.len() as u64) as usize;
+            let (n, rights) = if mflags & MSG_PEEK != 0 { (u.peek(&mut tmp[..want]), None) } else { u.take(&mut tmp[..want]) };
+            let data = &tmp[..n];
+            r(match msg {
+                None => {
+                    if let Some(rr) = rights {
+                        for &f in &rr.files[..rr.n as usize] {
+                            st.release(f as usize);
+                        }
+                    }
+                    st.put(i, a[1], data).and_then(|_| if a[4] != 0 { st.put(i, a[5], &0u32.to_le_bytes()) } else { Ok(0) })
+                }
+                Some(m) => scatter(st, i, m.iov, m.iovlen, data)
+                    .and_then(|_| if m.name != 0 { st.put(i, m.namelen, &0u32.to_le_bytes()) } else { Ok(0) })
+                    .and_then(|_| give_rights(st, i, a[1], rights, mflags & MSG_CMSG_CLOEXEC != 0))
+                    .and_then(|fl| st.put(i, a[1] + 48, &fl.to_le_bytes())),
+            }
+            .map(|_| n as u64))
+        }
+        Sys::Shutdown => {
+            if phase != Phase::Connected {
+                return Out::Ret(err(ENOTCONN));
+            }
+            let peer = st.unix[k].peer;
+            // SHUT_RD, SHUT_WR, SHUT_RDWR.
+            if a[1] != 1 {
+                st.unix[k].eof = true;
+            }
+            if a[1] != 0 && peer != 0 {
+                st.unix[peer as usize - 1].eof = true;
+            }
+            Out::Ret(0)
+        }
+        Sys::Getsockname => r(put_sun(st, i, Some(k).filter(|&k| st.unix[k].name_len != 0), a[1], a[2]).map(|_| 0)),
+        Sys::Getpeername => match st.unix[k].peer {
+            0 => Out::Ret(err(ENOTCONN)),
+            p => {
+                let p = p as usize - 1;
+                r(put_sun(st, i, Some(p).filter(|&p| st.unix[p].name_len != 0), a[1], a[2]).map(|_| 0))
+            }
+        },
+        Sys::Setsockopt => Out::Ret(0),
+        Sys::Getsockopt => {
+            const SOL_SOCKET: u64 = 1;
+            const SO_TYPE: u64 = 3;
+            const SO_PEERCRED: u64 = 17;
+            const SO_ACCEPTCONN: u64 = 30;
+            let mut b = [0u8; 12];
+            let len = match (a[1], a[2]) {
+                (SOL_SOCKET, SO_PEERCRED) => {
+                    b[..4].copy_from_slice(&st.unix[k].peer_pid.to_le_bytes());
+                    12
+                }
+                (SOL_SOCKET, SO_TYPE) => {
+                    b[0] = sock::SOCK_STREAM as u8;
+                    4
+                }
+                (SOL_SOCKET, SO_ACCEPTCONN) => {
+                    b[0] = (phase == Phase::Listening) as u8;
+                    4
+                }
+                _ => 4,
+            };
+            let mut l = [0u8; 4];
+            if !st.copy_in(i, a[4], &mut l) {
+                return Out::Ret(err(EFAULT));
+            }
+            let n = (u32::from_le_bytes(l) as usize).min(len);
+            r(st.put(i, a[3], &b[..n]).and_then(|_| st.put(i, a[4], &(len as u32).to_le_bytes())).map(|_| 0))
+        }
+        _ => Out::Ret(err(EOPNOTSUPP)),
     }
 }
 
@@ -4286,7 +4790,7 @@ fn input_ioctl(st: &mut State, i: usize, d: usize, cmd: u64, arg: u64) -> Result
         0x02 => return st.put(i, arg, &[6, 0, 0, 0, d as u8 + 1, 0, 1, 0]),
         // EVIOCGNAME: as much of it as fits, with its NUL.
         0x06 => {
-            let name: &[u8] = if d == 0 { b"Superior keyboard " } else { b"Superior pointer " };
+            let name: &[u8] = if d == 0 { b"Superior keyboard\0" } else { b"Superior pointer\0" };
             let n = name.len().min(size);
             out[..n].copy_from_slice(&name[..n]);
             n
@@ -4638,6 +5142,18 @@ const RUNS: &[(&[&str], u32)] = &[
             "sh",
             "-c",
             r#"cd /tmp/cc && printf 'int open(const char *, int, ...); int ioctl(int, unsigned long, ...); long read(int, void *, unsigned long); long write(int, const void *, unsigned long); int printf(const char *, ...);\nstruct ev { long s, us; unsigned short type, code; int value; };\nint main(void) { char name[32]; struct ev e; int k = open("/dev/input/event0", 0), p = open("/dev/input/event1", 0), x = -1, y = -1, down = 0, up = 0, keys[4], n = 0; if (k < 0 || p < 0 || ioctl(p, 0x80204506, name) < 0) return 1; write(1, "input: ready\\n", 13); while (!up) { if (read(p, &e, sizeof e) != sizeof e) return 2; if (e.type == 3 && e.code == 0) x = e.value; if (e.type == 3 && e.code == 1) y = e.value; if (e.type == 1 && e.code == 0x110) { if (e.value) down = 1; else if (down) up = 1; } } while (n < 4) { if (read(k, &e, sizeof e) != sizeof e) return 3; if (e.type == 1) keys[n++] = e.code << 1 | e.value; } printf("input: %%s at %%d,%%d, left pressed and let go; keys %%d %%d, %%d %%d, %%d %%d, %%d %%d\\n", name, x, y, keys[0] >> 1, keys[0] & 1, keys[1] >> 1, keys[1] & 1, keys[2] >> 1, keys[2] & 1, keys[3] >> 1, keys[3] & 1); return 0; }\n' > in.c && tcc -o in in.c && ./in"#,
+        ],
+        0,
+    ),
+    // Unix domain sockets: a pipe's descriptor passed over a socket pair
+    // (SCM_RIGHTS); a named socket, listened on and polled, a child's
+    // connection accepted, its sender known (SO_PEERCRED), and the end
+    // seen once the child has gone.
+    (
+        &[
+            "sh",
+            "-c",
+            r#"cd /tmp/cc && printf 'int socket(int, int, int); int socketpair(int, int, int, int *); int bind(int, const void *, unsigned); int listen(int, int); int accept(int, void *, unsigned *); int connect(int, const void *, unsigned); long sendmsg(int, const void *, int); long recvmsg(int, void *, int); int pipe(int *); long read(int, void *, unsigned long); long write(int, const void *, unsigned long); int close(int); int fork(void); int poll(void *, unsigned long, int); int getsockopt(int, int, int, void *, unsigned *); int waitpid(int, int *, int); void _exit(int); int printf(const char *, ...);\nstruct iov { void *b; unsigned long n; }; struct msg { void *name; unsigned namelen; struct iov *iov; unsigned long iovlen; void *ctl; unsigned long ctllen; int flags; }; struct ctl { unsigned long len; int level, type, fd, pad; }; struct sun { unsigned short fam; char path[108]; }; struct pfd { int fd; short ev, rev; };\nint main(void) { int sv[2], p[2], s, c, pid, cred[3], st; char b[32]; unsigned l = 12; long n; struct iov v = { b, 1 }; struct ctl k = { 20, 1, 1, 0, 0 }; struct msg m = { 0, 0, &v, 1, &k, 24, 0 }; struct sun a = { 1, "/tmp/sock" }; struct pfd q = { 0, 1, 0 }; if (socketpair(1, 1, 0, sv) || pipe(p)) return 1; write(p[1], "through a pipe", 14); close(p[1]); k.fd = p[0]; b[0] = 120; if (sendmsg(sv[0], &m, 0) != 1) return 2; close(p[0]); k.fd = -1; k.len = 0; if (recvmsg(sv[1], &m, 0) != 1 || k.len != 20 || k.level != 1 || k.type != 1 || m.ctllen != 24) return 3; n = read(k.fd, b, 31); b[n] = 0; printf("unix: a pipe passed over a socket pair, read: %%s\\n", b); s = socket(1, 1, 0); if (bind(s, &a, sizeof a) || listen(s, 4)) return 4; pid = fork(); if (!pid) { c = socket(1, 1, 0); if (connect(c, &a, sizeof a)) _exit(1); write(c, "hello from the child", 20); _exit(0); } q.fd = s; if (poll(&q, 1, 5000) != 1 || !(q.rev & 1)) return 5; c = accept(s, 0, 0); if (c < 0) return 6; if (getsockopt(c, 1, 17, cred, &l) || l != 12 || cred[0] != pid) return 7; n = read(c, b, 31); b[n] = 0; waitpid(pid, &st, 0); printf("unix: %%s, accepted at /tmp/sock, its credentials right; then %%ld\\n", b, read(c, b + 20, 11)); return 0; }\n' > un.c && tcc -o un un.c && ./un; s=$?; rm -f un un.c; exit $s"#,
         ],
         0,
     ),

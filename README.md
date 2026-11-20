@@ -1968,6 +1968,27 @@ holds the rest):
   clicks on its window through QEMU's USB tablet and types two keys. The
   program prints the pointer's place, the button pressed and let go, and
   the keys' codes, on both ISAs.
+- Unix domain sockets (`AF_UNIX`, `SOCK_STREAM`), the first thing a
+  Wayland or X11 client needs. The personality keeps them itself
+  (`user/linux/src/unix.rs`), since they join its own processes:
+  - `socketpair`, and a socket named by a path or an abstract name with
+    `bind`, `listen`, `connect` and `accept`;
+  - bytes through a 2 KiB buffer per socket;
+  - open files passed with them as `SCM_RIGHTS`, which `recvmsg` gives as
+    new descriptors (`MSG_CTRUNC` if they do not fit, `MSG_CMSG_CLOEXEC`
+    honoured), and which are closed if read with plain `read` or never
+    read;
+  - `SO_PEERCRED`, `shutdown`, `getsockname`, `getpeername`;
+  - `EPIPE` and `SIGPIPE` once the peer has gone, end of file after what
+    it sent;
+  - `poll` and epoll readiness.
+
+  A file's last reference may now be a message's in flight, so closing a
+  descriptor drops one reference (`release`). `linux-test` has a program
+  pass a pipe's read end over a socket pair and read through it. It then
+  forks a child that connects to a named socket it polls and accepts,
+  checks the child's credentials, and sees the end once the child has
+  gone, on both ISAs.
 - Interrupt and exception entries clear the direction flag. User code may be
   interrupted mid-way through a backward copy, with the flag set; the kernel's own
   copies need it clear, and without the `cld` they ran backwards, wrecking saved
