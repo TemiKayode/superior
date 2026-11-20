@@ -1745,6 +1745,22 @@ impl State {
 
 static RUN_PID: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
+/// The Unix time when the uptime was 0, from the kernel's real-time clock
+/// the first time it is asked for (0 where there is none). `now` is the
+/// uptime in ticks.
+fn epoch(now: u64) -> u64 {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    static EPOCH: AtomicU64 = AtomicU64::new(u64::MAX);
+    match EPOCH.load(Ordering::Relaxed) {
+        u64::MAX => {
+            let e = superior_sys::time().map_or(0, |t| t.saturating_sub(now / TICK_HZ));
+            EPOCH.store(e, Ordering::Relaxed);
+            e
+        }
+        e => e,
+    }
+}
+
 /// Linux's `struct stat` for an inode (or a console or pipe: `ino` 0).
 fn stat_bytes(mode: u32, ino: u64, size: u64) -> [u8; 144] {
     let mut s = [0u8; 144];
@@ -2027,7 +2043,11 @@ fn answer(st: &mut State, t: usize, call: Sys, a: [u64; 6]) -> Out {
         }
         Sys::ClockGettime | Sys::Gettimeofday => {
             let t = superior_sys::ticks();
-            let (sec, frac) = (t / TICK_HZ, t % TICK_HZ);
+            // The time of day (CLOCK_REALTIME and its kin, and
+            // gettimeofday) is the uptime from when it was the RTC's
+            // reading; the other clocks are the uptime.
+            let real = call == Sys::Gettimeofday || matches!(a[0], 0 | 5 | 8 | 11);
+            let (sec, frac) = (t / TICK_HZ + if real { epoch(t) } else { 0 }, t % TICK_HZ);
             let mut ts = [0u8; 16];
             ts[..8].copy_from_slice(&sec.to_le_bytes());
             let sub = if call == Sys::ClockGettime { frac * (1_000_000_000 / TICK_HZ) } else { frac * (1_000_000 / TICK_HZ) };
@@ -4218,6 +4238,11 @@ const RUNS: &[(&[&str], u32)] = &[
     (&["sh", "-c", "wget -q -O - http://[fd00:3::2]:47081/hello6"], 0),
     // A browser: links fetches a page from the host and renders it.
     (&["sh", "-c", "links -dump http://10.0.3.2:47081/page.html"], 0),
+    // The same page over HTTPS: OpenSSL checks the server's certificate
+    // against the test's CA (links refuses it otherwise).
+    (&["sh", "-c", "SSL_CERT_FILE=/usr/share/ca/superior-test.pem links -ssl.certificates 2 -dump https://10.0.3.2:47443/page.html"], 0),
+    // Without the CA, the certificate is refused and no page shown.
+    (&["sh", "-c", "links -ssl.certificates 2 -dump https://10.0.3.2:47443/page.html; echo links said $?"], 0),
     (&["sh", "-c", "echo echoed over TCP and IPv6 | nc fd00:3::2 47002"], 0),
     (&["sh", "-c", "echo echoed over UDP and IPv6 | nc -u -w 2 fd00:3::2 47001"], 0),
 ];

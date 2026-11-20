@@ -1910,6 +1910,19 @@ holds the rest):
   links before. `linux-test` has a program find nothing ready on a pipe,
   then wait until a child writes to it (`epoll: 0 ready, then 1, data
   7`), on both ISAs.
+- links fetches over HTTPS, and the Linux personality keeps the time of
+  day. `CLOCK_REALTIME` (and `_COARSE`, `_ALARM` and `CLOCK_TAI`) and
+  `gettimeofday` are the uptime from the kernel's real-time clock reading
+  (read once), where they were the uptime alone (1970, before any
+  certificate is valid); the other clocks stay the uptime. xtask makes the
+  test a CA and a certificate it signs for the gateway's address,
+  10.0.3.2, both from fixed Ed25519 seeds, so every bundle has the same
+  CA; the CA is in the tools archive at `/usr/share/ca/superior-test.pem`
+  (not `/etc`, which is the disk's), and the test's server serves the page
+  over TLS 1.3 on port 47443. `linux-test` runs `links -ssl.certificates 2
+  -dump` on the page with `SSL_CERT_FILE` naming the CA, which renders it
+  as over HTTP, then without it, which OpenSSL refuses (`Invalid
+  certificate`, links' status 1), on both ISAs.
 - Interrupt and exception entries clear the direction flag. User code may be
   interrupted mid-way through a backward copy, with the flag set; the kernel's own
   copies need it clear, and without the `cld` they ran backwards, wrecking saved

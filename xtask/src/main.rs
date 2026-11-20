@@ -711,6 +711,9 @@ fn toolchain_files(arch: Arch) -> Result<Vec<(String, Vec<u8>)>, String> {
         }
     }
     ustar_entry(&mut archive, "usr/lib/libc.so", &[], Some(&format!("/lib/ld-musl-{isa}.so.1")))?;
+    // The test's CA, which its runs point OpenSSL at (SSL_CERT_FILE): not
+    // /etc, which is the disk's.
+    ustar_entry(&mut archive, "usr/share/ca/superior-test.pem", linux_tls()?.0.as_bytes(), None)?;
     archive.extend([0u8; 1024]);
     out.push(("tools".to_string(), archive));
     Ok(out)
@@ -1088,6 +1091,12 @@ fn linux_test(img: &Image) -> Result<(), String> {
         "linux: >      * first item",
         "linux: >      * second item",
         "links -dump http://10.0.3.2:47081/page.html exited with status 0",
+        // And over HTTPS, the certificate checked against the test's CA.
+        "linux: >    Fetched over HTTP and rendered by links on Superior.",
+        "SSL_CERT_FILE=/usr/share/ca/superior-test.pem links -ssl.certificates 2 -dump https://10.0.3.2:47443/page.html exited with status 0",
+        // Without the CA, OpenSSL refuses the certificate.
+        "linux: > Invalid certificate",
+        "linux: > links said 1",
         "linux: > echoed over TCP and IPv6",
         "nc fd00:3::2 47002 exited with status 0",
         "linux: > echoed over UDP and IPv6",
@@ -1164,6 +1173,9 @@ fn linux_test(img: &Image) -> Result<(), String> {
 /// The port the Linux personality test's guest fetches a page over HTTP
 /// from (on the gateway, which QEMU passes to the host's loopback).
 const LINUX_HTTP_PORT: u16 = 47081;
+/// The port the Linux test's browser fetches the same page from over
+/// HTTPS (TLS 1.3, with a certificate the test's own CA signed).
+const LINUX_HTTPS_PORT: u16 = 47443;
 /// The page the Linux test's browser (links) fetches and renders.
 const LINUX_PAGE: &str = "<html><head><title>Superior</title></head><body>\
 <h1>A page for links</h1><p>Fetched over HTTP and <b>rendered by links</b> on Superior.</p>\
@@ -1234,6 +1246,51 @@ fn linux_net_servers(
             );
         }
     }));
+    // The page over HTTPS: links must check the certificate against the CA
+    // in the guest's /usr/share/ca/superior-test.pem, for the address it asked.
+    let tls = TcpListener::bind(("127.0.0.1", LINUX_HTTPS_PORT))
+        .map_err(|e| format!("binding the HTTPS port {LINUX_HTTPS_PORT}: {e}"))?;
+    tls.set_nonblocking(true).map_err(|e| e.to_string())?;
+    let config = linux_tls()?.1.clone();
+    let s = stop.clone();
+    threads.push(std::thread::spawn(move || {
+        while !s.load(Ordering::Relaxed) {
+            let Ok((c, _)) = tls.accept() else {
+                std::thread::sleep(Duration::from_millis(20));
+                continue;
+            };
+            let _ = c.set_nonblocking(false);
+            let _ = c.set_read_timeout(Some(Duration::from_secs(10)));
+            let Ok(conn) = rustls::ServerConnection::new(config.clone()) else { continue };
+            let mut t = rustls::StreamOwned::new(conn, c);
+            let mut req = Vec::new();
+            let mut buf = [0u8; 1024];
+            while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                match t.read(&mut buf) {
+                    Ok(n) if n > 0 => req.extend_from_slice(&buf[..n]),
+                    other => {
+                        if let Err(e) = other {
+                            println!("\n== the HTTPS server's connection: {e}");
+                        }
+                        break;
+                    }
+                }
+            }
+            if req.is_empty() {
+                continue;
+            }
+            let found = req.starts_with(b"GET /page.html ");
+            let (status, body) = if found { ("200 OK", LINUX_PAGE) } else { ("404 Not Found", "") };
+            let _ = write!(
+                t,
+                "HTTP/1.1 {status}\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            t.conn.send_close_notify();
+            let _ = t.flush();
+            let _ = t.sock.shutdown(std::net::Shutdown::Both);
+        }
+    }));
     let served = Arc::new(Mutex::new(String::new()));
     let (s, got) = (stop.clone(), served.clone());
     threads.push(std::thread::spawn(move || {
@@ -1250,6 +1307,60 @@ fn linux_net_servers(
         }
     }));
     Ok((threads, served))
+}
+
+/// The Linux test's TLS: its CA's certificate (PEM, the guest's
+/// `/usr/share/ca/superior-test.pem`) and the HTTPS server's configuration, a
+/// certificate for the gateway's address (10.0.3.2) the CA signed. Both
+/// keys come from fixed seeds, so the CA is the same in every bundle.
+fn linux_tls() -> Result<&'static (String, Arc<rustls::ServerConfig>), String> {
+    static TLS: std::sync::OnceLock<(String, Arc<rustls::ServerConfig>)> = std::sync::OnceLock::new();
+    if let Some(t) = TLS.get() {
+        return Ok(t);
+    }
+    // PKCS #8 for an Ed25519 private key (RFC 8410), the seed last.
+    let pkcs8 = |seed: u8| {
+        let mut k = vec![0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04, 0x20];
+        k.extend([seed; 32]);
+        k
+    };
+    let e = |what: &'static str| move |e: rcgen::Error| format!("the Linux test's {what}: {e}");
+    let ca_key = rcgen::KeyPair::try_from(&pkcs8(0x5a)[..]).map_err(e("CA key"))?;
+    let mut ca = rcgen::CertificateParams::new(Vec::<String>::new()).map_err(e("CA"))?;
+    ca.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    ca.distinguished_name.push(rcgen::DnType::CommonName, "Superior test CA");
+    ca.key_usages = vec![rcgen::KeyUsagePurpose::KeyCertSign, rcgen::KeyUsagePurpose::CrlSign];
+    let ca = ca.self_signed(&ca_key).map_err(e("CA"))?;
+    let server = pkcs8(0x5b);
+    let key = rcgen::KeyPair::try_from(&server[..]).map_err(e("server key"))?;
+    let mut params = rcgen::CertificateParams::new(vec!["10.0.3.2".to_string()]).map_err(e("server certificate"))?;
+    params.distinguished_name.push(rcgen::DnType::CommonName, "10.0.3.2");
+    let cert = params.signed_by(&key, &ca, &ca_key).map_err(e("server certificate"))?;
+    let private = rustls::pki_types::PrivateKeyDer::Pkcs8(server.into());
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let config = rustls::ServerConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .and_then(|b| b.with_no_client_auth().with_single_cert(vec![cert.der().clone()], private))
+        .map_err(|e| format!("the Linux test's TLS configuration: {e}"))?;
+    Ok(TLS.get_or_init(|| (pem_certificate(ca.der()), Arc::new(config))))
+}
+
+/// A certificate's DER as PEM (base64, 64 columns).
+fn pem_certificate(der: &[u8]) -> String {
+    const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut text = Vec::new();
+    for c in der.chunks(3) {
+        let n = c.iter().enumerate().fold(0u32, |n, (i, &b)| n | (b as u32) << (16 - 8 * i));
+        for i in 0..4 {
+            text.push(if i <= c.len() { B64[(n >> (18 - 6 * i)) as usize & 63] } else { b'=' });
+        }
+    }
+    let mut pem = String::from("-----BEGIN CERTIFICATE-----\n");
+    for line in text.chunks(64) {
+        pem.push_str(std::str::from_utf8(line).unwrap());
+        pem.push('\n');
+    }
+    pem + "-----END CERTIFICATE-----\n"
 }
 
 /// Linux's `driver` source, unmodified: downloaded once, and checked
