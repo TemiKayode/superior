@@ -12,14 +12,25 @@
 //! it and remade if that changes. Its pages are shared pages of its own:
 //! a window's pages are lent once, so each commit copies the buffer in,
 //! and the buffer is released at once. A frame callback is done when its
-//! commit is shown. The window's close box closes the toplevel. Input
-//! (`wl_seat`) is not served yet.
+//! commit is shown. The window's close box closes the toplevel.
+//!
+//! Input (`wl_seat`, version 5): the toplevel's window's events, as the
+//! client's pointers and keyboards are told them. The pointer's place is
+//! its surface's (the window's) pixels; its buttons are Linux's
+//! `BTN_LEFT`, `BTN_RIGHT` and `BTN_MIDDLE`, the wheel an axis event,
+//! each change ended by a frame. Keys are Linux's codes, as `/dev/input`
+//! gives them, the modifier keys too as their byte changes, with the
+//! modifiers (Shift, Control, Mod1 and Mod4, as an XKB keymap's) after.
+//! The window with the compositor's keyboard focus has the keyboard's; a
+//! held key is repeated by the client (`repeat_info`), not here. The
+//! keymap sent is `no_keymap`, with an empty memory file.
 //!
 //! The server's tables are in shared pages kept for them ([`WL_PAGES`]),
 //! not in the personality's state, which has no room.
 
 use crate::{
-    EINVAL, ENOMEM, FileKind, PAGE, SHM_PAGES, SHM_SLOTS, SHM_VA, State, TICK_HZ, fb_call, unix, unix_new, window,
+    EINVAL, ENOMEM, FileKind, HID_KEYS, MOD_KEYS, O_RDWR, PAGE, SHM_PAGES, SHM_SLOTS, SHM_VA, Shm, State, TICK_HZ,
+    fb_call, unix, unix_new, window,
 };
 
 /// Where clients connect: `$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY`.
@@ -38,7 +49,7 @@ const MAX_POOLS: usize = 8;
 const MAX_FRAMES: usize = 4;
 
 /// The globals, by name (their index + 1): interface and version.
-const GLOBALS: [(&[u8], u32); 3] = [(b"wl_compositor", 4), (b"wl_shm", 1), (b"xdg_wm_base", 1)];
+const GLOBALS: [(&[u8], u32); 4] = [(b"wl_compositor", 4), (b"wl_shm", 1), (b"xdg_wm_base", 1), (b"wl_seat", 5)];
 
 /// `wl_shm` formats: ARGB8888 and XRGB8888, which the screen's pixels are.
 const ARGB8888: u32 = 0;
@@ -65,6 +76,10 @@ enum Iface {
     Positioner,
     XdgSurface,
     Toplevel,
+    /// The seat, its pointers and keyboards: `data` is the version bound.
+    Seat,
+    Pointer,
+    Keyboard,
 }
 
 /// A client's object: its id, interface, and the table entry it is (a
@@ -118,6 +133,7 @@ struct Buffer {
 struct Surface {
     used: bool,
     client: u8,
+    id: u32,
     /// What `attach` asked for (a buffer's id, 0 none) and whether it did
     /// since the last commit.
     pending: u32,
@@ -134,6 +150,12 @@ struct Surface {
     pages: u16,
     frames: [u32; MAX_FRAMES],
     nframes: usize,
+    /// The pointer over it (and where, and the buttons held), and
+    /// whether it has the keyboard focus.
+    pointer: bool,
+    at: (i32, i32),
+    buttons: u8,
+    focus: bool,
 }
 
 pub struct Server {
@@ -142,6 +164,10 @@ pub struct Server {
     serial: u32,
     /// Windows made so far, for where the next goes.
     made: u32,
+    /// The keymap's memory file (an open file's index + 1), and the
+    /// modifier keys held.
+    keymap: u8,
+    mods: u8,
     clients: [Client; MAX_CLIENTS],
     pools: [Pool; MAX_POOLS],
     buffers: [Buffer; MAX_BUFFERS],
@@ -170,7 +196,15 @@ pub fn start(st: &mut State) {
     u.name[..SOCKET.len()].copy_from_slice(SOCKET);
     u.name_len = SOCKET.len() as u8;
     u.phase = unix::Phase::Listening;
-    server().listener = k as u8 + 1;
+    let sv = server();
+    sv.listener = k as u8 + 1;
+    // The keymap: an empty memory file, kept open.
+    if let Some(m) = st.shm.iter().position(|s| !s.used) {
+        if let Some(f) = st.new_file(FileKind::Shm, 0, m as u8, O_RDWR) {
+            st.shm[m] = Shm { used: true, open: true, first: 0, pages: 0, size: 0 };
+            sv.keymap = f as u8 + 1;
+        }
+    }
 }
 
 /// A message being built: an object's event.
@@ -216,6 +250,40 @@ fn send(st: &mut State, sv: &mut Server, c: usize, mut m: Msg) {
     let peer = &mut st.unix[p as usize - 1];
     if peer.room() < n || peer.put(&m.b[..n], None) != Some(n) {
         cl.dead = true;
+    }
+}
+
+/// Sends `m` with open file `f` (its descriptor), which then holds a
+/// reference for it.
+fn send_fd(st: &mut State, sv: &mut Server, c: usize, mut m: Msg, f: usize) {
+    let cl = &mut sv.clients[c];
+    let s = cl.sock as usize - 1;
+    let n = m.n;
+    m.b[6..8].copy_from_slice(&(n as u16).to_le_bytes());
+    let p = st.unix[s].peer;
+    if p == 0 || cl.dead {
+        return;
+    }
+    let peer = &mut st.unix[p as usize - 1];
+    let mut files = [0u8; unix::RIGHTS_FDS];
+    files[0] = f as u8;
+    if peer.room() < n || peer.put(&m.b[..n], Some((1, files))) != Some(n) {
+        cl.dead = true;
+        return;
+    }
+    st.files[f].refs += 1;
+}
+
+/// Sends what `m` makes for each of client `c`'s objects of `iface`
+/// (given its id and version).
+fn each(st: &mut State, sv: &mut Server, c: usize, iface: Iface, m: impl Fn(u32, u8) -> Option<Msg>) {
+    for k in 0..MAX_OBJECTS {
+        let o = sv.clients[c].objs[k];
+        if o.iface == iface {
+            if let Some(msg) = m(o.id, o.data) {
+                send(st, sv, c, msg);
+            }
+        }
     }
 }
 
@@ -389,18 +457,27 @@ fn request(st: &mut State, sv: &mut Server, c: usize, id: u32, op: u16, args: &[
         (Iface::Registry, 0) => {
             let name = a.u().map_err(bad)?;
             let _ = a.s().map_err(bad)?;
-            let _ = a.u().map_err(bad)?;
+            let version = a.u().map_err(bad)?;
             let new = a.u().map_err(bad)?;
             let iface = match name {
                 1 => Iface::Compositor,
                 2 => Iface::Shm,
                 3 => Iface::WmBase,
+                4 => Iface::Seat,
                 _ => return Err(bad(INVALID_METHOD)),
             };
-            add(sv, c, new, iface, 0)?;
+            let version = version.clamp(1, GLOBALS[name as usize - 1].1) as u8;
+            add(sv, c, new, iface, version)?;
             if iface == Iface::Shm {
                 send(st, sv, c, Msg::new(new, 0).u(ARGB8888));
                 send(st, sv, c, Msg::new(new, 0).u(XRGB8888));
+            }
+            // wl_seat: a pointer and a keyboard (capabilities), its name.
+            if iface == Iface::Seat {
+                send(st, sv, c, Msg::new(new, 0).u(3));
+                if version >= 2 {
+                    send(st, sv, c, Msg::new(new, 1).s(b"seat0"));
+                }
             }
         }
         // wl_compositor.create_surface, create_region.
@@ -411,6 +488,7 @@ fn request(st: &mut State, sv: &mut Server, c: usize, id: u32, op: u16, args: &[
             sv.surfaces[s] = Surface {
                 used: true,
                 client: c as u8,
+                id: new,
                 pending: 0,
                 attached: false,
                 xdg: 0,
@@ -423,6 +501,10 @@ fn request(st: &mut State, sv: &mut Server, c: usize, id: u32, op: u16, args: &[
                 pages: 0,
                 frames: [0; MAX_FRAMES],
                 nframes: 0,
+                pointer: false,
+                at: (0, 0),
+                buttons: 0,
+                focus: false,
             };
         }
         (Iface::Compositor, 1) => add(sv, c, a.u().map_err(bad)?, Iface::Region, 0)?,
@@ -549,6 +631,31 @@ fn request(st: &mut State, sv: &mut Server, c: usize, id: u32, op: u16, args: &[
             }
         }
         (Iface::Toplevel, _) => {}
+        // wl_seat: get_pointer, get_keyboard (its keymap, its repeat,
+        // and the focus if a surface of the client's has it),
+        // get_touch (a touchscreen there is not: it never hears),
+        // release.
+        (Iface::Seat, 0) => add(sv, c, a.u().map_err(bad)?, Iface::Pointer, data)?,
+        (Iface::Seat, 1) => {
+            let new = a.u().map_err(bad)?;
+            add(sv, c, new, Iface::Keyboard, data)?;
+            if let Some(f) = sv.keymap.checked_sub(1) {
+                send_fd(st, sv, c, Msg::new(new, 0).u(0).u(0), f as usize);
+            }
+            if data >= 4 {
+                let rate = 1000 / window::REPEAT_INTERVAL as u32;
+                send(st, sv, c, Msg::new(new, 5).u(rate).u(window::REPEAT_DELAY as u32));
+            }
+            if let Some(s) = sv.surfaces.iter().position(|s| s.used && s.client as usize == c && s.focus) {
+                let (sid, n, mods) = (sv.surfaces[s].id, serial(sv), modifiers(sv.mods));
+                send(st, sv, c, Msg::new(new, 1).u(n).u(sid).empty());
+                send(st, sv, c, Msg::new(new, 4).u(n).u(mods).u(0).u(0).u(0));
+            }
+        }
+        (Iface::Seat, 2) => add(sv, c, a.u().map_err(bad)?, Iface::Positioner, 0)?,
+        (Iface::Seat, 3) | (Iface::Pointer, 1) | (Iface::Keyboard, 0) => remove(st, sv, c, id),
+        // wl_pointer.set_cursor: the compositor draws its own.
+        (Iface::Pointer, 0) => {}
         _ => return Err(bad(INVALID_METHOD)),
     }
     Ok(())
@@ -685,17 +792,105 @@ fn disconnect(st: &mut State, sv: &mut Server, c: usize) {
     st.unix_close(cl.sock as usize - 1);
 }
 
-/// The toplevels' windows' events: the close box closes the toplevel.
+/// The XKB modifier masks for Superior's modifier byte (USB HID's: the
+/// left Control, Shift, Alt and GUI keys, then the right): Shift 1,
+/// Control 4, Mod1 (Alt) 8, Mod4 (GUI) 64.
+fn modifiers(mods: u8) -> u32 {
+    const MASKS: [u32; 4] = [4, 1, 8, 64];
+    (0..8).filter(|b| mods & 1 << b != 0).fold(0, |m, b| m | MASKS[b % 4])
+}
+
+/// The toplevels' windows' events, as the clients' pointers and
+/// keyboards hear them; the close box closes the toplevel.
 pub fn window_events(st: &mut State) {
+    const BUTTONS: [u32; 3] = [0x110, 0x111, 0x112];
     let sv = server();
+    let fixed = |v: i32| (v << 8) as u32;
     for s in 0..MAX_SURFACES {
-        let sf = sv.surfaces[s];
-        if !sf.used || sf.window == 0 {
+        if !sv.surfaces[s].used || sv.surfaces[s].window == 0 {
             continue;
         }
-        while let Some(m) = fb_call(window::next(sf.window as u64 - 1), None).filter(|m| m[0] == 0) {
-            if m[1] == window::CLOSE && sf.toplevel != 0 {
-                send(st, sv, sf.client as usize, Msg::new(sf.toplevel, 1));
+        let window = sv.surfaces[s].window as u64 - 1;
+        while let Some(m) = fb_call(window::next(window), None).filter(|m| m[0] == 0) {
+            let sf = sv.surfaces[s];
+            let c = sf.client as usize;
+            let (a, b) = (m[2], m[3]);
+            let time = (superior_sys::ticks() * 1000 / TICK_HZ) as u32;
+            let frame = |id: u32, v: u8| (v >= 5).then(|| Msg::new(id, 5));
+            match m[1] {
+                window::CLOSE if sf.toplevel != 0 => send(st, sv, c, Msg::new(sf.toplevel, 1)),
+                window::POINTER => {
+                    let at = (a as u16 as i16 as i32, (a >> 16) as u16 as i16 as i32);
+                    if !sf.pointer {
+                        let n = serial(sv);
+                        each(st, sv, c, Iface::Pointer, |id, _| Some(Msg::new(id, 0).u(n).u(sf.id).u(fixed(at.0)).u(fixed(at.1))));
+                    } else if at != sf.at {
+                        each(st, sv, c, Iface::Pointer, |id, _| Some(Msg::new(id, 2).u(time).u(fixed(at.0)).u(fixed(at.1))));
+                    }
+                    let held = b as u8;
+                    for (k, &code) in BUTTONS.iter().enumerate() {
+                        if (held ^ sf.buttons) & 1 << k != 0 {
+                            let (n, down) = (serial(sv), (held >> k & 1) as u32);
+                            each(st, sv, c, Iface::Pointer, |id, _| Some(Msg::new(id, 3).u(n).u(time).u(code).u(down)));
+                        }
+                    }
+                    each(st, sv, c, Iface::Pointer, frame);
+                    let sf = &mut sv.surfaces[s];
+                    (sf.pointer, sf.at, sf.buttons) = (true, at, held);
+                }
+                window::LEAVE if sf.pointer => {
+                    let n = serial(sv);
+                    each(st, sv, c, Iface::Pointer, |id, _| Some(Msg::new(id, 1).u(n).u(sf.id)));
+                    each(st, sv, c, Iface::Pointer, frame);
+                    sv.surfaces[s].pointer = false;
+                }
+                // Up (away) is negative on Wayland's vertical axis; ten
+                // units a step, as a wheel's are.
+                window::WHEEL => {
+                    for (axis, steps) in [(0u32, -(b as u32 as i32)), (1, (b >> 32) as u32 as i32)] {
+                        if steps != 0 {
+                            each(st, sv, c, Iface::Pointer, |id, v| (v >= 5).then(|| Msg::new(id, 6).u(0)));
+                            each(st, sv, c, Iface::Pointer, |id, v| (v >= 5).then(|| Msg::new(id, 8).u(axis).u(steps as u32)));
+                            each(st, sv, c, Iface::Pointer, |id, _| Some(Msg::new(id, 4).u(time).u(axis).u(fixed(steps * 10))));
+                        }
+                    }
+                    each(st, sv, c, Iface::Pointer, frame);
+                }
+                window::FOCUS => {
+                    let n = serial(sv);
+                    if a != 0 {
+                        let mods = modifiers(sv.mods);
+                        each(st, sv, c, Iface::Keyboard, |id, _| Some(Msg::new(id, 1).u(n).u(sf.id).empty()));
+                        each(st, sv, c, Iface::Keyboard, |id, _| Some(Msg::new(id, 4).u(n).u(mods).u(0).u(0).u(0)));
+                    } else {
+                        each(st, sv, c, Iface::Keyboard, |id, _| Some(Msg::new(id, 2).u(n).u(sf.id)));
+                    }
+                    sv.surfaces[s].focus = a != 0;
+                }
+                // A key, after the modifier keys that changed with it; not
+                // its repeats.
+                window::KEY => {
+                    let mods = (b >> 8) as u8;
+                    let changed = mods ^ sv.mods;
+                    for bit in 0..8 {
+                        if changed & 1 << bit != 0 {
+                            let (n, down) = (serial(sv), (mods >> bit & 1) as u32);
+                            let code = MOD_KEYS[bit] as u32;
+                            each(st, sv, c, Iface::Keyboard, |id, _| Some(Msg::new(id, 3).u(n).u(time).u(code).u(down)));
+                        }
+                    }
+                    if changed != 0 {
+                        let (n, m) = (serial(sv), modifiers(mods));
+                        each(st, sv, c, Iface::Keyboard, |id, _| Some(Msg::new(id, 4).u(n).u(m).u(0).u(0).u(0)));
+                        sv.mods = mods;
+                    }
+                    let code = HID_KEYS.get(a as usize).copied().unwrap_or(0) as u32;
+                    if code != 0 && b & 3 != 3 {
+                        let (n, down) = (serial(sv), (b & 1) as u32);
+                        each(st, sv, c, Iface::Keyboard, |id, _| Some(Msg::new(id, 3).u(n).u(time).u(code).u(down)));
+                    }
+                }
+                _ => {}
             }
         }
     }

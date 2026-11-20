@@ -2029,6 +2029,28 @@ holds the rest):
   draws a gradient into a pool, and waits for its frame and the
   buffer's release. The host's screenshot then checks the window pixel
   by pixel, on both ISAs.
+- Wayland input: the server offers `wl_seat` (version 5) with a pointer
+  and a keyboard, fed by each toplevel's window's events:
+  - the pointer as `enter`, `motion` and `leave` in the surface's pixels;
+  - its buttons as `BTN_LEFT`, `BTN_RIGHT` and `BTN_MIDDLE`;
+  - the wheel as axis events, ending each change with `frame`;
+  - the window with the compositor's keyboard focus has the keyboard's
+    (`enter`, `leave`);
+  - keys as Linux's codes (the modifier keys too), with the modifiers
+    as an XKB keymap's masks (Shift, Control, Mod1, Mod4);
+  - `repeat_info` from the compositor's repeat timing, so clients repeat
+    held keys themselves.
+
+  The keymap is sent as a descriptor, for now `no_keymap` with an empty
+  memory file. Sending descriptors from the server goes through the same
+  path as `SCM_RIGHTS` between processes. `linux-test`'s client binds the
+  seat and gets a pointer and a keyboard; the host clicks on its window
+  and types two keys. The client prints where the pointer was, the
+  button pressed and let go, the keyboard's focus, the keymap and its
+  descriptor, and the keys, on both ISAs.
+- `exec` copies a program's arguments and environment to its stack a piece
+  at a time. Before, one longer than 4 KiB (a long `sh -c` script) ran
+  past the copy buffer and stopped the personality.
 - Interrupt and exception entries clear the direction flag. User code may be
   interrupted mid-way through a backward copy, with the flag set; the kernel's own
   copies need it clear, and without the `cld` they ran backwards, wrecking saved

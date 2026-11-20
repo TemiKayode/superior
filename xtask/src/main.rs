@@ -997,11 +997,18 @@ fn linux_test(img: &Image) -> Result<(), String> {
         let acts = [Act::Tablet(340, 230), Act::Button(true), Act::Button(false), Act::Type("hi")];
         acts.iter().try_for_each(|a| input_act(a, arch).map(drop)).map(|()| "clicked and typed".to_string())
     };
+    // Then a click on the Wayland client's window, at (100, 50) in it,
+    // and keys typed.
+    let wayland_input = move || {
+        let acts = [Act::Tablet(140, 90), Act::Button(true), Act::Button(false), Act::Type("hi")];
+        acts.iter().try_for_each(|a| input_act(a, arch).map(drop)).map(|()| "clicked and typed on the Wayland window".to_string())
+    };
     let shots = vec![
         shot(1, "linux: > fb0: 320x240", check_linux_fb),
         shot(2, "linux: > fb0: drawn, not panned", check_linux_fb_live),
         Shot { marker: "linux: > input: ready", act: Box::new(input), result: Arc::default() },
         shot(4, "linux: > wayland: 2 formats", check_linux_wayland),
+        Shot { marker: "linux: > wayland: input ready", act: Box::new(wayland_input), result: Arc::default() },
     ];
     let results: Vec<_> = shots.iter().map(|s| s.result.clone()).collect();
     let out = drive_linux(img, LINUX_SESSION, shots);
@@ -1097,6 +1104,8 @@ fn linux_test(img: &Image) -> Result<(), String> {
         "linux: > memfd: drawn by the child, 12288 bytes",
         "linux: > memfd: the child sees: written back",
         "linux: > wayland: 2 formats, configured 1, a 160x100 buffer shown, its frame done and the buffer released",
+        "linux: > wayland: input ready",
+        "linux: > wayland: seat 3, pointer at 100,50, left pressed and let go; keyboard entered 1, keymap 0 with 1 fd, keys 35 1, 35 0, 23 1, 23 0",
         // A program far larger than a page, loaded from its file.
         "linux: > ran a program of more than 200000 bytes",
         // Threads (clone, futexes) in pigz, and zlib loaded by musl: what
