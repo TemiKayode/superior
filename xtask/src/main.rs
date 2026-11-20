@@ -1093,6 +1093,8 @@ fn linux_test(img: &Image) -> Result<(), String> {
         "linux: > input: Superior pointer at 100,50, left pressed and let go; keys 35 1, 35 0, 23 1, 23 0",
         "linux: > unix: a pipe passed over a socket pair, read: through a pipe",
         "linux: > unix: hello from the child, accepted at /tmp/sock, its credentials right; then 0",
+        "linux: > memfd: drawn by the child, 12288 bytes",
+        "linux: > memfd: the child sees: written back",
         // A program far larger than a page, loaded from its file.
         "linux: > ran a program of more than 200000 bytes",
         // Threads (clone, futexes) in pigz, and zlib loaded by musl: what

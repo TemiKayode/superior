@@ -1989,6 +1989,24 @@ holds the rest):
   forks a child that connects to a named socket it polls and accepts,
   checks the child's credentials, and sees the end once the child has
   gone, on both ISAs.
+- Shared memory: `memfd_create`, the other half of how a Wayland client
+  hands its compositor a buffer. At boot the personality cuts a 1 MiB
+  block of the rest of RAM into pages, kept in the slots after the
+  processes'. A memory file holds a run of those pages:
+  - `ftruncate` sizes it, growing in place, or moving while nothing maps
+    it;
+  - `read`, `write`, `lseek` and `fstat` work as on a file, and seals
+    are taken;
+  - `mmap` maps its pages into the process, shared, as `/dev/fb0`'s are,
+    so a forked child and any process the descriptor is passed to see the
+    same bytes.
+
+  Its pages are given back once it is closed and no live process maps
+  it. A `munmap` does not yet drop the mapping (as for `/dev/fb0`), so
+  that waits for the process to exec or exit. `linux-test` has a child
+  make, size and map a memory file, draw in it, and pass it over a
+  socket pair. The parent maps it, reads what was drawn and its size, and
+  writes back what the child then reads, on both ISAs.
 - Interrupt and exception entries clear the direction flag. User code may be
   interrupted mid-way through a backward copy, with the flag set; the kernel's own
   copies need it clear, and without the `cld` they ran backwards, wrecking saved

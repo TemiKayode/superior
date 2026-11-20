@@ -878,6 +878,9 @@ pub enum FileKind {
     Epoll,
     /// A Unix domain socket ([`crate::unix`]), its number in `pipe`.
     Unix,
+    /// Shared memory (`memfd_create`), its number in `pipe`
+    /// (`State::shm`).
+    Shm,
 }
 
 /// An open-file description, shared by the descriptors `dup` and `fork`

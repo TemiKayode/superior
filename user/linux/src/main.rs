@@ -270,6 +270,30 @@ const FB_VA: u64 = USER_BASE + 0x1_9a00_0000;
 /// as a screen would show it: every FB_PERIOD ticks (25 times a second).
 const FB_PERIOD: u64 = TICK_HZ / 25;
 const _: () = assert!(FB_PAGES << 12 <= 1 << FB_BLOCK_BITS && FB_SLOTS + FB_PAGES <= AS_FILE);
+/// Shared memory (`memfd_create`): a block of the rest of RAM cut into
+/// SHM_PAGES pages, here at SHM_VA, in the slots after the processes'.
+/// A memory file holds a run of them, which the processes that map it
+/// share ([`Shm`]).
+const SHM_BLOCK: u64 = PROC_SLOTS + MAX_PROCS as u64 * PROC_SPAN;
+const SHM_BLOCK_BITS: u64 = 20;
+const SHM_SLOTS: u64 = SHM_BLOCK + 1;
+const SHM_PAGES: u64 = 1 << (SHM_BLOCK_BITS - 12);
+const SHM_VA: u64 = USER_BASE + 0x1_9c00_0000;
+const MAX_SHM: usize = 16;
+const _: () = assert!(SHM_SLOTS + SHM_PAGES <= 1 << 16 && FB_VA + FB_PAGES * PAGE <= SHM_VA);
+
+/// A memory file: `size` bytes in the `pages` shared pages from `first`.
+/// Its pages are given back once it is closed and no process maps them
+/// ([`State::shm_sweep`]).
+#[derive(Clone, Copy)]
+struct Shm {
+    used: bool,
+    open: bool,
+    first: u16,
+    pages: u16,
+    size: u64,
+}
+
 /// Where Alpine puts gcc's own files: under its target's name.
 const CC1_PATH: &[u8] = if cfg!(target_arch = "x86_64") {
     b"/usr/libexec/gcc/x86_64-alpine-linux-musl/12.2.1/cc1"
@@ -328,6 +352,7 @@ const EACCES: u64 = 13;
 const E2BIG: u64 = 7;
 const EFAULT: u64 = 14;
 const ENODEV: u64 = 19;
+const ENXIO: u64 = 6;
 const EMFILE: u64 = 24;
 const ENOTTY: u64 = 25;
 const ESPIPE: u64 = 29;
@@ -476,6 +501,7 @@ enum Sys {
     Setsockopt,
     Getsockopt,
     Socketpair,
+    MemfdCreate,
     Unsupported(u64),
 }
 
@@ -543,6 +569,7 @@ fn decode(nr: u64, a: [u64; 6]) -> (Sys, [u64; 6]) {
         54 => Sys::Setsockopt,
         55 => Sys::Getsockopt,
         53 => Sys::Socketpair,
+        319 => Sys::MemfdCreate,
         40 => Sys::Sendfile,
         56 => Sys::Clone,
         57 => Sys::Fork,
@@ -649,6 +676,7 @@ fn decode(nr: u64, a: [u64; 6]) -> (Sys, [u64; 6]) {
         208 => Sys::Setsockopt,
         209 => Sys::Getsockopt,
         199 => Sys::Socketpair,
+        279 => Sys::MemfdCreate,
         210 => Sys::Shutdown,
         172 => Sys::Getpid,
         178 => Sys::Gettid,
@@ -923,6 +951,10 @@ struct State {
     input_at: (i32, i32),
     /// Unix domain sockets.
     unix: [unix::Unix; unix::MAX_UNIX],
+    /// Memory files, whether their pages are there, and which are taken.
+    shm: [Shm; MAX_SHM],
+    shm_pages: bool,
+    shm_used: [u64; (SHM_PAGES / 64) as usize],
 }
 
 /// An input device's events, oldest first: (when, in ticks; type; code;
@@ -1778,6 +1810,94 @@ impl State {
         Ok(fd as u64)
     }
 
+    /// Whether a process maps memory file `k`'s pages.
+    fn shm_mapped(&self, k: usize) -> bool {
+        let s = self.shm[k];
+        let pages = SHM_SLOTS + s.first as u64..SHM_SLOTS + s.first as u64 + s.pages as u64;
+        self.procs.iter().any(|p| p.used && !p.zombie && p.shared[..p.nshared].iter().any(|r| pages.contains(&r.slot)))
+    }
+
+    /// Gives back the pages of memory files closed and no longer mapped.
+    fn shm_sweep(&mut self) {
+        for k in 0..MAX_SHM {
+            if self.shm[k].used && !self.shm[k].open && !self.shm_mapped(k) {
+                let s = self.shm[k];
+                self.shm_take(s.first as u64, s.pages as u64, false);
+                self.shm[k].used = false;
+            }
+        }
+    }
+
+    /// Marks shared pages [first, first + n) taken or free.
+    fn shm_take(&mut self, first: u64, n: u64, taken: bool) {
+        for p in first..first + n {
+            let (w, b) = ((p / 64) as usize, p % 64);
+            self.shm_used[w] = if taken { self.shm_used[w] | 1 << b } else { self.shm_used[w] & !(1 << b) };
+        }
+    }
+
+    fn shm_free(&self, first: u64, n: u64) -> bool {
+        first + n <= SHM_PAGES && (first..first + n).all(|p| self.shm_used[(p / 64) as usize] & 1 << (p % 64) == 0)
+    }
+
+    /// Memory file `k`'s bytes from `off`, at most `n`, up to its size.
+    fn shm_bytes(&self, k: usize, off: u64, n: usize) -> &[u8] {
+        let s = self.shm[k];
+        let n = (n as u64).min(s.size.saturating_sub(off)) as usize;
+        // SAFETY: the file's pages, mapped here for this server's life;
+        // [off, off + n) lies within its size, so within them.
+        unsafe { core::slice::from_raw_parts((SHM_VA + s.first as u64 * PAGE + off) as *const u8, n) }
+    }
+
+    /// `ftruncate` of memory file `k`: what is cut off reads as zeros
+    /// if it grows again. It grows in place, or, while no process maps
+    /// it, moves to pages with room.
+    fn shm_resize(&mut self, k: usize, size: u64) -> Result<(), u64> {
+        const EFBIG: u64 = 27;
+        let s = self.shm[k];
+        let base = SHM_VA + s.first as u64 * PAGE;
+        let zero = |from: u64, to: u64| {
+            // SAFETY: shared pages, mapped here for this server's life.
+            unsafe { core::ptr::write_bytes((SHM_VA + from) as *mut u8, 0, (to - from) as usize) }
+        };
+        if size > SHM_PAGES * PAGE {
+            return Err(EFBIG);
+        }
+        let need = size.div_ceil(PAGE);
+        let have = s.pages as u64;
+        if size < s.size {
+            zero(base - SHM_VA + size, base - SHM_VA + s.size);
+        }
+        if need > have {
+            let first = s.first as u64;
+            if have > 0 && self.shm_free(first + have, need - have) {
+                self.shm_take(first + have, need - have, true);
+            } else {
+                if have > 0 && self.shm_mapped(k) {
+                    return Err(ENOMEM);
+                }
+                self.shm_sweep();
+                let to = (0..SHM_PAGES).find(|&p| self.shm_free(p, need)).ok_or(ENOMEM)?;
+                self.shm_take(to, need, true);
+                if have > 0 {
+                    // SAFETY: two runs of shared pages, apart (the new one
+                    // was free), mapped here.
+                    unsafe { core::ptr::copy_nonoverlapping(base as *const u8, (SHM_VA + to * PAGE) as *mut u8, s.size as usize) };
+                    self.shm_take(first, have, false);
+                }
+                self.shm[k].first = to as u16;
+            }
+            let first = self.shm[k].first as u64;
+            zero((first + have) * PAGE, (first + need) * PAGE);
+            if have == 0 || self.shm[k].first != s.first {
+                zero(first * PAGE + s.size, (first + have) * PAGE);
+            }
+            self.shm[k].pages = need as u16;
+        }
+        self.shm[k].size = size;
+        Ok(())
+    }
+
     /// The framebuffer's window, made (and its pages lent) the first time.
     fn fb(&mut self) -> Result<u64, u64> {
         if !self.fb_pages {
@@ -1839,6 +1959,10 @@ impl State {
                 FileKind::Socket => sock::close(k),
                 FileKind::Epoll => self.epolls[k].used = false,
                 FileKind::Unix => self.unix_close(k),
+                FileKind::Shm => {
+                    self.shm[k].open = false;
+                    self.shm_sweep();
+                }
                 _ => {}
             }
         }
@@ -2121,8 +2245,12 @@ fn answer(st: &mut State, t: usize, call: Sys, a: [u64; 6]) -> Out {
         Sys::Dup2 if a[0] == a[1] => r(st.file(i, a[0]).map(|_| a[1]).ok_or(EBADF)),
         Sys::Dup2 | Sys::Dup3 => r(dup3(st, i, a[0], a[1], if call == Sys::Dup3 { a[2] as u32 } else { 0 })),
         Sys::Fcntl => r(fcntl(st, i, a[0], a[1], a[2])),
+        Sys::MemfdCreate => r(memfd_create(st, i, a[1])),
         Sys::Ftruncate => r(st.file(i, a[0]).ok_or(EBADF).and_then(|f| {
             let o = st.files[f];
+            if o.kind == FileKind::Shm {
+                return st.shm_resize(o.pipe as usize, a[1]).map(|_| 0);
+            }
             if o.kind != FileKind::Node || o.flags & O_ACCMODE == 0 {
                 return Err(EINVAL);
             }
@@ -2324,6 +2452,7 @@ fn fstat(st: &mut State, i: usize, fd: u64, buf: u64) -> Result<u64, u64> {
         FileKind::Node => stat_bytes(mode_of(st.fs.kind(o.ino)), o.ino as u64, st.fs.size(o.ino)),
         FileKind::Console | FileKind::Tty => stat_bytes(0o20620, 0, 0),
         FileKind::Socket | FileKind::Unix => stat_bytes(0o140777, 0, 0),
+        FileKind::Shm => stat_bytes(0o100600, 0, st.shm[o.pipe as usize].size),
         _ => stat_bytes(0o10600, 0, st.pipes[o.pipe as usize].len as u64),
     };
     st.put(i, buf, &s[..STAT_LEN])
@@ -2344,13 +2473,14 @@ fn fstatat(st: &mut State, i: usize, a: [u64; 6]) -> Result<u64, u64> {
 fn lseek(st: &mut State, i: usize, fd: u64, off: i64, whence: u64) -> Result<u64, u64> {
     let f = st.file(i, fd).ok_or(EBADF)?;
     let o = st.files[f];
-    if o.kind != FileKind::Node {
+    if o.kind != FileKind::Node && o.kind != FileKind::Shm {
         return Err(ESPIPE);
     }
+    let size = if o.kind == FileKind::Shm { st.shm[o.pipe as usize].size } else { st.fs.size(o.ino) };
     let base = match whence {
         0 => 0,
         1 => o.off as i64,
-        2 => st.fs.size(o.ino) as i64,
+        2 => size as i64,
         _ => return Err(EINVAL),
     };
     let to = base.checked_add(off).filter(|&t| t >= 0).ok_or(EINVAL)?;
@@ -2466,6 +2596,9 @@ fn fcntl(st: &mut State, i: usize, fd: u64, cmd: u64, arg: u64) -> Result<u64, u
             Ok(0)
         }
         3 => Ok(st.files[f].flags as u64),
+        // F_ADD_SEALS, F_GET_SEALS: a memory file's seals are taken and
+        // not kept.
+        1033 | 1034 if st.files[f].kind == FileKind::Shm => Ok(0),
         4 => {
             let keep = O_APPEND | O_NONBLOCK;
             let o = &mut st.files[f];
@@ -2554,6 +2687,12 @@ fn read(st: &mut State, i: usize, fd: u64, buf: u64, len: u64) -> Out {
             }
             pipe.take(&mut tmp[..want])
         }
+        FileKind::Shm => {
+            let n = st.shm_bytes(o.pipe as usize, o.off, want).len();
+            tmp[..n].copy_from_slice(st.shm_bytes(o.pipe as usize, o.off, want));
+            st.files[f].off += n as u64;
+            n
+        }
         FileKind::Unix => {
             let u = &mut st.unix[o.pipe as usize];
             if u.phase != unix::Phase::Connected {
@@ -2608,7 +2747,7 @@ fn write(st: &mut State, i: usize, fd: u64, buf: u64, len: u64) -> Out {
             room.min(len as usize)
         }
         FileKind::Node if o.flags & O_ACCMODE == 0 => return Out::Ret(err(EBADF)),
-        FileKind::Console | FileKind::Tty | FileKind::Node | FileKind::Socket | FileKind::Unix => {
+        FileKind::Console | FileKind::Tty | FileKind::Node | FileKind::Socket | FileKind::Unix | FileKind::Shm => {
             len.min(tmp.len() as u64) as usize
         }
         _ => return Out::Ret(err(EBADF)),
@@ -2617,6 +2756,22 @@ fn write(st: &mut State, i: usize, fd: u64, buf: u64, len: u64) -> Out {
         return Out::Ret(err(EFAULT));
     }
     Out::Ret(match o.kind {
+        // Past its end, it grows.
+        FileKind::Shm => {
+            let k = o.pipe as usize;
+            let end = o.off + n as u64;
+            match if end > st.shm[k].size { st.shm_resize(k, end) } else { Ok(()) } {
+                Ok(()) => {
+                    let at = SHM_VA + st.shm[k].first as u64 * PAGE + o.off;
+                    // SAFETY: the file's pages, mapped here for this
+                    // server's life; [off, end) lies within its size.
+                    unsafe { core::slice::from_raw_parts_mut(at as *mut u8, n) }.copy_from_slice(&tmp[..n]);
+                    st.files[f].off = end;
+                    n as u64
+                }
+                Err(e) => err(e),
+            }
+        }
         FileKind::Unix => match unix_send(st, i, o.pipe as usize, &tmp[..n], None, false) {
             Ok(w) => w as u64,
             Err(EAGAIN) if o.flags & O_NONBLOCK == 0 => return Out::Block(Blocked::Write { fd, buf, len }),
@@ -2829,6 +2984,41 @@ fn munmap(st: &mut State, i: usize, addr: u64, len: u64) -> Result<u64, u64> {
     Ok(0)
 }
 
+/// Maps `len` bytes of pages that are shared (here at `ptr`, in slots from
+/// `slot`) in process `i`, at `addr` if `fixed`: where.
+#[allow(clippy::too_many_arguments)]
+fn map_run(st: &mut State, i: usize, addr: u64, len: u64, fixed: bool, ptr: u64, slot: u64, flags: u64) -> Result<u64, u64> {
+    let i = st.mem(i);
+    if st.procs[i].nshared == st.procs[i].shared.len() {
+        return Err(ENOMEM);
+    }
+    let at = if fixed { addr } else { st.place(i, len)? };
+    if at % PAGE != 0 || at < CHILD || at + len > STACK_TOP - STACK_PAGES * PAGE {
+        return Err(ENOMEM);
+    }
+    for page in (at..at + len).step_by(PAGE as usize) {
+        st.set_reserved(i, page, false);
+        st.unmap_private(i, page);
+    }
+    let p = &mut st.procs[i];
+    p.shared[p.nshared] = Shared { start: at, end: at + len, ptr, slot, flags };
+    p.nshared += 1;
+    Ok(at)
+}
+
+/// `memfd_create(name, flags)`: an empty memory file (`MFD_CLOEXEC`
+/// honoured; seals allowed, and not kept).
+fn memfd_create(st: &mut State, i: usize, flags: u64) -> Result<u64, u64> {
+    if !st.shm_pages {
+        return Err(ENOMEM);
+    }
+    st.shm_sweep();
+    let k = st.shm.iter().position(|s| !s.used).ok_or(ENFILE)?;
+    let f = st.new_file(FileKind::Shm, 0, k as u8, O_RDWR).ok_or(ENFILE)?;
+    st.shm[k] = Shm { used: true, open: true, first: 0, pages: 0, size: 0 };
+    st.new_fd(i, f, 0, flags & 1 != 0).inspect_err(|_| st.release(f))
+}
+
 /// `mmap` of a file (private: what the process writes stays its own).
 /// Unpacks the toolchain's archive (ustar: files, directories, symbolic
 /// links) into the tree.
@@ -2894,34 +3084,29 @@ fn mmap_file(st: &mut State, i: usize, addr: u64, len: u64, prot: u64, fixed: bo
     const PROT_EXEC: u64 = 4;
     let f = st.file(i, fd).ok_or(EBADF)?;
     let o = st.files[f];
-    if o.kind != FileKind::Node || st.fs.kind(o.ino) == Kind::Dir {
-        return Err(ENODEV);
-    }
     if off % PAGE != 0 {
         return Err(EINVAL);
+    }
+    // A memory file: its pages, shared (writable if so mapped), as far
+    // as it has them.
+    if o.kind == FileKind::Shm {
+        let s = st.shm[o.pipe as usize];
+        if off.checked_add(len).is_none_or(|e| e > s.pages as u64 * PAGE) {
+            return Err(ENXIO);
+        }
+        let flags = if prot & PROT_WRITE != 0 { MAP_WRITE } else { 0 };
+        let first = s.first as u64 + off / PAGE;
+        return map_run(st, i, addr, len, fixed, SHM_VA + first * PAGE, SHM_SLOTS + first, flags);
+    }
+    if o.kind != FileKind::Node || st.fs.kind(o.ino) == Kind::Dir {
+        return Err(ENODEV);
     }
     // The framebuffer: its own pages, shared.
     if st.fs.kind(o.ino) == Kind::Fb {
         if off.checked_add(len).is_none_or(|e| e > FB_PAGES * PAGE) {
             return Err(EINVAL);
         }
-        let i = st.mem(i);
-        if st.procs[i].nshared == st.procs[i].shared.len() {
-            return Err(ENOMEM);
-        }
-        let at = if fixed { addr } else { st.place(i, len)? };
-        if at % PAGE != 0 || at < CHILD || at + len > STACK_TOP - STACK_PAGES * PAGE {
-            return Err(ENOMEM);
-        }
-        for page in (at..at + len).step_by(PAGE as usize) {
-            st.set_reserved(i, page, false);
-            st.unmap_private(i, page);
-        }
-        let run = Shared { start: at, end: at + len, ptr: FB_VA + off, slot: FB_SLOTS + off / PAGE, flags: MAP_WRITE };
-        let p = &mut st.procs[i];
-        p.shared[p.nshared] = run;
-        p.nshared += 1;
-        return Ok(at);
+        return map_run(st, i, addr, len, fixed, FB_VA + off, FB_SLOTS + off / PAGE, MAP_WRITE);
     }
     let i = st.mem(i);
     let p = &st.procs[i];
@@ -5157,6 +5342,18 @@ const RUNS: &[(&[&str], u32)] = &[
         ],
         0,
     ),
+    // Shared memory, as a Wayland client gives its compositor a buffer: a
+    // child makes a memory file, sizes and maps it, draws in it, and
+    // passes it over a socket; the parent maps it, reads it, and writes
+    // back what the child then sees.
+    (
+        &[
+            "sh",
+            "-c",
+            r#"cd /tmp/cc && printf 'int socketpair(int, int, int, int *); long sendmsg(int, const void *, int); long recvmsg(int, void *, int); int memfd_create(const char *, unsigned); int ftruncate(int, long); void *mmap(void *, unsigned long, int, int, int, long); long lseek(int, long, int); long read(int, void *, unsigned long); long write(int, const void *, unsigned long); int close(int); int fork(void); int waitpid(int, int *, int); void _exit(int); int printf(const char *, ...); char *strcpy(char *, const char *); int fflush(void *);\nstruct iov { void *b; unsigned long n; }; struct msg { void *name; unsigned namelen; struct iov *iov; unsigned long iovlen; void *ctl; unsigned long ctllen; int flags; }; struct ctl { unsigned long len; int level, type, fd, pad; };\nint main(void) { int sv[2], fd, pid, st; char b[4]; char *p; struct iov v = { b, 1 }; struct ctl k = { 20, 1, 1, 0, 0 }; struct msg m = { 0, 0, &v, 1, &k, 24, 0 }; if (socketpair(1, 1, 0, sv)) return 1; pid = fork(); if (!pid) { fd = memfd_create("buffer", 1); if (fd < 0 || ftruncate(fd, 3 * 4096)) _exit(2); p = mmap(0, 3 * 4096, 3, 1, fd, 0); if (p == (char *)-1) _exit(3); strcpy(p + 8192, "drawn by the child"); k.fd = fd; if (sendmsg(sv[0], &m, 0) != 1 || read(sv[0], b, 1) != 1) _exit(4); printf("memfd: the child sees: %%s\\n", p); fflush(0); _exit(0); } k.fd = -1; if (recvmsg(sv[1], &m, 0) != 1 || k.fd < 0) return 5; p = mmap(0, 3 * 4096, 3, 1, k.fd, 0); if (p == (char *)-1) return 6; printf("memfd: %%s, %%ld bytes\\n", p + 8192, lseek(k.fd, 0, 2)); strcpy(p, "written back"); write(sv[1], b, 1); waitpid(pid, &st, 0); return st; }\n' > shm.c && tcc -o shm shm.c 2>&1 && ./shm; s=$?; rm -f shm shm.c; exit $s"#,
+        ],
+        0,
+    ),
     // A program larger than a page many times over, read from its file
     // as it is loaded.
     (
@@ -5292,6 +5489,18 @@ fn setup() -> Result<&'static mut State, &'static str> {
                 && sys(Syscall::FrameMap, FB_SLOTS + p, [FB_VA + p * PAGE, 1, 0, 0]).is_ok()
         })
     };
+    // The pages memory files share.
+    let shm_pages = {
+        while from < UNTYPED_SPARE + UNTYPED_SPARE_COUNT
+            && sys(Syscall::Retype, from, [ObjectType::Untyped as u64, SHM_BLOCK_BITS, SHM_BLOCK, 0]).is_err()
+        {
+            from += 1;
+        }
+        (0..SHM_PAGES).all(|p| {
+            sys(Syscall::Retype, SHM_BLOCK, [ObjectType::Frame as u64, 0, SHM_SLOTS + p, 0]).is_ok()
+                && sys(Syscall::FrameMap, SHM_SLOTS + p, [SHM_VA + p * PAGE, 1, 0, 0]).is_ok()
+        })
+    };
     // Then as many spare blocks as the rest has room for (the more, the
     // larger a process can grow), at least one.
     let mut spares = 0;
@@ -5328,6 +5537,7 @@ fn setup() -> Result<&'static mut State, &'static str> {
     // Spare blocks there was no room for: never lent.
     st.spare_owner[spares..].fill(u8::MAX);
     st.fb_pages = fb_pages;
+    st.shm_pages = shm_pages;
     let interp = map_file(INTERP_FILE, INTERP_VA, MMAPTEST_FILE - INTERP_FILE);
     let mmaptest = map_file(MMAPTEST_FILE, MMAPTEST_VA, PIGZ_FILE - MMAPTEST_FILE);
     let pigz = map_file(PIGZ_FILE, PIGZ_VA, SMPTEST_FILE - PIGZ_FILE);
