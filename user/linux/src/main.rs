@@ -515,6 +515,8 @@ enum Sys {
     Getsockopt,
     Socketpair,
     MemfdCreate,
+    EventFd,
+    EventFd2,
     Unsupported(u64),
 }
 
@@ -583,6 +585,8 @@ fn decode(nr: u64, a: [u64; 6]) -> (Sys, [u64; 6]) {
         55 => Sys::Getsockopt,
         53 => Sys::Socketpair,
         319 => Sys::MemfdCreate,
+        284 => Sys::EventFd,
+        290 => Sys::EventFd2,
         40 => Sys::Sendfile,
         56 => Sys::Clone,
         57 => Sys::Fork,
@@ -690,6 +694,7 @@ fn decode(nr: u64, a: [u64; 6]) -> (Sys, [u64; 6]) {
         209 => Sys::Getsockopt,
         199 => Sys::Socketpair,
         279 => Sys::MemfdCreate,
+        19 => Sys::EventFd2,
         210 => Sys::Shutdown,
         172 => Sys::Getpid,
         178 => Sys::Gettid,
@@ -2269,6 +2274,8 @@ fn answer(st: &mut State, t: usize, call: Sys, a: [u64; 6]) -> Out {
         Sys::Dup2 | Sys::Dup3 => r(dup3(st, i, a[0], a[1], if call == Sys::Dup3 { a[2] as u32 } else { 0 })),
         Sys::Fcntl => r(fcntl(st, i, a[0], a[1], a[2])),
         Sys::MemfdCreate => r(memfd_create(st, i, a[1])),
+        Sys::EventFd => r(eventfd(st, i, a[0], 0)),
+        Sys::EventFd2 => r(eventfd(st, i, a[0], a[1])),
         Sys::Ftruncate => r(st.file(i, a[0]).ok_or(EBADF).and_then(|f| {
             let o = st.files[f];
             if o.kind == FileKind::Shm {
@@ -2476,6 +2483,7 @@ fn fstat(st: &mut State, i: usize, fd: u64, buf: u64) -> Result<u64, u64> {
         FileKind::Console | FileKind::Tty => stat_bytes(0o20620, 0, 0),
         FileKind::Socket | FileKind::Unix => stat_bytes(0o140777, 0, 0),
         FileKind::Shm => stat_bytes(0o100600, 0, st.shm[o.pipe as usize].size),
+        FileKind::EventFd => stat_bytes(0o600, 0, 0),
         _ => stat_bytes(0o10600, 0, st.pipes[o.pipe as usize].len as u64),
     };
     st.put(i, buf, &s[..STAT_LEN])
@@ -2710,6 +2718,19 @@ fn read(st: &mut State, i: usize, fd: u64, buf: u64, len: u64) -> Out {
             }
             pipe.take(&mut tmp[..want])
         }
+        FileKind::EventFd if len < 8 => return Out::Ret(err(EINVAL)),
+        FileKind::EventFd if o.off == 0 => {
+            if o.flags & O_NONBLOCK != 0 {
+                return Out::Ret(err(EAGAIN));
+            }
+            return Out::Block(Blocked::Read { fd, buf, len });
+        }
+        FileKind::EventFd => {
+            let v = if o.pipe != 0 { 1 } else { o.off };
+            st.files[f].off -= v;
+            tmp[..8].copy_from_slice(&v.to_ne_bytes());
+            8
+        }
         FileKind::Shm => {
             let n = st.shm_bytes(o.pipe as usize, o.off, want).len();
             tmp[..n].copy_from_slice(st.shm_bytes(o.pipe as usize, o.off, want));
@@ -2770,6 +2791,8 @@ fn write(st: &mut State, i: usize, fd: u64, buf: u64, len: u64) -> Out {
             room.min(len as usize)
         }
         FileKind::Node if o.flags & O_ACCMODE == 0 => return Out::Ret(err(EBADF)),
+        FileKind::EventFd if len < 8 => return Out::Ret(err(EINVAL)),
+        FileKind::EventFd => 8,
         FileKind::Console | FileKind::Tty | FileKind::Node | FileKind::Socket | FileKind::Unix | FileKind::Shm => {
             len.min(tmp.len() as u64) as usize
         }
@@ -2779,6 +2802,24 @@ fn write(st: &mut State, i: usize, fd: u64, buf: u64, len: u64) -> Out {
         return Out::Ret(err(EFAULT));
     }
     Out::Ret(match o.kind {
+        // Added to the counter; at most u64::MAX - 1, waiting for a read
+        // to make room.
+        FileKind::EventFd => {
+            let v = u64::from_ne_bytes([tmp[0], tmp[1], tmp[2], tmp[3], tmp[4], tmp[5], tmp[6], tmp[7]]);
+            let have = st.files[f].off;
+            if v == u64::MAX {
+                err(EINVAL)
+            } else if v > u64::MAX - 1 - have {
+                if o.flags & O_NONBLOCK != 0 {
+                    err(EAGAIN)
+                } else {
+                    return Out::Block(Blocked::Write { fd, buf, len });
+                }
+            } else {
+                st.files[f].off = have + v;
+                8
+            }
+        }
         // Past its end, it grows.
         FileKind::Shm => {
             let k = o.pipe as usize;
@@ -3040,6 +3081,20 @@ fn memfd_create(st: &mut State, i: usize, flags: u64) -> Result<u64, u64> {
     let f = st.new_file(FileKind::Shm, 0, k as u8, O_RDWR).ok_or(ENFILE)?;
     st.shm[k] = Shm { used: true, open: true, first: 0, pages: 0, size: 0 };
     st.new_fd(i, f, 0, flags & 1 != 0).inspect_err(|_| st.release(f))
+}
+
+/// `eventfd2(initval, flags)`: a counter that writes add to and a read
+/// takes (all of it, or one with `EFD_SEMAPHORE`), blocking at zero.
+fn eventfd(st: &mut State, i: usize, initval: u64, flags: u64) -> Result<u64, u64> {
+    const EFD_SEMAPHORE: u64 = 1;
+    const EFD_CLOEXEC: u64 = 0o2000000;
+    if flags & !(EFD_SEMAPHORE | O_NONBLOCK as u64 | EFD_CLOEXEC) != 0 {
+        return Err(EINVAL);
+    }
+    let sem = (flags & EFD_SEMAPHORE) as u8;
+    let f = st.new_file(FileKind::EventFd, 0, sem, O_RDWR | (flags as u32 & O_NONBLOCK)).ok_or(ENFILE)?;
+    st.files[f].off = initval & 0xffff_ffff;
+    st.new_fd(i, f, 0, flags & EFD_CLOEXEC != 0).inspect_err(|_| st.release(f))
 }
 
 /// `mmap` of a file (private: what the process writes stays its own).
@@ -3768,15 +3823,19 @@ fn futex_wake(st: &mut State, i: usize, addr: u64, n: u64, to: Option<u64>) -> u
 }
 
 /// Typed bytes from the UART: into the terminal, signals to its
-/// foreground group.
+/// foreground group. The interrupt is cleared before the UART is emptied,
+/// not after: a byte arriving in between would otherwise be left there
+/// with its interrupt cleared, and (the PL011 raising it only as it stops
+/// being empty) none again until something else read it, every byte
+/// typed meanwhile lost.
 fn uart_input(st: &mut State) {
+    tty::uart::clear_interrupt();
     while let Some(b) = tty::uart::try_read() {
         if let Some(sig) = st.tty.input(b) {
             let fg = st.tty.fg;
             st.post_group(fg, sig);
         }
     }
-    tty::uart::clear_interrupt();
     syscall(Syscall::IrqAck, tty::UART_IRQ, [0; 4]);
 }
 
@@ -4093,6 +4152,7 @@ fn readiness(st: &State, f: usize) -> u16 {
         // An epoll instance is readable when something it watches is
         // ready (one instance inside another is not followed further).
         FileKind::Epoll => 0,
+        FileKind::EventFd => (if o.off > 0 { POLLIN } else { 0 }) | if o.off < u64::MAX - 1 { POLLOUT } else { 0 },
         FileKind::Unix => {
             let u = &st.unix[o.pipe as usize];
             match u.phase {
@@ -5231,7 +5291,7 @@ const APPLETS: &[&str] = &[
     "sh", "ash", "echo", "cat", "ls", "wc", "seq", "mkdir", "rmdir", "rm", "touch", "true", "false", "uname", "awk",
     "sort", "head", "tail", "grep", "tr", "env", "pwd", "test", "[", "basename", "dirname", "cp", "mv", "ln", "printf",
     "expr", "cut", "uniq", "sed", "xargs", "find", "stat", "readlink", "sleep", "yes", "tee", "od", "stty",
-    "kill", "gzip", "md5sum", "nproc", "wget", "nc", "ping", "ping6",
+    "kill", "gzip", "md5sum", "nproc", "wget", "nc", "ping", "ping6", "tar",
 ];
 
 /// What the test runs, and the exit status each must end with. They share
@@ -5442,6 +5502,29 @@ const RUNS: &[(&[&str], u32)] = &[
     (&["sh", "-c", "links -ssl.certificates 2 -dump https://10.0.3.2:47443/page.html; echo links said $?"], 0),
     (&["sh", "-c", "echo echoed over TCP and IPv6 | nc fd00:3::2 47002"], 0),
     (&["sh", "-c", "echo echoed over UDP and IPv6 | nc -u -w 2 fd00:3::2 47001"], 0),
+    // Packages installed onto the disk, as apk would: Alpine's glib, and
+    // the libintl and PCRE2 it links to, fetched from the host by wget and
+    // unpacked by tar under /opt/alpine, with musl's dynamic linker told
+    // to look there.
+    (
+        &[
+            "sh",
+            "-c",
+            "mkdir -p /opt/alpine /etc && for p in libintl-0.21.1-r7 pcre2-10.42-r1 glib-2.76.6-r0; do wget -q -O - http://10.0.3.2:47081/apk/$p.apk | tar -xzf - -C /opt/alpine usr/lib || exit 1; done; echo /lib:/usr/lib:/opt/alpine/usr/lib > /etc/ld-musl-$(uname -m).path && cd /opt/alpine/usr/lib && ls libglib-2.0.so.0 libpcre2-8.so.0 libintl.so.8",
+        ],
+        0,
+    ),
+    // A program tcc links against glib from there: a hash table, a regular
+    // expression (PCRE2's), and glib's main loop with a timeout. Then the
+    // packages are removed, so the second boot sees the disk as before.
+    (
+        &[
+            "sh",
+            "-c",
+            r#"cd /tmp/cc && printf 'char *g_strdup_printf(const char *, ...); void g_free(void *); const char *glib_check_version(unsigned, unsigned, unsigned);\nvoid *g_hash_table_new(unsigned (*)(const void *), int (*)(const void *, const void *)); unsigned g_str_hash(const void *); int g_str_equal(const void *, const void *);\nint g_hash_table_insert(void *, void *, void *); void *g_hash_table_lookup(void *, const void *);\nint g_regex_match_simple(const char *, const char *, int, int);\nvoid *g_main_loop_new(void *, int); void g_main_loop_run(void *); void g_main_loop_quit(void *); unsigned g_timeout_add(unsigned, int (*)(void *), void *);\nint printf(const char *, ...); int eventfd(unsigned, int); long read(int, void *, unsigned long); long write(int, const void *, unsigned long);\nint ticks;\nint tick(void *loop) { if (++ticks < 3) return 1; g_main_loop_quit(loop); return 0; }\nint main(void) {\n  void *h = g_hash_table_new(g_str_hash, g_str_equal), *loop = g_main_loop_new(0, 0);\n  char *s;\n  g_hash_table_insert(h, "greeting", "hello");\n  g_timeout_add(10, tick, loop);\n  g_main_loop_run(loop);\n  s = g_strdup_printf("glib: version %%s, regex %%d, table says %%s, the main loop ticked %%d times", glib_check_version(2, 76, 0) ? "too old" : "2.76", g_regex_match_simple("^gl[a-z]+$", "glib", 0, 0), (char *)g_hash_table_lookup(h, "greeting"), ticks);\n  printf("%%s\\n", s);\n  g_free(s);\n  {\n    int e = eventfd(2, 1 | 04000); unsigned long v = 0, five = 5; long r[4];\n    r[0] = read(e, &v, 8); r[1] = read(e, &v, 8); r[2] = read(e, &v, 8); write(e, &five, 8); r[3] = read(e, &v, 8);\n    printf("eventfd: reads %%ld %%ld %%ld, after writing 5: %%ld of %%lu\\n", r[0], r[1], r[2], r[3], v);\n  }\n  return 0;\n}\n' > g.c && tcc -o g g.c /opt/alpine/usr/lib/libglib-2.0.so.0 2>&1 && ./g; s=$?; rm -f g g.c; rm -r /opt /etc/ld-musl-$(uname -m).path; exit $s"#,
+        ],
+        0,
+    ),
 ];
 
 /// The second boot's runs (`arg 1`, boot/linux-verify.manifest): what the

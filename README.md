@@ -2058,6 +2058,28 @@ holds the rest):
   Shift+1) into text with it, "Hi!", on both ISAs. The exec buffer and the
   framebuffer's slots moved there too, so the toolchain's archive now has
   room for 1.5 MiB.
+- Packages installed onto the disk: the guest fetches Alpine's packages from
+  the host over HTTP with BusyBox's `wget` and unpacks them with its `tar`
+  under `/opt/alpine`, on the filesystem server's disk (64 MiB in
+  `linux-test`), and writes `/etc/ld-musl-<arch>.path` so musl's dynamic
+  linker looks there. This is the way big libraries (GTK, then the
+  browsers) reach the personality, past the bundle's 64 MiB. The host
+  serves the pinned packages byte for byte; the guest unpacks only `usr/lib`
+  (an apk's signature's name is longer than the filesystem's 58 bytes).
+  `linux-test` installs glib with the libintl and PCRE2 it links to, and a
+  program tcc links against it uses a hash table, a regular expression and
+  glib's main loop, on both ISAs; then the packages are removed.
+- The terminal's typed bytes are not lost on a slow guest: the UART's
+  interrupt is cleared before it is emptied, not after (a byte arriving in
+  between was left with no interrupt to come). `linux-test` types a byte
+  at a time and waits for each to be echoed, since QEMU's console on
+  Windows drops bytes the guest cannot take yet; and polls for a
+  background job to be stopped, not a fixed second. The file pool (`/tmp`,
+  `/usr`'s unpacked files) is 224 pages, 896 KiB, up from 768 KiB.
+- `eventfd` and `eventfd2`: a counter that writes add to and reads take
+  (all of it, or one with `EFD_SEMAPHORE`), blocking at zero, with
+  `EFD_NONBLOCK` and `EFD_CLOEXEC`, and readable in `poll` and `epoll`
+  while above zero. glib's main loop wakes through one.
 - `exec` copies a program's arguments and environment to its stack a piece
   at a time. Before, one longer than 4 KiB (a long `sh -c` script) ran
   past the copy buffer and stopped the personality.

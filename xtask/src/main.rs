@@ -695,18 +695,7 @@ fn toolchain_files(arch: Arch) -> Result<Vec<(String, Vec<u8>)>, String> {
     let mut out = Vec::new();
     let mut archive = Vec::new();
     for &(repo, package, sha256, files) in packages {
-        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-        let apk = dir.join(format!("{package}-{isa}.apk"));
-        if !apk.exists() {
-            println!("== fetching Alpine's {package} ({isa})");
-            let url = format!("https://dl-cdn.alpinelinux.org/alpine/{repo}/{isa}/{package}.apk");
-            run(Command::new("curl").args(["-sSfL", "-o"]).arg(&apk).arg(&url))?;
-        }
-        let bytes = std::fs::read(&apk).map_err(|e| format!("reading {}: {e}", apk.display()))?;
-        let hash: String = superior_objects::crypto::sha2::sha256(&bytes).iter().map(|b| format!("{b:02x}")).collect();
-        if hash != sha256 {
-            return Err(format!("{} is not Alpine's {package}: delete it to fetch it again", apk.display()));
-        }
+        let apk = alpine_apk(repo, package, sha256, isa)?;
         let to = dir.join(isa).join(package);
         std::fs::create_dir_all(&to).map_err(|e| e.to_string())?;
         let mut tar = Command::new("tar");
@@ -732,6 +721,57 @@ fn toolchain_files(arch: Arch) -> Result<Vec<(String, Vec<u8>)>, String> {
     archive.extend([0u8; 1024]);
     out.push(("tools".to_string(), archive));
     Ok(out)
+}
+
+/// Alpine's `package` for `isa`, from `repo`: downloaded once into
+/// `target/linux/alpine`, and checked against its pinned hash every time.
+/// Its path.
+fn alpine_apk(repo: &str, package: &str, sha256: &str, isa: &str) -> Result<PathBuf, String> {
+    let dir = root().join("target/linux/alpine");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let apk = dir.join(format!("{package}-{isa}.apk"));
+    if !apk.exists() {
+        println!("== fetching Alpine's {package} ({isa})");
+        let url = format!("https://dl-cdn.alpinelinux.org/alpine/{repo}/{isa}/{package}.apk");
+        run(Command::new("curl").args(["-sSfL", "-o"]).arg(&apk).arg(&url))?;
+    }
+    let bytes = std::fs::read(&apk).map_err(|e| format!("reading {}: {e}", apk.display()))?;
+    let hash: String = superior_objects::crypto::sha2::sha256(&bytes).iter().map(|b| format!("{b:02x}")).collect();
+    if hash != sha256 {
+        return Err(format!("{} is not Alpine's {package}: delete it to fetch it again", apk.display()));
+    }
+    Ok(apk)
+}
+
+/// Packages the Linux test's guest installs itself, onto its disk: served
+/// by the host's HTTP server at `/apk/<package>.apk`, unpacked by BusyBox's
+/// tar under `/opt/alpine`. glib, and the libintl and PCRE2 it links to.
+type DiskPackage = (&'static str, &'static str, &'static str);
+const DISK_PACKAGES_X86_64: [DiskPackage; 3] = [
+    ("v3.18/main", "libintl-0.21.1-r7", "fd037a245ebae75479cc0844302465db1d807906f0b18d097939a77c008a67c3"),
+    ("v3.18/main", "pcre2-10.42-r1", "4204b387996078ca226b3c6717f67069d63df7958b7fc3846d0cf0edd3f728cd"),
+    ("v3.18/main", "glib-2.76.6-r0", "e0cdde2133d4f5356c788dc1f508ff8579bce4997837344dea7fe268e6b3b84b"),
+];
+const DISK_PACKAGES_AARCH64: [DiskPackage; 3] = [
+    ("v3.18/main", "libintl-0.21.1-r7", "8e4fae02dccbdb52ccf588ec0e32b1f36817c7e176eb80fc6e0ab7bd98027a36"),
+    ("v3.18/main", "pcre2-10.42-r1", "8fe7998769545233bfa1365a4c846bd541341948b5e3b59482b7fe907819e07d"),
+    ("v3.18/main", "glib-2.76.6-r0", "d60ec850dcc98c1e6caeda3567d73adccefbe7c9f681c9aa040315bad74188bf"),
+];
+
+/// The disk packages for `arch`, each as (its request path, its bytes).
+fn disk_packages(arch: Arch) -> Result<Vec<(String, Vec<u8>)>, String> {
+    let (isa, packages) = match arch {
+        Arch::X86_64 => ("x86_64", &DISK_PACKAGES_X86_64),
+        Arch::Aarch64 => ("aarch64", &DISK_PACKAGES_AARCH64),
+    };
+    packages
+        .iter()
+        .map(|&(repo, package, sha256)| {
+            let apk = alpine_apk(repo, package, sha256, isa)?;
+            let bytes = std::fs::read(&apk).map_err(|e| format!("reading {}: {e}", apk.display()))?;
+            Ok((format!("/apk/{package}.apk"), bytes))
+        })
+        .collect()
 }
 
 /// Appends a ustar entry to `archive`: a file holding `data`, or a
@@ -868,10 +908,11 @@ const LINUX_SESSION: &[(&str, &str, bool)] = &[
     ("\x1a", "Stopped", true),
     ("bg; wait; echo waited\n", "\nwaited", true),
     // A background job reading the terminal is stopped (SIGTTIN), and
-    // reads once brought to the foreground. (A moment first: the job may
-    // still be starting on the other CPU.)
+    // reads once brought to the foreground. (Polled for up to 10 s: the
+    // job may still be starting, on a slow guest; what is typed says
+    // "Stop", not the "Stopped" waited for.)
     ("sh -c 'read x; echo read $x' &\n", "", true),
-    ("sleep 1; jobs\n", "Stopped", true),
+    ("for k in 1 2 3 4 5 6 7 8 9 10; do sleep 1; jobs > /tmp/j; grep -q Stop /tmp/j && break; done; cat /tmp/j\n", "Stopped", true),
     ("fg\n", "read x;", false),
     ("hello\n", "\nread hello", true),
     // A job stopped while running in user space (suspended where it
@@ -937,16 +978,56 @@ fn drive_linux(img: &Image, script: &[(&str, &str, bool)], shots: Vec<Shot>) -> 
             std::thread::sleep(Duration::from_millis(20));
         }
     };
+    // Waits for `b` to be echoed, in the output after `from` (where it
+    // was when `b` was typed), leaving out the escape sequences the
+    // shell's line editing writes, which have characters that may be
+    // typed.
+    let echoed = |b: u8, from: usize| -> Result<(), ()> {
+        let deadline = Instant::now() + scaled(Duration::from_secs(30));
+        loop {
+            {
+                let out = seen.lock().unwrap();
+                let mut bytes = out[from.min(out.len())..].iter();
+                while let Some(&c) = bytes.next() {
+                    if c == b {
+                        return Ok(());
+                    }
+                    // ESC [ parameters final, or ESC and one more.
+                    if c == 0x1b && bytes.next() == Some(&b'[') {
+                        bytes.by_ref().find(|&&c| (0x40..0x7f).contains(&c));
+                    }
+                }
+            }
+            if Instant::now() > deadline {
+                return Err(());
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    };
     let mut at = 0;
     let mut result = Ok(());
     for (typed, want, prompt) in script {
-        // A byte at a time, as from a keyboard.
-        for b in typed.bytes() {
-            stdin.write_all(&[b]).map_err(|e| e.to_string())?;
-            stdin.flush().map_err(|e| e.to_string())?;
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        let step = expect(want, at).and_then(|p| if *prompt { expect(LINUX_PROMPT, p) } else { Ok(p) });
+        // A byte at a time, as from a keyboard; each printable one echoed
+        // (by the shell's line editing, or the terminal) before the next
+        // is typed. The UART holds one byte, and QEMU's console on Windows
+        // drops a byte it cannot take when it comes: bytes typed while the
+        // guest is busy pile up in the pipe and then arrive together, all
+        // but the first lost. So no more than one is ever on its way.
+        // (Control characters and newlines are not always echoed as typed;
+        // what the step waits for follows them.)
+        let typing = typed.bytes().try_for_each(|b| {
+            let from = seen.lock().unwrap().len();
+            stdin.write_all(&[b]).and_then(|()| stdin.flush()).map_err(|e| e.to_string())?;
+            if b.is_ascii_graphic() || b == b' ' {
+                echoed(b, from).map_err(|()| format!("Linux session: {:?} of {typed:?} was not echoed", char::from(b)))
+            } else {
+                std::thread::sleep(Duration::from_millis(5));
+                Ok(())
+            }
+        });
+        let step = typing
+            .and_then(|()| expect(want, at))
+            .and_then(|p| if *prompt { expect(LINUX_PROMPT, p) } else { Ok(p) });
         match step {
             Ok(p) => at = p,
             Err(e) => {
@@ -986,9 +1067,10 @@ fn linux_test(img: &Image) -> Result<(), String> {
     use std::sync::atomic::{AtomicBool, Ordering};
     println!("== Linux personality test on {}", img.path.display());
     let disk = linux_disk();
-    std::fs::write(&disk, vec![0u8; 16 << 20]).map_err(|e| format!("writing {}: {e}", disk.display()))?;
+    // 64 MiB: room for the packages the guest installs onto it.
+    std::fs::write(&disk, vec![0u8; 64 << 20]).map_err(|e| format!("writing {}: {e}", disk.display()))?;
     let stop = Arc::new(AtomicBool::new(false));
-    let (servers, served) = linux_net_servers(stop.clone())?;
+    let (servers, served) = linux_net_servers(stop.clone(), disk_packages(img.arch)?)?;
     // The framebuffer panned, then drawn and left mapped (shown as drawn);
     // then a click on its window, at (100, 50) in it, and keys typed.
     let shot = |k: usize, marker, check: fn(&Path) -> Result<String, String>| {
@@ -1195,6 +1277,15 @@ fn linux_test(img: &Image) -> Result<(), String> {
         "nc fd00:3::2 47002 exited with status 0",
         "linux: > echoed over UDP and IPv6",
         "nc -u -w 2 fd00:3::2 47001 exited with status 0",
+        // glib and what it links to, installed onto the disk from the
+        // host, and a program linked against it.
+        "linux: > libglib-2.0.so.0",
+        "linux: > libintl.so.8",
+        "linux: > libpcre2-8.so.0",
+        "linux: > glib: version 2.76, regex 1, table says hello, the main loop ticked 3 times",
+        // An eventfd as a semaphore, made with 2: two reads of 1, then
+        // EAGAIN; a write of 5, and a read of 1 again.
+        "linux: > eventfd: reads 8 8 -1, after writing 5: 8 of 1",
         // The terminal session (its steps were checked as it ran).
         "linux: running sh (pid ",
         "linux: sh exited with status 0",
@@ -1366,6 +1457,7 @@ fn check_fb(path: &Path, what: &str, pixel: impl Fn(usize, usize) -> [u8; 3]) ->
 /// answered; what it was answered with.
 fn linux_net_servers(
     stop: Arc<std::sync::atomic::AtomicBool>,
+    packages: Vec<(String, Vec<u8>)>,
 ) -> Result<(Vec<std::thread::JoinHandle<()>>, Arc<Mutex<String>>), String> {
     use std::io::Read;
     use std::net::{TcpListener, TcpStream, UdpSocket};
@@ -1407,22 +1499,26 @@ fn linux_net_servers(
                     _ => break,
                 }
             }
-            let body = if req.starts_with(b"GET /hello ") {
-                "hello over HTTP\n"
+            // The packages the guest installs: Alpine's, byte for byte.
+            let apk = packages.iter().find(|(path, _)| req.starts_with(format!("GET {path} ").as_bytes()));
+            let (body, kind): (&[u8], _) = if req.starts_with(b"GET /hello ") {
+                (b"hello over HTTP\n", "text/plain")
             } else if req.starts_with(b"GET /hello6 ") {
-                "hello over HTTP and IPv6\n"
+                (b"hello over HTTP and IPv6\n", "text/plain")
             } else if req.starts_with(b"GET /page.html ") {
-                LINUX_PAGE
+                (LINUX_PAGE.as_bytes(), "text/html")
+            } else if let Some((_, bytes)) = apk {
+                (bytes, "application/octet-stream")
             } else {
-                ""
+                (b"", "text/plain")
             };
             let status = if body.is_empty() { "404 Not Found" } else { "200 OK" };
-            let kind = if body == LINUX_PAGE { "text/html" } else { "text/plain" };
             let _ = write!(
                 c,
-                "HTTP/1.1 {status}\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                "HTTP/1.1 {status}\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                 body.len()
             );
+            let _ = c.write_all(body);
         }
     }));
     // The page over HTTPS: links must check the certificate against the CA

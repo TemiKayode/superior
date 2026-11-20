@@ -34,7 +34,7 @@ const DIRECT: usize = FILE_BLOCKS - 1;
 const INDIRECT: usize = FILE_BLOCKS - 1;
 /// The most pages a file of the tree may have.
 const MAX_FILE_PAGES: usize = DIRECT + PAGE / 2;
-pub const POOL_PAGES: usize = 192;
+pub const POOL_PAGES: usize = 224;
 /// The filesystem server's longest name.
 pub const NAME_MAX: usize = server::MAX_NAME;
 /// Bytes of a path on the server, as it is given it.
@@ -881,6 +881,9 @@ pub enum FileKind {
     /// Shared memory (`memfd_create`), its number in `pipe`
     /// (`State::shm`).
     Shm,
+    /// An eventfd: its counter in `off` (shared, as the description is,
+    /// by `dup` and `fork`), `EFD_SEMAPHORE` in `pipe`.
+    EventFd,
 }
 
 /// An open-file description, shared by the descriptors `dup` and `fork`
