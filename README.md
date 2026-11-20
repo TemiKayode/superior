@@ -1940,6 +1940,13 @@ holds the rest):
   tcc that draws a gradient into the mapped framebuffer and pans it. QEMU's
   screenshot must then have every pixel right: the desktop, and the window
   at (240, 180). It passes on both ISAs.
+- The framebuffer is shown as it is drawn, as a screen shows its memory.
+  While a process has `/dev/fb0` mapped, the personality shows the window
+  25 times a second, waking for it as it does for sleepers. A program no
+  longer has to pan, write or close the device. `linux-test` has a second
+  program draw another picture and sleep with the framebuffer still
+  mapped, never panning it; the screenshot taken while it sleeps must have
+  every pixel right, on both ISAs.
 - Interrupt and exception entries clear the direction flag. User code may be
   interrupted mid-way through a backward copy, with the flag set; the kernel's own
   copies need it clear, and without the `cld` they ran backwards, wrecking saved

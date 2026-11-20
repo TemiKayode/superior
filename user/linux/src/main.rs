@@ -262,6 +262,9 @@ const FB_H: u64 = 240;
 const FB_PAGES: u64 = (FB_W * FB_H * 4).div_ceil(PAGE);
 const FB_AT: (u64, u64) = (240, 180);
 const FB_VA: u64 = USER_BASE + 0x1_9a00_0000;
+/// While a process has the framebuffer mapped, it is shown as it is drawn,
+/// as a screen would show it: every FB_PERIOD ticks (25 times a second).
+const FB_PERIOD: u64 = TICK_HZ / 25;
 const _: () = assert!(FB_PAGES << 12 <= 1 << FB_BLOCK_BITS && FB_SLOTS + FB_PAGES <= AS_FILE);
 /// Where Alpine puts gcc's own files: under its target's name.
 const CC1_PATH: &[u8] = if cfg!(target_arch = "x86_64") {
@@ -902,6 +905,8 @@ struct State {
     fb_pages: bool,
     fb_window: u64,
     fb_shown: bool,
+    /// When a mapped framebuffer is next shown (ticks).
+    fb_next: u64,
 }
 
 const _: () = assert!(core::mem::size_of::<State>() as u64 <= STATE_PAGES * PAGE);
@@ -3118,6 +3123,14 @@ fn finish(st: &mut State, t: usize, pc: u64, value: u64, place: Option<u64>) {
 fn wake(st: &mut State) {
     // Timers due: SIGALRM.
     let now = superior_sys::ticks();
+    // A mapped framebuffer, shown as it is drawn.
+    let fb_mapped = st.procs.iter().any(|p| {
+        p.used && !p.zombie && p.shared[..p.nshared].iter().any(|s| (FB_SLOTS..FB_SLOTS + FB_PAGES).contains(&s.slot))
+    });
+    if fb_mapped && now >= st.fb_next {
+        st.fb_show();
+        st.fb_next = now + FB_PERIOD;
+    }
     for i in 0..MAX_PROCS {
         let p = &mut st.procs[i];
         if p.used && !p.zombie && p.alarm != 0 && now >= p.alarm {
@@ -3239,6 +3252,7 @@ fn wake(st: &mut State) {
             _ => None,
         })
         .chain(st.procs.iter().filter(|p| p.used && !p.zombie && p.alarm != 0).map(|p| p.alarm))
+        .chain(fb_mapped.then_some(st.fb_next))
         .min();
     let ticks = next.map_or(0, |until| until.saturating_sub(superior_sys::ticks()).max(1));
     // A call waiting on a socket: tried again every tick (this server
@@ -4372,6 +4386,17 @@ const RUNS: &[(&[&str], u32)] = &[
             "sh",
             "-c",
             r#"cd /tmp/cc && printf 'int open(const char *, int, ...); int ioctl(int, unsigned long, ...); void *mmap(void *, unsigned long, int, int, int, long); int printf(const char *, ...);\nint main(void) { unsigned v[40], f[20]; int fd = open("/dev/fb0", 2); if (fd < 0 || ioctl(fd, 0x4600, v) || ioctl(fd, 0x4602, f)) return 1; unsigned w = v[0], h = v[1], line = f[12]; unsigned *p = mmap(0, f[6], 3, 1, fd, 0); if (p == (void *)-1) return 2; for (unsigned y = 0; y < h; y++) for (unsigned x = 0; x < w; x++) p[y * (line / 4) + x] = x * 255 / (w - 1) << 16 | y * 255 / (h - 1) << 8 | 0x80; ioctl(fd, 0x4606, v); printf("fb0: %%ux%%u, %%u bits, line %%u\\n", w, h, v[6], line); return 0; }\n' > fb.c && tcc -o fb fb.c && ./fb"#,
+        ],
+        0,
+    ),
+    // Shown as it is drawn: another picture (red falling across, blue
+    // rising down), never panned, the program asleep while the screen is
+    // looked at, the framebuffer still mapped.
+    (
+        &[
+            "sh",
+            "-c",
+            r#"cd /tmp/cc && printf 'int open(const char *, int, ...); int ioctl(int, unsigned long, ...); void *mmap(void *, unsigned long, int, int, int, long); long write(int, const void *, unsigned long); unsigned sleep(unsigned);\nint main(void) { unsigned v[40], f[20]; int fd = open("/dev/fb0", 2); if (fd < 0 || ioctl(fd, 0x4600, v) || ioctl(fd, 0x4602, f)) return 1; unsigned w = v[0], h = v[1], line = f[12]; unsigned *p = mmap(0, f[6], 3, 1, fd, 0); if (p == (void *)-1) return 2; for (unsigned y = 0; y < h; y++) for (unsigned x = 0; x < w; x++) p[y * (line / 4) + x] = (w - 1 - x) * 255 / (w - 1) << 16 | 0x40 << 8 | y * 255 / (h - 1); write(1, "fb0: drawn, not panned\\n", 23); sleep(3); return 0; }\n' > live.c && tcc -o live live.c && ./live"#,
         ],
         0,
     ),
