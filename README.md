@@ -1990,7 +1990,7 @@ holds the rest):
   checks the child's credentials, and sees the end once the child has
   gone, on both ISAs.
 - Shared memory: `memfd_create`, the other half of how a Wayland client
-  hands its compositor a buffer. At boot the personality cuts a 1 MiB
+  hands its compositor a buffer. At boot the personality cuts a 2 MiB
   block of the rest of RAM into pages, kept in the slots after the
   processes'. A memory file holds a run of those pages:
   - `ftruncate` sizes it, growing in place, or moving while nothing maps
@@ -2007,6 +2007,28 @@ holds the rest):
   make, size and map a memory file, draw in it, and pass it over a
   socket pair. The parent maps it, reads what was drawn and its size, and
   writes back what the child then reads, on both ISAs.
+- A Wayland display server in the personality (`user/linux/src/wl.rs`),
+  showing Wayland clients on Superior's compositor. It listens on
+  `/tmp/wayland-0` (`XDG_RUNTIME_DIR=/tmp`) and speaks the wire protocol:
+  - the core: `wl_display`, `wl_registry`, `wl_callback`;
+  - `wl_compositor` with surfaces and regions;
+  - `wl_shm` with pools (a memory file passed with the request) and
+    buffers in ARGB8888 or XRGB8888;
+  - `xdg_wm_base` with `xdg_surface` and `xdg_toplevel`, configured at
+    once.
+
+  Each toplevel is an undecorated compositor window (a Wayland client
+  draws its own decorations), made the size of the first buffer committed
+  and remade if that changes. A window's pages are lent once, so each
+  commit copies the buffer into the window's own shared pages, then
+  releases the buffer and finishes the frame callbacks. The close box
+  sends `xdg_toplevel.close`. The server's tables live in shared pages
+  kept for them, and a client's windows go when it disconnects. Input
+  (`wl_seat`) and popups come later. `linux-test` runs a client that
+  speaks the protocol itself: it binds the globals, makes a toplevel,
+  draws a gradient into a pool, and waits for its frame and the
+  buffer's release. The host's screenshot then checks the window pixel
+  by pixel, on both ISAs.
 - Interrupt and exception entries clear the direction flag. User code may be
   interrupted mid-way through a backward copy, with the flag set; the kernel's own
   copies need it clear, and without the `cld` they ran backwards, wrecking saved

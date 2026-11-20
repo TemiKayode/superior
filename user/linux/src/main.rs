@@ -91,6 +91,7 @@ mod signal;
 mod sock;
 mod tty;
 mod unix;
+mod wl;
 
 use fs::{FileKind, Fs, Kind, MAX_FILES, MAX_IMAGES, MAX_PIPES, Open, PIPE_BUF, Pipe, ROOT};
 use signal::{Action, Next, SA_RESTART, SIGALRM, SIGCHLD, SIGPIPE, SIGSEGV, SYSCALL_LEN, TRAMPOLINE, TRAMPOLINE_CODE};
@@ -275,7 +276,7 @@ const _: () = assert!(FB_PAGES << 12 <= 1 << FB_BLOCK_BITS && FB_SLOTS + FB_PAGE
 /// A memory file holds a run of them, which the processes that map it
 /// share ([`Shm`]).
 const SHM_BLOCK: u64 = PROC_SLOTS + MAX_PROCS as u64 * PROC_SPAN;
-const SHM_BLOCK_BITS: u64 = 20;
+const SHM_BLOCK_BITS: u64 = 21;
 const SHM_SLOTS: u64 = SHM_BLOCK + 1;
 const SHM_PAGES: u64 = 1 << (SHM_BLOCK_BITS - 12);
 const SHM_VA: u64 = USER_BASE + 0x1_9c00_0000;
@@ -3485,6 +3486,8 @@ fn wake(st: &mut State) {
     }
     loop {
         let mut moved = false;
+        // Wayland clients' requests, which may answer what others wait for.
+        moved |= wl::service(st);
         for t in 0..MAX_TASKS {
             if !st.tasks[t].used {
                 continue;
@@ -3810,6 +3813,7 @@ fn run(st: &mut State, argv: &[&str], env: &[&str], interactive: bool) -> Result
             }
             if r.badge & 4 != 0 {
                 input_events(st);
+                wl::window_events(st);
             }
             wake(st);
             continue;
@@ -5354,6 +5358,19 @@ const RUNS: &[(&[&str], u32)] = &[
         ],
         0,
     ),
+    // A Wayland client, speaking the wire protocol itself: it binds the
+    // compositor, shm and xdg_wm_base, makes a toplevel, draws into a
+    // memory file's pool, and commits a buffer once configured; the
+    // personality's server shows it in a window of the compositor's,
+    // which the host's screenshot checks while the client sleeps.
+    (
+        &[
+            "sh",
+            "-c",
+            r#"cd /tmp/cc && printf 'int socket(int, int, int); int connect(int, const void *, unsigned); long sendmsg(int, const void *, int); long read(int, void *, unsigned long); long write(int, const void *, unsigned long); int memfd_create(const char *, unsigned); int ftruncate(int, long); void *mmap(void *, unsigned long, int, int, int, long); int printf(const char *, ...); int fflush(void *); unsigned sleep(unsigned); int strcmp(const char *, const char *); unsigned long strlen(const char *); void *memcpy(void *, const void *, unsigned long);\nstruct iov { void *b; unsigned long n; }; struct msg { void *name; unsigned namelen; struct iov *iov; unsigned long iovlen; void *ctl; unsigned long ctllen; int flags; }; struct ctl { unsigned long len; int level, type, fd, pad; }; struct sun { unsigned short fam; char path[108]; };\nunsigned q[128]; int n, s; char ib[4096]; int ih, it;\nvoid begin(unsigned id, unsigned op) { q[0] = id; q[1] = op; n = 2; } void u(unsigned v) { q[n++] = v; } void str(const char *t) { int l = strlen(t) + 1; q[n++] = l; q[n + (l + 3) / 4 - 1] = 0; memcpy(&q[n], t, l); n += (l + 3) / 4; }\nlong end(int fd) { struct iov v; struct ctl k; struct msg h = { 0 }; q[1] |= n * 4 << 16; if (fd < 0) return write(s, q, n * 4); v.b = q; v.n = n * 4; k.len = 20; k.level = 1; k.type = 1; k.fd = fd; k.pad = 0; h.iov = &v; h.iovlen = 1; h.ctl = &k; h.ctllen = 24; return sendmsg(s, &h, 0); }\nunsigned *ev(void) { unsigned *m; long r; for (;;) { if (it - ih >= 8) { m = (unsigned *)(ib + ih); if (it - ih >= (int)(m[1] >> 16)) { ih += m[1] >> 16; return m; } } if (ih == it) ih = it = 0; r = read(s, ib + it, sizeof ib - it); if (r <= 0) return 0; it += r; } }\nint main(void) { struct sun a = { 1, "/tmp/wayland-0" }; unsigned *m, comp = 0, shm = 0, wm = 0, serial = 0, *px; int fd, x, y, W = 160, H = 100, done = 0, released = 0, cfg = 0, fmts = 0; s = socket(1, 1, 0); if (connect(s, &a, sizeof a)) return 1; begin(1, 1); u(2); end(-1); begin(1, 0); u(3); end(-1); while ((m = ev()) && m[0] != 3) if (m[0] == 2 && (m[1] & 0xffff) == 0) { if (!strcmp((char *)&m[4], "wl_compositor")) comp = m[2]; if (!strcmp((char *)&m[4], "wl_shm")) shm = m[2]; if (!strcmp((char *)&m[4], "xdg_wm_base")) wm = m[2]; } if (!m || !comp || !shm || !wm) return 2; begin(2, 0); u(comp); str("wl_compositor"); u(4); u(4); end(-1); begin(2, 0); u(shm); str("wl_shm"); u(1); u(5); end(-1); begin(2, 0); u(wm); str("xdg_wm_base"); u(1); u(6); end(-1); begin(4, 0); u(7); end(-1); fd = memfd_create("wl", 1); if (fd < 0 || ftruncate(fd, W * H * 4)) return 3; px = mmap(0, W * H * 4, 3, 1, fd, 0); if (px == (unsigned *)-1) return 4; for (y = 0; y < H; y++) for (x = 0; x < W; x++) px[y * W + x] = (x * 255 / (W - 1)) << 16 | 0x20 << 8 | y * 255 / (H - 1); begin(5, 0); u(8); u(W * H * 4); if (end(fd) <= 0) return 5; begin(8, 0); u(9); u(0); u(W); u(H); u(W * 4); u(1); end(-1); begin(6, 2); u(10); u(7); end(-1); begin(10, 1); u(11); end(-1); begin(11, 2); str("wayland test"); end(-1); begin(7, 6); end(-1); while ((m = ev())) { if (m[0] == 5) fmts++; if (m[0] == 11 && (m[1] & 0xffff) == 0) cfg = 1; if (m[0] == 10 && (m[1] & 0xffff) == 0) { serial = m[2]; break; } } if (!m) return 6; begin(10, 4); u(serial); end(-1); begin(7, 1); u(9); u(0); u(0); end(-1); begin(7, 2); u(0); u(0); u(W); u(H); end(-1); begin(7, 3); u(12); end(-1); begin(7, 6); end(-1); while (!(done && released) && (m = ev())) { if (m[0] == 12) done = 1; if (m[0] == 9) released = 1; } if (!m) return 7; printf("wayland: %%d formats, configured %%d, a %%dx%%d buffer shown, its frame done and the buffer released\\n", fmts, cfg, W, H); fflush(0); sleep(3); return 0; }\n' > wl.c && tcc -o wl wl.c 2>&1 && ./wl; s=$?; rm -f wl wl.c; exit $s"#,
+        ],
+        0,
+    ),
     // A program larger than a page many times over, read from its file
     // as it is loaded.
     (
@@ -5538,6 +5555,7 @@ fn setup() -> Result<&'static mut State, &'static str> {
     st.spare_owner[spares..].fill(u8::MAX);
     st.fb_pages = fb_pages;
     st.shm_pages = shm_pages;
+    wl::start(st);
     let interp = map_file(INTERP_FILE, INTERP_VA, MMAPTEST_FILE - INTERP_FILE);
     let mmaptest = map_file(MMAPTEST_FILE, MMAPTEST_VA, PIGZ_FILE - MMAPTEST_FILE);
     let pigz = map_file(PIGZ_FILE, PIGZ_VA, SMPTEST_FILE - PIGZ_FILE);

@@ -1001,6 +1001,7 @@ fn linux_test(img: &Image) -> Result<(), String> {
         shot(1, "linux: > fb0: 320x240", check_linux_fb),
         shot(2, "linux: > fb0: drawn, not panned", check_linux_fb_live),
         Shot { marker: "linux: > input: ready", act: Box::new(input), result: Arc::default() },
+        shot(4, "linux: > wayland: 2 formats", check_linux_wayland),
     ];
     let results: Vec<_> = shots.iter().map(|s| s.result.clone()).collect();
     let out = drive_linux(img, LINUX_SESSION, shots);
@@ -1095,6 +1096,7 @@ fn linux_test(img: &Image) -> Result<(), String> {
         "linux: > unix: hello from the child, accepted at /tmp/sock, its credentials right; then 0",
         "linux: > memfd: drawn by the child, 12288 bytes",
         "linux: > memfd: the child sees: written back",
+        "linux: > wayland: 2 formats, configured 1, a 160x100 buffer shown, its frame done and the buffer released",
         // A program far larger than a page, loaded from its file.
         "linux: > ran a program of more than 200000 bytes",
         // Threads (clone, futexes) in pigz, and zlib loaded by musl: what
@@ -1259,6 +1261,39 @@ fn check_linux_fb(path: &Path) -> Result<String, String> {
 /// across and blue rising down (green 0x40), shown as it was drawn.
 fn check_linux_fb_live(path: &Path) -> Result<String, String> {
     check_fb(path, "shown as drawn", |x, y| [((319 - x) * 255 / 319) as u8, 0x40, (y * 255 / 239) as u8])
+}
+
+/// The Wayland client's toplevel: a window of the compositor's at (40,
+/// 40), 160x100, red rising across it and blue down (green 0x20), and the
+/// desktop in a band around it.
+fn check_linux_wayland(path: &Path) -> Result<String, String> {
+    let (at, size) = ((40, 40), (160, 100));
+    let pixels = read_screenshot(path)?;
+    let mut wrong = 0;
+    let mut first = None;
+    for y in at.1 - 8..at.1 + size.1 + 8 {
+        for x in at.0 - 8..at.0 + size.0 + 8 {
+            let inside = (at.0..at.0 + size.0).contains(&x) && (at.1..at.1 + size.1).contains(&y);
+            let want = if inside {
+                let (wx, wy) = (x - at.0, y - at.1);
+                [(wx * 255 / 159) as u8, 0x20, (wy * 255 / 99) as u8]
+            } else {
+                desktop_pixel(x, y)
+            };
+            let got = &pixels[(y * SCREEN.0 + x) * 3..][..3];
+            if got != want {
+                wrong += 1;
+                first.get_or_insert((x, y, [got[0], got[1], got[2]], want));
+            }
+        }
+    }
+    match first {
+        None => Ok(format!("the Wayland client's window on the screen: every pixel right ({})", path.display())),
+        Some((x, y, got, want)) => Err(format!(
+            "{wrong} pixels wrong in {}; the first at ({x}, {y}): {got:02x?}, want {want:02x?}",
+            path.display()
+        )),
+    }
 }
 
 /// Checks a screenshot pixel by pixel: the desktop, and over it at (240,
