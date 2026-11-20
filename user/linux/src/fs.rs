@@ -78,6 +78,8 @@ pub enum Kind {
     Null,
     /// The terminal (`/dev/tty`, `/dev/console`).
     Tty,
+    /// The framebuffer (`/dev/fb0`): a window on the compositor's screen.
+    Fb,
 }
 
 #[derive(Clone, Copy)]
@@ -157,6 +159,7 @@ impl Fs {
             let _ = self.create(dev, b"null", Kind::Null);
             let _ = self.create(dev, b"tty", Kind::Tty);
             let _ = self.create(dev, b"console", Kind::Tty);
+            let _ = self.create(dev, b"fb0", Kind::Fb);
         }
     }
 

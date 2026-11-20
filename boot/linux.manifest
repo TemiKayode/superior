@@ -25,6 +25,8 @@
 # makes empty; what the runs leave there, boot/linux-verify.manifest reads
 # back. Sockets are the network server's: the runs fetch a page over HTTP
 # from the host, have TCP and UDP echoed, and serve a connection from it.
+# /dev/fb0 is a window of the compositor's, which Linux's bochs driver
+# shows (both after the personality).
 
 # The disk under the root: PCI, its driver and the filesystem server, as
 # boot/fs.manifest has them. The personality is component 5 here and in
@@ -139,6 +141,34 @@ component linux
   uses fs 6
   # Sockets: the network server's.
   uses net 7
+  # /dev/fb0: a window of the compositor's.
+  uses window 1004
   # The terminal: the serial console's UART and its interrupt.
   device uart 3
   device uart-irq 4
+
+# The screen /dev/fb0 is shown on, as boot/desktop.manifest has it: Linux's
+# bochs driver runs the display, and the compositor is its one client.
+# After the personality, which stays component 5.
+
+component lde-bochs
+  image lde-bochs
+  priority 11
+  cspace 11
+  vspace 18
+  uses pci 0
+  provides display 1
+  notification 2
+  memory 22
+  untyped 20 3
+
+component compositor
+  image compositor
+  priority 10
+  cspace 13
+  vspace 17
+  uses display 0
+  provides window 1
+  notification 2
+  memory 22
+  untyped 21 3

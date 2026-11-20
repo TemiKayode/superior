@@ -261,6 +261,9 @@ struct Manager<'a> {
     services: [Option<(&'a str, usize)>; MAX_SERVICES],
     /// Whether the component's untyped block (and state page) exist yet.
     made: [bool; MAX_COMPONENTS],
+    /// Whether its untyped block exists yet ([`Manager::make_blocks`]
+    /// makes the boot components' first).
+    block_made: [bool; MAX_COMPONENTS],
     /// Where each component's shared pages start, once made.
     shared: [u64; MAX_COMPONENTS],
     /// The next free slot for shared pages.
@@ -288,6 +291,26 @@ impl<'a> Manager<'a> {
         self.resume(i)
     }
 
+    /// Makes the boot components' untyped blocks before anything else is
+    /// made from the manager's memory, the largest first. Memory is handed
+    /// out in order, each block aligned to its size: in this order none
+    /// leaves a gap, where in the manifest's a large block after small ones
+    /// would be put past a gap nearly as large as itself (a 64 MiB one in
+    /// 128 MiB leaving no room after it). One there is no room for is left
+    /// for [`Manager::build`] to try, and report.
+    fn make_blocks(&mut self) {
+        let boot = |c: &Option<Component>| matches!(c, Some(c) if c.start == Start::Boot);
+        for bits in (0..64u8).rev() {
+            for i in 0..MAX_COMPONENTS {
+                let c = self.manifest.components[i];
+                if boot(&c) && c.is_some_and(|c| c.memory_bits == bits) && !self.block_made[i] {
+                    let ut = BLOCKS + i as u64 * BLOCK + B_UNTYPED;
+                    self.block_made[i] = retype(root::UNTYPED, ObjectType::Untyped, bits as u64, ut).is_ok();
+                }
+            }
+        }
+    }
+
     /// Starts the thread of component `i`, built by [`Manager::build`].
     fn resume(&mut self, i: usize) -> Result<(), Failure> {
         let tcb = BLOCKS + i as u64 * BLOCK + B_THREAD;
@@ -306,8 +329,11 @@ impl<'a> Manager<'a> {
         let ut = block + B_UNTYPED;
         let (vspace, cnode, tcb) = (block + B_VSPACE, block + B_CNODE, block + B_THREAD);
         if !self.made[i] {
-            retype(root::UNTYPED, ObjectType::Untyped, c.memory_bits as u64, ut)
-                .map_err(|e| ("no memory for the component", e))?;
+            if !self.block_made[i] {
+                retype(root::UNTYPED, ObjectType::Untyped, c.memory_bits as u64, ut)
+                    .map_err(|e| ("no memory for the component", e))?;
+                self.block_made[i] = true;
+            }
             if let Some(n) = c.caps().find_map(|x| match x.kind {
                 CapKind::Shared(n) => Some(n as u64),
                 _ => None,
@@ -1566,6 +1592,7 @@ pub extern "C" fn _start(arg: u64) -> ! {
         status: [Status::NotStarted; MAX_COMPONENTS],
         services: [None; MAX_SERVICES],
         made: [false; MAX_COMPONENTS],
+        block_made: [false; MAX_COMPONENTS],
         shared: [0; MAX_COMPONENTS],
         shared_next: SHARED_PAGES,
         restarts: [[0; MAX_RESTARTS]; MAX_COMPONENTS],
@@ -1579,6 +1606,7 @@ pub extern "C" fn _start(arg: u64) -> ! {
         m.manifest.len(),
         m.bundle.len()
     );
+    m.make_blocks();
     if retype(root::UNTYPED, ObjectType::Endpoint, 0, CONTROL).is_err() {
         say!("could not make the control endpoint");
         shutdown(false);

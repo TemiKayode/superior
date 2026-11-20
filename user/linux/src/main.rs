@@ -94,10 +94,11 @@ mod tty;
 use fs::{FileKind, Fs, Kind, MAX_FILES, MAX_IMAGES, MAX_PIPES, Open, PIPE_BUF, Pipe, ROOT};
 use signal::{Action, Next, SA_RESTART, SIGALRM, SIGCHLD, SIGPIPE, SIGSEGV, SYSCALL_LEN, TRAMPOLINE, TRAMPOLINE_CODE};
 use superior_objects::abi::{
-    Error, FaultKind, FaultReply, MAP_EXEC, MAP_WRITE, ObjectType, REGS_COUNT, REGS_FOREIGN, REGS_FORK_FROM, REGS_FP_GET,
+    CapTransfer, Error, FaultKind, FaultReply, MAP_EXEC, MAP_WRITE, ObjectType, REGS_COUNT, REGS_FOREIGN, REGS_FORK_FROM, REGS_FP_GET,
     REGS_BARRIER, REGS_FP_SET, REGS_FP_WORDS, REGS_GET, REGS_SET, REGS_SET_TLS, REGS_SYSCALL, REGS_SYSCALL_MORE, REGS_TLS, Syscall, TICK_HZ,
 };
 use superior_objects::elf::{Elf, Machine, Segment};
+use superior_objects::idl::window;
 use superior_sys::{USER_BASE, print_line, syscall};
 
 macro_rules! say {
@@ -247,6 +248,21 @@ const LIBCRYPTO_VA: u64 = USER_BASE + 0x1_9600_0000;
 const LIBSSL_VA: u64 = USER_BASE + 0x1_9700_0000;
 const LIBEVENT_VA: u64 = USER_BASE + 0x1_9800_0000;
 const LIBBZ2_VA: u64 = USER_BASE + 0x1_9900_0000;
+/// The framebuffer (`/dev/fb0`): a window of the compositor's (`uses
+/// window` in the manifest), FB_W by FB_H, XRGB8888, its pages cut from
+/// a block of the rest of RAM, here at FB_VA and lent to the compositor;
+/// a process that maps it shares them. Shown where Linux's would be on a
+/// screen already: when a program pans it, writes to it or closes it.
+const WINDOWS: u64 = 1004;
+const FB_BLOCK: u64 = 9218;
+const FB_BLOCK_BITS: u64 = 19;
+const FB_SLOTS: u64 = 9219;
+const FB_W: u64 = 320;
+const FB_H: u64 = 240;
+const FB_PAGES: u64 = (FB_W * FB_H * 4).div_ceil(PAGE);
+const FB_AT: (u64, u64) = (240, 180);
+const FB_VA: u64 = USER_BASE + 0x1_9a00_0000;
+const _: () = assert!(FB_PAGES << 12 <= 1 << FB_BLOCK_BITS && FB_SLOTS + FB_PAGES <= AS_FILE);
 /// Where Alpine puts gcc's own files: under its target's name.
 const CC1_PATH: &[u8] = if cfg!(target_arch = "x86_64") {
     b"/usr/libexec/gcc/x86_64-alpine-linux-musl/12.2.1/cc1"
@@ -881,6 +897,11 @@ struct State {
     top_status: Option<u32>,
     /// The terminal (the serial console).
     tty: tty::Tty,
+    /// Whether the framebuffer's pages are there, and its window's number
+    /// plus one (0 until it is made, or once the compositor lost it).
+    fb_pages: bool,
+    fb_window: u64,
+    fb_shown: bool,
 }
 
 const _: () = assert!(core::mem::size_of::<State>() as u64 <= STATE_PAGES * PAGE);
@@ -1687,8 +1708,43 @@ impl State {
         Ok(fd as u64)
     }
 
+    /// The framebuffer's window, made (and its pages lent) the first time.
+    fn fb(&mut self) -> Result<u64, u64> {
+        if !self.fb_pages {
+            return Err(ENODEV);
+        }
+        if self.fb_window != 0 {
+            return Ok(self.fb_window - 1);
+        }
+        let ok = |m: Option<[u64; 4]>| m.filter(|m| m[0] == 0);
+        let n = ok(fb_call(window::create(FB_W | FB_H << 16, FB_AT.0 | FB_AT.1 << 16), None)).ok_or(ENODEV)?[1];
+        if !(0..FB_PAGES).all(|p| ok(fb_call(window::attach(n, p), Some(FB_SLOTS + p))).is_some()) {
+            let _ = fb_call(window::destroy(n), None);
+            return Err(ENODEV);
+        }
+        self.fb_window = n + 1;
+        Ok(n)
+    }
+
+    /// Shows the whole framebuffer as it is now; if the compositor
+    /// restarted (and lost the window), the window is made again.
+    fn fb_show(&mut self) {
+        for _ in 0..2 {
+            let Ok(n) = self.fb() else { return };
+            if fb_call(window::commit(n, FB_W << 32 | FB_H << 48), None).is_some_and(|m| m[0] == 0) {
+                if !self.fb_shown {
+                    self.fb_shown = true;
+                    say!("linux: /dev/fb0 shown: window {n}, {FB_W}x{FB_H} at {},{}", FB_AT.0, FB_AT.1);
+                }
+                return;
+            }
+            self.fb_window = 0;
+        }
+    }
+
     fn close(&mut self, i: usize, fd: usize) {
         let Some(f) = self.file(i, fd as u64) else { return };
+        let fb = self.files[f].kind == FileKind::Node && self.fs.kind(self.files[f].ino) == Kind::Fb;
         self.procs[i].fds[fd] = 0;
         self.procs[i].cloexec &= !(1 << fd);
         let o = &mut self.files[f];
@@ -1702,6 +1758,9 @@ impl State {
                 _ => {}
             }
             o.kind = FileKind::Closed;
+        }
+        if fb {
+            self.fb_show();
         }
     }
 
@@ -1791,6 +1850,7 @@ fn mode_of(kind: Kind) -> u32 {
         Kind::Image => 0o100755,
         Kind::Null => 0o20666,
         Kind::Tty => 0o20620,
+        Kind::Fb => 0o20660,
         Kind::Free => 0,
     }
 }
@@ -2138,6 +2198,9 @@ fn openat(st: &mut State, i: usize, a: [u64; 6]) -> Result<u64, u64> {
     if flags & O_TRUNC != 0 && writing && kind == Kind::File {
         st.fs.truncate(ino, 0)?;
     }
+    if kind == Kind::Fb {
+        st.fb()?;
+    }
     let fk = if kind == Kind::Tty { FileKind::Tty } else { FileKind::Node };
     let f = st.new_file(fk, ino, 0, flags).ok_or(ENFILE)?;
     st.new_fd(i, f, 0, flags & O_CLOEXEC != 0).inspect_err(|_| st.files[f].kind = FileKind::Closed)
@@ -2229,7 +2292,7 @@ fn getdents(st: &mut State, i: usize, fd: u64, buf: u64, count: u64) -> Result<u
         rec[18] = match e.kind {
             Kind::Dir => 4,
             Kind::Symlink => 10,
-            Kind::Null => 2,
+            Kind::Null | Kind::Fb => 2,
             _ => 8,
         };
         rec[19..19 + name.len()].copy_from_slice(name);
@@ -2330,6 +2393,14 @@ fn read(st: &mut State, i: usize, fd: u64, buf: u64, len: u64) -> Out {
         FileKind::Node => match st.fs.kind(o.ino) {
             Kind::Dir => return Out::Ret(err(EISDIR)),
             _ if o.flags & O_ACCMODE == O_WRONLY => return Out::Ret(err(EBADF)),
+            Kind::Fb => {
+                let n = want.min((FB_PAGES * PAGE).saturating_sub(o.off) as usize);
+                // SAFETY: the framebuffer's pages, mapped here for this
+                // server's life; n bytes from o.off lie within them.
+                tmp[..n].copy_from_slice(unsafe { core::slice::from_raw_parts((FB_VA + o.off) as *const u8, n) });
+                st.files[f].off += n as u64;
+                n
+            }
             _ => {
                 let n = st.fs.read(o.ino, o.off, &mut tmp[..want]);
                 st.files[f].off += n as u64;
@@ -2407,6 +2478,16 @@ fn write(st: &mut State, i: usize, fd: u64, buf: u64, len: u64) -> Out {
         },
         _ => match st.fs.kind(o.ino) {
             Kind::Null => n as u64,
+            // As Linux's: up to the framebuffer's end, then ENOSPC.
+            Kind::Fb if o.off >= FB_PAGES * PAGE => err(ENOSPC),
+            Kind::Fb => {
+                let n = n.min((FB_PAGES * PAGE - o.off) as usize);
+                // SAFETY: as for reading it.
+                unsafe { core::slice::from_raw_parts_mut((FB_VA + o.off) as *mut u8, n) }.copy_from_slice(&tmp[..n]);
+                st.files[f].off += n as u64;
+                st.fb_show();
+                n as u64
+            }
             _ => {
                 let at = if o.flags & O_APPEND != 0 { st.fs.size(o.ino) } else { o.off };
                 match st.fs.write(o.ino, at, &tmp[..n]) {
@@ -2653,6 +2734,29 @@ fn mmap_file(st: &mut State, i: usize, addr: u64, len: u64, prot: u64, fixed: bo
     }
     if off % PAGE != 0 {
         return Err(EINVAL);
+    }
+    // The framebuffer: its own pages, shared.
+    if st.fs.kind(o.ino) == Kind::Fb {
+        if off.checked_add(len).is_none_or(|e| e > FB_PAGES * PAGE) {
+            return Err(EINVAL);
+        }
+        let i = st.mem(i);
+        if st.procs[i].nshared == st.procs[i].shared.len() {
+            return Err(ENOMEM);
+        }
+        let at = if fixed { addr } else { st.place(i, len)? };
+        if at % PAGE != 0 || at < CHILD || at + len > STACK_TOP - STACK_PAGES * PAGE {
+            return Err(ENOMEM);
+        }
+        for page in (at..at + len).step_by(PAGE as usize) {
+            st.set_reserved(i, page, false);
+            st.unmap_private(i, page);
+        }
+        let run = Shared { start: at, end: at + len, ptr: FB_VA + off, slot: FB_SLOTS + off / PAGE, flags: MAP_WRITE };
+        let p = &mut st.procs[i];
+        p.shared[p.nshared] = run;
+        p.nshared += 1;
+        return Ok(at);
     }
     let i = st.mem(i);
     let p = &st.procs[i];
@@ -3992,6 +4096,57 @@ fn nanosleep(st: &mut State, i: usize, flags: u64, req: u64) -> Out {
 
 /// The terminal's `ioctl`s: its settings, window size and foreground
 /// group. Anything else is not a terminal.
+/// A call to the compositor, lending the page in slot `grant`: its answer,
+/// or `None` if the call failed (no compositor, or it restarted).
+fn fb_call(m: [u64; 4], grant: Option<u64>) -> Option<[u64; 4]> {
+    let x = CapTransfer { grant: grant.map(|s| s as u16), accept: None };
+    let r = superior_sys::syscall_x(Syscall::Call, WINDOWS, m, x);
+    (r.status == 0).then_some(r.msg)
+}
+
+/// The framebuffer's ioctls, as Linux's fbdev answers them: its mode
+/// (`FBIOGET_VSCREENINFO`; setting one is answered with the one it has),
+/// its layout (`FBIOGET_FSCREENINFO`), panning (which shows it) and
+/// blanking (nothing to do).
+fn fb_ioctl(st: &mut State, i: usize, cmd: u64, arg: u64) -> Result<u64, u64> {
+    const FBIOGET_VSCREENINFO: u64 = 0x4600;
+    const FBIOPUT_VSCREENINFO: u64 = 0x4601;
+    const FBIOGET_FSCREENINFO: u64 = 0x4602;
+    const FBIOPAN_DISPLAY: u64 = 0x4606;
+    const FBIOBLANK: u64 = 0x4611;
+    let word = |b: &mut [u8], at: usize, v: u64| b[at..at + 4].copy_from_slice(&(v as u32).to_le_bytes());
+    match cmd {
+        FBIOGET_VSCREENINFO | FBIOPUT_VSCREENINFO => {
+            // struct fb_var_screeninfo: the visible and virtual sizes, 32
+            // bits a pixel, red, green and blue (offset, length) at 16, 8
+            // and 0, and the screen's size in millimetres unknown.
+            let mut v = [0u8; 160];
+            for (at, x) in [(0, FB_W), (4, FB_H), (8, FB_W), (12, FB_H), (24, 32), (32, 16), (36, 8), (44, 8), (48, 8), (60, 8)] {
+                word(&mut v, at, x);
+            }
+            word(&mut v, 88, u32::MAX as u64);
+            word(&mut v, 92, u32::MAX as u64);
+            st.put(i, arg, &v)
+        }
+        FBIOGET_FSCREENINFO => {
+            // struct fb_fix_screeninfo: its name, length, packed pixels in
+            // true colour, and the bytes from one row to the next.
+            let mut f = [0u8; 80];
+            f[..8].copy_from_slice(b"superior");
+            word(&mut f, 24, FB_PAGES * PAGE);
+            word(&mut f, 36, 2);
+            word(&mut f, 48, FB_W * 4);
+            st.put(i, arg, &f)
+        }
+        FBIOPAN_DISPLAY => {
+            st.fb_show();
+            Ok(0)
+        }
+        FBIOBLANK => Ok(0),
+        _ => Err(ENOTTY),
+    }
+}
+
 fn ioctl(st: &mut State, i: usize, fd: u64, cmd: u64, arg: u64) -> Result<u64, u64> {
     const TCGETS: u64 = 0x5401;
     const TCSETS: u64 = 0x5402;
@@ -4006,6 +4161,9 @@ fn ioctl(st: &mut State, i: usize, fd: u64, cmd: u64, arg: u64) -> Result<u64, u
     const TIOCNOTTY: u64 = 0x5422;
     const TIOCGSID: u64 = 0x5429;
     let f = st.file(i, fd).ok_or(EBADF)?;
+    if st.files[f].kind == FileKind::Node && st.fs.kind(st.files[f].ino) == Kind::Fb {
+        return fb_ioctl(st, i, cmd, arg);
+    }
     if st.files[f].kind != FileKind::Tty {
         return Err(ENOTTY);
     }
@@ -4207,6 +4365,16 @@ const RUNS: &[(&[&str], u32)] = &[
         ],
         0,
     ),
+    // The framebuffer: a program reads its mode and layout, maps it, draws
+    // a gradient (red across, green down) and pans it, which shows it.
+    (
+        &[
+            "sh",
+            "-c",
+            r#"cd /tmp/cc && printf 'int open(const char *, int, ...); int ioctl(int, unsigned long, ...); void *mmap(void *, unsigned long, int, int, int, long); int printf(const char *, ...);\nint main(void) { unsigned v[40], f[20]; int fd = open("/dev/fb0", 2); if (fd < 0 || ioctl(fd, 0x4600, v) || ioctl(fd, 0x4602, f)) return 1; unsigned w = v[0], h = v[1], line = f[12]; unsigned *p = mmap(0, f[6], 3, 1, fd, 0); if (p == (void *)-1) return 2; for (unsigned y = 0; y < h; y++) for (unsigned x = 0; x < w; x++) p[y * (line / 4) + x] = x * 255 / (w - 1) << 16 | y * 255 / (h - 1) << 8 | 0x80; ioctl(fd, 0x4606, v); printf("fb0: %%ux%%u, %%u bits, line %%u\\n", w, h, v[6], line); return 0; }\n' > fb.c && tcc -o fb fb.c && ./fb"#,
+        ],
+        0,
+    ),
     // A program larger than a page many times over, read from its file
     // as it is loaded.
     (
@@ -4329,6 +4497,19 @@ fn setup() -> Result<&'static mut State, &'static str> {
         sys(Syscall::Retype, EXEC_BLOCK, [ObjectType::Frame as u64, 0, EXEC_SLOTS + p, 0]).map_err(|_| "no memory")?;
         sys(Syscall::FrameMap, EXEC_SLOTS + p, [EXEC_VA + p * PAGE, 1, 0, 0]).map_err(|_| "no room")?;
     }
+    // The framebuffer's pages, where there is a compositor to show them
+    // (none on the second boot).
+    let fb_pages = superior_sys::syscall(Syscall::Call, WINDOWS, window::info()).status == 0 && {
+        while from < UNTYPED_SPARE + UNTYPED_SPARE_COUNT
+            && sys(Syscall::Retype, from, [ObjectType::Untyped as u64, FB_BLOCK_BITS, FB_BLOCK, 0]).is_err()
+        {
+            from += 1;
+        }
+        (0..FB_PAGES).all(|p| {
+            sys(Syscall::Retype, FB_BLOCK, [ObjectType::Frame as u64, 0, FB_SLOTS + p, 0]).is_ok()
+                && sys(Syscall::FrameMap, FB_SLOTS + p, [FB_VA + p * PAGE, 1, 0, 0]).is_ok()
+        })
+    };
     // Then as many spare blocks as the rest has room for (the more, the
     // larger a process can grow), at least one.
     let mut spares = 0;
@@ -4363,6 +4544,7 @@ fn setup() -> Result<&'static mut State, &'static str> {
     let st = unsafe { &mut *(STATE_VA as *mut State) };
     // Spare blocks there was no room for: never lent.
     st.spare_owner[spares..].fill(u8::MAX);
+    st.fb_pages = fb_pages;
     let interp = map_file(INTERP_FILE, INTERP_VA, MMAPTEST_FILE - INTERP_FILE);
     let mmaptest = map_file(MMAPTEST_FILE, MMAPTEST_VA, PIGZ_FILE - MMAPTEST_FILE);
     let pigz = map_file(PIGZ_FILE, PIGZ_VA, SMPTEST_FILE - PIGZ_FILE);

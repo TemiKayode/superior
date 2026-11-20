@@ -456,7 +456,7 @@ const LINUX_SOURCES: [(&str, &str, &str); 5] = [
 /// a network test's, the display tests', or the audio test's.
 fn linux_driver(manifest: &str) -> Option<&'static str> {
     match manifest {
-        "display" | "desktop" | "input" | "windows" | "toolkit" | "panel" | "resize" | "widgets" | "notes" => Some("bochs"),
+        "display" | "desktop" | "input" | "windows" | "toolkit" | "panel" | "resize" | "widgets" | "notes" | "linux" => Some("bochs"),
         "audio" => Some("es1370"),
         _ => linux_nic(manifest).map(|l| l.0),
     }
@@ -872,8 +872,10 @@ const LINUX_PROMPT: &str = "linux$ ";
 
 /// Boots `img` and types `script` into the Linux personality's terminal
 /// (see [`LINUX_SESSION`]); all the output once QEMU exits with the pass
-/// code.
-fn drive_linux(img: &Image, script: &[(&str, &str, bool)]) -> Result<String, String> {
+/// code. With `shot`, once its marker is in the output, `check` is run on
+/// screenshots (a few, a fifth of a second apart, until one passes); what
+/// the last answered is left in `shot`'s result.
+fn drive_linux(img: &Image, script: &[(&str, &str, bool)], shot: Option<Shot>) -> Result<String, String> {
     let mut child = qemu_command(img)
         .args(["-display", "none"])
         .stdin(Stdio::piped())
@@ -884,6 +886,7 @@ fn drive_linux(img: &Image, script: &[(&str, &str, bool)]) -> Result<String, Str
     let mut stdout = child.stdout.take().unwrap();
     let seen = Arc::new(Mutex::new(Vec::<u8>::new()));
     let sink = Arc::clone(&seen);
+    let mut shot = shot;
     std::thread::spawn(move || {
         let mut buf = [0u8; 256];
         while let Ok(n) = stdout.read(&mut buf) {
@@ -892,7 +895,21 @@ fn drive_linux(img: &Image, script: &[(&str, &str, bool)]) -> Result<String, Str
             }
             let _ = std::io::stdout().write_all(&buf[..n]);
             let _ = std::io::stdout().flush();
-            sink.lock().unwrap().extend_from_slice(&buf[..n]);
+            let mut all = sink.lock().unwrap();
+            all.extend_from_slice(&buf[..n]);
+            let ready = shot.as_ref().is_some_and(|s| String::from_utf8_lossy(&all).contains(s.marker));
+            drop(all);
+            if let Some(s) = shot.take_if(|_| ready) {
+                let mut last = Err("no screenshot".to_string());
+                for _ in 0..5 {
+                    last = screendump(&s.path).and_then(|()| (s.check)(&s.path));
+                    if last.is_ok() {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+                *s.result.lock().unwrap() = Some(last);
+            }
         }
     });
     // The batch runs come first: the first prompt may take a while.
@@ -964,10 +981,24 @@ fn linux_test(img: &Image) -> Result<(), String> {
     std::fs::write(&disk, vec![0u8; 16 << 20]).map_err(|e| format!("writing {}: {e}", disk.display()))?;
     let stop = Arc::new(AtomicBool::new(false));
     let (servers, served) = linux_net_servers(stop.clone())?;
-    let out = drive_linux(img, LINUX_SESSION);
+    let path = root().join("target").join(format!("linux-fb-{}.ppm", img.arch.name()));
+    let _ = std::fs::remove_file(&path);
+    let shot = Shot {
+        marker: "linux: > fb0: 320x240",
+        path,
+        check: check_linux_fb,
+        result: Arc::default(),
+    };
+    let fb = shot.result.clone();
+    let out = drive_linux(img, LINUX_SESSION, Some(shot));
     stop.store(true, Ordering::Relaxed);
     servers.into_iter().for_each(|s| _ = s.join());
     let out = out?;
+    match fb.lock().unwrap().take() {
+        Some(Ok(said)) => println!("== {said}"),
+        Some(Err(e)) => return Err(format!("Linux personality test: the framebuffer: {e}")),
+        None => return Err("Linux personality test: no screenshot of the framebuffer".into()),
+    }
     if !served.lock().unwrap().contains("served from Linux") {
         return Err("Linux personality test: the connection to the guest's nc was not served".into());
     }
@@ -1036,6 +1067,9 @@ fn linux_test(img: &Image) -> Result<(), String> {
         "linux: > vfork shared: 42",
         // epoll: nothing ready, then a blocking wait woken by a write.
         "linux: > epoll: 0 ready, then 1, data 7",
+        // The framebuffer: its window shown when the program pans it.
+        "linux: /dev/fb0 shown: window 0, 320x240 at 240,180",
+        "linux: > fb0: 320x240, 32 bits, line 1280",
         // A program far larger than a page, loaded from its file.
         "linux: > ran a program of more than 200000 bytes",
         // Threads (clone, futexes) in pigz, and zlib loaded by musl: what
@@ -1180,6 +1214,48 @@ const LINUX_HTTPS_PORT: u16 = 47443;
 const LINUX_PAGE: &str = "<html><head><title>Superior</title></head><body>\
 <h1>A page for links</h1><p>Fetched over HTTP and <b>rendered by links</b> on Superior.</p>\
 <ul><li>first item</li><li>second item</li></ul></body></html>\n";
+
+/// A screenshot [`drive_linux`] takes once `marker` is in the output, and
+/// what `check` said of it.
+struct Shot {
+    marker: &'static str,
+    path: PathBuf,
+    check: fn(&Path) -> Result<String, String>,
+    result: Arc<Mutex<Option<Result<String, String>>>>,
+}
+
+/// Checks the Linux test's screenshot pixel by pixel: the desktop, and
+/// over it at (240, 180) the 320x240 window its program drew in
+/// /dev/fb0, red rising across it and green down (blue 0x80).
+fn check_linux_fb(path: &Path) -> Result<String, String> {
+    let (at, size) = ((240, 180), (320, 240));
+    let pixels = read_screenshot(path)?;
+    let mut wrong = 0;
+    let mut first = None;
+    for y in 0..SCREEN.1 {
+        for x in 0..SCREEN.0 {
+            let inside = (at.0..at.0 + size.0).contains(&x) && (at.1..at.1 + size.1).contains(&y);
+            let want = if inside {
+                let (wx, wy) = (x - at.0, y - at.1);
+                [(wx * 255 / (size.0 - 1)) as u8, (wy * 255 / (size.1 - 1)) as u8, 0x80]
+            } else {
+                desktop_pixel(x, y)
+            };
+            let got = &pixels[(y * SCREEN.0 + x) * 3..][..3];
+            if got != want {
+                wrong += 1;
+                first.get_or_insert((x, y, [got[0], got[1], got[2]], want));
+            }
+        }
+    }
+    match first {
+        None => Ok(format!("the framebuffer's window on the screen: every pixel right ({})", path.display())),
+        Some((x, y, got, want)) => Err(format!(
+            "{wrong} pixels wrong in {}; the first at ({x}, {y}): {got:02x?}, want {want:02x?}",
+            path.display()
+        )),
+    }
+}
 
 /// The host's side of the Linux personality's sockets, until `stop`: a
 /// page over HTTP, the TCP and UDP echoes, and a client that connects in
@@ -1855,7 +1931,7 @@ fn image_sealed(
         monitor: manifest == "suspend",
         display: matches!(
             manifest,
-            "display" | "desktop" | "input" | "windows" | "cursor" | "toolkit" | "panel" | "resize" | "widgets" | "notes"
+            "display" | "desktop" | "input" | "windows" | "cursor" | "toolkit" | "panel" | "resize" | "widgets" | "notes" | "linux"
         ),
         gpu: manifest == "cursor",
         audio: (manifest == "audio").then(|| audio_wav(arch)),

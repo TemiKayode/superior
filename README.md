@@ -1923,6 +1923,23 @@ holds the rest):
   -dump` on the page with `SSL_CERT_FILE` naming the CA, which renders it
   as over HTTP, then without it, which OpenSSL refuses (`Invalid
   certificate`, links' status 1), on both ISAs.
+- The Linux personality draws on the screen: `/dev/fb0`, Linux's
+  framebuffer, is a 320x240 window of the compositor's (`uses window`).
+  Its 75 pages (XRGB8888) are cut from the rest of RAM, if there is a
+  compositor, and lent to it when a program first opens the device. A
+  program reads the mode and layout with `FBIOGET_VSCREENINFO` and
+  `FBIOGET_FSCREENINFO` (setting a mode is answered with the one it has),
+  and maps the pages, shared, or reads and writes them. The window is
+  shown when the program pans (`FBIOPAN_DISPLAY`), writes or closes the
+  device, and made again if the compositor restarted. `boot/linux.manifest`
+  now has Linux's bochs driver and the compositor, after the personality.
+  For the room, the Component Manager now makes the boot components'
+  memory blocks first, the largest first. Blocks are aligned to their
+  size, so in manifest order the personality's 64 MiB block left no room
+  after it in the manager's 128 MiB. `linux-test` compiles a program with
+  tcc that draws a gradient into the mapped framebuffer and pans it. QEMU's
+  screenshot must then have every pixel right: the desktop, and the window
+  at (240, 180). It passes on both ISAs.
 - Interrupt and exception entries clear the direction flag. User code may be
   interrupted mid-way through a backward copy, with the flag set; the kernel's own
   copies need it clear, and without the `cld` they ran backwards, wrecking saved
