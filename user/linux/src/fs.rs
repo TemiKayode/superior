@@ -132,7 +132,7 @@ pub struct Fs {
 }
 
 /// Files from the bundle at most.
-pub const MAX_IMAGES: usize = 34;
+pub const MAX_IMAGES: usize = 37;
 
 impl Fs {
     /// Makes the tree: each of `images` (the bundle's files) at its path,

@@ -544,7 +544,7 @@ fn alpine_files(arch: Arch) -> Result<Vec<(String, Vec<u8>)>, String> {
 /// bundle file of the name given, or, for a name starting with `/`, into
 /// the toolchain's archive at that path.)
 type ToolPackage = (&'static str, &'static str, &'static str, &'static [(&'static str, &'static str)]);
-const TOOLCHAIN_X86_64: [ToolPackage; 19] = [
+const TOOLCHAIN_X86_64: [ToolPackage; 22] = [
     ("v3.22/community", "tcc-0.9.27_git20250106-r0", "db4720f2f9c6c5cf46812d52af151cbeaa95c0e4676aa956b3e57b2c3ad9802a", &[("usr/bin/tcc", "tcc")]),
     ("v3.22/community", "tcc-libs-0.9.27_git20250106-r0", "f0d06346af0ffd0d4bca073d56b51e6baaa2825b82996a58ddf6a31dba5df2d0", &[("usr/lib/libtcc.so", "libtcc")]),
     ("v3.22/community", "tcc-libs-static-0.9.27_git20250106-r0", "2aab7f70b8f8918ebe431f9b77193a6f43b72c9206b0e5c7b35fe3975e64f3a9", TCC_RUNTIME),
@@ -563,9 +563,12 @@ const TOOLCHAIN_X86_64: [ToolPackage; 19] = [
     ("v3.18/main", "libcrypto3-3.1.8-r0", "153652a07bd2bbf3ccb68d45241f23f1985659c201c9b2ac8defb07033e9086a", LIBCRYPTO),
     ("v3.18/main", "libssl3-3.1.8-r0", "bf43d9ce52524ff80d9f2f0a169ed3183c735f0c18522df2196a15ecd6fa17ed", LIBSSL),
     ("v3.18/main", "libevent-2.1.12-r6", "53079cb4aefcc8a05bdbdbc1e0890b98494d9bc6ce9dffa90d94f37f06ea4102", LIBEVENT),
+    ("v3.18/main", "wayland-libs-client-1.22.0-r2", "e1e9d59ad6e2f586cba15ef3eae3b933eb32b77837cf0f261ca080a74115b33f", WAYLAND),
+    ("v3.18/main", "libffi-3.4.4-r2", "a07676cad2fa65da8b86446fbc46f7b6838931c1dcf03c26ee16b1daa01f39c3", LIBFFI),
+    ("v3.18/main", "libxkbcommon-1.5.0-r2", "baafc5eda77e4f660af9e124481eb4a895ad314a8e7d205755b85b7d271645fe", XKBCOMMON),
     ("v3.18/main", "libbz2-1.0.8-r5", "4308508dc2c73a2d8d265d4a6ed5fc388adb481178bcf469a09d3f65261b2e7a", LIBBZ2),
 ];
-const TOOLCHAIN_AARCH64: [ToolPackage; 19] = [
+const TOOLCHAIN_AARCH64: [ToolPackage; 22] = [
     ("v3.22/community", "tcc-0.9.27_git20250106-r0", "556e5a32cb2b7270c0007039143a905160b7dbadd3deca7e3710c760623a50dc", &[("usr/bin/tcc", "tcc")]),
     ("v3.22/community", "tcc-libs-0.9.27_git20250106-r0", "93e9707704d398f88c2292d115db22f5a10a98d87e0fbf466940e06ca4a386fb", &[("usr/lib/libtcc.so", "libtcc")]),
     ("v3.22/community", "tcc-libs-static-0.9.27_git20250106-r0", "5dc97008751c0770cad9ad94c29cc5bf2a19e555fd37313b3eb256aabe973245", TCC_RUNTIME),
@@ -584,6 +587,9 @@ const TOOLCHAIN_AARCH64: [ToolPackage; 19] = [
     ("v3.18/main", "libcrypto3-3.1.8-r0", "877615578c6da0dd8c35f70b432c97945ff892af4df9172a698bb7ae4e57485f", LIBCRYPTO),
     ("v3.18/main", "libssl3-3.1.8-r0", "5901f5d6f033a70c99b2748ed150805f852447e51d89526e2ee4369d67efffb0", LIBSSL),
     ("v3.18/main", "libevent-2.1.12-r6", "10a4ba4f39321f31471641d62fc4a18a89a2ff93b69ec6e9ab4efda009d96770", LIBEVENT),
+    ("v3.18/main", "wayland-libs-client-1.22.0-r2", "8fac2c668be256ab15ba7998dc2bc595038a2f580878f7da56813a54971a31a8", WAYLAND),
+    ("v3.18/main", "libffi-3.4.4-r2", "87d1e17785b654351efa2aca7ee27c61453237690802cdc90b21f1feaa323793", LIBFFI),
+    ("v3.18/main", "libxkbcommon-1.5.0-r2", "353091501c787e135f6a94db97fae91ce843bc694d2cd8b33cc48d825863ebfc", XKBCOMMON),
     ("v3.18/main", "libbz2-1.0.8-r5", "76674b200330aa13d1aa9f0d1084e04fa173b51a05f75c376001557b200d92b2", LIBBZ2),
 ];
 /// gcc: the driver (its own name on AArch64, `gcc` a link to it), cc1,
@@ -630,6 +636,12 @@ const LIBCRYPTO: &[(&str, &str)] = &[("lib/libcrypto.so.3", "libcrypto")];
 const LIBSSL: &[(&str, &str)] = &[("lib/libssl.so.3", "libssl")];
 const LIBEVENT: &[(&str, &str)] = &[("usr/lib/libevent-2.1.so.7.0.1", "libevent")];
 const LIBBZ2: &[(&str, &str)] = &[("usr/lib/libbz2.so.1.0.8", "libbz2")];
+/// libwayland's client library, the libffi it calls through, and
+/// libxkbcommon, which reads a compositor's keymap: what a Wayland
+/// program links against.
+const WAYLAND: &[(&str, &str)] = &[("usr/lib/libwayland-client.so.0.22.0", "libwayland")];
+const LIBFFI: &[(&str, &str)] = &[("usr/lib/libffi.so.8.1.2", "libffi")];
+const XKBCOMMON: &[(&str, &str)] = &[("usr/lib/libxkbcommon.so.0.0.0", "libxkbcommon")];
 /// as and ld and the libraries they load. Each package has as and ld
 /// once, the other names hard links to them: in `/usr/bin` on x86-64, in
 /// the target's own directory on AArch64.
@@ -711,6 +723,9 @@ fn toolchain_files(arch: Arch) -> Result<Vec<(String, Vec<u8>)>, String> {
         }
     }
     ustar_entry(&mut archive, "usr/lib/libc.so", &[], Some(&format!("/lib/ld-musl-{isa}.so.1")))?;
+    // The names a program is linked by (-lwayland-client, -lxkbcommon).
+    ustar_entry(&mut archive, "usr/lib/libwayland-client.so", &[], Some("/usr/lib/libwayland-client.so.0"))?;
+    ustar_entry(&mut archive, "usr/lib/libxkbcommon.so", &[], Some("/usr/lib/libxkbcommon.so.0"))?;
     // The test's CA, which its runs point OpenSSL at (SSL_CERT_FILE): not
     // /etc, which is the disk's.
     ustar_entry(&mut archive, "usr/share/ca/superior-test.pem", linux_tls()?.0.as_bytes(), None)?;
@@ -1003,12 +1018,19 @@ fn linux_test(img: &Image) -> Result<(), String> {
         let acts = [Act::Tablet(140, 90), Act::Button(true), Act::Button(false), Act::Type("hi")];
         acts.iter().try_for_each(|a| input_act(a, arch).map(drop)).map(|()| "clicked and typed on the Wayland window".to_string())
     };
+    // And on the libwayland client's: Shift held for two of the keys,
+    // which its keymap (XKB's) makes "Hi!".
+    let xkb_input = move || {
+        let acts = [Act::Tablet(140, 90), Act::Button(true), Act::Button(false), Act::Key("shift+h"), Act::Type("i"), Act::Key("shift+1")];
+        acts.iter().try_for_each(|a| input_act(a, arch).map(drop)).map(|()| "clicked and typed on the libwayland window".to_string())
+    };
     let shots = vec![
         shot(1, "linux: > fb0: 320x240", check_linux_fb),
         shot(2, "linux: > fb0: drawn, not panned", check_linux_fb_live),
         Shot { marker: "linux: > input: ready", act: Box::new(input), result: Arc::default() },
         shot(4, "linux: > wayland: 2 formats", check_linux_wayland),
         Shot { marker: "linux: > wayland: input ready", act: Box::new(wayland_input), result: Arc::default() },
+        Shot { marker: "linux: > xkb: ready", act: Box::new(xkb_input), result: Arc::default() },
     ];
     let results: Vec<_> = shots.iter().map(|s| s.result.clone()).collect();
     let out = drive_linux(img, LINUX_SESSION, shots);
@@ -1105,7 +1127,9 @@ fn linux_test(img: &Image) -> Result<(), String> {
         "linux: > memfd: the child sees: written back",
         "linux: > wayland: 2 formats, configured 1, a 160x100 buffer shown, its frame done and the buffer released",
         "linux: > wayland: input ready",
-        "linux: > wayland: seat 3, pointer at 100,50, left pressed and let go; keyboard entered 1, keymap 0 with 1 fd, keys 35 1, 35 0, 23 1, 23 0",
+        "linux: > wayland: seat 3, pointer at 100,50, left pressed and let go; keyboard entered 1, keymap 1 with 1 fd, keys 35 1, 35 0, 23 1, 23 0",
+        "linux: > xkb: ready",
+        "linux: > xkb: keymap 1 of 6491 bytes, layout English (US); typed Hi!",
         // A program far larger than a page, loaded from its file.
         "linux: > ran a program of more than 200000 bytes",
         // Threads (clone, futexes) in pigz, and zlib loaded by musl: what

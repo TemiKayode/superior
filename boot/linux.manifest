@@ -90,10 +90,11 @@ component linux
   image linux
   priority 10
   # Its CNode (2^16 slots: the state's and files' pages, the files,
-  # glibc's from 8192, the toolchain's from 8832, the buffer at 9216,
-  # binutils' from 9472, gcc's from 11072, links' from 21552, and a
-  # 5888-slot span per process from 23552), address space, image, stack,
-  # the thirty-five files (copied into its memory, 64 MiB for them; its
+  # glibc's from 8192, the toolchain's from 8832, binutils' from 9472,
+  # gcc's from 11072, links' from 21552, a 5888-slot span per process
+  # from 23552, then the shared pages, the exec buffer and the
+  # framebuffer's), address space, image, stack,
+  # the thirty-eight files (copied into its memory, 64 MiB for them; its
   # processes' memory is cut from the rest of RAM).
   memory 26
   cspace 16
@@ -135,6 +136,11 @@ component linux
   file libssl 23216
   file libevent 23376
   file libbz2 23472
+  # libwayland's client library, libffi and libxkbcommon: in the slots
+  # after the framebuffer's, at the CNode's end.
+  file libwayland 65360
+  file libffi 65392
+  file libxkbcommon 65424
   # The rest of RAM, for the spare blocks (slots 920 on).
   untyped spare 920
   control 1

@@ -54,8 +54,9 @@
 //! from 213, zlib's from 216, fptest's from 250, BusyBox's from 252, and
 //! glibc's dynamic linker's from 8192, hello's from 8256, glibc's from
 //! 8320, the toolchain's from 8832 (tcc, make, libtcc, the archive of the
-//! rest), the exec buffer at 9216, and binutils' from 9472 (as, ld and
-//! their libraries) (`file` in the manifest). Process `i` owns the
+//! rest), and binutils' from 9472 (as, ld and their libraries) (`file`
+//! in the manifest); the exec buffer and the framebuffer after the shared
+//! pages, at the end. Process `i` owns the
 //! slots from `PROC_SLOTS + i * PROC_SPAN` (16384 on, 2048 each): its
 //! address space, then its threads (each with a badged fault endpoint)
 //! and pages as made, two slots a page (its frame and the mirror's copy),
@@ -151,18 +152,18 @@ const LIBC_FILE: u64 = 8320;
 const LIBC_PAGES: u64 = 512;
 /// The toolchain: tcc, make, tcc's library, and an archive (ustar) of the
 /// rest (C headers, start files, runtime libraries, gcc's linker plugin;
-/// up to 512 KiB), unpacked into the tree here.
+/// up to 1.5 MiB), unpacked into the tree here.
 const TCC_FILE: u64 = 8832;
 const MAKE_FILE: u64 = 8864;
 const LIBTCC_FILE: u64 = 8960;
 const TOOLS_FILE: u64 = 9088;
-const TOOLS_END: u64 = EXEC_BLOCK;
+const TOOLS_END: u64 = AS_FILE;
 /// Where the first page of a program in a file of the tree (not the
 /// bundle's) is read, for its headers, as it is loaded: `EXEC_PAGES`
 /// pages cut from a block of the rest of RAM. Its segments are read from
-/// the file a page at a time.
-const EXEC_BLOCK: u64 = 9216;
-const EXEC_SLOTS: u64 = 9217;
+/// the file a page at a time. In the slots after the shared pages'.
+const EXEC_BLOCK: u64 = SHM_SLOTS + SHM_PAGES;
+const EXEC_SLOTS: u64 = EXEC_BLOCK + 1;
 const EXEC_PAGES: u64 = 1;
 /// GNU binutils' assembler and linker, their libraries (BFD, CTF, SFrame,
 /// and the opcodes AArch64's assembler links to) and zstd's, which BFD
@@ -194,6 +195,14 @@ const LIBSSL_FILE: u64 = 23216;
 const LIBEVENT_FILE: u64 = 23376;
 const LIBBZ2_FILE: u64 = 23472;
 const LINKS_END: u64 = 23504;
+/// libwayland's client library, the libffi it calls through, and
+/// libxkbcommon: what a Wayland program links against. After the
+/// framebuffer's slots, at the CNode's end.
+const LIBWAYLAND_FILE: u64 = 65360;
+const LIBFFI_FILE: u64 = 65392;
+const LIBXKBCOMMON_FILE: u64 = 65424;
+const WAYLAND_END: u64 = 65520;
+const _: () = assert!(FB_SLOTS + FB_PAGES <= LIBWAYLAND_FILE && WAYLAND_END <= 1 << 16);
 const STATE_SLOTS: u64 = 512;
 const STATE_PAGES: u64 = 128;
 const POOL_SLOTS: u64 = STATE_SLOTS + STATE_PAGES;
@@ -253,15 +262,18 @@ const LIBCRYPTO_VA: u64 = USER_BASE + 0x1_9600_0000;
 const LIBSSL_VA: u64 = USER_BASE + 0x1_9700_0000;
 const LIBEVENT_VA: u64 = USER_BASE + 0x1_9800_0000;
 const LIBBZ2_VA: u64 = USER_BASE + 0x1_9900_0000;
+const LIBWAYLAND_VA: u64 = USER_BASE + 0x1_9d00_0000;
+const LIBFFI_VA: u64 = USER_BASE + 0x1_9e00_0000;
+const LIBXKBCOMMON_VA: u64 = USER_BASE + 0x1_9f00_0000;
 /// The framebuffer (`/dev/fb0`): a window of the compositor's (`uses
 /// window` in the manifest), FB_W by FB_H, XRGB8888, its pages cut from
 /// a block of the rest of RAM, here at FB_VA and lent to the compositor;
 /// a process that maps it shares them. Shown where Linux's would be on a
 /// screen already: when a program pans it, writes to it or closes it.
 const WINDOWS: u64 = 1004;
-const FB_BLOCK: u64 = 9218;
+const FB_BLOCK: u64 = EXEC_SLOTS + EXEC_PAGES;
 const FB_BLOCK_BITS: u64 = 19;
-const FB_SLOTS: u64 = 9219;
+const FB_SLOTS: u64 = FB_BLOCK + 1;
 const FB_W: u64 = 320;
 const FB_H: u64 = 240;
 const FB_PAGES: u64 = (FB_W * FB_H * 4).div_ceil(PAGE);
@@ -270,7 +282,7 @@ const FB_VA: u64 = USER_BASE + 0x1_9a00_0000;
 /// While a process has the framebuffer mapped, it is shown as it is drawn,
 /// as a screen would show it: every FB_PERIOD ticks (25 times a second).
 const FB_PERIOD: u64 = TICK_HZ / 25;
-const _: () = assert!(FB_PAGES << 12 <= 1 << FB_BLOCK_BITS && FB_SLOTS + FB_PAGES <= AS_FILE);
+const _: () = assert!(FB_PAGES << 12 <= 1 << FB_BLOCK_BITS && FB_SLOTS + FB_PAGES <= 1 << 16);
 /// Shared memory (`memfd_create`): a block of the rest of RAM cut into
 /// SHM_PAGES pages, here at SHM_VA, in the slots after the processes'.
 /// A memory file holds a run of them, which the processes that map it
@@ -5381,6 +5393,17 @@ const RUNS: &[(&[&str], u32)] = &[
         ],
         0,
     ),
+    // A Wayland client built on libwayland, linked by tcc against it and
+    // libxkbcommon: it shows a toplevel, compiles the server's keymap,
+    // and makes text of the keys the host types (Shift held for two).
+    (
+        &[
+            "sh",
+            "-c",
+            r#"cd /tmp/cc && printf 'typedef struct { const char *name, *sig; const void **types; } M;\ntypedef struct { const char *name; int version, nm; const M *m; int ne; const M *e; } I;\nvoid *wl_display_connect(const char *); int wl_display_roundtrip(void *); int wl_display_dispatch(void *);\nvoid *wl_proxy_marshal_flags(void *, unsigned, const I *, unsigned, unsigned, ...); int wl_proxy_add_listener(void *, void *, void *);\nvoid *xkb_context_new(int); void *xkb_keymap_new_from_string(void *, const char *, int, int); void *xkb_state_new(void *);\nint xkb_state_update_mask(void *, unsigned, unsigned, unsigned, unsigned, unsigned, unsigned); int xkb_state_key_get_utf8(void *, unsigned, char *, unsigned long); const char *xkb_keymap_layout_get_name(void *, unsigned);\nint memfd_create(const char *, unsigned); int ftruncate(int, long); void *mmap(void *, unsigned long, int, int, int, long); int close(int); unsigned sleep(unsigned);\nint printf(const char *, ...); int fflush(void *); int strcmp(const char *, const char *);\nconst void *nul[8];\nM reg_m[] = { { "bind", "usun", nul } }, reg_e[] = { { "global", "usu", nul }, { "global_remove", "u", nul } };\nI reg_i = { "wl_registry", 1, 1, reg_m, 2, reg_e };\nM comp_m[] = { { "create_surface", "n", nul }, { "create_region", "n", nul } };\nI comp_i = { "wl_compositor", 4, 2, comp_m, 0, 0 };\nM shm_m[] = { { "create_pool", "nhi", nul } }, shm_e[] = { { "format", "u", nul } };\nI shm_i = { "wl_shm", 1, 1, shm_m, 1, shm_e };\nM pool_m[] = { { "create_buffer", "niiiiu", nul }, { "destroy", "", nul }, { "resize", "i", nul } };\nI pool_i = { "wl_shm_pool", 1, 3, pool_m, 0, 0 };\nM buf_m[] = { { "destroy", "", nul } }, buf_e[] = { { "release", "", nul } };\nI buf_i = { "wl_buffer", 1, 1, buf_m, 1, buf_e };\nM surf_m[] = { { "destroy", "", nul }, { "attach", "?oii", nul }, { "damage", "iiii", nul }, { "frame", "n", nul }, { "set_opaque_region", "?o", nul }, { "set_input_region", "?o", nul }, { "commit", "", nul } }, surf_e[] = { { "enter", "o", nul }, { "leave", "o", nul } };\nI surf_i = { "wl_surface", 4, 7, surf_m, 2, surf_e };\nM wm_m[] = { { "destroy", "", nul }, { "create_positioner", "n", nul }, { "get_xdg_surface", "no", nul }, { "pong", "u", nul } }, wm_e[] = { { "ping", "u", nul } };\nI wm_i = { "xdg_wm_base", 1, 4, wm_m, 1, wm_e };\nM xs_m[] = { { "destroy", "", nul }, { "get_toplevel", "n", nul }, { "get_popup", "n?oo", nul }, { "set_window_geometry", "iiii", nul }, { "ack_configure", "u", nul } }, xs_e[] = { { "configure", "u", nul } };\nI xs_i = { "xdg_surface", 1, 5, xs_m, 1, xs_e };\nM tl_m[] = { { "destroy", "", nul }, { "set_parent", "?o", nul }, { "set_title", "s", nul } }, tl_e[] = { { "configure", "iia", nul }, { "close", "", nul } };\nI tl_i = { "xdg_toplevel", 1, 3, tl_m, 2, tl_e };\nM seat_m[] = { { "get_pointer", "n", nul }, { "get_keyboard", "n", nul } }, seat_e[] = { { "capabilities", "u", nul }, { "name", "2s", nul } };\nI seat_i = { "wl_seat", 5, 2, seat_m, 2, seat_e };\nM kb_m[] = { { "release", "3", nul } }, kb_e[] = { { "keymap", "uhu", nul }, { "enter", "uoa", nul }, { "leave", "uo", nul }, { "key", "uuuu", nul }, { "modifiers", "uuuuu", nul }, { "repeat_info", "4ii", nul } };\nI kb_i = { "wl_keyboard", 5, 1, kb_m, 6, kb_e };\nvoid *comp, *shm, *wm, *seat, *km, *xst; int configured, kfmt = -1, ksize, n; char text[64];\nvoid global(void *d, void *r, unsigned name, const char *ifc, unsigned v) {\n  if (!strcmp(ifc, "wl_compositor")) comp = wl_proxy_marshal_flags(r, 0, &comp_i, 4, 0, name, ifc, 4, 0);\n  if (!strcmp(ifc, "wl_shm")) shm = wl_proxy_marshal_flags(r, 0, &shm_i, 1, 0, name, ifc, 1, 0);\n  if (!strcmp(ifc, "xdg_wm_base")) wm = wl_proxy_marshal_flags(r, 0, &wm_i, 1, 0, name, ifc, 1, 0);\n  if (!strcmp(ifc, "wl_seat")) seat = wl_proxy_marshal_flags(r, 0, &seat_i, 5, 0, name, ifc, 5, 0);\n}\nvoid none(void) {}\nvoid ping(void *d, void *w, unsigned s) { wl_proxy_marshal_flags(w, 3, 0, 1, 0, s); }\nvoid xconf(void *d, void *x, unsigned s) { wl_proxy_marshal_flags(x, 4, 0, 1, 0, s); configured = 1; }\nvoid kmap(void *d, void *k, unsigned f, int fd, unsigned size) {\n  char *m = mmap(0, size, 1, 2, fd, 0);\n  kfmt = f; ksize = size;\n  void *ctx = xkb_context_new(1);\n  if (ctx && m != (char *)-1) km = xkb_keymap_new_from_string(ctx, m, 1, 0);\n  if (km) xst = xkb_state_new(km);\n  close(fd);\n}\nvoid key(void *d, void *k, unsigned s, unsigned t, unsigned code, unsigned st) { if (st == 1 && xst && n < 60) n += xkb_state_key_get_utf8(xst, code + 8, text + n, 64 - n); }\nvoid mods(void *d, void *k, unsigned s, unsigned dep, unsigned lat, unsigned lock, unsigned grp) { if (xst) xkb_state_update_mask(xst, dep, lat, lock, 0, 0, grp); }\nvoid *reg_l[] = { global, none }, *shm_l[] = { none }, *buf_l[] = { none }, *surf_l[] = { none, none }, *wm_l[] = { ping }, *xs_l[] = { xconf }, *tl_l[] = { none, none }, *seat_l[] = { none, none }, *kb_l[] = { kmap, none, none, key, mods, none };\nint main(void) {\n  void *d = wl_display_connect("/tmp/wayland-0"), *r, *pool, *buf, *surf, *xs, *tl, *kb; unsigned *px; int fd, i, W = 160, H = 100;\n  if (!d) return 1;\n  r = wl_proxy_marshal_flags(d, 1, &reg_i, 1, 0, 0);\n  wl_proxy_add_listener(r, reg_l, 0);\n  wl_display_roundtrip(d);\n  if (!comp || !shm || !wm || !seat) return 2;\n  wl_proxy_add_listener(shm, shm_l, 0); wl_proxy_add_listener(wm, wm_l, 0); wl_proxy_add_listener(seat, seat_l, 0);\n  fd = memfd_create("xkb", 1);\n  if (fd < 0 || ftruncate(fd, W * H * 4)) return 3;\n  px = mmap(0, W * H * 4, 3, 1, fd, 0);\n  if (px == (unsigned *)-1) return 4;\n  for (i = 0; i < W * H; i++) px[i] = 0x305070;\n  pool = wl_proxy_marshal_flags(shm, 0, &pool_i, 1, 0, 0, fd, W * H * 4);\n  buf = wl_proxy_marshal_flags(pool, 0, &buf_i, 1, 0, 0, 0, W, H, W * 4, 1);\n  wl_proxy_add_listener(buf, buf_l, 0);\n  surf = wl_proxy_marshal_flags(comp, 0, &surf_i, 4, 0, 0);\n  wl_proxy_add_listener(surf, surf_l, 0);\n  xs = wl_proxy_marshal_flags(wm, 2, &xs_i, 1, 0, 0, surf);\n  wl_proxy_add_listener(xs, xs_l, 0);\n  tl = wl_proxy_marshal_flags(xs, 1, &tl_i, 1, 0, 0);\n  wl_proxy_add_listener(tl, tl_l, 0);\n  wl_proxy_marshal_flags(tl, 2, 0, 1, 0, "xkb test");\n  wl_proxy_marshal_flags(surf, 6, 0, 4, 0);\n  while (!configured) if (wl_display_dispatch(d) < 0) return 5;\n  wl_proxy_marshal_flags(surf, 1, 0, 4, 0, buf, 0, 0);\n  wl_proxy_marshal_flags(surf, 2, 0, 4, 0, 0, 0, W, H);\n  wl_proxy_marshal_flags(surf, 6, 0, 4, 0);\n  kb = wl_proxy_marshal_flags(seat, 1, &kb_i, 5, 0, 0);\n  wl_proxy_add_listener(kb, kb_l, 0);\n  wl_display_roundtrip(d);\n  if (!xst) return 6;\n  sleep(2);\n  printf("xkb: ready\\n"); fflush(0);\n  while (n < 3) if (wl_display_dispatch(d) < 0) return 7;\n  printf("xkb: keymap %%d of %%d bytes, layout %%s; typed %%s\\n", kfmt, ksize, xkb_keymap_layout_get_name(km, 0), text);\n  return 0;\n}\n' > xkb.c && tcc -o xkb xkb.c -lwayland-client -lxkbcommon 2>&1 && ./xkb; s=$?; rm -f xkb xkb.c; exit $s"#,
+        ],
+        0,
+    ),
     // A program larger than a page many times over, read from its file
     // as it is loaded.
     (
@@ -5601,6 +5624,9 @@ fn setup() -> Result<&'static mut State, &'static str> {
     let libssl = map_file(LIBSSL_FILE, LIBSSL_VA, LIBEVENT_FILE - LIBSSL_FILE);
     let libevent = map_file(LIBEVENT_FILE, LIBEVENT_VA, LIBBZ2_FILE - LIBEVENT_FILE);
     let libbz2 = map_file(LIBBZ2_FILE, LIBBZ2_VA, LINKS_END - LIBBZ2_FILE);
+    let libwayland = map_file(LIBWAYLAND_FILE, LIBWAYLAND_VA, LIBFFI_FILE - LIBWAYLAND_FILE);
+    let libffi = map_file(LIBFFI_FILE, LIBFFI_VA, LIBXKBCOMMON_FILE - LIBFFI_FILE);
+    let libxkbcommon = map_file(LIBXKBCOMMON_FILE, LIBXKBCOMMON_VA, WAYLAND_END - LIBXKBCOMMON_FILE);
     // glibc's dynamic linker is where hello says it is.
     let glibc_ld_path = Elf::parse(hello).ok().and_then(|e| e.interpreter()).unwrap_or(b"");
     st.next_pid = 1;
@@ -5647,6 +5673,9 @@ fn setup() -> Result<&'static mut State, &'static str> {
         (b"/lib/libssl.so.3", libssl, LIBSSL_FILE),
         (b"/usr/lib/libevent-2.1.so.7", libevent, LIBEVENT_FILE),
         (b"/usr/lib/libbz2.so.1", libbz2, LIBBZ2_FILE),
+        (b"/usr/lib/libwayland-client.so.0", libwayland, LIBWAYLAND_FILE),
+        (b"/usr/lib/libffi.so.8", libffi, LIBFFI_FILE),
+        (b"/usr/lib/libxkbcommon.so.0", libxkbcommon, LIBXKBCOMMON_FILE),
     ];
     let mut tree = [(&b""[..], &b""[..]); MAX_IMAGES];
     let mut n = 0;

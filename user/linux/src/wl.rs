@@ -23,7 +23,8 @@
 //! modifiers (Shift, Control, Mod1 and Mod4, as an XKB keymap's) after.
 //! The window with the compositor's keyboard focus has the keyboard's; a
 //! held key is repeated by the client (`repeat_info`), not here. The
-//! keymap sent is `no_keymap`, with an empty memory file.
+//! keymap is a US keyboard's, as XKB's text ([`KEYMAP`]) in a memory
+//! file, ended by a zero byte as XKB clients take it.
 //!
 //! The server's tables are in shared pages kept for them ([`WL_PAGES`]),
 //! not in the personality's state, which has no room.
@@ -37,6 +38,9 @@ use crate::{
 pub const SOCKET: &[u8] = b"/tmp/wayland-0";
 /// The shared pages, from the first, the server's tables are kept in.
 pub const WL_PAGES: u64 = 8;
+/// The keyboard's keymap: XKB's text format (version 1), a US layout,
+/// its keycodes Linux's plus 8.
+const KEYMAP: &[u8] = include_bytes!("keymap.xkb");
 
 const MAX_CLIENTS: usize = 4;
 const MAX_OBJECTS: usize = 96;
@@ -198,11 +202,19 @@ pub fn start(st: &mut State) {
     u.phase = unix::Phase::Listening;
     let sv = server();
     sv.listener = k as u8 + 1;
-    // The keymap: an empty memory file, kept open.
+    // The keymap: a memory file, kept open.
     if let Some(m) = st.shm.iter().position(|s| !s.used) {
         if let Some(f) = st.new_file(FileKind::Shm, 0, m as u8, O_RDWR) {
             st.shm[m] = Shm { used: true, open: true, first: 0, pages: 0, size: 0 };
-            sv.keymap = f as u8 + 1;
+            if st.shm_resize(m, KEYMAP.len() as u64 + 1).is_ok() {
+                // SAFETY: the file's pages, just given it, mapped here.
+                let to = (SHM_VA + st.shm[m].first as u64 * PAGE) as *mut u8;
+                unsafe {
+                    core::ptr::copy_nonoverlapping(KEYMAP.as_ptr(), to, KEYMAP.len());
+                    to.add(KEYMAP.len()).write(0);
+                }
+                sv.keymap = f as u8 + 1;
+            }
         }
     }
 }
@@ -640,7 +652,7 @@ fn request(st: &mut State, sv: &mut Server, c: usize, id: u32, op: u16, args: &[
             let new = a.u().map_err(bad)?;
             add(sv, c, new, Iface::Keyboard, data)?;
             if let Some(f) = sv.keymap.checked_sub(1) {
-                send_fd(st, sv, c, Msg::new(new, 0).u(0).u(0), f as usize);
+                send_fd(st, sv, c, Msg::new(new, 0).u(1).u(KEYMAP.len() as u32 + 1), f as usize);
             }
             if data >= 4 {
                 let rate = 1000 / window::REPEAT_INTERVAL as u32;

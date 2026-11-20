@@ -2041,13 +2041,23 @@ holds the rest):
   - `repeat_info` from the compositor's repeat timing, so clients repeat
     held keys themselves.
 
-  The keymap is sent as a descriptor, for now `no_keymap` with an empty
-  memory file. Sending descriptors from the server goes through the same
+  The keymap is sent as a descriptor: a US keyboard as XKB's text
+  format, version 1 (`user/linux/src/keymap.xkb`). Sending descriptors from the server goes through the same
   path as `SCM_RIGHTS` between processes. `linux-test`'s client binds the
   seat and gets a pointer and a keyboard; the host clicks on its window
   and types two keys. The client prints where the pointer was, the
   button pressed and let go, the keyboard's focus, the keymap and its
   descriptor, and the keys, on both ISAs.
+- libwayland and libxkbcommon: the bundle carries Alpine's
+  `libwayland-client`, the `libffi` it calls through, and `libxkbcommon`,
+  the libraries a Wayland program links against. They are mapped into the
+  tree under `/usr/lib` like the other bundle files, in slots at the end
+  of the personality's CNode. `linux-test` builds a client with tcc against
+  both: it opens a toplevel through libwayland, compiles the server's
+  keymap with libxkbcommon, and turns the keys the host types (Shift+H, I,
+  Shift+1) into text with it, "Hi!", on both ISAs. The exec buffer and the
+  framebuffer's slots moved there too, so the toolchain's archive now has
+  room for 1.5 MiB.
 - `exec` copies a program's arguments and environment to its stack a piece
   at a time. Before, one longer than 4 KiB (a long `sh -c` script) ran
   past the copy buffer and stopped the personality.
