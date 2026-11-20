@@ -873,8 +873,8 @@ const LINUX_PROMPT: &str = "linux$ ";
 /// Boots `img` and types `script` into the Linux personality's terminal
 /// (see [`LINUX_SESSION`]); all the output once QEMU exits with the pass
 /// code. For each of `shots` in turn, once its marker is in the output,
-/// `check` is run on screenshots (a few, a fifth of a second apart, until
-/// one passes); what the last answered is left in the shot's result.
+/// its act is done (a screenshot checked, keys typed); what it answered
+/// is left in the shot's result.
 fn drive_linux(img: &Image, script: &[(&str, &str, bool)], shots: Vec<Shot>) -> Result<String, String> {
     let mut child = qemu_command(img)
         .args(["-display", "none"])
@@ -900,15 +900,8 @@ fn drive_linux(img: &Image, script: &[(&str, &str, bool)], shots: Vec<Shot>) -> 
             let ready = shots.peek().is_some_and(|s| String::from_utf8_lossy(&all).contains(s.marker));
             drop(all);
             if let Some(s) = shots.next_if(|_| ready) {
-                let mut last = Err("no screenshot".to_string());
-                for _ in 0..5 {
-                    last = screendump(&s.path).and_then(|()| (s.check)(&s.path));
-                    if last.is_ok() {
-                        break;
-                    }
-                    std::thread::sleep(Duration::from_millis(200));
-                }
-                *s.result.lock().unwrap() = Some(last);
+                let r = (s.act)();
+                *s.result.lock().unwrap() = Some(r);
             }
         }
     });
@@ -981,15 +974,33 @@ fn linux_test(img: &Image) -> Result<(), String> {
     std::fs::write(&disk, vec![0u8; 16 << 20]).map_err(|e| format!("writing {}: {e}", disk.display()))?;
     let stop = Arc::new(AtomicBool::new(false));
     let (servers, served) = linux_net_servers(stop.clone())?;
-    // The framebuffer panned, then drawn and left mapped (shown as drawn).
-    let shot = |k: usize, marker, check| {
+    // The framebuffer panned, then drawn and left mapped (shown as drawn);
+    // then a click on its window, at (100, 50) in it, and keys typed.
+    let shot = |k: usize, marker, check: fn(&Path) -> Result<String, String>| {
         let path = root().join("target").join(format!("linux-fb-{}-{k}.ppm", img.arch.name()));
         let _ = std::fs::remove_file(&path);
-        Shot { marker, path, check, result: Arc::default() }
+        let act = move || {
+            let mut last = Err("no screenshot".to_string());
+            for _ in 0..5 {
+                last = screendump(&path).and_then(|()| check(&path));
+                if last.is_ok() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            last
+        };
+        Shot { marker, act: Box::new(act), result: Arc::default() }
+    };
+    let arch = img.arch;
+    let input = move || {
+        let acts = [Act::Tablet(340, 230), Act::Button(true), Act::Button(false), Act::Type("hi")];
+        acts.iter().try_for_each(|a| input_act(a, arch).map(drop)).map(|()| "clicked and typed".to_string())
     };
     let shots = vec![
-        shot(1, "linux: > fb0: 320x240", check_linux_fb as fn(&Path) -> Result<String, String>),
+        shot(1, "linux: > fb0: 320x240", check_linux_fb),
         shot(2, "linux: > fb0: drawn, not panned", check_linux_fb_live),
+        Shot { marker: "linux: > input: ready", act: Box::new(input), result: Arc::default() },
     ];
     let results: Vec<_> = shots.iter().map(|s| s.result.clone()).collect();
     let out = drive_linux(img, LINUX_SESSION, shots);
@@ -999,8 +1010,8 @@ fn linux_test(img: &Image) -> Result<(), String> {
     for (k, r) in results.iter().enumerate() {
         match r.lock().unwrap().take() {
             Some(Ok(said)) => println!("== {said}"),
-            Some(Err(e)) => return Err(format!("Linux personality test: the framebuffer, picture {}: {e}", k + 1)),
-            None => return Err(format!("Linux personality test: no screenshot of the framebuffer's picture {}", k + 1)),
+            Some(Err(e)) => return Err(format!("Linux personality test: the framebuffer, step {}: {e}", k + 1)),
+            None => return Err(format!("Linux personality test: the framebuffer's step {} not reached", k + 1)),
         }
     }
     if !served.lock().unwrap().contains("served from Linux") {
@@ -1076,6 +1087,10 @@ fn linux_test(img: &Image) -> Result<(), String> {
         "linux: > fb0: 320x240, 32 bits, line 1280",
         // And shown as drawn, never panned.
         "linux: > fb0: drawn, not panned",
+        // Input: a click on the window and keys typed, read from the
+        // pointer's and the keys' devices.
+        "linux: > input: ready",
+        "linux: > input: Superior pointer at 100,50, left pressed and let go; keys 35 1, 35 0, 23 1, 23 0",
         // A program far larger than a page, loaded from its file.
         "linux: > ran a program of more than 200000 bytes",
         // Threads (clone, futexes) in pigz, and zlib loaded by musl: what
@@ -1221,12 +1236,11 @@ const LINUX_PAGE: &str = "<html><head><title>Superior</title></head><body>\
 <h1>A page for links</h1><p>Fetched over HTTP and <b>rendered by links</b> on Superior.</p>\
 <ul><li>first item</li><li>second item</li></ul></body></html>\n";
 
-/// A screenshot [`drive_linux`] takes once `marker` is in the output, and
-/// what `check` said of it.
+/// What [`drive_linux`] does once `marker` is in the output (a screenshot
+/// checked, keys typed), and what it answered.
 struct Shot {
     marker: &'static str,
-    path: PathBuf,
-    check: fn(&Path) -> Result<String, String>,
+    act: Box<dyn FnOnce() -> Result<String, String> + Send>,
     result: Arc<Mutex<Option<Result<String, String>>>>,
 }
 
@@ -1941,9 +1955,9 @@ fn image_sealed(
         linux_nic: linux_nic(manifest).map(|l| l.1),
         radio: manifest == "wifi",
         avx: manifest.starts_with("linux"),
-        keyboard: matches!(manifest, "keyboard" | "input" | "windows" | "cursor" | "toolkit" | "panel" | "resize" | "widgets" | "notes"),
+        keyboard: matches!(manifest, "keyboard" | "input" | "windows" | "cursor" | "toolkit" | "panel" | "resize" | "widgets" | "notes" | "linux"),
         xhci: false,
-        mouse: matches!(manifest, "input" | "windows" | "cursor" | "toolkit" | "panel" | "resize" | "widgets" | "notes"),
+        mouse: matches!(manifest, "input" | "windows" | "cursor" | "toolkit" | "panel" | "resize" | "widgets" | "notes" | "linux"),
         hotplug: manifest == "hotplug",
         monitor: manifest == "suspend",
         display: matches!(

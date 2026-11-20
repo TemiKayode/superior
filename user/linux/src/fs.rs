@@ -80,6 +80,9 @@ pub enum Kind {
     Tty,
     /// The framebuffer (`/dev/fb0`): a window on the compositor's screen.
     Fb,
+    /// An input device (`/dev/input/event0`, the keys, and `event1`, the
+    /// pointer, its number in `size`): the framebuffer window's events.
+    Input,
 }
 
 #[derive(Clone, Copy)]
@@ -160,6 +163,13 @@ impl Fs {
             let _ = self.create(dev, b"tty", Kind::Tty);
             let _ = self.create(dev, b"console", Kind::Tty);
             let _ = self.create(dev, b"fb0", Kind::Fb);
+            if let Ok(input) = self.create(dev, b"input", Kind::Dir) {
+                for (k, name) in [b"event0", b"event1"].iter().enumerate() {
+                    if let Ok(ino) = self.create(input, *name, Kind::Input) {
+                        self.inodes[ino as usize].size = k as u32;
+                    }
+                }
+            }
         }
     }
 

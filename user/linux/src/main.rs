@@ -129,6 +129,9 @@ const STATE_BLOCK_BITS: u64 = 19;
 const NTFN: u64 = 1001;
 const NTFN_UART: u64 = 1002;
 const NTFN_TIMER: u64 = 1003;
+/// Another, the framebuffer window's events (bit 2), lent to the
+/// compositor.
+const NTFN_WINDOW: u64 = 1005;
 /// The bundle's files (`file` in the manifest), their first slots: musl's
 /// dynamic linker, BusyBox, pigz, zlib, and fptest, smptest and mmaptest
 /// (if there: not on the second boot).
@@ -907,7 +910,63 @@ struct State {
     fb_shown: bool,
     /// When a mapped framebuffer is next shown (ticks).
     fb_next: u64,
+    /// The input devices' events not yet read (the keys', the pointer's),
+    /// and what the window's events last said: the modifier keys held,
+    /// the buttons held, where the pointer is.
+    input: [Events; 2],
+    input_mods: u8,
+    input_buttons: u8,
+    input_at: (i32, i32),
 }
+
+/// An input device's events, oldest first: (when, in ticks; type; code;
+/// value). The oldest go when it is full, as Linux's do.
+struct Events {
+    ev: [(u64, u16, u16, i32); 128],
+    head: usize,
+    len: usize,
+}
+
+impl Events {
+    fn push(&mut self, at: u64, ty: u16, code: u16, value: i32) {
+        let n = self.ev.len();
+        if self.len == n {
+            self.head = (self.head + 1) % n;
+            self.len -= 1;
+        }
+        self.ev[(self.head + self.len) % n] = (at, ty, code, value);
+        self.len += 1;
+    }
+
+    fn pop(&mut self) -> Option<(u64, u16, u16, i32)> {
+        if self.len == 0 {
+            return None;
+        }
+        let e = self.ev[self.head];
+        self.head = (self.head + 1) % self.ev.len();
+        self.len -= 1;
+        Some(e)
+    }
+}
+
+/// Linux's event types and codes the input devices use.
+const EV_SYN: u16 = 0;
+const EV_KEY: u16 = 1;
+const EV_REL: u16 = 2;
+const EV_ABS: u16 = 3;
+const REL_HWHEEL: u16 = 6;
+const REL_WHEEL: u16 = 8;
+const BTN_LEFT: u16 = 0x110;
+/// Linux's key code for each USB HID keyboard usage up to 0x67 (0: none),
+/// as Linux's HID driver maps them; and for the modifier byte's bits
+/// (Control, Shift, Alt, Meta; left, then right).
+const HID_KEYS: [u8; 0x68] = [
+    0, 0, 0, 0, 30, 48, 46, 32, 18, 33, 34, 35, 23, 36, 37, 38, 50, 49, 24, 25, 16, 19, 31, 20, 22, 47, 17, 45, 21, 44, 2, 3,
+    4, 5, 6, 7, 8, 9, 10, 11, 28, 1, 14, 15, 57, 12, 13, 26, 27, 43, 43, 39, 40, 41, 51, 52, 53, 58, 59, 60, 61, 62, 63, 64,
+    65, 66, 67, 68, 87, 88, 99, 70, 119, 110, 102, 104, 111, 107, 109, 106, 105, 108, 103, 69, 98, 55, 74, 78, 96, 79, 80, 81,
+    75, 76, 77, 71, 72, 73, 82, 83, 86, 127, 116, 117,
+];
+const MOD_KEYS: [u16; 8] = [29, 42, 56, 125, 97, 54, 100, 126];
 
 const _: () = assert!(core::mem::size_of::<State>() as u64 <= STATE_PAGES * PAGE);
 
@@ -1727,6 +1786,8 @@ impl State {
             let _ = fb_call(window::destroy(n), None);
             return Err(ENODEV);
         }
+        // Its events (the input devices') signal this server.
+        let _ = fb_call(window::listen(n), Some(NTFN_WINDOW));
         self.fb_window = n + 1;
         Ok(n)
     }
@@ -1856,6 +1917,7 @@ fn mode_of(kind: Kind) -> u32 {
         Kind::Null => 0o20666,
         Kind::Tty => 0o20620,
         Kind::Fb => 0o20660,
+        Kind::Input => 0o20640,
         Kind::Free => 0,
     }
 }
@@ -2206,6 +2268,13 @@ fn openat(st: &mut State, i: usize, a: [u64; 6]) -> Result<u64, u64> {
     if kind == Kind::Fb {
         st.fb()?;
     }
+    // An input device: the window's events from now on.
+    if kind == Kind::Input {
+        st.fb()?;
+        input_events(st);
+        let d = st.fs.size(ino) as usize & 1;
+        (st.input[d].head, st.input[d].len) = (0, 0);
+    }
     let fk = if kind == Kind::Tty { FileKind::Tty } else { FileKind::Node };
     let f = st.new_file(fk, ino, 0, flags).ok_or(ENFILE)?;
     st.new_fd(i, f, 0, flags & O_CLOEXEC != 0).inspect_err(|_| st.files[f].kind = FileKind::Closed)
@@ -2297,7 +2366,7 @@ fn getdents(st: &mut State, i: usize, fd: u64, buf: u64, count: u64) -> Result<u
         rec[18] = match e.kind {
             Kind::Dir => 4,
             Kind::Symlink => 10,
-            Kind::Null | Kind::Fb => 2,
+            Kind::Null | Kind::Fb | Kind::Input => 2,
             _ => 8,
         };
         rec[19..19 + name.len()].copy_from_slice(name);
@@ -2398,6 +2467,29 @@ fn read(st: &mut State, i: usize, fd: u64, buf: u64, len: u64) -> Out {
         FileKind::Node => match st.fs.kind(o.ino) {
             Kind::Dir => return Out::Ret(err(EISDIR)),
             _ if o.flags & O_ACCMODE == O_WRONLY => return Out::Ret(err(EBADF)),
+            // Whole events (struct input_event), waiting for one.
+            Kind::Input if want < 24 => return Out::Ret(err(EINVAL)),
+            Kind::Input => {
+                let d = st.fs.size(o.ino) as usize & 1;
+                if st.input[d].len == 0 {
+                    if o.flags & O_NONBLOCK != 0 {
+                        return Out::Ret(err(EAGAIN));
+                    }
+                    return Out::Block(Blocked::Read { fd, buf, len });
+                }
+                let mut n = 0;
+                while n + 24 <= want {
+                    let Some((at, ty, code, value)) = st.input[d].pop() else { break };
+                    let e = &mut tmp[n..n + 24];
+                    e[..8].copy_from_slice(&(epoch(at) + at / TICK_HZ).to_le_bytes());
+                    e[8..16].copy_from_slice(&(at % TICK_HZ * (1_000_000 / TICK_HZ)).to_le_bytes());
+                    e[16..18].copy_from_slice(&ty.to_le_bytes());
+                    e[18..20].copy_from_slice(&code.to_le_bytes());
+                    e[20..24].copy_from_slice(&value.to_le_bytes());
+                    n += 24;
+                }
+                n
+            }
             Kind::Fb => {
                 let n = want.min((FB_PAGES * PAGE).saturating_sub(o.off) as usize);
                 // SAFETY: the framebuffer's pages, mapped here for this
@@ -2483,6 +2575,7 @@ fn write(st: &mut State, i: usize, fd: u64, buf: u64, len: u64) -> Out {
         },
         _ => match st.fs.kind(o.ino) {
             Kind::Null => n as u64,
+            Kind::Input => err(EINVAL),
             // As Linux's: up to the framebuffer's end, then ENOSPC.
             Kind::Fb if o.off >= FB_PAGES * PAGE => err(ENOSPC),
             Kind::Fb => {
@@ -3463,6 +3556,9 @@ fn run(st: &mut State, argv: &[&str], env: &[&str], interactive: bool) -> Result
             if r.badge & 1 != 0 {
                 uart_input(st);
             }
+            if r.badge & 4 != 0 {
+                input_events(st);
+            }
             wake(st);
             continue;
         }
@@ -3719,6 +3815,9 @@ fn readiness(st: &State, f: usize) -> u16 {
         // An epoll instance is readable when something it watches is
         // ready (one instance inside another is not followed further).
         FileKind::Epoll => 0,
+        FileKind::Node if st.fs.kind(o.ino) == Kind::Input => {
+            if st.input[st.fs.size(o.ino) as usize & 1].len > 0 { POLLIN } else { 0 }
+        }
         _ => POLLIN | POLLOUT,
     }
 }
@@ -4110,6 +4209,133 @@ fn nanosleep(st: &mut State, i: usize, flags: u64, req: u64) -> Out {
 
 /// The terminal's `ioctl`s: its settings, window size and foreground
 /// group. Anything else is not a terminal.
+/// Takes the framebuffer window's events from the compositor, as Linux's
+/// input devices give them: a key (the modifier keys first, as their
+/// byte changed) to the keys' device; the pointer's place (absolute, in
+/// the window), its buttons and the wheel to the pointer's; each change a
+/// report (`SYN_REPORT` after it).
+fn input_events(st: &mut State) {
+    let Some(n) = st.fb_window.checked_sub(1) else { return };
+    let now = superior_sys::ticks();
+    while let Some(m) = fb_call(window::next(n), None).filter(|m| m[0] == 0) {
+        let (a, b) = (m[2], m[3]);
+        match m[1] {
+            window::KEY => {
+                let k = &mut st.input[0];
+                let mods = (b >> 8) as u8;
+                let changed = mods ^ st.input_mods;
+                for bit in 0..8 {
+                    if changed & 1 << bit != 0 {
+                        k.push(now, EV_KEY, MOD_KEYS[bit], (mods >> bit & 1) as i32);
+                    }
+                }
+                st.input_mods = mods;
+                if let Some(&code) = HID_KEYS.get(a as usize).filter(|&&c| c != 0) {
+                    k.push(now, EV_KEY, code as u16, match b & 3 { 1 => 1, 3 => 2, _ => 0 });
+                }
+                k.push(now, EV_SYN, 0, 0);
+            }
+            window::POINTER => {
+                let p = &mut st.input[1];
+                let at = (a as u16 as i16 as i32, (a >> 16) as u16 as i16 as i32);
+                if at.0 != st.input_at.0 {
+                    p.push(now, EV_ABS, 0, at.0);
+                }
+                if at.1 != st.input_at.1 {
+                    p.push(now, EV_ABS, 1, at.1);
+                }
+                let changed = b as u8 ^ st.input_buttons;
+                for bit in 0..3 {
+                    if changed & 1 << bit != 0 {
+                        p.push(now, EV_KEY, BTN_LEFT + bit, (b >> bit & 1) as i32);
+                    }
+                }
+                (st.input_at, st.input_buttons) = (at, b as u8);
+                p.push(now, EV_SYN, 0, 0);
+            }
+            window::WHEEL => {
+                let p = &mut st.input[1];
+                let (up, right) = (b as u32 as i32, (b >> 32) as u32 as i32);
+                if up != 0 {
+                    p.push(now, EV_REL, REL_WHEEL, up);
+                }
+                if right != 0 {
+                    p.push(now, EV_REL, REL_HWHEEL, right);
+                }
+                p.push(now, EV_SYN, 0, 0);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The input devices' ioctls (evdev's), as Linux answers them: the
+/// driver's version, the device's id and name, which event types and
+/// codes it gives (bit masks), the pointer's axes, and grabbing it (it is
+/// this window's alone already). Device 0 is the keys, 1 the pointer.
+fn input_ioctl(st: &mut State, i: usize, d: usize, cmd: u64, arg: u64) -> Result<u64, u64> {
+    let (size, ty, nr) = ((cmd >> 16 & 0x3fff) as usize, cmd >> 8 & 0xff, cmd & 0xff);
+    if ty != b'E' as u64 {
+        return Err(ENOTTY);
+    }
+    let mut out = [0u8; 96];
+    let set = |b: &mut [u8; 96], bit: usize| b[bit / 8] |= 1 << (bit % 8);
+    let n = match nr {
+        // EVIOCGVERSION, EVIOCGID (a virtual bus).
+        0x01 => return st.put(i, arg, &0x0001_0001u32.to_le_bytes()),
+        0x02 => return st.put(i, arg, &[6, 0, 0, 0, d as u8 + 1, 0, 1, 0]),
+        // EVIOCGNAME: as much of it as fits, with its NUL.
+        0x06 => {
+            let name: &[u8] = if d == 0 { b"Superior keyboard " } else { b"Superior pointer " };
+            let n = name.len().min(size);
+            out[..n].copy_from_slice(&name[..n]);
+            n
+        }
+        // EVIOCGBIT for the event types, then for keys, relative and
+        // absolute axes.
+        0x20 => {
+            for t in if d == 0 { &[EV_SYN, EV_KEY][..] } else { &[EV_SYN, EV_KEY, EV_REL, EV_ABS][..] } {
+                set(&mut out, *t as usize);
+            }
+            size.min(4)
+        }
+        0x21 => {
+            if d == 0 {
+                HID_KEYS.iter().map(|&k| k as u16).chain(MOD_KEYS).for_each(|k| set(&mut out, k as usize));
+            } else {
+                (0..3).for_each(|b| set(&mut out, BTN_LEFT as usize + b));
+            }
+            out[0] &= !1;
+            size.min(96)
+        }
+        0x22 if d == 1 => {
+            set(&mut out, REL_WHEEL as usize);
+            set(&mut out, REL_HWHEEL as usize);
+            size.min(2)
+        }
+        0x23 if d == 1 => {
+            set(&mut out, 0);
+            set(&mut out, 1);
+            size.min(8)
+        }
+        // Other types (and these on the keys): none of them. The keys,
+        // lights, sounds and switches held, and the properties: none.
+        0x09 | 0x18..=0x1b | 0x20..=0x3f => size.min(96),
+        // EVIOCGABS for x and y: where the pointer is, in the window.
+        0x40 | 0x41 if d == 1 => {
+            let (value, max) = if nr == 0x40 { (st.input_at.0, FB_W - 1) } else { (st.input_at.1, FB_H - 1) };
+            let mut a = [0u8; 24];
+            a[..4].copy_from_slice(&value.to_le_bytes());
+            a[8..12].copy_from_slice(&(max as i32).to_le_bytes());
+            return st.put(i, arg, &a);
+        }
+        // EVIOCGRAB: it is.
+        0x90 => return Ok(0),
+        _ => return Err(EINVAL),
+    };
+    st.put(i, arg, &out[..n]).map(|_| n as u64)
+}
+
 /// A call to the compositor, lending the page in slot `grant`: its answer,
 /// or `None` if the call failed (no compositor, or it restarted).
 fn fb_call(m: [u64; 4], grant: Option<u64>) -> Option<[u64; 4]> {
@@ -4177,6 +4403,10 @@ fn ioctl(st: &mut State, i: usize, fd: u64, cmd: u64, arg: u64) -> Result<u64, u
     let f = st.file(i, fd).ok_or(EBADF)?;
     if st.files[f].kind == FileKind::Node && st.fs.kind(st.files[f].ino) == Kind::Fb {
         return fb_ioctl(st, i, cmd, arg);
+    }
+    if st.files[f].kind == FileKind::Node && st.fs.kind(st.files[f].ino) == Kind::Input {
+        let d = st.fs.size(st.files[f].ino) as usize & 1;
+        return input_ioctl(st, i, d, cmd, arg);
     }
     if st.files[f].kind != FileKind::Tty {
         return Err(ENOTTY);
@@ -4400,6 +4630,17 @@ const RUNS: &[(&[&str], u32)] = &[
         ],
         0,
     ),
+    // Input: the pointer's device named, then a click on the window and
+    // two keys typed (the host does both once it is ready), read from the
+    // pointer's and the keys' devices as Linux's evdev gives them.
+    (
+        &[
+            "sh",
+            "-c",
+            r#"cd /tmp/cc && printf 'int open(const char *, int, ...); int ioctl(int, unsigned long, ...); long read(int, void *, unsigned long); long write(int, const void *, unsigned long); int printf(const char *, ...);\nstruct ev { long s, us; unsigned short type, code; int value; };\nint main(void) { char name[32]; struct ev e; int k = open("/dev/input/event0", 0), p = open("/dev/input/event1", 0), x = -1, y = -1, down = 0, up = 0, keys[4], n = 0; if (k < 0 || p < 0 || ioctl(p, 0x80204506, name) < 0) return 1; write(1, "input: ready\\n", 13); while (!up) { if (read(p, &e, sizeof e) != sizeof e) return 2; if (e.type == 3 && e.code == 0) x = e.value; if (e.type == 3 && e.code == 1) y = e.value; if (e.type == 1 && e.code == 0x110) { if (e.value) down = 1; else if (down) up = 1; } } while (n < 4) { if (read(k, &e, sizeof e) != sizeof e) return 3; if (e.type == 1) keys[n++] = e.code << 1 | e.value; } printf("input: %%s at %%d,%%d, left pressed and let go; keys %%d %%d, %%d %%d, %%d %%d, %%d %%d\\n", name, x, y, keys[0] >> 1, keys[0] & 1, keys[1] >> 1, keys[1] & 1, keys[2] >> 1, keys[2] & 1, keys[3] >> 1, keys[3] & 1); return 0; }\n' > in.c && tcc -o in in.c && ./in"#,
+        ],
+        0,
+    ),
     // A program larger than a page many times over, read from its file
     // as it is loaded.
     (
@@ -4552,6 +4793,7 @@ fn setup() -> Result<&'static mut State, &'static str> {
     sys(Syscall::Retype, FS_BLOCK, [ObjectType::Notification as u64, 0, NTFN, 0]).map_err(|_| "no notification")?;
     sys(Syscall::CapMint, NTFN, [NTFN_UART, ALL, 1, 0]).map_err(|_| "no notification")?;
     sys(Syscall::CapMint, NTFN, [NTFN_TIMER, ALL, 2, 0]).map_err(|_| "no notification")?;
+    sys(Syscall::CapMint, NTFN, [NTFN_WINDOW, ALL, 4, 0]).map_err(|_| "no notification")?;
     sys(Syscall::NotificationBind, NTFN, [0; 4]).map_err(|_| "could not bind the notification")?;
     if tty::uart::init() != 0 {
         return Err("could not map the UART");

@@ -96,7 +96,7 @@ const MAX_ENDPOINTS: usize = 32;
 #[cfg(feature = "selftest")]
 const MAX_ENDPOINTS: usize = 8;
 #[cfg(not(feature = "selftest"))]
-const MAX_NOTIFICATIONS: usize = 32;
+const MAX_NOTIFICATIONS: usize = 64;
 #[cfg(feature = "selftest")]
 const MAX_NOTIFICATIONS: usize = 8;
 /// Address spaces: one per boot process, plus address-space objects.

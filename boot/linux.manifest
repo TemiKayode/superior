@@ -26,7 +26,8 @@
 # back. Sockets are the network server's: the runs fetch a page over HTTP
 # from the host, have TCP and UDP echoed, and serve a connection from it.
 # /dev/fb0 is a window of the compositor's, which Linux's bochs driver
-# shows (both after the personality).
+# shows, and /dev/input/event0 and event1 its keys and pointer, from the
+# USB keyboard, mouse and tablet (all after the personality).
 
 # The disk under the root: PCI, its driver and the filesystem server, as
 # boot/fs.manifest has them. The personality is component 5 here and in
@@ -172,3 +173,21 @@ component compositor
   notification 2
   memory 22
   untyped 21 3
+  uses input 6
+
+# Keys and the pointer, as boot/input.manifest has them.
+
+component xhci
+  image xhci
+  priority 11
+  uses pci 0
+  provides usb 1
+  notification 2
+  untyped 17 3
+
+component hid
+  image hid
+  priority 11
+  uses usb 0
+  provides input 1
+  untyped 14 2

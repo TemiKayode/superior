@@ -1947,6 +1947,27 @@ holds the rest):
   program draw another picture and sleep with the framebuffer still
   mapped, never panning it; the screenshot taken while it sleeps must have
   every pixel right, on both ISAs.
+- The framebuffer takes input: `/dev/input/event0` (the keys) and
+  `/dev/input/event1` (the pointer) are its window's events, as Linux's
+  evdev gives them. The personality lends the compositor a notification of
+  its own (`LISTEN`). When it is signalled, the personality takes the
+  window's events and turns them into `struct input_event`s:
+  - a key as `EV_KEY` with Linux's key code for its USB usage, the
+    modifier keys as their byte changes;
+  - the pointer's place in the window as `EV_ABS`, its buttons as
+    `BTN_LEFT`, `BTN_RIGHT` and `BTN_MIDDLE`, the wheel as `EV_REL`;
+  - each change followed by `SYN_REPORT`.
+
+  Reads wait for whole events (or answer `EAGAIN` when non-blocking), and
+  `poll` and epoll see them. A device opened starts empty. evdev's
+  ioctls answer the version, id and name, the event types and codes each
+  device has, the pointer's axes, and grabbing. `boot/linux.manifest`
+  gains the xHCI and HID drivers, and the kernel's notification table
+  grows from 32 to 64 (the added components filled it). `linux-test` has
+  a program open both devices and name the pointer's; the host then
+  clicks on its window through QEMU's USB tablet and types two keys. The
+  program prints the pointer's place, the button pressed and let go, and
+  the keys' codes, on both ISAs.
 - Interrupt and exception entries clear the direction flag. User code may be
   interrupted mid-way through a backward copy, with the flag set; the kernel's own
   copies need it clear, and without the `cld` they ran backwards, wrecking saved
