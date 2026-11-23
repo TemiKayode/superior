@@ -4,7 +4,8 @@
 # crashed twice under calls (one-for-one). crasher faults every time it
 # starts, so the manager gives up on it after five restarts and
 # tombstones its service. Crashing base (rest-for-one) restarts after,
-# which comes after it, too.
+# which comes after it, too. counter runs on a budget of its own, made
+# again with each instance.
 
 component client
   image testclient
@@ -19,6 +20,7 @@ component counter
   image counter
   provides counter 0
   state 1
+  budget 5 10
 
 component crasher
   image testclient

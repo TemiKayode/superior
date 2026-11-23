@@ -241,6 +241,11 @@ struct Kernel {
     thread_used: [bool; MAX_THREADS],
     /// Made by retype (so destroyed with its last capability).
     thread_object: [bool; MAX_THREADS],
+    /// Scheduling-context table entries in use: by a boot thread (entry
+    /// `t` for boot thread `t`, kept for good) or a SchedContext object.
+    sc_used: [bool; MAX_THREADS],
+    /// Made by retype (so destroyed with its last capability).
+    sc_object: [bool; MAX_THREADS],
     /// Configured with ThreadConfigure, and at what priority.
     configured: [Option<u8>; MAX_THREADS],
     /// Not yet run: its frame holds start registers (entry, stack, argument),
@@ -406,6 +411,8 @@ static KERNEL: Mutex<Kernel> = Mutex::new(Kernel {
     fp_owner: [None; MAX_CPUS],
     thread_used: [false; MAX_THREADS],
     thread_object: [false; MAX_THREADS],
+    sc_used: [false; MAX_THREADS],
+    sc_object: [false; MAX_THREADS],
     configured: [None; MAX_THREADS],
     // The timer's notification belongs to the kernel and is never freed.
     ntfn_used: {
@@ -496,6 +503,10 @@ pub fn spawn_process_with(
     k.spaces[t] = Some(id as u16);
     k.thread_used[t] = true;
     k.fresh[t] = true;
+    k.sc_used[t] = true;
+    k.ipc
+        .bind_sc(tid, Some(tid))
+        .map_err(|_| "could not bind the thread's scheduling context")?;
     k.ipc
         .spawn(tid, prio)
         .map_err(|_| "could not make thread runnable")?;
@@ -738,6 +749,8 @@ pub fn handle_syscall(frame: &mut UserFrame) -> Exit {
         Some(Syscall::IntxLine) => intx_line(k, cur, &a),
         Some(Syscall::ThreadRegisters) => thread_registers(k, cur, &a),
         Some(Syscall::ThreadSetTimeoutHandler) => thread_set_timeout_handler(k, cur, &a),
+        Some(Syscall::SchedContextBind) => sched_context_bind(k, cur, &a),
+        Some(Syscall::SchedControlConfigure) => sched_control_configure(k, cur, &a),
         Some(Syscall::IrqMsiMessage) => irq_msi_message(k, cur, &a),
         Some(Syscall::FrameDmaAddress) => frame_dma_address(k, cur, a.a0),
         Some(Syscall::DeviceFrame) => device_frame(k, cur, &a),
@@ -1712,6 +1725,53 @@ fn thread_set_fault_handler(k: &mut Kernel, cur: Tid, f: &Args) -> Result<(), u6
     Ok(())
 }
 
+/// The scheduling context in the caller's slot `slot`, which must hold a
+/// SchedContext capability with Write.
+fn sched_context_cap(k: &Kernel, cur: Tid, slot: u64) -> Result<Tid, u64> {
+    let s = own_slot(k, cur, slot).ok_or(Error::InvalidCapability.code())?;
+    let cap = k.caps.get(s).ok_or(Error::InvalidCapability.code())?;
+    let Object::SchedContext { id } = cap.object else {
+        return Err(Error::InvalidCapability.code());
+    };
+    if !cap.rights.contains(Rights::WRITE) {
+        return Err(Error::InsufficientRights.code());
+    }
+    Ok(id as Tid)
+}
+
+/// `SchedContextBind`: rdi = thread, rsi = scheduling context, or
+/// `u64::MAX` for none.
+fn sched_context_bind(k: &mut Kernel, cur: Tid, f: &Args) -> Result<(), u64> {
+    let t = thread_cap(k, cur, f.a0)?;
+    let sc = if f.a1 == u64::MAX {
+        None
+    } else {
+        Some(sched_context_cap(k, cur, f.a1)?)
+    };
+    k.ipc.bind_sc(t, sc).map_err(|e| e.status())
+}
+
+/// `SchedControlConfigure`: rdi = sched control, rsi = scheduling context,
+/// rdx = budget, r8 = period (0: unlimited); a budget of 0 empties it.
+fn sched_control_configure(k: &mut Kernel, cur: Tid, f: &Args) -> Result<(), u64> {
+    let s = own_slot(k, cur, f.a0).ok_or(Error::InvalidCapability.code())?;
+    if !matches!(k.caps.get(s).map(|c| c.object), Some(Object::SchedControl)) {
+        return Err(Error::InvalidCapability.code());
+    }
+    let sc = sched_context_cap(k, cur, f.a1)?;
+    let r = match (f.a2, f.a3) {
+        (_, 0) => k.ipc.unlimit_sc(sc),
+        (0, _) => k.ipc.empty_sc(sc),
+        (b, p) => {
+            let (Ok(b), Ok(p)) = (u32::try_from(b), u32::try_from(p)) else {
+                return Err(Error::InvalidArgument.code());
+            };
+            k.ipc.configure_sc(sc, b, p)
+        }
+    };
+    r.map_err(|_| Error::InvalidArgument.code())
+}
+
 /// `ThreadSetTimeoutHandler`: rdi = thread, rsi = endpoint with Write, or
 /// `u64::MAX` for none.
 fn thread_set_timeout_handler(k: &mut Kernel, cur: Tid, f: &Args) -> Result<(), u64> {
@@ -1901,6 +1961,7 @@ fn reapable(o: &Object) -> bool {
             | Object::IoSpace { .. }
             | Object::Endpoint { .. }
             | Object::Notification { .. }
+            | Object::SchedContext { .. }
     )
 }
 
@@ -2307,6 +2368,15 @@ fn reap(k: &mut Kernel) {
             destroy_io_space(k, id);
             continue;
         }
+        // A scheduling context goes with its last capability, taking the
+        // CPU time of every thread on it until they are bound again.
+        for id in 0..MAX_THREADS {
+            if k.sc_object[id] && !live.scs[id] {
+                k.sc_object[id] = false;
+                k.sc_used[id] = false;
+                let _ = k.ipc.destroy_sc(id as Tid);
+            }
+        }
         for id in 0..MAX_ENDPOINTS {
             if k.ep_used[id] && !live.endpoints[id] {
                 k.ep_used[id] = false;
@@ -2359,6 +2429,7 @@ struct Live {
     io_spaces: [bool; MAX_IO_SPACES],
     endpoints: [bool; MAX_ENDPOINTS],
     ntfns: [bool; MAX_NOTIFICATIONS],
+    scs: [bool; MAX_THREADS],
 }
 
 impl Live {
@@ -2371,6 +2442,7 @@ impl Live {
             io_spaces: [false; MAX_IO_SPACES],
             endpoints: [false; MAX_ENDPOINTS],
             ntfns: [false; MAX_NOTIFICATIONS],
+            scs: [false; MAX_THREADS],
         };
         for c in k.caps.iter() {
             let i = match c.object {
@@ -2382,6 +2454,7 @@ impl Live {
                 Object::IoSpace { id } => l.io_spaces.get_mut(id as usize),
                 Object::Endpoint { id } => l.endpoints.get_mut(id as usize),
                 Object::Notification { id } => l.ntfns.get_mut(id as usize),
+                Object::SchedContext { id } => l.scs.get_mut(id as usize),
                 _ => None,
             };
             if let Some(i) = i {
@@ -2470,11 +2543,9 @@ fn thread_configure(k: &mut Kernel, cur: Tid, f: &Args) -> Result<(), u64> {
     let _ = k.ipc.set_timeout_handler(t, k.ipc.timeout_handler(cur));
     k.foreign[i] = false;
     k.tls[i] = 0;
-    // Nor escape its budget: the new thread gets the same parameters.
-    let sc = *k.ipc.sched_context(cur);
-    if let Some(budget) = sc.budget {
-        let _ = k.ipc.configure_sc(t, budget, sc.period);
-    }
+    // Nor escape its budget: the new thread shares its creator's context,
+    // so a component's threads draw on one budget however many it makes.
+    let _ = k.ipc.bind_sc(t, k.ipc.bound_sc(cur));
     k.configured[i] = Some(prio as u8);
     Ok(())
 }
@@ -2689,6 +2760,7 @@ fn retype(k: &mut Kernel, cur: Tid, f: &Args) -> Result<(), u64> {
                 .position(Option::is_none)
                 .ok_or(Error::ObjectTableFull.code())?,
         ),
+        ObjectType::SchedContext => Some(free(&k.sc_used).ok_or(Error::ObjectTableFull.code())?),
     };
     let base = k.caps.carve(src, bits).map_err(cap_error)?;
     let ipc_rights = Rights::READ | Rights::WRITE | Rights::GRANT | Rights::GRANT_REPLY;
@@ -2705,6 +2777,9 @@ fn retype(k: &mut Kernel, cur: Tid, f: &Args) -> Result<(), u64> {
             // Its previous thread was destroyed (so is inactive).
             let reset = k.ipc.reset_thread(t as Tid);
             debug_assert!(reset.is_ok(), "retyping active thread {t}");
+            // Entry t's context is not its own: it runs on none until
+            // ThreadConfigure binds it to its creator's.
+            let _ = k.ipc.bind_sc(t as Tid, None);
             k.thread_used[t] = true;
             k.thread_object[t] = true;
             k.cspace[t] = window(t);
@@ -2764,6 +2839,15 @@ fn retype(k: &mut Kernel, cur: Tid, f: &Args) -> Result<(), u64> {
             k.io_spaces[id] = Some(d);
             Capability::new(
                 Object::IoSpace { id: id as u32 },
+                Rights::READ | Rights::WRITE | Rights::GRANT,
+            )
+        }
+        (ObjectType::SchedContext, Some(id)) => {
+            k.sc_used[id] = true;
+            k.sc_object[id] = true;
+            let _ = k.ipc.empty_sc(id as Tid);
+            Capability::new(
+                Object::SchedContext { id: id as u32 },
                 Rights::READ | Rights::WRITE | Rights::GRANT,
             )
         }

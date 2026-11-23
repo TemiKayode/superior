@@ -6,7 +6,9 @@
 //! reply, reply-and-receive, signal, wait, yield, going passive, each with
 //! random objects, badges and capability transfers) or an outside event (a
 //! timer tick, an interrupt signal, a thread suspended or started, a
-//! budget changed, an object destroyed). After every step the harness:
+//! budget changed, a thread bound to another scheduling context or to
+//! none, a context emptied, made unlimited or destroyed, an object
+//! destroyed). After every step the harness:
 //!
 //! - runs `schedule` as the kernel does, then checks every structural
 //!   invariant of the engine ([`Ipc::check_invariants`]): queues
@@ -124,6 +126,13 @@ enum Op {
         budget: u32,
         period: u32,
     },
+    Bind {
+        t: Tid,
+        sc: Option<Tid>,
+    },
+    EmptySc(Tid),
+    UnlimitSc(Tid),
+    DestroySc(Tid),
     TimeoutHandler {
         t: Tid,
         ep: Option<u16>,
@@ -258,7 +267,19 @@ impl Sim {
                 t,
                 ep: r.chance(80).then_some(ep),
             },
-            94..=96 => {
+            94 => {
+                let sc = r.below(THREADS as u64) as Tid;
+                match r.below(6) {
+                    0..=2 => Op::Bind {
+                        t,
+                        sc: r.chance(85).then_some(sc),
+                    },
+                    3 => Op::EmptySc(sc),
+                    4 => Op::UnlimitSc(sc),
+                    _ => Op::DestroySc(sc),
+                }
+            }
+            95..=96 => {
                 // Mostly short periods, so threads are often throttled;
                 // some long enough to fill a context's refill ring.
                 let period = if r.chance(70) {
@@ -397,6 +418,10 @@ impl Sim {
                 Ok(())
             }
             Op::Budget { t, budget, period } => self.k.configure_sc(t, budget, period),
+            Op::Bind { t, sc } => self.k.bind_sc(t, sc),
+            Op::EmptySc(sc) => self.k.empty_sc(sc),
+            Op::UnlimitSc(sc) => self.k.unlimit_sc(sc),
+            Op::DestroySc(sc) => self.k.destroy_sc(sc),
             Op::TimeoutHandler { t, ep } => self
                 .k
                 .set_timeout_handler(t, ep.map(|e| (e, TIMEOUT_BADGE | t as u64))),
@@ -437,19 +462,31 @@ impl Sim {
         }
 
         self.k.check_invariants().map_err(|e| self.fail(seed, e))?;
-        self.check_bandwidth(began).map_err(|e| self.fail(seed, e))?;
+        // A context given new parameters starts a new budget now.
+        let restarted = match (op, result) {
+            (
+                Op::Budget { t: sc, .. } | Op::EmptySc(sc) | Op::UnlimitSc(sc) | Op::DestroySc(sc),
+                Ok(()),
+            ) => Some(sc),
+            _ => None,
+        };
+        self.check_bandwidth(began, restarted)
+            .map_err(|e| self.fail(seed, e))?;
         self.check_messages(op, cur, stopped, &before, result)
             .map_err(|e| self.fail(seed, e))
     }
 
     /// No context is charged more than its budget in any `period` ticks.
-    fn check_bandwidth(&mut self, began: u64) -> Result<(), String> {
+    fn check_bandwidth(&mut self, began: u64, restarted: Option<Tid>) -> Result<(), String> {
         for t in 0..THREADS {
             let sc = *self.k.sched_context(t as Tid);
-            if sc.consumed < self.consumed[t] {
-                // Configured again (or reset): a new budget starts now.
+            if restarted == Some(t as Tid) || sc.consumed < self.consumed[t] {
+                // Configured again (or destroyed): a new budget starts now,
+                // and nothing charged before it counts against it. Charges
+                // from this very step (none: no tick) would be lost.
                 self.charges[t].clear();
-                self.consumed[t] = 0;
+                self.consumed[t] = sc.consumed;
+                continue;
             }
             for _ in self.consumed[t]..sc.consumed {
                 self.charges[t].push_back(began);

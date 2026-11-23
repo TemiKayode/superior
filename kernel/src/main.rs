@@ -347,6 +347,24 @@ fn start_component_manager() -> Result<(), &'static str> {
             Capability::new(Object::IommuControl, Rights::ALL),
         )
     });
+    // CPU time: the right to give budgets, and the root task's own context
+    // (entry ROOT_TID, the boot thread's), which components share until
+    // the manager gives them one of their own.
+    let sched = [
+        (
+            root::SCHED_CONTROL as usize,
+            Capability::new(Object::SchedControl, Rights::ALL),
+        ),
+        (
+            root::SCHED_CONTEXT as usize,
+            Capability::new(
+                Object::SchedContext {
+                    id: task::ROOT_TID as u32,
+                },
+                Rights::READ | Rights::WRITE | Rights::GRANT,
+            ),
+        ),
+    ];
     let state = (0..root::STATE_PAGES).map(|p| {
         let frame = Object::Frame {
             paddr: store + p * 4096,
@@ -382,9 +400,9 @@ fn start_component_manager() -> Result<(), &'static str> {
             Capability::new(Object::Untyped { base, size_bits }, Rights::ALL),
         )
     });
-    let mut all = [(0, caps[0].1); 56 + root::SPARE_COUNT as usize];
+    let mut all = [(0, caps[0].1); 58 + root::SPARE_COUNT as usize];
     let mut n = 0;
-    for c in caps.into_iter().chain(pci).chain(iommu).chain(state).chain(intx).chain(ps2).chain(screen).chain(spare) {
+    for c in caps.into_iter().chain(pci).chain(iommu).chain(state).chain(intx).chain(ps2).chain(screen).chain(spare).chain(sched) {
         all[n] = c;
         n += 1;
     }

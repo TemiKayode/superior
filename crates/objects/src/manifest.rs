@@ -13,6 +13,8 @@
 //!                           # running component with the same image;
 //!                           # launch: when a launcher asks
 //!   priority 10             # default 10
+//!   budget 2 10             # 2 ticks of CPU time in every 10, shared by
+//!                           # all its threads (default: unlimited)
 //!   arg 0                   # passed in its first argument register
 //!   memory 20               # bits of untyped memory for this instance
 //!   restart one-for-one     # or rest-for-one, or never
@@ -65,6 +67,8 @@
 //! could never start).
 
 pub const MAX_COMPONENTS: usize = 16;
+/// The longest budget period, in ticks.
+pub const MAX_PERIOD: u64 = 100_000;
 /// Capabilities a component is given (the Linux personality, with its
 /// thirty-five files, has 42).
 pub const MAX_CAPS: usize = 48;
@@ -166,6 +170,9 @@ pub struct Component<'a> {
     pub start: Start,
     pub restart: Restart,
     pub priority: u8,
+    /// CPU time: `(budget, period)` in ticks, one scheduling context all
+    /// its threads share; `None` runs it unlimited.
+    pub budget: Option<(u32, u32)>,
     pub arg: u64,
     pub memory_bits: u8,
     /// Its CSpace size in bits.
@@ -204,6 +211,7 @@ impl<'a> Component<'a> {
             start: Start::Boot,
             restart: Restart::OneForOne,
             priority: 10,
+            budget: None,
             arg: 0,
             memory_bits: DEFAULT_MEMORY_BITS,
             cspace_bits: CSPACE_BITS,
@@ -402,6 +410,17 @@ impl<'a> Manifest<'a> {
                     match number(w)? {
                         p @ 1..=62 => c.priority = p as u8,
                         _ => return Err(err("priority must be 1 to 62", w)),
+                    }
+                    None
+                }
+                "budget" => {
+                    let b = arg("budget needs ticks and a period")?;
+                    let w = arg("budget needs ticks and a period")?;
+                    match (number(b)?, number(w)?) {
+                        (b @ 1.., p @ 1..=MAX_PERIOD) if b <= p => {
+                            c.budget = Some((b as u32, p as u32))
+                        }
+                        _ => return Err(err("budget must be 1 to its period, at most 100000", w)),
                     }
                     None
                 }
@@ -710,6 +729,17 @@ component memserver
     }
 
     #[test]
+    fn a_budget_is_ticks_in_a_period() {
+        let m = Manifest::parse("component a
+ image a
+ budget 2 10
+component b
+ image b").unwrap();
+        assert_eq!(m.components[0].as_ref().unwrap().budget, Some((2, 10)));
+        assert_eq!(m.components[1].as_ref().unwrap().budget, None, "unlimited by default");
+    }
+
+    #[test]
     fn untyped_spare_names_its_first_slot_once() {
         let m = Manifest::parse(
             "component mem
@@ -788,6 +818,18 @@ component memserver
         assert_eq!(
             error("component a\n image a\n priority 63"),
             (3, "priority must be 1 to 62")
+        );
+        assert_eq!(
+            error("component a\n image a\n budget 3 2"),
+            (3, "budget must be 1 to its period, at most 100000")
+        );
+        assert_eq!(
+            error("component a\n image a\n budget 0 2"),
+            (3, "budget must be 1 to its period, at most 100000")
+        );
+        assert_eq!(
+            error("component a\n image a\n budget 2"),
+            (3, "budget needs ticks and a period")
         );
         assert_eq!(
             error("component a\n image a\n memory 30"),

@@ -294,6 +294,18 @@ pub enum Syscall {
     /// [`FaultKind::Timeout`] call to it. `rsi` = `u64::MAX` removes it.
     /// A thread inherits its creator's.
     ThreadSetTimeoutHandler = 54,
+    /// Binds the thread in slot `rdi` (Write right) to the scheduling
+    /// context in slot `rsi` (Write right): it runs on that context's
+    /// budget, shared with every other thread bound to it. `rsi` =
+    /// `u64::MAX` unbinds it, and a thread bound to no context cannot run.
+    /// A thread starts bound to its creator's context.
+    SchedContextBind = 55,
+    /// Sets the budget of the scheduling context in slot `rsi` (Write
+    /// right): `rdx` ticks in every `r8` ticks, starting full now.
+    /// `r8` = 0 makes it unlimited, `rdx` = 0 empties it (its threads
+    /// cannot run). Needs the sched-control capability in slot `rdi`: CPU
+    /// time is handed out only by its holder (the Component Manager).
+    SchedControlConfigure = 56,
     /// Maps the frame in slot `rdi` at page-aligned `rsi` in the address
     /// space in slot `r8` (Write right). `rdx` = [`MAP_WRITE`] and/or
     /// [`MAP_EXEC`], never both. Needs the frame's Map right, plus Write
@@ -373,6 +385,8 @@ impl Syscall {
             52 => Syscall::IntxLine,
             53 => Syscall::ThreadRegisters,
             54 => Syscall::ThreadSetTimeoutHandler,
+            55 => Syscall::SchedContextBind,
+            56 => Syscall::SchedControlConfigure,
             42 => Syscall::IoFaults,
             0x100 => Syscall::DebugPutStr,
             0x101 => Syscall::DebugSelftestDone,
@@ -586,6 +600,10 @@ pub enum ObjectType {
     /// come out of its memory the same way. Only made when the machine
     /// has an IOMMU the kernel drives.
     IoSpace = 7,
+    /// A scheduling context: CPU time threads bound to it share. It holds
+    /// no budget until configured ([`Syscall::SchedControlConfigure`]),
+    /// and deleting its last capability leaves its threads with none.
+    SchedContext = 8,
 }
 
 impl ObjectType {
@@ -599,6 +617,7 @@ impl ObjectType {
             5 => ObjectType::CNode,
             6 => ObjectType::AddressSpace,
             7 => ObjectType::IoSpace,
+            8 => ObjectType::SchedContext,
             _ => return None,
         })
     }
@@ -627,6 +646,7 @@ impl ObjectType {
                 Some(requested as u8)
             }
             ObjectType::IoSpace => None,
+            ObjectType::SchedContext => Some(8),
         }
     }
 }
@@ -745,8 +765,14 @@ pub mod root {
     /// Server (`untyped spare` in the manifest).
     pub const SPARE: u64 = FRAMEBUFFER + 1;
     pub const SPARE_COUNT: u64 = 32;
+    /// The sched-control capability: the right to give scheduling
+    /// contexts budgets ([`Syscall::SchedControlConfigure`]).
+    pub const SCHED_CONTROL: u64 = SPARE + SPARE_COUNT;
+    /// The root task's own scheduling context (unlimited), which threads
+    /// it makes share unless it binds them to another.
+    pub const SCHED_CONTEXT: u64 = SCHED_CONTROL + 1;
     /// The first slot with nothing in it.
-    pub const FIRST_FREE: u64 = SPARE + SPARE_COUNT;
+    pub const FIRST_FREE: u64 = SCHED_CONTEXT + 1;
     /// The root task's argument: the bundle's length, and in the bits from
     /// [`REBOOTS_SHIFT`] how many fast reboots came before this start.
     pub const REBOOTS_SHIFT: u32 = 32;

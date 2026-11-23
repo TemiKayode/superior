@@ -111,7 +111,7 @@ const _: () = assert!(SHARED_PAGES + SHARED_SLOTS <= BLOCKS);
 /// Each component's block of slots: its untyped memory, then the objects
 /// of its current instance.
 const BLOCKS: u64 = 512;
-const BLOCK: u64 = 96;
+const BLOCK: u64 = 97;
 const B_UNTYPED: u64 = 0;
 const B_VSPACE: u64 = 1;
 const B_CNODE: u64 = 2;
@@ -120,7 +120,9 @@ const B_IMAGE: u64 = 4;
 const IMAGE_PAGES: u64 = 76;
 const B_STACK: u64 = B_IMAGE + IMAGE_PAGES;
 const STACK_PAGES: u64 = 16;
-const _: () = assert!(B_STACK + STACK_PAGES <= BLOCK);
+/// Its scheduling context, if the manifest gives it a `budget`.
+const B_SCHED: u64 = B_STACK + STACK_PAGES;
+const _: () = assert!(B_SCHED + 1 <= BLOCK);
 /// The system slots (`system` in the manifest, A/B updates): a badged
 /// capability to the system disk's block service for the manager's own
 /// reads and writes, a page it lends the driver for each, and the pages
@@ -431,6 +433,21 @@ impl<'a> Manager<'a> {
             [entry, STACK_TOP, c.arg, c.priority as u64],
         )
         .map_err(|e| ("configuring the thread", e))?;
+        // A budget: a context of its own, made from its block (so stopping
+        // it destroys the context), which every thread it makes shares.
+        // Without one it shares the manager's, unlimited.
+        if let Some((budget, period)) = c.budget {
+            let sc = block + B_SCHED;
+            retype(ut, ObjectType::SchedContext, 0, sc).map_err(|e| ("scheduling context", e))?;
+            sys(
+                Syscall::SchedControlConfigure,
+                root::SCHED_CONTROL,
+                [sc, budget as u64, period as u64, 0],
+            )
+            .map_err(|e| ("budget", e))?;
+            sys(Syscall::SchedContextBind, tcb, [sc, 0, 0, 0]).map_err(|e| ("budget", e))?;
+            say!("{}: budget {} ticks in {}", c.name, budget, period);
+        }
         sys(Syscall::ThreadSetVSpace, tcb, [vspace, 0, 0, 0])
             .map_err(|e| ("set address space", e))?;
         sys(Syscall::ThreadSetSpace, tcb, [cnode, 0, 0, 0]).map_err(|e| ("set CSpace", e))?;

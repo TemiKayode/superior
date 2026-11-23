@@ -2968,10 +2968,12 @@ fn supervise_test(img: &Image) -> Result<(), String> {
     let out = run_to_exit(img, Duration::from_secs(60))?;
     let steps = [
         "[cm] manifest: 5 components",
+        "[cm] counter: budget 5 ticks in 10",
         "[pass] supervise: counter starts at 0 (instance 1)",
         "[pass] supervise: add 5 (request 1): 5",
         "[cm] counter faulted: page fault",
         "[cm] restarting counter (one-for-one)",
+        "[cm] counter: budget 5 ticks in 10",
         "[pass] supervise: the counter crashed under a call",
         "[pass] supervise: after the restart: value 5 (instance 2)",
         "counter: instance 3 starting, value 15",

@@ -222,8 +222,19 @@ holds the rest):
   `Call` to it (kind, address, rip, error code). The handler's reply retries the
   instruction, resumes at a new rip with a value in `rax`, or stops the thread. A thread
   with no handler is stopped and logged; a kernel-mode fault still panics.
-- Scheduling contexts (MCS): each thread owns one, unlimited unless given a budget per
-  period. Budgets are charged per tick and replenished as sporadic servers: a tick
+- Scheduling contexts (MCS): kernel objects of their own, retyped from untyped memory
+  (`SchedContext`) and named by capabilities. A thread runs on the context it is bound
+  to (`SchedContextBind`), and threads bound to one share its budget, wherever they run:
+  when it runs dry, every one of them stops, on every CPU. A new thread is bound to its
+  creator's context, so a component cannot escape its budget by making threads. A new
+  context is empty (its threads cannot run) until the holder of sched control, which
+  only the Component Manager is given, configures it (`SchedControlConfigure`: a budget
+  per period, or unlimited); deleting its last capability leaves its threads with none.
+  The manager gives a component with `budget <ticks> <period>` in its manifest a context
+  of its own, made from the component's memory, so stopping the component destroys it
+  and a restarted one gets a fresh one (the supervision test runs its counter on 5 ticks
+  in 10 across crashes); a component without one shares the manager's, unlimited.
+  Budgets are charged per tick and replenished as sporadic servers: a tick
   charged when it began at `c` comes back as a refill released at `c + period`, in a
   ring of up to 8 refills per context (a charge that would need a ninth merges into
   the last refill, which only delays it). So no window of one period is charged more

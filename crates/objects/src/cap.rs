@@ -140,6 +140,12 @@ pub enum Object {
     /// The right to bind I/O address spaces to PCI functions. Handed out
     /// at boot, when there is an IOMMU.
     IommuControl,
+    /// A scheduling context (an entry in the kernel's table of them).
+    SchedContext {
+        id: u32,
+    },
+    /// The right to give scheduling contexts budgets. Handed out at boot.
+    SchedControl,
 }
 
 impl Object {

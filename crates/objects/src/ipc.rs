@@ -16,8 +16,13 @@
 //!   (the IPC fast path), unless a higher-priority thread is ready.
 //! - Strict fixed priorities (64 levels), FIFO within a level, and
 //!   round-robin time slices within a level driven by [`Ipc::tick`].
-//! - Scheduling contexts (MCS, spec section 3): every thread owns one,
-//!   unlimited unless configured with a budget per period. Budgets are
+//! - Scheduling contexts (MCS, spec section 3): objects of their own. A
+//!   thread runs on the context it is bound to ([`Ipc::bind_sc`]), and
+//!   several threads may share one (a component's threads draw on one
+//!   budget). A context is unlimited, empty (no budget: its threads cannot
+//!   run) or configured with a budget per period. A thread bound to none
+//!   cannot run; destroying a context unbinds its threads
+//!   ([`Ipc::destroy_sc`]). Thread `i` starts bound to context `i`. Budgets are
 //!   charged per timer tick and replenished as sporadic servers: a tick
 //!   charged at time `c` comes back at `c + period`, so no window of one
 //!   period is charged more than the budget (see [`SchedContext`]); a
@@ -135,10 +140,20 @@ const UNLIMITED: SchedContext = SchedContext {
     consumed: 0,
 };
 
+/// No budget at all, until configured: what a new context object holds.
+const EMPTY: SchedContext = SchedContext {
+    budget: Some(0),
+    period: 0,
+    refills: [NO_REFILL; MAX_REFILLS],
+    len: 0,
+    consumed: 0,
+};
+
 impl core::fmt::Debug for SchedContext {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self.budget {
             None => write!(f, "unlimited"),
+            Some(0) => write!(f, "empty"),
             Some(b) => write!(
                 f,
                 "{b}/{} refills {:?} used {}",
@@ -237,6 +252,13 @@ impl SchedContext {
             };
         };
         let r = self.refills();
+        if budget == 0 {
+            return if r.is_empty() {
+                Ok(())
+            } else {
+                Err(format!("empty context with refills {r:?}"))
+            };
+        }
         if r.is_empty() {
             return Err(format!("{budget}-tick budget with no refills"));
         }
@@ -294,6 +316,9 @@ pub struct Tcb {
     passive_pending: bool,
     /// The scheduling context a caller lent this (passive) thread.
     lent: Option<Tid>,
+    /// The scheduling context this thread is bound to (runs on when not
+    /// passive).
+    sc: Option<Tid>,
     /// The notification bound to this thread.
     bound: Option<u16>,
     /// Endpoint and badge a timeout fault calls.
@@ -333,6 +358,7 @@ const IDLE_TCB: Tcb = Tcb {
     lent: None,
     bound: None,
     timeout: None,
+    sc: None,
 };
 
 #[derive(Clone, Copy, Default, Debug)]
@@ -493,8 +519,14 @@ impl<const T: usize, const E: usize, const N: usize> Default for Ipc<T, E, N> {
 
 impl<const T: usize, const E: usize, const N: usize> Ipc<T, E, N> {
     pub const fn new() -> Self {
+        let mut threads = [IDLE_TCB; T];
+        let mut i = 0;
+        while i < T {
+            threads[i].sc = Some(i as Tid);
+            i += 1;
+        }
         Ipc {
-            threads: [IDLE_TCB; T],
+            threads,
             eps: [Endpoint {
                 state: EpState::Idle,
                 queue: Queue::EMPTY,
@@ -716,8 +748,9 @@ impl<const T: usize, const E: usize, const N: usize> Ipc<T, E, N> {
         Ok(())
     }
 
-    /// Clears an inactive thread's state (and scheduling context) so the
-    /// table entry can be reused for a new thread.
+    /// Clears an inactive thread's state so the table entry can be reused
+    /// for a new thread. It is bound to context `t` again; contexts are
+    /// objects of their own and outlive it.
     pub fn reset_thread(&mut self, t: Tid) -> Result<(), IpcError> {
         let tcb = self
             .threads
@@ -731,34 +764,7 @@ impl<const T: usize, const E: usize, const N: usize> Ipc<T, E, N> {
         }
         let tcb = &mut self.threads[t as usize];
         *tcb = IDLE_TCB;
-        self.scs[t as usize] = UNLIMITED;
-        // Its scheduling context goes with it: a passive thread running on
-        // it (lent by a call) loses it and cannot run until lent another.
-        for w in 0..T {
-            if self.threads[w].lent != Some(t) {
-                continue;
-            }
-            self.threads[w].lent = None;
-            match self.threads[w].state {
-                State::Running => {
-                    if self.currents[self.cpu] == Some(w as Tid) {
-                        self.currents[self.cpu] = None;
-                    }
-                    self.threads[w].state = State::NoSchedContext;
-                }
-                State::Ready => {
-                    let p = self.threads[w].prio as usize;
-                    self.ready[p].remove(&mut self.threads, w as Tid);
-                    if self.ready[p].is_empty() {
-                        self.ready_bits &= !(1 << p);
-                    }
-                    self.threads[w].state = State::NoSchedContext;
-                }
-                State::Throttled { .. } => self.threads[w].state = State::NoSchedContext,
-                _ => {}
-            }
-        }
-        self.schedule();
+        tcb.sc = Some(t);
         Ok(())
     }
 
@@ -899,23 +905,130 @@ impl<const T: usize, const E: usize, const N: usize> Ipc<T, E, N> {
         Ok(())
     }
 
-    /// Gives thread `t`'s scheduling context `budget` ticks every `period`
-    /// ticks, starting with a full budget now.
-    pub fn configure_sc(&mut self, t: Tid, budget: u32, period: u32) -> Result<(), IpcError> {
-        if t as usize >= T {
+    /// Gives scheduling context `sc` `budget` ticks every `period` ticks,
+    /// starting with a full budget now.
+    pub fn configure_sc(&mut self, sc: Tid, budget: u32, period: u32) -> Result<(), IpcError> {
+        if sc as usize >= T {
             return Err(IpcError::BadThread);
         }
         if budget == 0 || budget > period {
             return Err(IpcError::BadSchedParams);
         }
-        self.scs[t as usize] = SchedContext::limited(budget, period, self.now);
-        // Threads throttled on this context have budget again.
-        for w in 0..T {
-            if self.threads[w].state == (State::Throttled { sc: t }) {
-                self.wake(w as Tid);
+        self.set_sc(sc, SchedContext::limited(budget, period, self.now));
+        Ok(())
+    }
+
+    /// Makes context `sc` unlimited.
+    pub fn unlimit_sc(&mut self, sc: Tid) -> Result<(), IpcError> {
+        if sc as usize >= T {
+            return Err(IpcError::BadThread);
+        }
+        self.set_sc(sc, UNLIMITED);
+        Ok(())
+    }
+
+    /// Takes all budget from context `sc` (a new context object): threads
+    /// on it cannot run until it is configured.
+    pub fn empty_sc(&mut self, sc: Tid) -> Result<(), IpcError> {
+        if sc as usize >= T {
+            return Err(IpcError::BadThread);
+        }
+        self.set_sc(sc, EMPTY);
+        Ok(())
+    }
+
+    /// Replaces context `sc` and moves every thread on it to match: ready
+    /// threads may now be throttled, throttled ones may run.
+    fn set_sc(&mut self, sc: Tid, ctx: SchedContext) {
+        let consumed = self.scs[sc as usize].consumed;
+        self.scs[sc as usize] = SchedContext { consumed, ..ctx };
+        for w in 0..T as Tid {
+            if self.active_sc(w) == Some(sc) {
+                self.recheck(w);
             }
         }
+        self.schedule();
+    }
+
+    /// Binds thread `t` to context `sc` (or to none: it cannot run). A
+    /// passive thread keeps running on what callers lend it; the binding
+    /// counts once it is no longer passive.
+    pub fn bind_sc(&mut self, t: Tid, sc: Option<Tid>) -> Result<(), IpcError> {
+        if t as usize >= T {
+            return Err(IpcError::BadThread);
+        }
+        if sc.is_some_and(|x| x as usize >= T) {
+            return Err(IpcError::BadThread);
+        }
+        self.threads[t as usize].sc = sc;
+        self.recheck(t);
+        self.schedule();
+        self.preempt_if_outranked();
         Ok(())
+    }
+
+    /// The context thread `t` is bound to.
+    pub fn bound_sc(&self, t: Tid) -> Option<Tid> {
+        self.threads[t as usize].sc
+    }
+
+    /// Destroys context `sc`: threads bound to it, and passive threads
+    /// running on it as a loan, are left with none and cannot run.
+    pub fn destroy_sc(&mut self, sc: Tid) -> Result<(), IpcError> {
+        if sc as usize >= T {
+            return Err(IpcError::BadThread);
+        }
+        for w in 0..T {
+            let tcb = &mut self.threads[w];
+            let mut changed = false;
+            if tcb.sc == Some(sc) {
+                tcb.sc = None;
+                changed = true;
+            }
+            if tcb.lent == Some(sc) {
+                tcb.lent = None;
+                changed = true;
+            }
+            if changed {
+                self.recheck(w as Tid);
+            }
+        }
+        self.scs[sc as usize] = UNLIMITED;
+        self.schedule();
+        Ok(())
+    }
+
+    /// Thread `t`'s context changed (bound, lent, emptied, refilled): puts
+    /// it where it now belongs. A thread running on another CPU is only
+    /// marked, and that CPU lets it go when it next enters the kernel.
+    fn recheck(&mut self, t: Tid) {
+        let usable = match self.active_sc(t) {
+            None => Err(State::NoSchedContext),
+            Some(sc) if self.scs[sc as usize].exhausted(self.now) => Err(State::Throttled { sc }),
+            Some(_) => Ok(()),
+        };
+        let state = self.threads[t as usize].state;
+        match (state, usable) {
+            (State::Running, Err(parked)) => {
+                self.threads[t as usize].state = parked;
+                if self.currents[self.cpu] == Some(t) {
+                    self.currents[self.cpu] = None;
+                }
+            }
+            (State::Ready, Err(parked)) => {
+                let p = self.threads[t as usize].prio as usize;
+                self.ready[p].remove(&mut self.threads, t);
+                if self.ready[p].is_empty() {
+                    self.ready_bits &= !(1 << p);
+                }
+                self.threads[t as usize].state = parked;
+            }
+            (State::Throttled { .. } | State::NoSchedContext, Err(parked)) => {
+                self.threads[t as usize].state = parked;
+            }
+            (State::Throttled { .. } | State::NoSchedContext, Ok(())) => self.wake(t),
+            _ => {}
+        }
     }
 
     pub fn sched_context(&self, sc: Tid) -> &SchedContext {
@@ -975,7 +1088,7 @@ impl<const T: usize, const E: usize, const N: usize> Ipc<T, E, N> {
     /// The scheduling context `t` runs on, if any.
     pub fn active_sc(&self, t: Tid) -> Option<Tid> {
         let tcb = &self.threads[t as usize];
-        if tcb.passive { tcb.lent } else { Some(t) }
+        if tcb.passive { tcb.lent } else { tcb.sc }
     }
 
     /// One timer tick: charges the tick to the current thread's scheduling
@@ -1018,11 +1131,23 @@ impl<const T: usize, const E: usize, const N: usize> Ipc<T, E, N> {
             self.currents[self.cpu] = None;
             return;
         };
-        if sc != c {
+        let lent = self.threads[c as usize].passive;
+        if lent {
             self.stats.donated_ticks += 1;
         }
         if self.scs[sc as usize].charge(began) {
-            if sc != c && self.raise_timeout(c, sc) {
+            // Every other thread on the context stops too, wherever it runs.
+            for x in 0..MAX_CPUS {
+                if let Some(o) = self.currents[x]
+                    && x != self.cpu
+                    && self.threads[o as usize].state == State::Running
+                    && self.active_sc(o) == Some(sc)
+                {
+                    self.threads[o as usize].state = State::Throttled { sc };
+                    self.stats.throttles += 1;
+                }
+            }
+            if lent && self.raise_timeout(c, sc) {
                 return;
             }
             self.threads[c as usize].state = State::Throttled { sc };
@@ -2769,16 +2894,97 @@ mod tests {
     }
 
     #[test]
-    fn reset_thread_needs_inactive_and_clears_budget() {
+    fn reset_thread_needs_inactive_and_leaves_contexts_alone() {
         let mut k = K::new();
         k.spawn(CLIENT, 5).unwrap();
         k.configure_sc(CLIENT, 1, 4).unwrap();
+        k.bind_sc(CLIENT, Some(OTHER)).unwrap();
         assert_eq!(k.reset_thread(CLIENT), Err(IpcError::ThreadActive));
         k.schedule();
         k.suspend(CLIENT).unwrap();
         k.reset_thread(CLIENT).unwrap();
-        assert_eq!(k.sched_context(CLIENT).budget, None);
+        assert_eq!(k.sched_context(CLIENT).budget, Some(1), "contexts outlive threads");
+        assert_eq!(k.bound_sc(CLIENT), Some(CLIENT), "bound to its own index again");
         assert_eq!(k.thread(CLIENT).state, State::Inactive);
+    }
+
+    #[test]
+    fn threads_sharing_a_context_share_its_budget() {
+        let mut k = K::new();
+        k.spawn(SERVER, 10).unwrap();
+        k.spawn(OTHER, 10).unwrap();
+        k.spawn(CLIENT, 5).unwrap();
+        k.configure_sc(SERVER, 2, 10).unwrap();
+        k.bind_sc(OTHER, Some(SERVER)).unwrap();
+        k.schedule();
+        let mut ran = 0;
+        for _ in 0..100 {
+            let c = k.current();
+            k.tick();
+            k.check_invariants().unwrap();
+            if c == Some(SERVER) || c == Some(OTHER) {
+                ran += 1;
+            }
+        }
+        assert_eq!(ran, 20, "2 ticks in 10 between them, not each");
+        assert_eq!(k.sched_context(SERVER).consumed, 20);
+    }
+
+    #[test]
+    fn a_thread_bound_to_no_context_or_an_empty_one_cannot_run() {
+        let mut k = K::new();
+        k.spawn(SERVER, 10).unwrap();
+        k.spawn(CLIENT, 5).unwrap();
+        k.schedule();
+        assert_eq!(k.current(), Some(SERVER));
+        k.bind_sc(SERVER, None).unwrap();
+        assert_eq!(k.thread(SERVER).state, State::NoSchedContext);
+        assert_eq!(k.current(), Some(CLIENT));
+        k.empty_sc(OTHER).unwrap();
+        k.bind_sc(SERVER, Some(OTHER)).unwrap();
+        assert_eq!(k.thread(SERVER).state, State::Throttled { sc: OTHER });
+        k.tick();
+        assert_eq!(k.current(), Some(CLIENT), "an empty context never refills");
+        k.configure_sc(OTHER, 3, 6).unwrap();
+        assert_eq!(k.current(), Some(SERVER), "configured: it runs and preempts");
+        k.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn destroying_a_context_unbinds_its_threads() {
+        let mut k = K::new();
+        k.spawn(SERVER, 10).unwrap();
+        k.spawn(OTHER, 8).unwrap();
+        k.spawn(CLIENT, 5).unwrap();
+        k.bind_sc(OTHER, Some(SERVER)).unwrap();
+        k.schedule();
+        k.destroy_sc(SERVER).unwrap();
+        assert_eq!(k.bound_sc(SERVER), None);
+        assert_eq!(k.bound_sc(OTHER), None);
+        assert_eq!(k.thread(SERVER).state, State::NoSchedContext);
+        assert_eq!(k.thread(OTHER).state, State::NoSchedContext);
+        assert_eq!(k.current(), Some(CLIENT));
+        k.bind_sc(OTHER, Some(CLIENT)).unwrap();
+        assert_eq!(k.current(), Some(OTHER), "rebound, it runs again");
+        k.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn a_context_running_dry_stops_its_threads_on_every_cpu() {
+        let mut k = two_cpus();
+        // CPU 0 runs SERVER, CPU 1 runs CLIENT; both now share one tick.
+        k.configure_sc(SERVER, 1, 10).unwrap();
+        k.bind_sc(CLIENT, Some(SERVER)).unwrap();
+        k.set_cpu(0);
+        k.tick_cpu(true);
+        assert_eq!(k.thread(SERVER).state, State::Throttled { sc: SERVER });
+        assert_eq!(k.thread(CLIENT).state, State::Throttled { sc: SERVER });
+        assert_eq!(k.current_on(1), Some(CLIENT), "kept by CPU 1 until it enters the kernel");
+        assert!(k.needs_kick(1));
+        k.set_cpu(1);
+        k.reschedule();
+        assert_eq!(k.current_on(1), None);
+        k.check_invariants().unwrap();
     }
     // Regressions found by the simulation harness (crate::sim).
 
@@ -2836,8 +3042,7 @@ mod tests {
         k.recv(0, true).unwrap();
         k.call(0, 0, [0; 4]).unwrap();
         assert_eq!(k.current(), Some(SERVER));
-        k.suspend(CLIENT).unwrap();
-        k.reset_thread(CLIENT).unwrap();
+        k.destroy_sc(CLIENT).unwrap();
         assert_eq!(k.thread(SERVER).state, State::NoSchedContext);
         assert_eq!(k.current(), None);
     }
