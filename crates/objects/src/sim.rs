@@ -13,6 +13,10 @@
 //!   well-formed and consistent with thread states, one running thread at
 //!   the highest ready priority, budgets respected, no caller left waiting
 //!   on a reply nobody owes;
+//! - checks bandwidth: the harness notes when every tick charged to each
+//!   scheduling context began (the clock before the step) and requires that no `period` ticks hold
+//!   more charges than the context's `budget` (the sporadic-server
+//!   guarantee), independently of how the engine keeps its refills;
 //! - checks message integrity: every message a thread receives was sent to
 //!   that endpoint, with the sender's badge, and is received at most once;
 //!   a message whose sender was suspended before delivery is never
@@ -139,6 +143,10 @@ struct Sim {
     carrying: [Option<u64>; THREADS],
     hash: u64,
     recent: VecDeque<String>,
+    /// Per scheduling context: `consumed` as last seen, and when each tick
+    /// charged since it was last configured began.
+    consumed: [u64; THREADS],
+    charges: [VecDeque<u64>; THREADS],
 }
 
 impl Sim {
@@ -154,6 +162,8 @@ impl Sim {
             carrying: [None; THREADS],
             hash: 0xcbf2_9ce4_8422_2325,
             recent: VecDeque::new(),
+            consumed: [0; THREADS],
+            charges: core::array::from_fn(|_| VecDeque::new()),
         };
         // Threads 0..4 start at a few priorities (so there are ties); the
         // last is left inactive for Spawn to start later.
@@ -211,7 +221,13 @@ impl Sim {
                 prio: 1 + r.below(3) as u8,
             },
             93..=95 => {
-                let period = 2 + r.below(6) as u32;
+                // Mostly short periods, so threads are often throttled;
+                // some long enough to fill a context's refill ring.
+                let period = if r.chance(70) {
+                    2 + r.below(6) as u32
+                } else {
+                    8 + r.below(33) as u32
+                };
                 Op::Budget {
                     t,
                     budget: 1 + r.below(period as u64) as u32,
@@ -275,6 +291,8 @@ impl Sim {
             }
         }
         let before: [State; THREADS] = core::array::from_fn(|t| self.k.thread(t as Tid).state);
+        // A tick charged in this step began at the clock as it is now.
+        let began = self.k.now();
         let cur = self.k.current();
         let id = self.step;
         let xfer = CapTransfer {
@@ -372,8 +390,41 @@ impl Sim {
         }
 
         self.k.check_invariants().map_err(|e| self.fail(seed, e))?;
+        self.check_bandwidth(began).map_err(|e| self.fail(seed, e))?;
         self.check_messages(op, cur, stopped, &before, result)
             .map_err(|e| self.fail(seed, e))
+    }
+
+    /// No context is charged more than its budget in any `period` ticks.
+    fn check_bandwidth(&mut self, began: u64) -> Result<(), String> {
+        for t in 0..THREADS {
+            let sc = *self.k.sched_context(t as Tid);
+            if sc.consumed < self.consumed[t] {
+                // Configured again (or reset): a new budget starts now.
+                self.charges[t].clear();
+                self.consumed[t] = 0;
+            }
+            for _ in self.consumed[t]..sc.consumed {
+                self.charges[t].push_back(began);
+            }
+            self.consumed[t] = sc.consumed;
+            let Some(budget) = sc.budget else {
+                self.charges[t].clear();
+                continue;
+            };
+            let h = &mut self.charges[t];
+            while h.front().is_some_and(|&c| c + sc.period as u64 <= began) {
+                h.pop_front();
+            }
+            if h.len() > budget as usize {
+                return Err(format!(
+                    "context {t}: {} ticks charged in the {} ticks to {began}, budget {budget}: {h:?}",
+                    h.len(),
+                    sc.period
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn check_messages(

@@ -223,8 +223,13 @@ holds the rest):
   instruction, resumes at a new rip with a value in `rax`, or stops the thread. A thread
   with no handler is stopped and logged; a kernel-mode fault still panics.
 - Scheduling contexts (MCS): each thread owns one, unlimited unless given a budget per
-  period. Budgets are charged per tick and refilled each period (periodic, not yet
-  sporadic); a thread that runs dry is throttled until the refill. A passive server
+  period. Budgets are charged per tick and replenished as sporadic servers: a tick
+  charged when it began at `c` comes back as a refill released at `c + period`, in a
+  ring of up to 8 refills per context (a charge that would need a ninth merges into
+  the last refill, which only delays it). So no window of one period is charged more
+  than the budget, where periodic refills allowed twice that across a boundary; the
+  engine simulation checks exactly that for every context in every run. A thread
+  that runs dry is throttled until a refill is due. A passive server
   (`SchedPassive`) runs only on its caller's context, lent on `Call` and returned on
   reply, so serving a client is charged to that client.
 - Idle: a CPU with no thread it can run halts until an interrupt (or a kick from another
@@ -2164,7 +2169,7 @@ capability (today any component holding one may shut the machine down), and rele
 given up on to a supervisor above it (today the
 manager is the only one), memory budgets from a policy service (Phase 3), sizing the Memory Server's CSpace
 from the RAM it gets (its manifest names the size, 2^17 slots on the test machines), page tables for boot processes paid for from user memory,
-multi-level CSpaces, the first call's capability forwarded by a lazy-start watcher, scheduling-context capabilities (budgets are set at boot), sporadic refills,
+multi-level CSpaces, the first call's capability forwarded by a lazy-start watcher, scheduling-context capabilities (budgets are set at boot),
 timeout faults, per-CPU ready queues and thread affinity (one lock and shared queues
 today), device interrupts spread over CPUs, more than four CPUs, an IPC benchmark on bare
 metal.

@@ -18,9 +18,10 @@
 //!   round-robin time slices within a level driven by [`Ipc::tick`].
 //! - Scheduling contexts (MCS, spec section 3): every thread owns one,
 //!   unlimited unless configured with a budget per period. Budgets are
-//!   charged per timer tick and refilled in full at each period boundary
-//!   (periodic, not yet sporadic); a thread whose context runs dry is
-//!   throttled until the refill.
+//!   charged per timer tick and replenished as sporadic servers: a tick
+//!   charged at time `c` comes back at `c + period`, so no window of one
+//!   period is charged more than the budget (see [`SchedContext`]); a
+//!   thread whose context runs dry is throttled until a refill is due.
 //! - A passive server has given up its own context and runs only on its
 //!   caller's, lent on `Call` and returned on reply, so time spent serving
 //!   a client is charged to that client. A passive thread with no lent
@@ -83,29 +84,169 @@ pub enum State {
     NoSchedContext,
 }
 
+/// Refills a scheduling context keeps at once. When a charge would need
+/// one more, it is merged into the last, which only delays budget.
+pub const MAX_REFILLS: usize = 8;
+
+/// `amount` ticks of budget usable from tick `release` on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Refill {
+    pub release: u64,
+    pub amount: u32,
+}
+
+const NO_REFILL: Refill = Refill {
+    release: 0,
+    amount: 0,
+};
+
 /// CPU time a thread may consume. Scheduling context `i` belongs to
 /// thread `i`; a passive server borrows its caller's.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+///
+/// A limited context is a sporadic server: its `budget` is split into
+/// refills, each usable from its release tick. A tick charged at time `c`
+/// is taken from a released refill and comes back as a refill released
+/// at `c + period`, so every tick of budget is used at most once in any
+/// `period` ticks and no window of `period` ticks is charged more than
+/// `budget` (a periodic refill allows twice that across a boundary).
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct SchedContext {
     /// Ticks per period; `None` is unlimited.
     pub budget: Option<u32>,
     pub period: u32,
-    /// Ticks left in the current period.
-    pub remaining: u32,
-    /// Tick at which the budget is next refilled.
-    pub next_refill: u64,
+    /// Ordered by release, strictly increasing; amounts sum to `budget`.
+    refills: [Refill; MAX_REFILLS],
+    len: u8,
+    /// Ticks ever charged to this context.
+    pub consumed: u64,
 }
 
 const UNLIMITED: SchedContext = SchedContext {
     budget: None,
     period: 0,
-    remaining: 0,
-    next_refill: 0,
+    refills: [NO_REFILL; MAX_REFILLS],
+    len: 0,
+    consumed: 0,
 };
 
+impl core::fmt::Debug for SchedContext {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self.budget {
+            None => write!(f, "unlimited"),
+            Some(b) => write!(
+                f,
+                "{b}/{} refills {:?} used {}",
+                self.period,
+                self.refills(),
+                self.consumed
+            ),
+        }
+    }
+}
+
 impl SchedContext {
-    fn exhausted(&self) -> bool {
-        self.budget.is_some() && self.remaining == 0
+    /// A full `budget` usable from `now`.
+    fn limited(budget: u32, period: u32, now: u64) -> SchedContext {
+        let mut refills = [NO_REFILL; MAX_REFILLS];
+        refills[0] = Refill {
+            release: now,
+            amount: budget,
+        };
+        SchedContext {
+            budget: Some(budget),
+            period,
+            refills,
+            len: 1,
+            consumed: 0,
+        }
+    }
+
+    /// The pending refills, earliest first.
+    pub fn refills(&self) -> &[Refill] {
+        &self.refills[..self.len as usize]
+    }
+
+    /// Ticks of budget usable at `now` (0 for an unlimited context).
+    pub fn available(&self, now: u64) -> u32 {
+        self.refills()
+            .iter()
+            .take_while(|r| r.release <= now)
+            .map(|r| r.amount)
+            .sum()
+    }
+
+    fn exhausted(&self, now: u64) -> bool {
+        self.budget.is_some() && self.available(now) == 0
+    }
+
+    fn remove(&mut self, i: usize) {
+        let n = self.len as usize;
+        self.refills.copy_within(i + 1..n, i);
+        self.refills[n - 1] = NO_REFILL;
+        self.len -= 1;
+    }
+
+    /// Charges the tick that began at `now` (the clock before the tick
+    /// advanced it). Returns whether the context is then exhausted.
+    fn charge(&mut self, now: u64) -> bool {
+        self.consumed += 1;
+        let Some(_) = self.budget else { return false };
+        // Released refills are one pool: fold them into the first.
+        while self.len >= 2 && self.refills[1].release <= now {
+            self.refills[0].amount += self.refills[1].amount;
+            self.remove(1);
+        }
+        if self.len == 0 || self.refills[0].release > now {
+            // Nothing released (cannot happen to a running thread).
+            return true;
+        }
+        self.refills[0].amount -= 1;
+        if self.refills[0].amount == 0 {
+            self.remove(0);
+        }
+        // The tick comes back one period after it began. Every pending
+        // release is at most `now + period`, so appending keeps the order;
+        // merging into a full ring's last refill only delays that refill.
+        let release = now + self.period as u64;
+        let n = self.len as usize;
+        if n > 0 && (self.refills[n - 1].release == release || n == MAX_REFILLS) {
+            self.refills[n - 1].release = release;
+            self.refills[n - 1].amount += 1;
+        } else {
+            self.refills[n] = Refill { release, amount: 1 };
+            self.len += 1;
+        }
+        self.exhausted(now)
+    }
+
+    /// The refill ring is well formed at `now`.
+    #[cfg(test)]
+    fn check(&self, now: u64) -> Result<(), std::string::String> {
+        use std::format;
+        let Some(budget) = self.budget else {
+            return if self.len == 0 {
+                Ok(())
+            } else {
+                Err(format!("unlimited context with refills {:?}", self.refills()))
+            };
+        };
+        let r = self.refills();
+        if r.is_empty() {
+            return Err(format!("{budget}-tick budget with no refills"));
+        }
+        if r.iter().map(|x| x.amount as u64).sum::<u64>() != budget as u64 {
+            return Err(format!("refills {r:?} do not sum to the {budget}-tick budget"));
+        }
+        if r.iter().any(|x| x.amount == 0) {
+            return Err(format!("empty refill in {r:?}"));
+        }
+        if r.windows(2).any(|w| w[0].release >= w[1].release) {
+            return Err(format!("refills out of order: {r:?}"));
+        }
+        if r[r.len() - 1].release > now + self.period as u64 {
+            return Err(format!("refill past one period from {now}: {r:?}"));
+        }
+        Ok(())
     }
 }
 
@@ -745,12 +886,7 @@ impl<const T: usize, const E: usize, const N: usize> Ipc<T, E, N> {
         if budget == 0 || budget > period {
             return Err(IpcError::BadSchedParams);
         }
-        self.scs[t as usize] = SchedContext {
-            budget: Some(budget),
-            period,
-            remaining: budget,
-            next_refill: self.now + period as u64,
-        };
+        self.scs[t as usize] = SchedContext::limited(budget, period, self.now);
         // Threads throttled on this context have budget again.
         for w in 0..T {
             if self.threads[w].state == (State::Throttled { sc: t }) {
@@ -762,6 +898,16 @@ impl<const T: usize, const E: usize, const N: usize> Ipc<T, E, N> {
 
     pub fn sched_context(&self, sc: Tid) -> &SchedContext {
         &self.scs[sc as usize]
+    }
+
+    /// Ticks of budget context `sc` may use now.
+    pub fn budget_left(&self, sc: Tid) -> u32 {
+        self.scs[sc as usize].available(self.now)
+    }
+
+    /// Timer ticks since boot (advanced by the global tick).
+    pub fn now(&self) -> u64 {
+        self.now
     }
 
     /// The current thread gives up its own scheduling context the next
@@ -795,12 +941,14 @@ impl<const T: usize, const E: usize, const N: usize> Ipc<T, E, N> {
     /// and slices its own time.
     pub fn tick_cpu(&mut self, global: bool) -> bool {
         self.settle();
+        // The tick being charged began at the clock's current value.
+        let began = self.now;
         if global {
             self.now += 1;
         }
         let before = self.currents[self.cpu];
         if let Some(c) = before {
-            self.charge(c);
+            self.charge(c, began);
         }
         if global {
             self.refill();
@@ -812,7 +960,7 @@ impl<const T: usize, const E: usize, const N: usize> Ipc<T, E, N> {
         self.currents[self.cpu] != before
     }
 
-    fn charge(&mut self, c: Tid) {
+    fn charge(&mut self, c: Tid, began: u64) {
         let Some(sc) = self.active_sc(c) else {
             // Passive with nothing lent: may not run unaccounted.
             self.threads[c as usize].state = State::NoSchedContext;
@@ -822,32 +970,18 @@ impl<const T: usize, const E: usize, const N: usize> Ipc<T, E, N> {
         if sc != c {
             self.stats.donated_ticks += 1;
         }
-        let ctx = &mut self.scs[sc as usize];
-        if ctx.budget.is_some() {
-            ctx.remaining = ctx.remaining.saturating_sub(1);
-            if ctx.remaining == 0 {
-                self.threads[c as usize].state = State::Throttled { sc };
-                self.currents[self.cpu] = None;
-                self.stats.throttles += 1;
-            }
+        if self.scs[sc as usize].charge(began) {
+            self.threads[c as usize].state = State::Throttled { sc };
+            self.currents[self.cpu] = None;
+            self.stats.throttles += 1;
         }
     }
 
+    /// Wakes threads throttled on a context that a refill released.
     fn refill(&mut self) {
-        let now = self.now;
-        for ctx in self.scs.iter_mut() {
-            if let Some(b) = ctx.budget
-                && now >= ctx.next_refill
-            {
-                ctx.remaining = b;
-                while ctx.next_refill <= now {
-                    ctx.next_refill += ctx.period as u64;
-                }
-            }
-        }
         for t in 0..T {
             if let State::Throttled { sc } = self.threads[t].state
-                && !self.scs[sc as usize].exhausted()
+                && !self.scs[sc as usize].exhausted(self.now)
             {
                 self.wake(t as Tid);
             }
@@ -903,7 +1037,7 @@ impl<const T: usize, const E: usize, const N: usize> Ipc<T, E, N> {
             // it until a refill, as it would have been on waking.
             match self.active_sc(t) {
                 None => self.threads[t as usize].state = State::NoSchedContext,
-                Some(sc) if self.scs[sc as usize].exhausted() => {
+                Some(sc) if self.scs[sc as usize].exhausted(self.now) => {
                     self.threads[t as usize].state = State::Throttled { sc };
                 }
                 Some(_) => {
@@ -1304,7 +1438,7 @@ impl<const T: usize, const E: usize, const N: usize> Ipc<T, E, N> {
                 self.threads[t as usize].state = State::NoSchedContext;
                 return false;
             }
-            Some(sc) if self.scs[sc as usize].exhausted() => {
+            Some(sc) if self.scs[sc as usize].exhausted(self.now) => {
                 self.threads[t as usize].state = State::Throttled { sc };
                 return false;
             }
@@ -1369,7 +1503,7 @@ impl<const T: usize, const E: usize, const N: usize> Ipc<T, E, N> {
             self.currents[self.cpu] = None;
             let runnable = self
                 .active_sc(c)
-                .is_some_and(|sc| !self.scs[sc as usize].exhausted());
+                .is_some_and(|sc| !self.scs[sc as usize].exhausted(self.now));
             if runnable {
                 let cp = self.threads[c as usize].prio as usize;
                 self.threads[c as usize].state = State::Ready;
@@ -1388,7 +1522,7 @@ impl<const T: usize, const E: usize, const N: usize> Ipc<T, E, N> {
         debug_assert!(self.currents[self.cpu].is_none());
         let runnable = self
             .active_sc(t)
-            .is_some_and(|sc| !self.scs[sc as usize].exhausted());
+            .is_some_and(|sc| !self.scs[sc as usize].exhausted(self.now));
         match self.highest_ready() {
             _ if !runnable => {
                 self.make_ready(t); // parks it
@@ -1541,7 +1675,7 @@ impl<const T: usize, const E: usize, const N: usize> Ipc<T, E, N> {
                 }
             }
             if let State::Throttled { sc } = tcb.state
-                && !self.scs[sc as usize].exhausted()
+                && !self.scs[sc as usize].exhausted(self.now)
             {
                 return Err(format!("thread {t} throttled on a context with budget"));
             }
@@ -1577,21 +1711,14 @@ impl<const T: usize, const E: usize, const N: usize> Ipc<T, E, N> {
         if let Some(c) = current {
             match self.active_sc(c) {
                 None => return Err(format!("current thread {c} has no scheduling context")),
-                Some(sc) if self.scs[sc as usize].exhausted() => {
+                Some(sc) if self.scs[sc as usize].exhausted(self.now) => {
                     return Err(format!("current thread {c} runs on an empty budget"));
                 }
                 _ => {}
             }
         }
         for (i, sc) in self.scs.iter().enumerate() {
-            if let Some(b) = sc.budget
-                && sc.remaining > b
-            {
-                return Err(format!(
-                    "context {i}: {} left of a {b} budget",
-                    sc.remaining
-                ));
-            }
+            sc.check(self.now).map_err(|e| format!("context {i}: {e}"))?;
         }
         Ok(())
     }
@@ -1600,6 +1727,7 @@ impl<const T: usize, const E: usize, const N: usize> Ipc<T, E, N> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::vec::Vec;
 
     type K = Ipc<8, 4, 4>;
     const SERVER: Tid = 0;
@@ -2121,12 +2249,104 @@ mod tests {
         assert_eq!(k.current(), Some(CLIENT));
         assert_eq!(k.thread(SERVER).state, State::Throttled { sc: SERVER });
         assert_eq!(k.stats.throttles, 1);
-        assert!(!k.tick()); // tick 3
-        assert!(!k.tick()); // tick 4
-        assert!(k.tick(), "tick 5: refilled, higher priority preempts");
+        // The ticks that began at 0 and 1 come back at 5 and 6.
+        assert_eq!(
+            k.sched_context(SERVER).refills(),
+            [Refill { release: 5, amount: 1 }, Refill { release: 6, amount: 1 }]
+        );
+        for _ in 3..=4 {
+            assert!(!k.tick());
+        }
+        assert!(k.tick(), "tick 5: one tick back, higher priority preempts");
         assert_eq!(k.current(), Some(SERVER));
-        assert_eq!(k.sched_context(SERVER).remaining, 2);
+        assert_eq!(k.budget_left(SERVER), 1);
         assert_eq!(k.thread(CLIENT).state, State::Ready);
+        assert!(!k.tick(), "tick 6: the second tick is back as the first is used");
+        assert!(k.tick(), "tick 7: both used again, throttled until 10");
+        assert_eq!(k.current(), Some(CLIENT));
+    }
+
+    /// Runs `k` for `ticks` ticks and returns at which ticks `t` was charged.
+    fn charged_at(k: &mut K, t: Tid, ticks: u64) -> Vec<u64> {
+        let mut at = Vec::new();
+        for _ in 0..ticks {
+            let before = k.sched_context(t).consumed;
+            k.tick();
+            k.check_invariants().unwrap();
+            if k.sched_context(t).consumed != before {
+                at.push(k.now());
+            }
+        }
+        at
+    }
+
+    /// No `period` ticks hold more than `budget` charges.
+    fn assert_window(at: &[u64], budget: usize, period: u64) {
+        for (i, &c) in at.iter().enumerate() {
+            let n = at[i..].iter().take_while(|&&x| x < c + period).count();
+            assert!(n <= budget, "{n} charges in the {period} ticks from {c}: {at:?}");
+        }
+    }
+
+    #[test]
+    fn a_hog_gets_exactly_its_bandwidth_in_every_window() {
+        let mut k = K::new();
+        k.spawn(SERVER, 10).unwrap();
+        k.spawn(CLIENT, 5).unwrap();
+        k.configure_sc(SERVER, 3, 10).unwrap();
+        k.schedule();
+        let at = charged_at(&mut k, SERVER, 100);
+        assert_window(&at, 3, 10);
+        assert_eq!(at.len(), 30, "the full budget every period: {at:?}");
+    }
+
+    #[test]
+    fn no_double_budget_across_a_period_boundary() {
+        // Periodic refills let a thread that wakes late in a period use its
+        // budget, then the next period's at once: 4 ticks in a row here.
+        let mut k = K::new();
+        k.spawn(SERVER, 10).unwrap();
+        k.spawn(CLIENT, 5).unwrap();
+        k.configure_sc(SERVER, 2, 10).unwrap();
+        k.schedule();
+        k.wait(0).unwrap(); // the server sleeps
+        for _ in 0..7 {
+            k.tick();
+        }
+        k.signal(0, 1).unwrap(); // and wakes at tick 7, near the boundary
+        assert_eq!(k.current(), Some(SERVER));
+        let at = charged_at(&mut k, SERVER, 30);
+        assert_eq!(&at[..4], [8, 9, 18, 19], "two ticks, then a period off");
+        assert_window(&at, 2, 10);
+    }
+
+    #[test]
+    fn a_full_refill_ring_only_delays_budget() {
+        // Short runs spread over time give every charged tick its own
+        // release, more than the ring holds.
+        let mut k = K::new();
+        k.spawn(SERVER, 10).unwrap();
+        k.spawn(CLIENT, 5).unwrap();
+        k.configure_sc(SERVER, 20, 100).unwrap();
+        k.schedule();
+        let mut at = Vec::new();
+        for _ in 0..300 {
+            let running = k.current() == Some(SERVER);
+            let before = k.sched_context(SERVER).consumed;
+            k.tick();
+            if k.sched_context(SERVER).consumed != before {
+                at.push(k.now());
+            }
+            if running && k.current() == Some(SERVER) {
+                k.wait(0).unwrap(); // one tick, then sleep
+            } else if !running && k.now() % 3 == 0 {
+                k.signal(0, 1).unwrap();
+            }
+            k.check_invariants().unwrap();
+            assert!(k.sched_context(SERVER).refills().len() <= MAX_REFILLS);
+        }
+        assert_window(&at, 20, 100);
+        assert!(at.len() >= 40, "still runs: {}", at.len());
     }
 
     #[test]
@@ -2161,11 +2381,7 @@ mod tests {
         assert_eq!(k.current(), Some(SERVER));
         assert_eq!(k.active_sc(SERVER), Some(CLIENT), "lent by the caller");
         k.tick();
-        assert_eq!(
-            k.sched_context(CLIENT).remaining,
-            2,
-            "charged to the client"
-        );
+        assert_eq!(k.budget_left(CLIENT), 2, "charged to the client");
         assert_eq!(k.stats.donated_ticks, 1);
         k.reply_recv(0, [0; 4]).unwrap();
         assert_eq!(k.current(), Some(CLIENT));
@@ -2182,7 +2398,7 @@ mod tests {
         k.tick(); // 2
         k.tick(); // 3
         assert_eq!(k.current(), None);
-        k.tick(); // 4: refill
+        k.tick(); // 4: the tick that began at 0 is back
         assert_eq!(k.current(), Some(SERVER));
     }
 
