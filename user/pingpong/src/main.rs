@@ -22,6 +22,12 @@
 //! - role 3, the **hog**: spins forever above every other thread. Only its
 //!   scheduling context's budget (2 ticks in 10) lets anything else run.
 //!
+//! - role 4, the **slow server**: passive, and spins on every call, so it
+//!   runs its caller's budget dry; role 5, its **caller**, has a budget of
+//!   1 tick in 10; role 6 is the slow server's **timeout handler**, which
+//!   gets the timeout fault and stops it. The handler and the caller
+//!   report to the client on the spinner's done notification.
+//!
 //! Finally the client sleeps on the timer notification. With every other
 //! thread blocked, that only returns if the kernel idles and the timer
 //! wakes it.
@@ -251,6 +257,9 @@ pub extern "C" fn _start(role: u64) -> ! {
         0 => server(),
         1 => client(),
         2 => spinner(),
+        4 => slow_server(),
+        5 => slow_caller(),
+        6 => timeout_handler(),
         _ => hog(),
     }
 }
@@ -613,7 +622,7 @@ fn thread_tests() -> bool {
     say!("     made {made} threads before the table filled");
     pass &= expect(
         "deleting the capability destroys the thread and frees its entry",
-        ok(del == 0 && made == 4 && last == Error::ObjectTableFull.code() && rv == 0),
+        ok(del == 0 && made == 1 && last == Error::ObjectTableFull.code() && rv == 0),
         1,
     );
     pass
@@ -741,6 +750,47 @@ fn transfer_tests() -> bool {
         1,
     );
     pass
+}
+
+/// Timeout test reports, ORed into the spinner's done notification.
+const HANDLER_OK: u64 = 0x10;
+const CALLER_OK: u64 = 0x20;
+const TIMEOUT_FAILED: u64 = 0x40;
+/// Its slots: an endpoint (slow server, handler), the success and failure
+/// reports (caller, handler).
+const OWN_EP: u64 = 0;
+const REPORT_OK: u64 = 1;
+const REPORT_FAILED: u64 = 2;
+
+/// Passive; spins on the first call it gets, on its caller's budget.
+fn slow_server() -> ! {
+    syscall(Syscall::SchedPassive, 0, [0; 4]);
+    syscall(Syscall::Recv, OWN_EP, [0; 4]);
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+/// Calls the slow server on a 1-tick budget: its call must fail with
+/// `PeerRestarted` once the handler stops the server.
+fn slow_caller() -> ! {
+    let r = syscall(Syscall::Call, OWN_EP, [0; 4]);
+    let ok = r.status == Error::PeerRestarted.code();
+    syscall(Syscall::Signal, if ok { REPORT_OK } else { REPORT_FAILED }, [0; 4]);
+    // Nobody receives there any more: blocks for good.
+    syscall(Syscall::Call, OWN_EP, [0; 4]);
+    finish(false)
+}
+
+/// The slow server's timeout handler: checks the fault, stops the server.
+fn timeout_handler() -> ! {
+    let r = syscall(Syscall::Recv, OWN_EP, [0; 4]);
+    let ok = r.status == 0 && r.badge == 0x7E && r.msg == [FaultKind::Timeout as u64, 1, 10, 0];
+    let stop = syscall(Syscall::Reply, 0, [FaultReply::Stop as u64, 0, 0, 0]);
+    let ok = ok && stop.status == 0;
+    syscall(Syscall::Signal, if ok { REPORT_OK } else { REPORT_FAILED }, [0; 4]);
+    syscall(Syscall::Recv, OWN_EP, [0; 4]);
+    finish(false)
 }
 
 /// Spins forever at the highest priority; its budget keeps it in check.
@@ -1040,6 +1090,16 @@ fn client() -> ! {
     // Wait for the spinner to finish, then sleep with nothing else runnable.
     let r = syscall(Syscall::Wait, SPINNER_DONE, [0; 4]);
     pass &= expect("spinner finished and signalled", r.status, 0);
+    // The timeout test reports on the same notification.
+    let mut bits = r.badge;
+    while bits & (HANDLER_OK | CALLER_OK) != HANDLER_OK | CALLER_OK && bits & TIMEOUT_FAILED == 0 {
+        bits |= syscall(Syscall::Wait, SPINNER_DONE, [0; 4]).badge;
+    }
+    pass &= expect(
+        "a caller's budget running dry in a passive server is a timeout fault; stopping the server fails the call",
+        bits & (HANDLER_OK | CALLER_OK | TIMEOUT_FAILED),
+        HANDLER_OK | CALLER_OK,
+    );
     let mut woke = 0;
     for _ in 0..SLEEP_TICKS {
         let r = syscall(Syscall::Wait, TIMER, [0; 4]);

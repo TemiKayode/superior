@@ -231,7 +231,15 @@ holds the rest):
   engine simulation checks exactly that for every context in every run. A thread
   that runs dry is throttled until a refill is due. A passive server
   (`SchedPassive`) runs only on its caller's context, lent on `Call` and returned on
-  reply, so serving a client is charged to that client.
+  reply, so serving a client is charged to that client. If that lent budget runs out
+  mid-request and the server has a timeout handler (`ThreadSetTimeoutHandler`, inherited
+  by threads it creates), the server does not sit throttled with its other callers
+  queued behind it: it calls the handler with a `Timeout` fault (the context's budget
+  and period). `Retry` leaves it to wait for the caller's refill; `Stop` stops it at
+  once, and the caller's call fails with `PeerRestarted`. The boot self-test runs a
+  passive server that spins on a caller with 1 tick in 10, and its handler stops it;
+  the engine simulation checks every timeout fault is raised before it is received,
+  received once, and dropped if its sender is stopped first.
 - Idle: a CPU with no thread it can run halts until an interrupt (or a kick from another
   CPU) gives it one. The timer signals a notification each tick, so threads sleep by waiting on it.
 - IPC engine: `Send`, `Call`, `Recv`, `Reply`, `ReplyRecv`, `Signal`, `Wait`, `Yield`;
@@ -2169,8 +2177,7 @@ capability (today any component holding one may shut the machine down), and rele
 given up on to a supervisor above it (today the
 manager is the only one), memory budgets from a policy service (Phase 3), sizing the Memory Server's CSpace
 from the RAM it gets (its manifest names the size, 2^17 slots on the test machines), page tables for boot processes paid for from user memory,
-multi-level CSpaces, the first call's capability forwarded by a lazy-start watcher, scheduling-context capabilities (budgets are set at boot),
-timeout faults, per-CPU ready queues and thread affinity (one lock and shared queues
+multi-level CSpaces, the first call's capability forwarded by a lazy-start watcher, scheduling-context capabilities (budgets are set at boot), per-CPU ready queues and thread affinity (one lock and shared queues
 today), device interrupts spread over CPUs, more than four CPUs, an IPC benchmark on bare
 metal.
 

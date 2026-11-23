@@ -13,6 +13,10 @@
 //!   well-formed and consistent with thread states, one running thread at
 //!   the highest ready priority, budgets respected, no caller left waiting
 //!   on a reply nobody owes;
+//! - checks timeout faults: a thread given a timeout handler (badge
+//!   `0x100 | thread`) that empties a lent budget calls it; every such
+//!   fault is received at most once, only after it was raised, and never
+//!   after its sender was stopped;
 //! - checks bandwidth: the harness notes when every tick charged to each
 //!   scheduling context began (the clock before the step) and requires that no `period` ticks hold
 //!   more charges than the context's `budget` (the sporadic-server
@@ -32,7 +36,7 @@
 //! the last operations; `SIM_SEED=<n> SIM_STEPS=<m> cargo test sim::`
 //! replays one seed.
 
-use crate::abi::{CapTransfer, Error};
+use crate::abi::{CapTransfer, Error, FaultKind};
 use crate::ipc::{Ipc, IpcError, State, Tid};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::format;
@@ -120,6 +124,10 @@ enum Op {
         budget: u32,
         period: u32,
     },
+    TimeoutHandler {
+        t: Tid,
+        ep: Option<u16>,
+    },
     DestroyEp(u16),
     DestroyNtfn(u16),
 }
@@ -127,6 +135,8 @@ enum Op {
 /// Message words carry a tag so receipts can be traced to their send.
 const SENT_TAG: u64 = 1 << 40;
 const REPLY_TAG: u64 = 2 << 40;
+/// Badge of a timeout handler's endpoint, ORed with the thread it serves.
+const TIMEOUT_BADGE: u64 = 0x100;
 
 struct Sim {
     k: Engine,
@@ -147,6 +157,8 @@ struct Sim {
     /// charged since it was last configured began.
     consumed: [u64; THREADS],
     charges: [VecDeque<u64>; THREADS],
+    /// Threads whose timeout fault is raised and not yet received.
+    faults: HashSet<Tid>,
 }
 
 impl Sim {
@@ -164,18 +176,41 @@ impl Sim {
             recent: VecDeque::new(),
             consumed: [0; THREADS],
             charges: core::array::from_fn(|_| VecDeque::new()),
+            faults: HashSet::new(),
         };
         // Threads 0..4 start at a few priorities (so there are ties); the
         // last is left inactive for Spawn to start later.
         for t in 0..THREADS as Tid - 1 {
             let prio = 1 + sim.rng.below(3) as u8;
             sim.k.spawn(t, prio).unwrap();
+            // Some start limited and some with a timeout handler, so lent
+            // budgets run dry under handlers from the start.
+            if sim.rng.chance(50) {
+                let period = 2 + sim.rng.below(10) as u32;
+                let budget = 1 + sim.rng.below(period as u64) as u32;
+                sim.k.configure_sc(t, budget, period).unwrap();
+            }
+            if sim.rng.chance(50) {
+                let ep = sim.rng.below(ENDPOINTS as u64) as u16;
+                sim.k
+                    .set_timeout_handler(t, Some((ep, TIMEOUT_BADGE | t as u64)))
+                    .unwrap();
+            }
         }
         sim.k.schedule();
         sim
     }
 
     fn pick(&mut self) -> Op {
+        // A server working on a caller's budget does work between system
+        // calls, so its budget can run dry mid-request.
+        let serving = self
+            .k
+            .current()
+            .is_some_and(|c| self.k.active_sc(c).is_some_and(|sc| sc != c));
+        if serving && self.rng.chance(80) {
+            return Op::Tick;
+        }
         let r = &mut self.rng;
         let ep = r.below(ENDPOINTS as u64) as u16;
         let ntfn = r.below(NOTIFICATIONS as u64) as u16;
@@ -203,8 +238,7 @@ impl Sim {
             },
             57..=62 => Op::Wait { ntfn },
             63..=67 => Op::Yield,
-            68 if r.chance(25) => Op::Passive,
-            68 => Op::Tick,
+            68 => Op::Passive,
             69..=80 => Op::Tick,
             81..=84 => Op::Irq {
                 ntfn,
@@ -220,7 +254,11 @@ impl Sim {
                 t,
                 prio: 1 + r.below(3) as u8,
             },
-            93..=95 => {
+            93 => Op::TimeoutHandler {
+                t,
+                ep: r.chance(80).then_some(ep),
+            },
+            94..=96 => {
                 // Mostly short periods, so threads are often throttled;
                 // some long enough to fill a context's refill ring.
                 let period = if r.chance(70) {
@@ -234,7 +272,7 @@ impl Sim {
                     period,
                 }
             }
-            96..=97 => Op::DestroyEp(ep),
+            97 => Op::DestroyEp(ep),
             _ => Op::DestroyNtfn(ntfn),
         }
     }
@@ -359,10 +397,19 @@ impl Sim {
                 Ok(())
             }
             Op::Budget { t, budget, period } => self.k.configure_sc(t, budget, period),
+            Op::TimeoutHandler { t, ep } => self
+                .k
+                .set_timeout_handler(t, ep.map(|e| (e, TIMEOUT_BADGE | t as u64))),
             Op::DestroyEp(ep) => self.k.destroy_endpoint(ep),
             Op::DestroyNtfn(n) => self.k.destroy_notification(n),
         };
         let _ = self.k.take_transfers();
+        if let Some(f) = self.k.take_timeout() {
+            if !matches!(op, Op::Tick) {
+                return Err(self.fail(seed, format!("timeout fault by {f} outside a tick")));
+            }
+            self.faults.insert(f);
+        }
         if idle {
             // Back to the idle loop, which reschedules.
             self.k.reschedule();
@@ -471,6 +518,18 @@ impl Sim {
         for t in receivers {
             let tcb = *self.k.thread(t);
             let m = tcb.msg[0];
+            if m == FaultKind::Timeout as u64 && tcb.badge & TIMEOUT_BADGE != 0 {
+                let from = (tcb.badge & 0xff) as Tid;
+                if !self.faults.remove(&from) {
+                    return Err(format!(
+                        "thread {t} received a timeout fault from {from}, which raised none"
+                    ));
+                }
+                if tcb.msg[1] == 0 || tcb.msg[1] > tcb.msg[2] {
+                    return Err(format!("timeout fault with budget/period {:?}", tcb.msg));
+                }
+                continue;
+            }
             if m & SENT_TAG == 0 {
                 return Err(format!("thread {t} received {m:#x}, which nobody sent"));
             }
@@ -498,6 +557,11 @@ impl Sim {
                 }
             }
         }
+        // A fault not received is only ever waiting to be: its sender is
+        // queued to send it, or it was cancelled (stopped, endpoint gone).
+        let k = &self.k;
+        self.faults
+            .retain(|&f| matches!(k.thread(f).state, State::BlockedSend { call: true, .. }));
         if result.is_err()
             && !matches!(
                 result,
@@ -561,6 +625,8 @@ pub fn coverage(seeds: u64, steps: u64) -> HashMap<&'static str, u64> {
             }
         }
         *c.entry("messages received").or_insert(0) += sim.received.len() as u64;
+        *c.entry("timeout faults").or_insert(0) += sim.k.stats.timeouts;
+        *c.entry("donated ticks").or_insert(0) += sim.k.stats.donated_ticks;
     }
     c
 }
@@ -619,6 +685,7 @@ mod tests {
             "waiting on notification",
             "throttled",
             "passive, no context",
+            "timeout faults",
             "messages received",
         ] {
             assert!(c.get(key).copied().unwrap_or(0) > 0, "never reached: {key}");

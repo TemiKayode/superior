@@ -288,6 +288,12 @@ pub enum Syscall {
     /// of the `REGS_*` operations, `rdx` = its value. Meaningful while the
     /// thread waits on its handler.
     ThreadRegisters = 53,
+    /// Makes the endpoint in slot `rsi` (Write right) the timeout handler
+    /// of the thread in slot `rdi` (Write right), with that capability's
+    /// badge: a context lent to the thread running dry then becomes a
+    /// [`FaultKind::Timeout`] call to it. `rsi` = `u64::MAX` removes it.
+    /// A thread inherits its creator's.
+    ThreadSetTimeoutHandler = 54,
     /// Maps the frame in slot `rdi` at page-aligned `rsi` in the address
     /// space in slot `r8` (Write right). `rdx` = [`MAP_WRITE`] and/or
     /// [`MAP_EXEC`], never both. Needs the frame's Map right, plus Write
@@ -366,6 +372,7 @@ impl Syscall {
             51 => Syscall::Time,
             52 => Syscall::IntxLine,
             53 => Syscall::ThreadRegisters,
+            54 => Syscall::ThreadSetTimeoutHandler,
             42 => Syscall::IoFaults,
             0x100 => Syscall::DebugPutStr,
             0x101 => Syscall::DebugSelftestDone,
@@ -430,6 +437,13 @@ pub enum FaultKind {
     /// instruction. The handler reads the arguments with `ThreadRegisters`
     /// and answers [`FaultReply::ResumeAt`] that address with the result.
     ForeignSyscall = 5,
+    /// A scheduling context lent to the thread (a caller's, while it
+    /// serves that call) ran out of budget: `msg[1]` = the context's
+    /// budget, `msg[2]` = its period, in ticks. Sent to the thread's
+    /// timeout handler ([`Syscall::ThreadSetTimeoutHandler`]). `Retry`
+    /// leaves it to wait for the caller's next refill; `Stop` stops it,
+    /// failing that caller with [`Error::PeerRestarted`].
+    Timeout = 6,
 }
 
 impl FaultKind {
@@ -440,6 +454,7 @@ impl FaultKind {
             3 => FaultKind::InvalidOpcode,
             4 => FaultKind::DivideError,
             5 => FaultKind::ForeignSyscall,
+            6 => FaultKind::Timeout,
             _ => return None,
         })
     }

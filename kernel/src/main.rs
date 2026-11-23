@@ -531,6 +531,45 @@ fn start_pingpong() -> Result<(), &'static str> {
     kprintln!(
         "[ok] hog (prio 20, 2/10 ticks), passive server (prio 10), spinner and client (prio 5) loaded"
     );
+    start_timeout_test(spinner_done)
+}
+
+/// Timeout faults. A passive slow server (thread 4) spins on every call; a
+/// caller (5) with a budget of 1 tick in 10 calls it, so the server runs
+/// that budget dry mid-request. Its timeout handler (6) gets the fault and
+/// says stop, the caller's call fails with `PeerRestarted`, and each of
+/// the handler and the caller reports to the client on the spinner's done
+/// notification: bit 0x10 (handler) and 0x20 (caller) for success, 0x40
+/// for anything else.
+fn start_timeout_test(done: Object) -> Result<(), &'static str> {
+    let rw = Rights::READ | Rights::WRITE;
+    let report = |badge| Capability {
+        badge,
+        ..Capability::new(done, Rights::WRITE)
+    };
+    task::spawn_process(
+        4,
+        USER_IMAGE,
+        8,
+        4,
+        &[(0, Capability::new(Object::Endpoint { id: 4 }, rw))],
+    )?;
+    task::spawn_process(5, USER_IMAGE, 6, 5, &[(1, report(0x20)), (2, report(0x40))])?;
+    task::derive_cap(4, 0, 5, 0, Rights::WRITE, Some(0x5C))?;
+    task::configure_sched(5, 1, 10)?;
+    task::spawn_process(
+        6,
+        USER_IMAGE,
+        9,
+        6,
+        &[
+            (0, Capability::new(Object::Endpoint { id: 5 }, rw)),
+            (1, report(0x10)),
+            (2, report(0x40)),
+        ],
+    )?;
+    task::set_timeout_handler(4, 5, 0x7E)?;
+    kprintln!("[ok] slow server (prio 8), its 1/10-tick caller (prio 6) and timeout handler (prio 9) loaded");
     Ok(())
 }
 

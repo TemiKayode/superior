@@ -530,6 +530,15 @@ pub fn configure_sched(t: Tid, budget: u32, period: u32) -> Result<(), &'static 
         .map_err(|_| "bad scheduling parameters")
 }
 
+/// Makes endpoint `ep` (with `badge`) thread `t`'s timeout handler at boot.
+pub fn set_timeout_handler(t: Tid, ep: u16, badge: u64) -> Result<(), &'static str> {
+    KERNEL
+        .lock()
+        .ipc
+        .set_timeout_handler(t, Some((ep, badge)))
+        .map_err(|_| "bad timeout handler")
+}
+
 /// Places an original capability in thread `t`'s slot `slot` at boot.
 pub fn grant_root(t: Tid, slot: usize, cap: Capability) -> Result<(), &'static str> {
     let mut k = KERNEL.lock();
@@ -728,6 +737,7 @@ pub fn handle_syscall(frame: &mut UserFrame) -> Exit {
         },
         Some(Syscall::IntxLine) => intx_line(k, cur, &a),
         Some(Syscall::ThreadRegisters) => thread_registers(k, cur, &a),
+        Some(Syscall::ThreadSetTimeoutHandler) => thread_set_timeout_handler(k, cur, &a),
         Some(Syscall::IrqMsiMessage) => irq_msi_message(k, cur, &a),
         Some(Syscall::FrameDmaAddress) => frame_dma_address(k, cur, a.a0),
         Some(Syscall::DeviceFrame) => device_frame(k, cur, &a),
@@ -834,6 +844,7 @@ pub fn handle_timer(frame: &mut UserFrame) -> Exit {
         // idle halt in `resume`. Advance time (refilling budgets), wake any
         // sleeper, and return to it; the idle loop decides who runs.
         k.ipc.tick_cpu(global);
+        note_timeout(k);
         if global {
             let _ = k.ipc.signal_irq(TIMER_NTFN, 1);
             fire_timers(k);
@@ -844,6 +855,7 @@ pub fn handle_timer(frame: &mut UserFrame) -> Exit {
     if k.ipc.tick_cpu(global) {
         k.stats.preemptions += 1;
     }
+    note_timeout(k);
     if global {
         let _ = k.ipc.signal_irq(TIMER_NTFN, 1);
         fire_timers(k);
@@ -890,6 +902,45 @@ pub fn handle_fault(frame: &mut UserFrame, kind: FaultKind, code: u64, addr: u64
         _ => raise_fault(k, cur, kind, addr, frame.pc(), code),
     }
     resume(guard, frame)
+}
+
+/// A tick that emptied a budget lent to a thread with a timeout handler
+/// made it call that handler: from here on it is a fault like any other,
+/// resumed or stopped by the handler's reply. Its registers were saved
+/// before the tick, so `Retry` resumes it exactly.
+fn note_timeout(k: &mut Kernel) {
+    if let Some(t) = k.ipc.take_timeout() {
+        k.stats.faults_handled += 1;
+        k.in_fault[t as usize] = true;
+        k.syscall_fault[t as usize] = false;
+    }
+}
+
+/// Whether a fault handler's reply `msg` stops the thread rather than
+/// resuming it (see [`apply_fault_reply`]).
+fn fault_reply_stops(msg: &[u64; 4]) -> bool {
+    !(msg[0] == FaultReply::Retry as u64 || (msg[0] == FaultReply::ResumeAt as u64 && vm::is_user(msg[1])))
+}
+
+/// After a reply to `to`: if `to` waits in a fault and the reply says
+/// stop, it stops now rather than when it next runs. A thread whose
+/// timeout fault is answered `Stop` may be throttled on its caller's empty
+/// budget, and that caller learns it has to retry only once it stops.
+fn stop_if_told(k: &mut Kernel, to: Option<Tid>, msg: &[u64; 4]) {
+    let Some(t) = to else { return };
+    if !k.in_fault[t as usize] || k.ipc.thread(t).status != 0 || !fault_reply_stops(msg) {
+        return;
+    }
+    // Woken by this reply, it is not running anywhere yet.
+    if matches!(
+        k.ipc.thread(t).state,
+        superior_objects::ipc::State::Ready | superior_objects::ipc::State::Throttled { .. }
+    ) {
+        k.in_fault[t as usize] = false;
+        kprintln!("[fault] thread {t}: handler said stop; stopped");
+        k.stats.faults_unhandled += 1;
+        let _ = k.ipc.destroy(t);
+    }
 }
 
 /// Makes thread `cur`'s fault a `Call` to its fault handler, or stops it
@@ -1661,6 +1712,20 @@ fn thread_set_fault_handler(k: &mut Kernel, cur: Tid, f: &Args) -> Result<(), u6
     Ok(())
 }
 
+/// `ThreadSetTimeoutHandler`: rdi = thread, rsi = endpoint with Write, or
+/// `u64::MAX` for none.
+fn thread_set_timeout_handler(k: &mut Kernel, cur: Tid, f: &Args) -> Result<(), u64> {
+    let t = thread_cap(k, cur, f.a0)?;
+    let handler = if f.a1 == u64::MAX {
+        None
+    } else {
+        Some(fault_endpoint(k, cur, f.a1)?)
+    };
+    k.ipc
+        .set_timeout_handler(t, handler)
+        .map_err(|e| e.status())
+}
+
 /// The endpoint and badge of the caller's slot `slot`, which must hold an
 /// endpoint capability with Write.
 fn fault_endpoint(k: &Kernel, cur: Tid, slot: u64) -> Result<(u16, u64), u64> {
@@ -2402,6 +2467,7 @@ fn thread_configure(k: &mut Kernel, cur: Tid, f: &Args) -> Result<(), u64> {
     k.fresh[i] = true;
     k.preempted[i] = false;
     k.fault_ep[i] = k.fault_ep[cur as usize];
+    let _ = k.ipc.set_timeout_handler(t, k.ipc.timeout_handler(cur));
     k.foreign[i] = false;
     k.tls[i] = 0;
     // Nor escape its budget: the new thread gets the same parameters.
@@ -2774,7 +2840,10 @@ fn ipc_op(
         }
     }
     if op == Syscall::Reply {
-        return k.ipc.reply(msg).map_err(|e| e.status());
+        let to = k.ipc.caller_of(cur);
+        k.ipc.reply(msg).map_err(|e| e.status())?;
+        stop_if_told(k, to, &msg);
+        return Ok(());
     }
     if op == Syscall::ReplySave {
         let i = k.ipc.save_caller().map_err(|e| e.status())?;
@@ -2785,7 +2854,10 @@ fn ipc_op(
         if xfer.grant.is_some() {
             return Err(Error::InvalidArgument.code());
         }
-        return k.ipc.reply_saved(slot, msg).map_err(|e| e.status());
+        let to = k.ipc.saved_caller(cur, slot);
+        k.ipc.reply_saved(slot, msg).map_err(|e| e.status())?;
+        stop_if_told(k, to, &msg);
+        return Ok(());
     }
     let cap = *cap_slot(k, cur, slot)
         .and_then(|s| k.caps.get(s))
@@ -2796,6 +2868,11 @@ fn ipc_op(
         } else {
             Err(Error::InsufficientRights.code())
         }
+    };
+    let replied_to = if op == Syscall::ReplyRecv {
+        k.ipc.caller_of(cur)
+    } else {
+        None
     };
     let ipc = &mut k.ipc;
     let r = match (op, cap.object) {
@@ -2836,7 +2913,9 @@ fn ipc_op(
         }
         _ => return Err(Error::InvalidCapability.code()),
     };
-    r.map_err(|e| e.status())
+    r.map_err(|e| e.status())?;
+    stop_if_told(k, replied_to, &msg);
+    Ok(())
 }
 
 fn debug_put_str(k: &Kernel, cur: Tid, ptr: u64, len: u64) -> Result<(), u64> {
@@ -2852,8 +2931,9 @@ fn debug_put_str(k: &Kernel, cur: Tid, ptr: u64, len: u64) -> Result<(), u64> {
 }
 
 /// Checks the boot self-test's scheduling-context scenario: a budgeted
-/// high-priority hog must have been throttled, and the passive server must
-/// have run on its callers' contexts.
+/// high-priority hog must have been throttled, the passive server must
+/// have run on its callers' contexts, and the slow server must have had a
+/// timeout fault when its caller's budget ran out.
 fn report_sched(s: superior_objects::ipc::SchedStats) {
     if s.throttles == 0 {
         kprintln!("[fail] no thread was ever throttled by its budget");
@@ -2868,8 +2948,13 @@ fn report_sched(s: superior_objects::ipc::SchedStats) {
             s.donated_ticks
         );
     }
+    if s.timeouts == 0 {
+        kprintln!("[fail] no lent budget ran dry under a timeout handler");
+    } else {
+        kprintln!("[pass] timeout faults: {}", s.timeouts);
+    }
     SCHED_OK.store(
-        s.throttles > 0 && s.donated_ticks > 0,
+        s.throttles > 0 && s.donated_ticks > 0 && s.timeouts > 0,
         core::sync::atomic::Ordering::Relaxed,
     );
 }
@@ -2903,16 +2988,17 @@ fn selftest_done(cur: Tid, code: u64, stats: Stats) -> ! {
         code.max(1)
     };
     // The client's faults all went to its handler; the spinner's one
-    // fault had no handler and stopped it.
-    let code = if stats.faults_handled > 0 && stats.faults_unhandled == 1 {
+    // fault had no handler and stopped it, and the slow server's timeout
+    // handler stopped it.
+    let code = if stats.faults_handled > 0 && stats.faults_unhandled == 2 {
         kprintln!(
-            "[pass] faults: {} handled by IPC, 1 unhandled stopped its thread",
+            "[pass] faults: {} handled by IPC, 2 stopped their threads",
             stats.faults_handled
         );
         code
     } else {
         kprintln!(
-            "[fail] faults: {} handled, {} unhandled (want >0 and 1)",
+            "[fail] faults: {} handled, {} unhandled (want >0 and 2)",
             stats.faults_handled,
             stats.faults_unhandled
         );

@@ -27,6 +27,12 @@
 //!   a client is charged to that client. A passive thread with no lent
 //!   context cannot run: woken any other way (a `Send`, a signal), it is
 //!   parked in [`State::NoSchedContext`].
+//! - Timeout faults: a thread that empties a context lent to it (a server
+//!   whose caller's budget ran out mid-request) and has a timeout handler
+//!   ([`Ipc::set_timeout_handler`]) is not throttled holding up its other
+//!   callers: it calls the handler with [`FaultKind::Timeout`] instead,
+//!   as the kernel makes any fault a call. Without a handler it is
+//!   throttled until the caller's next refill.
 //!
 //! Message delivery always fills `msg`, `badge` and `status` of the thread
 //! being woken; the kernel copies them into that thread's registers.
@@ -46,7 +52,7 @@
 //! between CSpaces, and reports the outcome with [`Ipc::set_cap_received`].
 //! CSpaces themselves are not this module's business.
 
-use crate::abi::{CapTransfer, Error, MSG_WORDS};
+use crate::abi::{CapTransfer, Error, FaultKind, MSG_WORDS};
 
 pub type Tid = u16;
 /// CPUs the engine schedules for.
@@ -257,6 +263,8 @@ pub struct SchedStats {
     pub throttles: u64,
     /// Ticks charged to a context lent by a caller (a passive server ran).
     pub donated_ticks: u64,
+    /// Timeout faults raised (a lent budget ran out under a handler).
+    pub timeouts: u64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -288,6 +296,8 @@ pub struct Tcb {
     lent: Option<Tid>,
     /// The notification bound to this thread.
     bound: Option<u16>,
+    /// Endpoint and badge a timeout fault calls.
+    timeout: Option<(u16, u64)>,
 }
 
 /// A capability to copy from `from`'s slot `grant` into `to`'s slot `accept`.
@@ -322,6 +332,7 @@ const IDLE_TCB: Tcb = Tcb {
     passive_pending: false,
     lent: None,
     bound: None,
+    timeout: None,
 };
 
 #[derive(Clone, Copy, Default, Debug)]
@@ -469,6 +480,9 @@ pub struct Ipc<const T: usize, const E: usize, const N: usize> {
     /// Timer ticks since boot.
     now: u64,
     pub stats: SchedStats,
+    /// The thread the last tick made raise a timeout fault, for the kernel
+    /// to mark as in a fault ([`Ipc::take_timeout`]).
+    timeout_raised: Option<Tid>,
 }
 
 impl<const T: usize, const E: usize, const N: usize> Default for Ipc<T, E, N> {
@@ -500,7 +514,9 @@ impl<const T: usize, const E: usize, const N: usize> Ipc<T, E, N> {
             stats: SchedStats {
                 throttles: 0,
                 donated_ticks: 0,
+                timeouts: 0,
             },
+            timeout_raised: None,
         }
     }
 
@@ -800,6 +816,12 @@ impl<const T: usize, const E: usize, const N: usize> Ipc<T, E, N> {
             self.threads[t as usize].status = Error::ObjectDestroyed.code();
             self.wake(t);
         }
+        // A handler gone is no handler: its index may name a new endpoint.
+        for tcb in self.threads.iter_mut() {
+            if tcb.timeout.is_some_and(|(x, _)| x == ep) {
+                tcb.timeout = None;
+            }
+        }
         self.eps[e].state = EpState::Idle;
         self.schedule();
         Ok(())
@@ -910,6 +932,35 @@ impl<const T: usize, const E: usize, const N: usize> Ipc<T, E, N> {
         self.now
     }
 
+    /// Makes `handler` (endpoint, badge) the one thread `t` calls with a
+    /// timeout fault when a context lent to it runs dry; `None` for none.
+    pub fn set_timeout_handler(&mut self, t: Tid, handler: Option<(u16, u64)>) -> Result<(), IpcError> {
+        if t as usize >= T {
+            return Err(IpcError::BadThread);
+        }
+        if let Some((ep, _)) = handler {
+            self.ep_index(ep)?;
+        }
+        self.threads[t as usize].timeout = handler;
+        Ok(())
+    }
+
+    pub fn timeout_handler(&self, t: Tid) -> Option<(u16, u64)> {
+        self.threads[t as usize].timeout
+    }
+
+    /// The thread that the last tick made call its timeout handler, once.
+    /// The kernel treats it as in a fault: the handler's reply says
+    /// whether it goes on ([`crate::abi::FaultReply`]).
+    pub fn take_timeout(&mut self) -> Option<Tid> {
+        self.timeout_raised.take()
+    }
+
+    /// The caller server `t` set aside as `i` ([`Ipc::save_caller`]).
+    pub fn saved_caller(&self, t: Tid, i: usize) -> Option<Tid> {
+        self.threads.get(t as usize)?.saved.get(i).copied().flatten()
+    }
+
     /// The current thread gives up its own scheduling context the next
     /// time it blocks, and from then on runs only on contexts its callers
     /// lend it.
@@ -971,10 +1022,41 @@ impl<const T: usize, const E: usize, const N: usize> Ipc<T, E, N> {
             self.stats.donated_ticks += 1;
         }
         if self.scs[sc as usize].charge(began) {
+            if sc != c && self.raise_timeout(c, sc) {
+                return;
+            }
             self.threads[c as usize].state = State::Throttled { sc };
             self.currents[self.cpu] = None;
             self.stats.throttles += 1;
         }
+    }
+
+    /// The current thread `c` emptied context `sc`, lent to it: if it has
+    /// a timeout handler, it calls it (`msg` = [`FaultKind::Timeout`], the
+    /// context's budget and period) and keeps the lent context, as a
+    /// server keeps it through any call it makes. Returns false if there
+    /// is no handler or the call fails, for the caller to throttle it.
+    fn raise_timeout(&mut self, c: Tid, sc: Tid) -> bool {
+        let Some((ep, badge)) = self.threads[c as usize].timeout else {
+            return false;
+        };
+        let ctx = self.scs[sc as usize];
+        let msg = [
+            FaultKind::Timeout as u64,
+            ctx.budget.unwrap_or(0) as u64,
+            ctx.period as u64,
+            0,
+        ];
+        // A fault message carries no capability, whatever the thread's
+        // last system call named.
+        let xfer = core::mem::replace(&mut self.threads[c as usize].xfer, CapTransfer::NONE);
+        let raised = self.call(ep, badge, msg).is_ok();
+        self.threads[c as usize].xfer = xfer;
+        if raised {
+            self.stats.timeouts += 1;
+            self.timeout_raised = Some(c);
+        }
+        raised
     }
 
     /// Wakes threads throttled on a context that a refill released.
@@ -2347,6 +2429,96 @@ mod tests {
         }
         assert_window(&at, 20, 100);
         assert!(at.len() >= 40, "still runs: {}", at.len());
+    }
+
+    /// A passive server (0, prio 10) on EP 0 with a timeout handler (2,
+    /// prio 12, waiting on EP 1); the client (1) has a 1-tick budget in 10
+    /// and has just called the server, which now runs on that budget.
+    fn server_with_timeout_handler() -> K {
+        let mut k = K::new();
+        k.spawn(OTHER, 12).unwrap();
+        k.schedule();
+        k.recv(1, true).unwrap(); // the handler waits
+        k.spawn(SERVER, 10).unwrap();
+        k.spawn(CLIENT, 5).unwrap();
+        k.configure_sc(CLIENT, 1, 10).unwrap();
+        k.schedule();
+        k.make_passive().unwrap();
+        k.set_timeout_handler(SERVER, Some((1, 0x7E))).unwrap();
+        k.recv(0, true).unwrap();
+        k.call(0, 0, [0; 4]).unwrap();
+        assert_eq!(k.current(), Some(SERVER));
+        assert_eq!(k.active_sc(SERVER), Some(CLIENT));
+        k
+    }
+
+    #[test]
+    fn a_lent_budget_running_dry_calls_the_timeout_handler() {
+        let mut k = server_with_timeout_handler();
+        k.tick();
+        k.check_invariants().unwrap();
+        assert_eq!(k.take_timeout(), Some(SERVER));
+        assert_eq!(k.take_timeout(), None, "reported once");
+        assert_eq!(k.stats.timeouts, 1);
+        assert_eq!(k.stats.throttles, 0, "not throttled");
+        assert_eq!(k.current(), Some(OTHER), "the handler runs");
+        let h = k.thread(OTHER);
+        assert_eq!(h.msg, [FaultKind::Timeout as u64, 1, 10, 0]);
+        assert_eq!(h.badge, 0x7E);
+        assert_eq!(k.thread(SERVER).state, State::BlockedReply);
+        assert_eq!(k.thread(CLIENT).state, State::BlockedReply, "still served");
+        // Retry: the server keeps the client's budget and waits for it.
+        k.reply_recv(1, [0; 4]).unwrap();
+        assert_eq!(k.thread(SERVER).state, State::Throttled { sc: CLIENT });
+        while k.now() < 9 {
+            k.tick();
+        }
+        assert_eq!(k.current(), None);
+        k.tick();
+        assert_eq!(k.current(), Some(SERVER), "back at the client's refill");
+        k.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn stopping_a_timed_out_server_fails_its_caller() {
+        let mut k = server_with_timeout_handler();
+        k.tick();
+        assert_eq!(k.take_timeout(), Some(SERVER));
+        // The kernel stops the server when the handler answers Stop.
+        k.destroy(SERVER).unwrap();
+        assert_eq!(k.thread(CLIENT).status, Error::PeerRestarted.code());
+        k.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn running_out_of_its_own_budget_is_no_timeout() {
+        let mut k = K::new();
+        k.spawn(OTHER, 12).unwrap();
+        k.schedule();
+        k.recv(1, true).unwrap();
+        k.spawn(SERVER, 10).unwrap();
+        k.configure_sc(SERVER, 1, 10).unwrap();
+        k.set_timeout_handler(SERVER, Some((1, 0x7E))).unwrap();
+        k.schedule();
+        k.tick();
+        assert_eq!(k.take_timeout(), None);
+        assert_eq!(k.thread(SERVER).state, State::Throttled { sc: SERVER });
+    }
+
+    #[test]
+    fn a_destroyed_handler_endpoint_is_no_handler() {
+        let mut k = server_with_timeout_handler();
+        assert_eq!(k.set_timeout_handler(SERVER, Some((9, 0))), Err(IpcError::BadObject));
+        k.destroy_endpoint(1).unwrap();
+        assert_eq!(k.timeout_handler(SERVER), None);
+        k.schedule();
+        // The handler woke with an error and outranks the server; let it
+        // block, then the server runs dry with nobody to call.
+        k.wait(0).unwrap();
+        assert_eq!(k.current(), Some(SERVER));
+        k.tick();
+        assert_eq!(k.take_timeout(), None);
+        assert_eq!(k.thread(SERVER).state, State::Throttled { sc: CLIENT });
     }
 
     #[test]

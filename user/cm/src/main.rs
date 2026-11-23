@@ -1522,6 +1522,7 @@ fn fault_name(kind: u64) -> &'static str {
         Some(FaultKind::InvalidOpcode) => "invalid instruction",
         Some(FaultKind::DivideError) => "divide error",
         Some(FaultKind::ForeignSyscall) => "foreign system call",
+        Some(FaultKind::Timeout) => "caller's budget ran out mid-request",
         None => "unknown fault",
     }
 }
