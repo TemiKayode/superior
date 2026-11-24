@@ -260,6 +260,7 @@ pub extern "C" fn _start(role: u64) -> ! {
         4 => slow_server(),
         5 => slow_caller(),
         6 => timeout_handler(),
+        7 => tour(),
         _ => hog(),
     }
 }
@@ -790,6 +791,30 @@ fn timeout_handler() -> ! {
     let ok = ok && stop.status == 0;
     syscall(Syscall::Signal, if ok { REPORT_OK } else { REPORT_FAILED }, [0; 4]);
     syscall(Syscall::Recv, OWN_EP, [0; 4]);
+    finish(false)
+}
+
+/// Visits every CPU: pins itself (slot 0 holds its own thread) to CPU
+/// 0, 1, ... in turn, each call returning once that CPU runs it, until a
+/// CPU is not online. Then it lets any CPU run it and stops. However many
+/// CPUs there are, each runs a user thread.
+fn tour() -> ! {
+    const SELF: u64 = 0;
+    let mut cpu = 0;
+    let status = loop {
+        let r = syscall(Syscall::ThreadSetAffinity, SELF, [cpu, 0, 0, 0]);
+        if r.status != 0 {
+            break r.status;
+        }
+        cpu += 1;
+    };
+    let unpinned = syscall(Syscall::ThreadSetAffinity, SELF, [u64::MAX, 0, 0, 0]).status == 0;
+    if cpu == 0 || status != Error::InvalidArgument.code() || !unpinned {
+        put_str("FAIL tour: pinning to a CPU\n");
+        finish(false);
+    }
+    syscall(Syscall::ThreadSuspend, SELF, [0; 4]);
+    put_str("FAIL tour survived suspending itself\n");
     finish(false)
 }
 

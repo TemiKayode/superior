@@ -133,6 +133,11 @@ enum Op {
     EmptySc(Tid),
     UnlimitSc(Tid),
     DestroySc(Tid),
+    /// Pin a thread to one of the simulated CPUs, or unpin it.
+    Affinity {
+        t: Tid,
+        cpu: Option<usize>,
+    },
     TimeoutHandler {
         t: Tid,
         ep: Option<u16>,
@@ -220,6 +225,7 @@ impl Sim {
         if serving && self.rng.chance(80) {
             return Op::Tick;
         }
+        let cpus = self.cpus as u64;
         let r = &mut self.rng;
         let ep = r.below(ENDPOINTS as u64) as u16;
         let ntfn = r.below(NOTIFICATIONS as u64) as u16;
@@ -269,14 +275,18 @@ impl Sim {
             },
             94 => {
                 let sc = r.below(THREADS as u64) as Tid;
-                match r.below(6) {
+                match r.below(8) {
                     0..=2 => Op::Bind {
                         t,
                         sc: r.chance(85).then_some(sc),
                     },
                     3 => Op::EmptySc(sc),
                     4 => Op::UnlimitSc(sc),
-                    _ => Op::DestroySc(sc),
+                    5 => Op::DestroySc(sc),
+                    _ => Op::Affinity {
+                        t,
+                        cpu: r.chance(60).then(|| r.below(cpus) as usize),
+                    },
                 }
             }
             95..=96 => {
@@ -422,6 +432,7 @@ impl Sim {
             Op::EmptySc(sc) => self.k.empty_sc(sc),
             Op::UnlimitSc(sc) => self.k.unlimit_sc(sc),
             Op::DestroySc(sc) => self.k.destroy_sc(sc),
+            Op::Affinity { t, cpu } => self.k.set_affinity(t, cpu),
             Op::TimeoutHandler { t, ep } => self
                 .k
                 .set_timeout_handler(t, ep.map(|e| (e, TIMEOUT_BADGE | t as u64))),
@@ -706,6 +717,28 @@ mod tests {
         let c = coverage(200, LONG_STEPS);
         std::println!(
             "simulation: {LONG_SEEDS} seeds x {LONG_STEPS} steps, no violation; coverage {c:?}"
+        );
+    }
+
+    /// Long runs on the most CPUs the engine has: `cargo xtask sim-smp`
+    /// (and `cargo xtask test`), in release mode.
+    #[test]
+    #[ignore]
+    fn long_simulated_runs_on_every_cpu_keep_every_invariant() {
+        const SMP_SEEDS: u64 = 2_000;
+        const SMP_STEPS: u64 = 5_000;
+        let cpus = crate::ipc::MAX_CPUS;
+        let mut migrations = 0;
+        for seed in SEEDS..SEEDS + SMP_SEEDS {
+            let mut sim = Sim::new(seed, cpus);
+            for _ in 0..SMP_STEPS {
+                sim.step(seed).unwrap_or_else(|e| panic!("{cpus} CPUs: {e}"));
+            }
+            migrations += sim.k.stats.migrations;
+        }
+        assert!(migrations > 0, "no thread ever moved between CPUs");
+        std::println!(
+            "simulation on {cpus} CPUs: {SMP_SEEDS} seeds x {SMP_STEPS} steps, no violation; {migrations} migrations"
         );
     }
 

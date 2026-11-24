@@ -61,7 +61,7 @@ use crate::abi::{CapTransfer, Error, FaultKind, MSG_WORDS};
 
 pub type Tid = u16;
 /// CPUs the engine schedules for.
-pub const MAX_CPUS: usize = 4;
+pub const MAX_CPUS: usize = 8;
 pub const PRIORITIES: usize = 64;
 /// Timer ticks a thread runs before yielding to a ready peer of the same
 /// (or higher) priority.
@@ -287,12 +287,22 @@ pub struct SchedStats {
     pub donated_ticks: u64,
     /// Timeout faults raised (a lent budget ran out under a handler).
     pub timeouts: u64,
+    /// Threads a CPU took from another CPU's ready queue.
+    pub migrations: u64,
 }
 
 #[derive(Clone, Copy, Debug)]
 pub struct Tcb {
     pub state: State,
     pub prio: u8,
+    /// The CPU whose ready queue it joins: the one it last ran on, or
+    /// the one it is pinned to.
+    home: u8,
+    /// Pinned to `home` ([`Ipc::set_affinity`]): no other CPU runs it.
+    pinned: bool,
+    /// When it was queued to run (lower is longer ago; 0 for a thread
+    /// preempted mid-slice, which goes first).
+    queued: u64,
     pub msg: [u64; MSG_WORDS],
     pub badge: u64,
     /// Result of this thread's last completed operation (0 = ok).
@@ -359,6 +369,9 @@ const IDLE_TCB: Tcb = Tcb {
     bound: None,
     timeout: None,
     sc: None,
+    home: 0,
+    pinned: false,
+    queued: 0,
 };
 
 #[derive(Clone, Copy, Default, Debug)]
@@ -492,9 +505,21 @@ pub struct Ipc<const T: usize, const E: usize, const N: usize> {
     threads: [Tcb; T],
     eps: [Endpoint; E],
     ntfns: [Notification; N],
-    ready: [Queue; PRIORITIES],
-    /// Bit p set ⇔ ready[p] non-empty.
-    ready_bits: u64,
+    /// Each CPU's ready queues, one per priority. A thread queues on its
+    /// home CPU's (the one it last ran on), and a CPU runs the highest
+    /// priority ready anywhere, its own queue first among equals: the
+    /// highest-priority threads always run, and a thread stays on its CPU
+    /// (and its cache) unless another CPU would otherwise run something
+    /// lower, or nothing. A slice's end or a yield hands the turn to the
+    /// equal that has waited longest anywhere ([`Ipc::longest_waiting`]).
+    ready: [[Queue; PRIORITIES]; MAX_CPUS],
+    /// Bit p of entry x set ⇔ ready[x][p] non-empty.
+    ready_bits: [u64; MAX_CPUS],
+    /// Threads pinned to a CPU (while there are none, every ready thread
+    /// may run anywhere and the scheduler takes its fast path).
+    pinned_count: usize,
+    /// Counts queuings, to tell which ready thread has waited longest.
+    queue_seq: u64,
     /// The thread each CPU runs. A thread stopped by another CPU stays
     /// here, no longer `Running`, until its own CPU next enters the kernel
     /// and [`Ipc::settle`]s: its registers are still on that CPU.
@@ -536,8 +561,10 @@ impl<const T: usize, const E: usize, const N: usize> Ipc<T, E, N> {
                 waiters: Queue::EMPTY,
                 bound: None,
             }; N],
-            ready: [Queue::EMPTY; PRIORITIES],
-            ready_bits: 0,
+            ready: [[Queue::EMPTY; PRIORITIES]; MAX_CPUS],
+            ready_bits: [0; MAX_CPUS],
+            pinned_count: 0,
+            queue_seq: 0,
             currents: [None; MAX_CPUS],
             cpu: 0,
             transfers: [None; MAX_TRANSFERS],
@@ -547,6 +574,7 @@ impl<const T: usize, const E: usize, const N: usize> Ipc<T, E, N> {
                 throttles: 0,
                 donated_ticks: 0,
                 timeouts: 0,
+                migrations: 0,
             },
             timeout_raised: None,
         }
@@ -692,11 +720,7 @@ impl<const T: usize, const E: usize, const N: usize> Ipc<T, E, N> {
                 false
             }
             State::Ready => {
-                let p = self.threads[t as usize].prio as usize;
-                self.ready[p].remove(&mut self.threads, t);
-                if self.ready[p].is_empty() {
-                    self.ready_bits &= !(1 << p);
-                }
+                self.dequeue(t);
                 false
             }
             State::BlockedSend { ep, .. } | State::BlockedRecv { ep } => {
@@ -748,6 +772,49 @@ impl<const T: usize, const E: usize, const N: usize> Ipc<T, E, N> {
         Ok(())
     }
 
+    /// Pins thread `t` to CPU `cpu`, so only that CPU runs it, or (`None`)
+    /// lets any CPU run it again. A ready thread moves to that CPU's
+    /// queue; a thread running elsewhere stops and queues there (one this
+    /// CPU runs is switched away from at once; another CPU's stays kept
+    /// there until that CPU settles). Pinning outlasts suspension.
+    pub fn set_affinity(&mut self, t: Tid, cpu: Option<usize>) -> Result<(), IpcError> {
+        if t as usize >= T || cpu.is_some_and(|c| c >= MAX_CPUS) {
+            return Err(IpcError::BadThread);
+        }
+        let tcb = self.threads[t as usize];
+        let ready = tcb.state == State::Ready;
+        if ready {
+            self.dequeue(t);
+        }
+        match (tcb.pinned, cpu.is_some()) {
+            (false, true) => self.pinned_count += 1,
+            (true, false) => self.pinned_count -= 1,
+            _ => {}
+        }
+        let tcb = &mut self.threads[t as usize];
+        tcb.pinned = cpu.is_some();
+        if let Some(c) = cpu {
+            tcb.home = c as u8;
+        }
+        if ready {
+            self.enqueue(t, false);
+        } else if tcb.state == State::Running && !self.may_run(t, self.running_on(t)) {
+            let here = self.currents[self.cpu] == Some(t);
+            self.threads[t as usize].state = State::Ready;
+            self.enqueue(t, true);
+            if here {
+                self.currents[self.cpu] = None;
+            }
+        }
+        self.schedule();
+        Ok(())
+    }
+
+    /// The CPU running thread `t` (which must be running).
+    fn running_on(&self, t: Tid) -> usize {
+        self.currents.iter().position(|&c| c == Some(t)).unwrap_or(self.cpu)
+    }
+
     /// Clears an inactive thread's state so the table entry can be reused
     /// for a new thread. It is bound to context `t` again; contexts are
     /// objects of their own and outlive it.
@@ -761,6 +828,9 @@ impl<const T: usize, const E: usize, const N: usize> Ipc<T, E, N> {
         }
         if let Some(n) = tcb.bound {
             self.ntfns[n as usize].bound = None;
+        }
+        if tcb.pinned {
+            self.pinned_count -= 1;
         }
         let tcb = &mut self.threads[t as usize];
         *tcb = IDLE_TCB;
@@ -899,6 +969,9 @@ impl<const T: usize, const E: usize, const N: usize> Ipc<T, E, N> {
             return Err(IpcError::BadPriority);
         }
         tcb.prio = prio;
+        if !tcb.pinned {
+            tcb.home = self.cpu as u8;
+        }
         tcb.slice = TIMESLICE_TICKS;
         // Like any wakeup: a thread that outranks the running one takes over.
         self.wake(t);
@@ -1016,11 +1089,7 @@ impl<const T: usize, const E: usize, const N: usize> Ipc<T, E, N> {
                 }
             }
             (State::Ready, Err(parked)) => {
-                let p = self.threads[t as usize].prio as usize;
-                self.ready[p].remove(&mut self.threads, t);
-                if self.ready[p].is_empty() {
-                    self.ready_bits &= !(1 << p);
-                }
+                self.dequeue(t);
                 self.threads[t as usize].state = parked;
             }
             (State::Throttled { .. } | State::NoSchedContext, Err(parked)) => {
@@ -1075,8 +1144,8 @@ impl<const T: usize, const E: usize, const N: usize> Ipc<T, E, N> {
     }
 
     /// The current thread gives up its own scheduling context the next
-    /// time it blocks, and from then on runs only on contexts its callers
-    /// lend it.
+    /// time it blocks or receives, and from then on runs only on contexts
+    /// its callers lend it.
     pub fn make_passive(&mut self) -> Result<(), IpcError> {
         let cur = self.cur()?;
         let tcb = &mut self.threads[cur as usize];
@@ -1209,8 +1278,15 @@ impl<const T: usize, const E: usize, const N: usize> Ipc<T, E, N> {
         if let Some(p) = self.highest_ready()
             && p >= prio
         {
+            // Among equals, the one that has waited longest anywhere.
+            let peer = (p == prio)
+                .then(|| self.longest_waiting(p as usize, self.cpu))
+                .flatten();
             self.currents[self.cpu] = None;
             self.make_ready(c);
+            if let Some(t) = peer {
+                self.run_queued(t);
+            }
         }
     }
 
@@ -1222,37 +1298,36 @@ impl<const T: usize, const E: usize, const N: usize> Ipc<T, E, N> {
         }
         // Levels whose every thread another CPU still keeps.
         let mut kept = 0u64;
-        while self.ready_bits & !kept != 0 {
-            let bits = self.ready_bits & !kept;
+        while self.all_ready_bits() & !kept != 0 {
+            let bits = self.all_ready_bits() & !kept;
             let p = 63 - bits.leading_zeros() as usize;
-            let mut at = self.ready[p].head;
-            while let Some(x) = at
-                && self.pinned_off(x, self.cpu)
-            {
-                at = self.threads[x as usize].next;
-            }
-            let Some(t) = at else {
+            let Some(t) = self.first_runnable(p, self.cpu) else {
                 kept |= 1 << p;
                 continue;
             };
-            self.ready[p].remove(&mut self.threads, t);
-            if self.ready[p].is_empty() {
-                self.ready_bits &= !(1 << p);
-            }
-            // A queued thread's context may have run dry since it was
-            // queued (another thread on the same context used it up): park
-            // it until a refill, as it would have been on waking.
-            match self.active_sc(t) {
-                None => self.threads[t as usize].state = State::NoSchedContext,
-                Some(sc) if self.scs[sc as usize].exhausted(self.now) => {
-                    self.threads[t as usize].state = State::Throttled { sc };
-                }
-                Some(_) => {
-                    self.switch_to(t);
-                    return;
-                }
+            if self.run_queued(t) {
+                return;
             }
         }
+    }
+
+    /// Takes queued thread `t` off its queue and runs it on this CPU, or,
+    /// if its context has run dry since it was queued (another thread on
+    /// the same context used it up), parks it until a refill, as it would
+    /// have been on waking. Returns whether it runs.
+    fn run_queued(&mut self, t: Tid) -> bool {
+        self.dequeue(t);
+        match self.active_sc(t) {
+            None => self.threads[t as usize].state = State::NoSchedContext,
+            Some(sc) if self.scs[sc as usize].exhausted(self.now) => {
+                self.threads[t as usize].state = State::Throttled { sc };
+            }
+            Some(_) => {
+                self.switch_to(t);
+                return true;
+            }
+        }
+        false
     }
 
     // ---- system calls, always on behalf of `current` --------------------
@@ -1320,6 +1395,10 @@ impl<const T: usize, const E: usize, const N: usize> Ipc<T, E, N> {
             return Err(IpcError::Notified);
         }
         if self.eps[e].state == EpState::Sending {
+            // A pending switch to passive takes effect on any receive, not
+            // just one that blocks: a server whose first caller is already
+            // queued must run on that caller's context, not its own.
+            self.settle_passive(cur);
             self.take_from_sender(cur, e);
             // A passive receiver runs on what the caller lent it, which
             // may be nothing (the caller went passive as it blocked).
@@ -1524,7 +1603,22 @@ impl<const T: usize, const E: usize, const N: usize> Ipc<T, E, N> {
         let cur = self.cur()?;
         self.threads[cur as usize].status = 0;
         self.currents[self.cpu] = None;
+        // The peer of equal priority that has waited longest gets the
+        // turn, wherever it is queued: queued behind it on this CPU, the
+        // yielder would otherwise come straight back while a peer on a
+        // busy CPU's queue waits out that CPU's time slice.
+        let p = self.threads[cur as usize].prio;
+        let peer = if self.highest_ready() == Some(p) {
+            self.longest_waiting(p as usize, self.cpu)
+        } else {
+            None
+        };
         self.make_ready(cur);
+        if let Some(t) = peer
+            && self.run_queued(t)
+        {
+            return Ok(());
+        }
         self.schedule();
         Ok(())
     }
@@ -1628,12 +1722,20 @@ impl<const T: usize, const E: usize, const N: usize> Ipc<T, E, N> {
         }
     }
 
-    /// Stops the current thread `t` if it has no context to run on.
+    /// Stops the current thread `t` if it has no context to run on, or
+    /// one with no budget: a passive server that took a call lent a
+    /// context emptied while its caller waited in the queue.
     fn park_if_no_sc(&mut self, t: Tid) {
-        if self.currents[self.cpu] == Some(t) && self.active_sc(t).is_none() {
-            self.threads[t as usize].state = State::NoSchedContext;
-            self.currents[self.cpu] = None;
+        if self.currents[self.cpu] != Some(t) {
+            return;
         }
+        let parked = match self.active_sc(t) {
+            None => State::NoSchedContext,
+            Some(sc) if self.scs[sc as usize].exhausted(self.now) => State::Throttled { sc },
+            Some(_) => return,
+        };
+        self.threads[t as usize].state = parked;
+        self.currents[self.cpu] = None;
     }
 
     /// Queues `t` to run, or, if it has no context with budget, parks it
@@ -1651,11 +1753,88 @@ impl<const T: usize, const E: usize, const N: usize> Ipc<T, E, N> {
             }
             Some(_) => {}
         }
-        let p = self.threads[t as usize].prio as usize;
         self.threads[t as usize].state = State::Ready;
-        self.ready[p].push_back(&mut self.threads, t);
-        self.ready_bits |= 1 << p;
+        self.enqueue(t, false);
         true
+    }
+
+    /// Queues ready thread `t` on its home CPU, at the back of its level
+    /// or (preempted, so it resumes before peers that have not run) the
+    /// front.
+    fn enqueue(&mut self, t: Tid, front: bool) {
+        let (h, p) = (self.threads[t as usize].home as usize, self.threads[t as usize].prio as usize);
+        if front {
+            self.threads[t as usize].queued = 0;
+            self.ready[h][p].push_front(&mut self.threads, t);
+        } else {
+            self.queue_seq += 1;
+            self.threads[t as usize].queued = self.queue_seq;
+            self.ready[h][p].push_back(&mut self.threads, t);
+        }
+        self.ready_bits[h] |= 1 << p;
+    }
+
+    /// Takes ready thread `t` off its queue.
+    fn dequeue(&mut self, t: Tid) {
+        let (h, p) = (self.threads[t as usize].home as usize, self.threads[t as usize].prio as usize);
+        self.ready[h][p].remove(&mut self.threads, t);
+        if self.ready[h][p].is_empty() {
+            self.ready_bits[h] &= !(1 << p);
+        }
+    }
+
+    /// Levels with a thread ready on any CPU.
+    fn all_ready_bits(&self) -> u64 {
+        self.ready_bits.iter().fold(0, |a, b| a | b)
+    }
+
+    /// The first thread at level `p` CPU `cpu` may run: from its own queue
+    /// if it has one there, else from the next CPU's round, skipping any
+    /// another CPU still keeps.
+    fn first_runnable(&self, p: usize, cpu: usize) -> Option<Tid> {
+        (0..MAX_CPUS).map(|i| (cpu + i) % MAX_CPUS).find_map(|x| {
+            let mut at = self.ready[x][p].head;
+            while let Some(t) = at {
+                if self.may_run(t, cpu) && !self.pinned_off(t, cpu) {
+                    return Some(t);
+                }
+                at = self.threads[t as usize].next;
+            }
+            None
+        })
+    }
+
+    /// The thread at level `p` that has waited longest of those CPU `cpu`
+    /// may run, on any CPU's queue (its own first among equals): who takes
+    /// the turn when a thread's slice ends or it yields, so that threads
+    /// of equal priority share every CPU in turn, not just their own.
+    fn longest_waiting(&self, p: usize, cpu: usize) -> Option<Tid> {
+        let mut best: Option<Tid> = None;
+        for x in (0..MAX_CPUS).map(|i| (cpu + i) % MAX_CPUS) {
+            let mut at = self.ready[x][p].head;
+            while let Some(t) = at {
+                if self.may_run(t, cpu) && !self.pinned_off(t, cpu) {
+                    if best.is_none_or(|b| self.threads[t as usize].queued < self.threads[b as usize].queued) {
+                        best = Some(t);
+                    }
+                    break;
+                }
+                at = self.threads[t as usize].next;
+            }
+        }
+        best
+    }
+
+    /// The CPU whose queue ready thread `t` is on, if it is ready.
+    pub fn queued_on(&self, t: Tid) -> Option<usize> {
+        let tcb = &self.threads[t as usize];
+        (tcb.state == State::Ready).then_some(tcb.home as usize)
+    }
+
+    /// Whether CPU `cpu` may run thread `t`: any CPU, unless it is pinned.
+    fn may_run(&self, t: Tid, cpu: usize) -> bool {
+        let tcb = &self.threads[t as usize];
+        !tcb.pinned || tcb.home as usize == cpu
     }
 
     /// The highest priority with a thread ready that this CPU may run.
@@ -1666,19 +1845,15 @@ impl<const T: usize, const E: usize, const N: usize> Ipc<T, E, N> {
     /// The highest priority with a thread ready that CPU `cpu` may run
     /// (one no other CPU keeps).
     fn highest_ready_on(&self, cpu: usize) -> Option<u8> {
-        if !self.any_pinned() {
-            return (self.ready_bits != 0).then(|| 63 - self.ready_bits.leading_zeros() as u8);
+        let bits = self.all_ready_bits();
+        if self.pinned_count == 0 && !self.any_pinned() {
+            return (bits != 0).then(|| 63 - bits.leading_zeros() as u8);
         }
-        (0..PRIORITIES).rev().find_map(|p| {
-            let mut at = self.ready[p].head;
-            while let Some(x) = at {
-                if !self.pinned_off(x, cpu) {
-                    return Some(p as u8);
-                }
-                at = self.threads[x as usize].next;
-            }
-            None
-        })
+        (0..PRIORITIES)
+            .rev()
+            .filter(|&p| bits >> p & 1 == 1)
+            .find(|&p| self.first_runnable(p, cpu).is_some())
+            .map(|p| p as u8)
     }
 
     /// Makes `t` runnable; preempts the current thread if `t` outranks it.
@@ -1688,13 +1863,12 @@ impl<const T: usize, const E: usize, const N: usize> Ipc<T, E, N> {
         }
         if let Some(c) = self.currents[self.cpu]
             && self.threads[t as usize].prio > self.threads[c as usize].prio
+            && self.may_run(t, self.cpu)
         {
             // The preempted thread goes to the front of its level so it
             // resumes before peers that have not run.
-            let p = self.threads[c as usize].prio as usize;
             self.threads[c as usize].state = State::Ready;
-            self.ready[p].push_front(&mut self.threads, c);
-            self.ready_bits |= 1 << p;
+            self.enqueue(c, true);
             self.currents[self.cpu] = None;
             self.schedule();
         }
@@ -1712,10 +1886,8 @@ impl<const T: usize, const E: usize, const N: usize> Ipc<T, E, N> {
                 .active_sc(c)
                 .is_some_and(|sc| !self.scs[sc as usize].exhausted(self.now));
             if runnable {
-                let cp = self.threads[c as usize].prio as usize;
                 self.threads[c as usize].state = State::Ready;
-                self.ready[cp].push_front(&mut self.threads, c);
-                self.ready_bits |= 1 << cp;
+                self.enqueue(c, true);
             } else {
                 self.make_ready(c); // parks it
             }
@@ -1731,7 +1903,7 @@ impl<const T: usize, const E: usize, const N: usize> Ipc<T, E, N> {
             .active_sc(t)
             .is_some_and(|sc| !self.scs[sc as usize].exhausted(self.now));
         match self.highest_ready() {
-            _ if !runnable => {
+            _ if !runnable || !self.may_run(t, self.cpu) => {
                 self.make_ready(t); // parks it
                 self.schedule();
             }
@@ -1744,7 +1916,13 @@ impl<const T: usize, const E: usize, const N: usize> Ipc<T, E, N> {
     }
 
     fn switch_to(&mut self, t: Tid) {
-        self.threads[t as usize].state = State::Running;
+        debug_assert!(self.may_run(t, self.cpu));
+        let tcb = &mut self.threads[t as usize];
+        if tcb.home as usize != self.cpu {
+            tcb.home = self.cpu as u8;
+            self.stats.migrations += 1;
+        }
+        tcb.state = State::Running;
         self.currents[self.cpu] = Some(t);
     }
 }
@@ -1788,22 +1966,37 @@ impl<const T: usize, const E: usize, const N: usize> Ipc<T, E, N> {
             }
             Ok(())
         };
-        // Ready queues.
-        for p in 0..PRIORITIES {
-            let q = walk(&self.ready[p], "ready")?;
-            if (self.ready_bits >> p & 1 == 1) != !q.is_empty() {
-                return Err(format!("ready bit {p} disagrees with its queue"));
-            }
-            for &t in &q {
-                let tcb = &th[t as usize];
-                if tcb.state != State::Ready || tcb.prio as usize != p {
-                    return Err(format!(
-                        "thread {t} in ready[{p}] is {:?} prio {}",
-                        tcb.state, tcb.prio
-                    ));
+        // Ready queues: each thread on its home CPU's.
+        for x in 0..MAX_CPUS {
+            for p in 0..PRIORITIES {
+                let q = walk(&self.ready[x][p], "ready")?;
+                if (self.ready_bits[x] >> p & 1 == 1) != !q.is_empty() {
+                    return Err(format!("CPU {x}'s ready bit {p} disagrees with its queue"));
                 }
+                for &t in &q {
+                    let tcb = &th[t as usize];
+                    if tcb.state != State::Ready || tcb.prio as usize != p || tcb.home as usize != x {
+                        return Err(format!(
+                            "thread {t} in CPU {x}'s ready[{p}] is {:?} prio {} home {}",
+                            tcb.state, tcb.prio, tcb.home
+                        ));
+                    }
+                }
+                mark(&q, "ready")?;
             }
-            mark(&q, "ready")?;
+        }
+        // Pinning: counted right, and no CPU runs a thread pinned elsewhere.
+        let pinned = th.iter().filter(|t| t.pinned).count();
+        if pinned != self.pinned_count {
+            return Err(format!("{pinned} threads pinned but the count is {}", self.pinned_count));
+        }
+        for (x, c) in self.currents.iter().enumerate() {
+            if let Some(t) = *c
+                && th[t as usize].state == State::Running
+                && !self.may_run(t, x)
+            {
+                return Err(format!("CPU {x} runs thread {t}, pinned to CPU {}", th[t as usize].home));
+            }
         }
         // Endpoints.
         for e in 0..E {
@@ -1981,7 +2174,7 @@ mod tests {
             assert_eq!(k.thread(CLIENT).status, 0);
             assert_eq!(k.thread(SERVER).state, State::BlockedRecv { ep: EP });
         }
-        assert_eq!(k.ready_bits, 0, "fast path never touched the ready queues");
+        assert_eq!(k.ready_bits, [0; MAX_CPUS], "fast path never touched the ready queues");
     }
 
     #[test]
@@ -2727,6 +2920,31 @@ mod tests {
         assert_eq!(k.current(), Some(SERVER));
     }
     #[test]
+    fn a_server_going_passive_runs_on_a_caller_already_queued() {
+        let mut k = K::new();
+        k.spawn(SERVER, 10).unwrap();
+        k.spawn(CLIENT, 5).unwrap();
+        k.configure_sc(CLIENT, 2, 10).unwrap();
+        // CLIENT calls before SERVER first receives (on another CPU, say).
+        k.set_cpu(1);
+        k.schedule();
+        assert_eq!(k.current_on(1), Some(CLIENT));
+        k.call(0, 1, [0; MSG_WORDS]).unwrap();
+        k.set_cpu(0);
+        k.schedule();
+        assert_eq!(k.current(), Some(SERVER));
+        k.make_passive().unwrap();
+        k.recv(0, true).unwrap();
+        // It took the call without blocking, and runs on CLIENT's budget.
+        assert_eq!(k.current(), Some(SERVER));
+        assert_eq!(k.active_sc(SERVER), Some(CLIENT));
+        k.tick();
+        k.tick();
+        assert_eq!(k.thread(SERVER).state, State::Throttled { sc: CLIENT });
+        k.check_invariants().unwrap();
+    }
+
+    #[test]
     fn destroying_an_endpoint_wakes_its_queue_with_an_error() {
         let mut k = K::new();
         k.spawn(SERVER, 10).unwrap();
@@ -2951,6 +3169,35 @@ mod tests {
     }
 
     #[test]
+    fn a_passive_server_lent_an_emptied_context_stops() {
+        // SERVER (passive) waits; OTHER calls it on CPU 0 and it runs.
+        let mut k = passive_server(5, 10);
+        k.spawn(OTHER, 7).unwrap();
+        assert_eq!(k.current(), Some(OTHER));
+        k.call(0, 1, [0; 4]).unwrap();
+        assert_eq!(k.current(), Some(SERVER));
+        // Meanwhile CLIENT calls on CPU 1 and waits in the queue, and its
+        // context is emptied while it waits.
+        k.set_cpu(1);
+        k.schedule();
+        assert_eq!(k.current(), Some(CLIENT));
+        k.call(0, 2, [0; 4]).unwrap();
+        assert!(matches!(k.thread(CLIENT).state, State::BlockedSend { .. }));
+        k.empty_sc(CLIENT).unwrap();
+        // SERVER answers OTHER and takes CLIENT's call on an empty loan:
+        // it may not run on it.
+        k.set_cpu(0);
+        k.reply_recv(0, [0; 4]).unwrap();
+        assert_eq!(k.thread(SERVER).state, State::Throttled { sc: CLIENT });
+        assert_eq!(k.current(), Some(OTHER));
+        k.check_invariants().unwrap();
+        // Given budget again, it runs on it.
+        k.configure_sc(CLIENT, 2, 10).unwrap();
+        assert_eq!(k.current(), Some(SERVER));
+        k.check_invariants().unwrap();
+    }
+
+    #[test]
     fn destroying_a_context_unbinds_its_threads() {
         let mut k = K::new();
         k.spawn(SERVER, 10).unwrap();
@@ -3050,6 +3297,198 @@ mod tests {
     // ---- several CPUs -----------------------------------------------------
 
     /// CPU 0 runs SERVER (prio 10), CPU 1 runs CLIENT (prio 5).
+    #[test]
+    fn a_preempted_thread_queues_on_the_cpu_it_ran_on() {
+        let mut k = two_cpus();
+        // CPU 1 runs CLIENT; OTHER (prio 8) made on CPU 1 preempts it.
+        k.spawn(OTHER, 8).unwrap();
+        assert_eq!(k.current_on(1), Some(OTHER));
+        assert_eq!(k.queued_on(CLIENT), Some(1), "back on CPU 1's queue");
+        k.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn a_cpu_runs_its_own_thread_before_an_equal_one_queued_elsewhere() {
+        let mut k = K::new();
+        // Two prio-5 threads, made on CPU 0 and on CPU 1, both queued
+        // behind SERVER on CPU 0 and CLIENT on CPU 1.
+        k.spawn(SERVER, 10).unwrap();
+        k.schedule();
+        k.spawn(OTHER, 5).unwrap();
+        k.set_cpu(1);
+        k.spawn(CLIENT, 10).unwrap();
+        k.schedule();
+        k.spawn(3, 5).unwrap();
+        assert_eq!(k.queued_on(OTHER), Some(0));
+        assert_eq!(k.queued_on(3), Some(1));
+        // CLIENT blocks: CPU 1 takes its own 3, though OTHER queued first.
+        k.recv(EP, true).unwrap();
+        assert_eq!(k.current_on(1), Some(3));
+        assert_eq!(k.queued_on(OTHER), Some(0));
+        assert_eq!(k.stats.migrations, 0);
+        k.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn a_cpu_takes_a_higher_thread_from_another_cpus_queue() {
+        let mut k = K::new();
+        k.spawn(SERVER, 10).unwrap();
+        k.schedule();
+        k.spawn(OTHER, 7).unwrap();
+        k.set_cpu(1);
+        k.spawn(CLIENT, 10).unwrap();
+        k.schedule();
+        k.spawn(3, 5).unwrap();
+        // CPU 1's own 3 is prio 5; CPU 0's OTHER, 7, goes first.
+        k.recv(EP, true).unwrap();
+        assert_eq!(k.current_on(1), Some(OTHER), "the highest ready runs");
+        assert_eq!(k.stats.migrations, 1);
+        k.check_invariants().unwrap();
+        // It now lives on CPU 1: preempted there, it queues there.
+        k.spawn(4, 9).unwrap();
+        assert_eq!(k.queued_on(OTHER), Some(1));
+        k.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn eight_cpus_run_the_eight_highest_threads() {
+        let mut k = Ipc::<16, 4, 4>::new();
+        for t in 0..12u16 {
+            k.set_cpu(t as usize % 2);
+            k.spawn(t, 1 + t as u8).unwrap();
+        }
+        for cpu in 0..MAX_CPUS {
+            k.set_cpu(cpu);
+            k.schedule();
+            k.check_invariants().unwrap();
+        }
+        let mut running: Vec<Tid> = (0..MAX_CPUS).filter_map(|x| k.current_on(x)).collect();
+        running.sort();
+        assert_eq!(running, (4..12).collect::<Vec<Tid>>());
+        for t in 0..4 {
+            assert!(k.queued_on(t).is_some(), "the four lowest wait");
+        }
+    }
+
+    #[test]
+    fn a_thread_pinned_elsewhere_waits_for_its_cpu() {
+        let mut k = K::new();
+        k.spawn(SERVER, 10).unwrap();
+        k.schedule();
+        // OTHER, pinned to CPU 1, outranks nothing CPU 0 could leave it to.
+        k.spawn(OTHER, 12).unwrap();
+        assert_eq!(k.current(), Some(OTHER));
+        k.set_affinity(OTHER, Some(1)).unwrap();
+        assert_eq!(k.current(), Some(SERVER), "CPU 0 lets it go");
+        assert_eq!(k.queued_on(OTHER), Some(1));
+        assert!(k.needs_kick(1));
+        assert!(!k.needs_kick(0));
+        k.check_invariants().unwrap();
+        k.set_cpu(1);
+        k.schedule();
+        assert_eq!(k.current_on(1), Some(OTHER));
+        // Blocked and woken on CPU 0, it still queues for CPU 1 alone.
+        k.recv(EP, true).unwrap();
+        k.set_cpu(0);
+        k.send(EP, 0, [0; MSG_WORDS], true).unwrap();
+        assert_eq!(k.current_on(0), Some(SERVER));
+        assert_eq!(k.queued_on(OTHER), Some(1));
+        k.check_invariants().unwrap();
+        // Unpinned, CPU 0 takes it (it outranks SERVER).
+        k.set_affinity(OTHER, None).unwrap();
+        k.reschedule();
+        assert_eq!(k.current_on(0), Some(OTHER));
+        k.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn pinning_a_thread_running_elsewhere_stops_it_there() {
+        let mut k = two_cpus();
+        // From CPU 0, pin CPU 1's CLIENT to CPU 0: CPU 1 keeps it until
+        // it settles, and CPU 0 may not run it before then.
+        k.set_cpu(0);
+        k.set_affinity(CLIENT, Some(0)).unwrap();
+        assert_eq!(k.thread(CLIENT).state, State::Ready);
+        assert!(k.needs_kick(1));
+        k.check_invariants().unwrap();
+        k.set_cpu(1);
+        k.reschedule();
+        assert_eq!(k.current_on(1), None, "nothing else CPU 1 may run");
+        k.set_cpu(0);
+        k.suspend(SERVER).unwrap();
+        assert_eq!(k.current_on(0), Some(CLIENT));
+        k.check_invariants().unwrap();
+        // A pin survives suspension: resumed on CPU 1, it queues for 0.
+        k.suspend(CLIENT).unwrap();
+        k.set_cpu(1);
+        k.spawn(CLIENT, 5).unwrap();
+        assert_eq!(k.current_on(1), None);
+        assert_eq!(k.queued_on(CLIENT), Some(0));
+        k.reset_thread(SERVER).unwrap();
+        k.suspend(CLIENT).unwrap();
+        k.reset_thread(CLIENT).unwrap();
+        k.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn a_yield_hands_the_turn_to_a_peer_queued_on_another_cpu() {
+        let mut k = two_cpus();
+        // CPU 0's SERVER blocks and a prio-5 thread, 3, runs there; OTHER,
+        // CLIENT's peer (prio 5), queues behind it on CPU 1.
+        k.set_cpu(0);
+        k.recv(EP, true).unwrap();
+        k.spawn(3, 5).unwrap();
+        k.schedule();
+        assert_eq!(k.current_on(0), Some(3));
+        k.set_cpu(1);
+        k.spawn(OTHER, 5).unwrap();
+        assert_eq!(k.queued_on(OTHER), Some(1));
+        // 3 yields: OTHER runs on CPU 0.
+        k.set_cpu(0);
+        k.yield_now().unwrap();
+        assert_eq!(k.current_on(0), Some(OTHER), "the peer takes the turn");
+        assert_eq!(k.queued_on(3), Some(0));
+        k.check_invariants().unwrap();
+        // Alone at its level, a yielder goes on.
+        k.yield_now().unwrap();
+        assert_eq!(k.current_on(0), Some(3));
+        k.yield_now().unwrap();
+        assert_eq!(k.current_on(0), Some(OTHER));
+        k.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn equal_threads_take_turns_on_every_cpu() {
+        let mut k = two_cpus();
+        // SERVER drops to CLIENT's prio 5 by blocking; OTHER (prio 5)
+        // runs on CPU 0, and 3 (prio 5) queues behind CLIENT on CPU 1.
+        k.set_cpu(0);
+        k.recv(EP, true).unwrap();
+        k.spawn(OTHER, 5).unwrap();
+        k.schedule();
+        k.set_cpu(1);
+        k.spawn(3, 5).unwrap();
+        assert_eq!(k.queued_on(3), Some(1));
+        // CPU 0's slice ends: 3, waiting on CPU 1's queue, takes the turn.
+        k.set_cpu(0);
+        for _ in 0..TIMESLICE_TICKS {
+            k.tick();
+        }
+        k.schedule();
+        assert_eq!(k.current_on(0), Some(3));
+        assert_eq!(k.queued_on(OTHER), Some(0));
+        k.check_invariants().unwrap();
+        // CPU 1's slice ends: OTHER, now waiting longest, runs there.
+        k.set_cpu(1);
+        for _ in 0..TIMESLICE_TICKS {
+            k.tick();
+        }
+        k.schedule();
+        assert_eq!(k.current_on(1), Some(OTHER));
+        assert_eq!(k.queued_on(CLIENT), Some(1));
+        k.check_invariants().unwrap();
+    }
+
     fn two_cpus() -> K {
         let mut k = K::new();
         k.spawn(SERVER, 10).unwrap();

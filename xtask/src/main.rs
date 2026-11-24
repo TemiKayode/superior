@@ -16,6 +16,8 @@
 //!                                  architecture the boot self-tests in QEMU and
 //!                                  a scripted session with the shell
 //!   cargo xtask boot-test [arch]   just the boot self-tests
+//!   cargo xtask sim-smp            just the long simulation on every CPU the
+//!                                  engine has (8), in release mode
 //!   cargo xtask shell-test [arch]  just the shell session
 //!   cargo xtask el2-test           AArch64 entered at EL2 (-kernel and UEFI)
 //!   cargo xtask layout-test        AArch64 with ECAM moved (highmem=on): the
@@ -263,6 +265,17 @@ fn main() -> ExitCode {
             .and_then(|img| shell_session(&img)),
         Some("sel4-test") => sel4_image().and_then(|img| shell_session(&img)),
         Some("boot-test") => image(true, arch).and_then(|img| boot(&img, true)),
+        Some("sim-smp") => run(cargo().args([
+            "test",
+            "--quiet",
+            "--release",
+            "-p",
+            "superior-objects",
+            "--",
+            "--ignored",
+            "--nocapture",
+            "long_simulated_runs_on_every_cpu",
+        ])),
         Some("shell-test") => image(false, arch).and_then(|img| shell_session(&img)),
         Some("el2-test") => el2_test(),
         Some("layout-test") => layout_test(),
@@ -2259,7 +2272,7 @@ fn cpus() -> usize {
     env::var("SUPERIOR_CPUS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .filter(|&n| (1..=4).contains(&n))
+        .filter(|&n| (1..=8).contains(&n))
         .unwrap_or(2)
 }
 

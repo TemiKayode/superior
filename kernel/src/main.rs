@@ -588,6 +588,11 @@ fn start_timeout_test(done: Object) -> Result<(), &'static str> {
     )?;
     task::set_timeout_handler(4, 5, 0x7E)?;
     kprintln!("[ok] slow server (prio 8), its 1/10-tick caller (prio 6) and timeout handler (prio 9) loaded");
+    // A thread that pins itself to each CPU in turn, so every CPU runs a
+    // user thread however many there are (thread 7 is the client's).
+    let own = Capability::new(Object::Thread { id: 8 }, Rights::WRITE);
+    task::spawn_process(8, USER_IMAGE, 15, 7, &[(0, own)])?;
+    kprintln!("[ok] CPU tour (prio 15) loaded");
     Ok(())
 }
 

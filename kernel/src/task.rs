@@ -70,7 +70,7 @@ use superior_objects::ipc::{Ipc, Tid};
 #[cfg(not(feature = "selftest"))]
 pub const MAX_THREADS: usize = 32;
 #[cfg(feature = "selftest")]
-pub const MAX_THREADS: usize = 8;
+pub const MAX_THREADS: usize = 9;
 const _: () = assert!(arch::TICK_HZ as u64 == superior_objects::abi::TICK_HZ);
 pub const CSPACE_SLOTS: usize = 16;
 /// Layout of the one capability table: each thread's own window, then one
@@ -751,6 +751,7 @@ pub fn handle_syscall(frame: &mut UserFrame) -> Exit {
         Some(Syscall::ThreadSetTimeoutHandler) => thread_set_timeout_handler(k, cur, &a),
         Some(Syscall::SchedContextBind) => sched_context_bind(k, cur, &a),
         Some(Syscall::SchedControlConfigure) => sched_control_configure(k, cur, &a),
+        Some(Syscall::ThreadSetAffinity) => thread_set_affinity(k, cur, &a),
         Some(Syscall::IrqMsiMessage) => irq_msi_message(k, cur, &a),
         Some(Syscall::FrameDmaAddress) => frame_dma_address(k, cur, a.a0),
         Some(Syscall::DeviceFrame) => device_frame(k, cur, &a),
@@ -1749,6 +1750,17 @@ fn sched_context_bind(k: &mut Kernel, cur: Tid, f: &Args) -> Result<(), u64> {
         Some(sched_context_cap(k, cur, f.a1)?)
     };
     k.ipc.bind_sc(t, sc).map_err(|e| e.status())
+}
+
+/// `ThreadSetAffinity`: rdi = thread, rsi = CPU, or `u64::MAX` for any.
+fn thread_set_affinity(k: &mut Kernel, cur: Tid, f: &Args) -> Result<(), u64> {
+    let t = thread_cap(k, cur, f.a0)?;
+    let cpu = match f.a1 {
+        u64::MAX => None,
+        c if c < crate::smp::online() as u64 => Some(c as usize),
+        _ => return Err(Error::InvalidArgument.code()),
+    };
+    k.ipc.set_affinity(t, cpu).map_err(|e| e.status())
 }
 
 /// `SchedControlConfigure`: rdi = sched control, rsi = scheduling context,

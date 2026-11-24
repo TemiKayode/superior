@@ -150,13 +150,22 @@ holds the rest):
   0x20 with every line masked, carrying COM1 only on a machine with no I/O APIC.
 - All usable physical memory handed to the root CNode as untyped capabilities; every
   page table and user page is retyped from them. There is no kernel heap.
-- Several CPUs (SMP; QEMU runs every test with 2, `SUPERIOR_CPUS` sets up to 4): the
+- Several CPUs (SMP; QEMU runs every test with 2, `SUPERIOR_CPUS` sets up to 8): the
   other CPUs start through an INIT/start-up trampoline that climbs from real mode to long
   mode (x86-64) or PSCI `CPU_ON` (AArch64), each with its own kernel stack, GDT and TSS or
   redistributor, and timer. One kernel lock covers all kernel work, taken in turn (a
   ticket lock, so no CPU waits behind the others for ever); the IPC engine keeps
-  a current thread per CPU and a shared set of ready queues, so any CPU runs the
-  highest-priority thread it can. A thread another CPU stops (suspended, destroyed, its
+  a current thread per CPU and ready queues per CPU. A thread queues on the CPU it
+  last ran on, and a CPU runs the highest-priority thread ready anywhere, its own
+  queue first among equals: the highest-priority threads always run, and a thread
+  stays on its CPU (and its cache) unless another CPU would otherwise run something
+  lower, or nothing (the engine counts such migrations). When a thread's time slice
+  ends or it yields, the turn goes to the thread of its priority that has waited
+  longest on any CPU, so equals share every CPU in turn: a driver polling with
+  `Yield` hands over at once, and four threads queued on one CPU do not crawl while
+  a fifth has another to itself. `ThreadSetAffinity` pins a
+  thread to one CPU, which alone may run it, or unpins it; pinning a running thread
+  moves it at once, and a pin outlasts suspension. A thread another CPU stops (suspended, destroyed, its
   scheduling context gone) stays with its own CPU until that CPU next enters the kernel
   and saves its registers, and nobody else may run it before then; a system call it was
   making is made again, and every tick, interrupt signal or reschedule on a CPU lets go
@@ -169,9 +178,12 @@ holds the rest):
   the CPU doing it asks each one by interrupt and waits, and a CPU waiting for the
   kernel lock answers such requests while it waits, so the wait cannot deadlock. Device
   interrupts go to CPU 0; code a CPU loads is made visible to every CPU's instruction
-  cache. The boot self-test checks that every CPU ran user threads; the engine's
-  simulation runs every seed on 2, 3 and 4 CPUs too, including interrupts that reach an
-  idle CPU; and every QEMU test passes with 1, 2 and 4 CPUs. Test logs are checked in
+  cache. The boot self-test checks that every CPU ran user threads: a tour thread
+  pins itself to each CPU in turn, however many there are; the engine's simulation
+  runs every seed on 2 to 8 CPUs too, including interrupts that reach an idle CPU and
+  threads pinned and unpinned, and `cargo xtask sim-smp` runs 2,000 seeds of 5,000
+  steps on 8; and every QEMU test passes with 1, 2 and 4 CPUs, the boot, file system
+  and Component Manager tests with 8. Test logs are checked in
   order per thread, since threads on different CPUs print in either order.
 - `syscall`/`sysret` entry on each CPU's kernel stack (found through `swapgs`), with the
   seL4 model of saving user registers in the thread's TCB. System calls and interrupts share one register frame;
@@ -2188,8 +2200,8 @@ capability (today any component holding one may shut the machine down), and rele
 given up on to a supervisor above it (today the
 manager is the only one), memory budgets from a policy service (Phase 3), sizing the Memory Server's CSpace
 from the RAM it gets (its manifest names the size, 2^17 slots on the test machines), page tables for boot processes paid for from user memory,
-multi-level CSpaces, the first call's capability forwarded by a lazy-start watcher, scheduling-context capabilities (budgets are set at boot), per-CPU ready queues and thread affinity (one lock and shared queues
-today), device interrupts spread over CPUs, more than four CPUs, an IPC benchmark on bare
+multi-level CSpaces, the first call's capability forwarded by a lazy-start watcher, per-CPU kernel locks (one lock covers all kernel work
+today), device interrupts spread over CPUs, an IPC benchmark on bare
 metal.
 
 The architectural specification lives in the Superior OS Architectural Specification doc:

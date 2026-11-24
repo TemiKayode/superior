@@ -85,7 +85,8 @@ pub enum Syscall {
     /// through its parent.
     CapDelete = 11,
     /// The caller gives up its own scheduling context the next time it
-    /// blocks; afterwards it runs only on contexts lent by its callers.
+    /// blocks or receives; afterwards it runs only on contexts lent by
+    /// its callers.
     SchedPassive = 12,
     /// Makes a new kernel object from the untyped capability in slot `rdi`:
     /// `rsi` = [`ObjectType`], `rdx` = size in bits (untyped, CNode and
@@ -306,6 +307,11 @@ pub enum Syscall {
     /// cannot run). Needs the sched-control capability in slot `rdi`: CPU
     /// time is handed out only by its holder (the Component Manager).
     SchedControlConfigure = 56,
+    /// Pins the thread in slot `rdi` (Write right) to CPU `rsi`, so only
+    /// that CPU runs it, or (`rsi` = `u64::MAX`) lets any CPU run it
+    /// again. A CPU that is not online is `InvalidArgument`. Pinning a
+    /// running thread moves it at once; a pin outlasts suspension.
+    ThreadSetAffinity = 57,
     /// Maps the frame in slot `rdi` at page-aligned `rsi` in the address
     /// space in slot `r8` (Write right). `rdx` = [`MAP_WRITE`] and/or
     /// [`MAP_EXEC`], never both. Needs the frame's Map right, plus Write
@@ -387,6 +393,7 @@ impl Syscall {
             54 => Syscall::ThreadSetTimeoutHandler,
             55 => Syscall::SchedContextBind,
             56 => Syscall::SchedControlConfigure,
+            57 => Syscall::ThreadSetAffinity,
             42 => Syscall::IoFaults,
             0x100 => Syscall::DebugPutStr,
             0x101 => Syscall::DebugSelftestDone,
