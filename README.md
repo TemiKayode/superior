@@ -431,9 +431,9 @@ holds the rest):
     gone, first loses everything (its functions' domains, BAR pages and
     interrupts are revoked, whoever held them), then the slot is powered off,
     which lets it go. `cargo xtask hotplug-test` plugs a card in through QEMU's
-    monitor, takes it out and plugs another in, on both ISAs: the client opens
-    the first, finds its page and domain revoked when it goes, and opens the
-    second. The NVMe test reads an RTL-8139's registers through its I/O
+    monitor, takes it out and plugs another in, on both ISAs, each step once
+    the guest has acted on the one before: the client opens the first, finds
+    its page and domain revoked when it goes, and opens the second. The NVMe test reads an RTL-8139's registers through its I/O
     BAR behind a root port and compares them with its memory BAR, and reaches a
     virtio device's prefetchable BAR through a bridge's prefetchable window. Every bus can be numbered on x86-64 (VT-d's
     context table for a bus is made when a function on it is first bound), and

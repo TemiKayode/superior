@@ -7946,7 +7946,10 @@ fn type_words(
 
 /// Plugs a virtio entropy card into root port `hp0` through QEMU's
 /// monitor, takes it out, and plugs another in, some seconds apart.
-fn plug_cards(stop: std::sync::Arc<std::sync::atomic::AtomicBool>) {
+fn plug_cards(
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    stage: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) {
     use std::io::{BufRead, BufReader};
     use std::net::TcpStream;
     use std::sync::atomic::Ordering;
@@ -7968,18 +7971,36 @@ fn plug_cards(stop: std::sync::Arc<std::sync::atomic::AtomicBool>) {
         )
     };
     let del = "{\"execute\":\"device_del\",\"arguments\":{\"id\":\"hot0\"}}\n".to_string();
-    // The guest has booted by the first; each later step leaves it time
-    // to act on the one before.
-    for (wait, command) in [(5, add("hot0")), (8, del), (8, add("hot1"))] {
-        for _ in 0..wait * 10 {
+    // Each step waits for the guest to have acted on the one before (see
+    // `hotplug_stage`), then a second more: a fixed timetable ran ahead of
+    // a guest slow to boot, which then found the second card already in
+    // and waited for a removal that had come and gone.
+    for (needed, command) in [(1, add("hot0")), (2, del), (3, add("hot1"))] {
+        while stage.load(Ordering::Relaxed) < needed {
             if stop.load(Ordering::Relaxed) {
                 return;
             }
             std::thread::sleep(Duration::from_millis(100));
         }
+        std::thread::sleep(Duration::from_secs(1));
         if s.write_all(command.as_bytes()).is_err() {
             return;
         }
+    }
+}
+
+/// How far the hot-plug guest has got, for [`plug_cards`]: 1 once the bus
+/// server watches its slot, 2 once the client has the first card, 3 once
+/// the card taken out is let go (or the client has given up on it).
+fn hotplug_stage(out: &str) -> usize {
+    if out.contains("its card is let go") || out.contains("hotplug: taken out") {
+        3
+    } else if out.contains("hotplug: a card plugged in while running") {
+        2
+    } else if out.contains("hot-plug slots, looked at every") {
+        1
+    } else {
+        0
     }
 }
 
@@ -7987,15 +8008,19 @@ fn plug_cards(stop: std::sync::Arc<std::sync::atomic::AtomicBool>) {
 /// card in, takes it out and plugs another in while the machine runs.
 fn hotplug_test(arch: Arch) -> Result<(), String> {
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     let img = image_with(false, arch, "hotplug")?;
     println!("== hot-plug test on {}", img.path.display());
     let stop = Arc::new(AtomicBool::new(false));
+    let stage = Arc::new(AtomicUsize::new(0));
     let plugger = {
-        let stop = stop.clone();
-        std::thread::spawn(move || plug_cards(stop))
+        let (stop, stage) = (stop.clone(), stage.clone());
+        std::thread::spawn(move || plug_cards(stop, stage))
     };
-    let out = run_to_exit(&img, Duration::from_secs(120));
+    let watched = stage.clone();
+    let out = run_to_exit_watching(&img, Duration::from_secs(120), move |out| {
+        watched.fetch_max(hotplug_stage(out), Ordering::Relaxed);
+    });
     stop.store(true, Ordering::Relaxed);
     let _ = plugger.join();
     let out = out?;
