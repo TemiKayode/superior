@@ -6415,11 +6415,25 @@ fn notes_state(n: &NotesUi) -> &'static str {
 fn notes_act(act: &Act, arch: Arch) -> Result<Option<String>, String> {
     let Act::Shot(k) = act else { return input_act(act, arch) };
     let path = root().join("target").join(format!("notes-{}-{k}.ppm", arch.name()));
-    let _ = std::fs::remove_file(&path);
-    screendump(&path)?;
     let (layer, pointer) = &notes_pictures()[*k - 1];
-    check_layers(&path, *k, std::slice::from_ref(layer), None, *pointer)
+    settled_shot(&path, |p| check_layers(p, *k, std::slice::from_ref(layer), None, *pointer))
         .map(|()| Some(format!("screenshot {k}: all {} pixels right: the Notes window, the pointer at {pointer:?}", SCREEN.0 * SCREEN.1)))
+}
+
+/// Takes a screenshot into `path` until `check` passes or 3 s go by (the
+/// last check's error). An app logs its new state as it hands the frame
+/// over, which can reach the screen a moment later: a shot taken at once
+/// may show the frame before.
+fn settled_shot(path: &Path, check: impl Fn(&Path) -> Result<(), String>) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        let _ = std::fs::remove_file(path);
+        screendump(path)?;
+        match check(path) {
+            Err(_) if std::time::Instant::now() < deadline => std::thread::sleep(Duration::from_millis(200)),
+            r => return r,
+        }
+    }
 }
 
 /// The notes test's log lines for the text area's state: lines, cursor,
@@ -6469,6 +6483,19 @@ milk
 eggs
 {NOTES_WORDS}");
     let typed = notes_line(8, (7, NOTES_WORDS.len()), 3, &with_words);
+    // The words go in one at a time, each once the app shows the one
+    // before: typed all at once, keys come faster than a slow guest
+    // redraws the wrapping line, and a window keeps only its last
+    // `window::EVENTS` events.
+    let mut words: Vec<(Vec<&'static str>, Vec<Act>)> = Vec::new();
+    let mut shown = 0;
+    for (i, word) in NOTES_WORDS.split(' ').enumerate() {
+        let word: &'static str = if i == 0 { word } else { format!(" {word}").leak() };
+        let wait = if i == 0 { pasted } else { format!("eggs\\n{}\"", &NOTES_WORDS[..shown]).leak() };
+        let acts = if i == 0 { vec![Shot(6), Type(word)] } else { vec![Type(word)] };
+        words.push((vec![wait], acts));
+        shown += word.len();
+    }
     let script = vec![
         (
             vec!["relative X and Y", "absolute X and Y", "compositor: input subscribed", "notes: ready", "notes: the Notes window is on the screen"],
@@ -6514,11 +6541,12 @@ eggs
             vec![cut, "notes: copied 10 bytes to the clipboard"],
             vec![Key("down"), Key("down"), Key("down"), Key("down"), Key("end"), Key("ret"), Key("ctrl+v")],
         ),
-        (vec![pasted], vec![Shot(6), Type(NOTES_WORDS)]),
+    ];
+    let script = script.into_iter().chain(words).chain([
         (vec![typed], vec![Key("up")]),
         (vec![up], vec![Shot(7), to(NOTES_THIRD, NOTES_CLOSE), Button(true), Button(false)]),
         (vec!["notes: the Notes window is gone"], vec![]),
-    ];
+    ]).collect();
     let (out, shots) = run_script(&img, arch, "notes test", script, notes_act)?;
     let log = [
         "notes: ready: window 0, decorated, titled \"Notes\"",
