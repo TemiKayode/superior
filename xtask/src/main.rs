@@ -974,9 +974,13 @@ fn drive_linux(img: &Image, script: &[(&str, &str, bool)], shots: Vec<Shot>) -> 
             }
         }
     });
-    // The batch runs come first: the first prompt may take a while.
+    // The batch runs come first: the first prompt (what is waited for from
+    // the start of the output) may take a while. On x86-64 the BIOS loader
+    // alone reads the kernel and the Linux bundle in it, some 66 MB, for
+    // about three minutes before the kernel says a word.
     let expect = |want: &str, from: usize| -> Result<usize, String> {
-        let deadline = Instant::now() + scaled(Duration::from_secs(120));
+        let limit = if from == 0 { 600 } else { 120 };
+        let deadline = Instant::now() + scaled(Duration::from_secs(limit));
         loop {
             {
                 let out = seen.lock().unwrap();
