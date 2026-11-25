@@ -15,6 +15,8 @@ pub mod abi;
 pub mod bundle;
 pub mod cap;
 pub mod crypto;
+#[cfg(test)]
+pub mod cspace_model;
 pub mod elf;
 pub mod http;
 pub mod idl;

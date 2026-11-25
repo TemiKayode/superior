@@ -2948,6 +2948,7 @@ fn cm_test(img: &Image) -> Result<(), String> {
         "[cm] probe stays stopped (restart never)".to_string(),
         "[cm] started echo (lazy: first call to its service)".to_string(),
         "echo: running in its own address space".to_string(),
+        "echo: serving through slot 1000".to_string(),
         "[pass] client: call 1: sent 100, got 101".to_string(),
         "[pass] client: call 2: sent 200, got 201".to_string(),
         "[pass] client: call 3: sent 300, got 301".to_string(),
@@ -2963,6 +2964,10 @@ fn cm_test(img: &Image) -> Result<(), String> {
     // must not run the kernel with it set (x86-64 only).
     if img.arch == Arch::X86_64 && !out.contains("[pass] client: direction flag set across") {
         return Err("Component Manager test: the direction-flag check did not pass".into());
+    }
+    // echo's CSpace has two levels; its service is in the last CNodes.
+    if !out.contains("[cm] echo: CSpace in two levels, 64 CNodes of 16 slots") {
+        return Err("Component Manager test: echo's CSpace was not built in two levels".into());
     }
     for bad in ["[fail]", "started spare", "could not start", "panic"] {
         if out.contains(bad) {

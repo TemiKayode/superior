@@ -4,7 +4,9 @@
 # before the client finishes. echo and spare are lazy: echo starts on the
 # client's first call; nothing ever calls spare, so it never starts. The
 # spinner competes with the client for the CPU, both with the direction
-# flag set, so a kernel entry that leaves the flag set shows up.
+# flag set, so a kernel entry that leaves the flag set shows up. echo
+# runs in a two-level CSpace (64 CNodes of 16 slots under a root) and
+# serves through slot 1000, index 8 of the CNode in root slot 62.
 
 component probe
   image testclient
@@ -27,7 +29,9 @@ component client
 component echo
   image echo
   start lazy
-  provides echo 0
+  cspace 10 4
+  arg 1000
+  provides echo 1000
 
 component spare
   image echo

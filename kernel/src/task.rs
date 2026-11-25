@@ -12,8 +12,11 @@
 //! decides who runs next.
 //!
 //! A thread's CSpace starts as its own window of [`CSPACE_SLOTS`] slots; a
-//! CNode made by retype can replace it (`ThreadSetSpace`). Either way it is
-//! a range of one capability table, so a capability
+//! CNode made by retype can replace it (`ThreadSetSpace`), addressed by
+//! index or, given a depth, as the root of a two-level CSpace whose
+//! addresses resolve through the CNodes in its slots, each checked against
+//! its guard ([`Table::resolve`]). Every CNode is a range of one capability
+//! table, so a capability
 //! granted through IPC is derived from the sender's across CSpaces, and
 //! revoking the sender's copy reaches every copy it handed out.
 //!
@@ -62,7 +65,7 @@ use superior_objects::abi::{
     CNODE_SLOT_BITS, CapTransfer, DEVICE_FRAME_MAX_BITS, Error, FaultKind, FaultReply, MAP_EXEC, MAP_WRITE, ObjectType,
     Syscall,
 };
-use superior_objects::cap::{CapError, Capability, Object, Rights, Slot, Table};
+use superior_objects::cap::{CSPACE_MAX_DEPTH, CapError, Capability, Object, Rights, Slot, Table};
 use superior_objects::ipc::{Ipc, Tid};
 
 /// Table sizes. Self-test builds keep them small: the self-test fills
@@ -187,9 +190,8 @@ struct Kernel {
     spaces: [Option<u16>; MAX_THREADS],
     /// Every capability: thread windows, CSpace roots and CNode objects.
     caps: BootTable<Table>,
-    /// Each thread's CSpace as (first table index, slot count). Empty if
-    /// its CNode was destroyed under it.
-    cspace: [(u32, u32); MAX_THREADS],
+    /// Each thread's CSpace. Empty if its CNode was destroyed under it.
+    cspace: [CSpace; MAX_THREADS],
     /// Live CNode objects, by first pool chunk: their slot-count bits.
     cnodes: BootTable<[Option<u8>]>,
     /// Pool chunks some CNode covers.
@@ -262,6 +264,21 @@ struct Kernel {
     /// ring indexed by the reboot count.
     reboot_ticks: [u64; MAX_REBOOTS],
     stats: Stats,
+}
+
+/// A thread's CSpace: a range of the capability table (its window, or a
+/// CNode), addressed by slot (`depth` 0); or (`depth` > 0) a two-level
+/// space whose root is that CNode, addresses `depth` bits deep resolved
+/// through the CNodes in its slots ([`Table::resolve`]).
+#[derive(Clone, Copy)]
+struct CSpace {
+    base: u32,
+    size: u32,
+    depth: u8,
+}
+
+impl CSpace {
+    const NONE: CSpace = CSpace { base: 0, size: 0, depth: 0 };
 }
 
 /// Where a frame capability is mapped: (space id, page-aligned address),
@@ -381,7 +398,7 @@ static KERNEL: Mutex<Kernel> = Mutex::new(Kernel {
     spaces: [None; MAX_THREADS],
     caps: BootTable(no_slice::<Slot>().0 as *mut Table),
     cspace: {
-        let mut c = [(0, 0); MAX_THREADS];
+        let mut c = [CSpace::NONE; MAX_THREADS];
         let mut t = 0;
         while t < MAX_THREADS {
             c[t] = window(t);
@@ -579,22 +596,35 @@ pub fn give_cnode(t: Tid, bits: u8, self_slot: usize) -> Result<(), &'static str
     k.caps
         .insert_root(root, cap)
         .map_err(|_| "CSpace root slot in use")?;
-    k.cspace[t as usize] = (base as u32, 1 << bits);
+    k.cspace[t as usize] = CSpace { base: base as u32, size: 1 << bits, depth: 0 };
     k.caps
         .derive(root, base + self_slot, Rights::ALL, None)
         .map_err(|_| "CNode self slot")?;
     Ok(())
 }
 
-/// Index in the capability table of thread `t`'s slot `slot`.
+/// Index in the capability table of thread `t`'s slot `slot`: the slot
+/// itself in a one-level CSpace, or the second-level slot address `slot`
+/// resolves to in a two-level one.
 fn cap_slot(k: &Kernel, t: Tid, slot: usize) -> Option<usize> {
-    let (base, size) = *k.cspace.get(t as usize)?;
-    (slot < size as usize).then(|| base as usize + slot)
+    let cs = *k.cspace.get(t as usize)?;
+    if cs.depth == 0 {
+        return (slot < cs.size as usize).then(|| cs.base as usize + slot);
+    }
+    if cs.size == 0 {
+        return None;
+    }
+    let root_bits = cs.size.trailing_zeros() as u8;
+    k.caps.resolve(cs.base as usize, root_bits, cs.depth, slot as u64)
 }
 
 /// Thread `t`'s own window of the capability table.
-const fn window(t: usize) -> (u32, u32) {
-    ((t * CSPACE_SLOTS) as u32, CSPACE_SLOTS as u32)
+const fn window(t: usize) -> CSpace {
+    CSpace {
+        base: (t * CSPACE_SLOTS) as u32,
+        size: CSPACE_SLOTS as u32,
+        depth: 0,
+    }
 }
 
 /// Runs the highest-priority thread this CPU can, idling until there is
@@ -1138,7 +1168,7 @@ fn tear_down_root(k: &mut Kernel) {
         }
     }
     let space = k.spaces[t as usize];
-    let (base, size) = k.cspace[t as usize];
+    let CSpace { base, size, .. } = k.cspace[t as usize];
     destroy_thread(k, t);
     // Its CSpace holds a capability to itself, so nothing else frees it.
     if size > 0 {
@@ -2344,7 +2374,9 @@ fn cap_error(e: CapError) -> u64 {
         CapError::SlotEmpty | CapError::SlotOutOfRange => Error::InvalidCapability.code(),
         CapError::SlotOccupied => Error::SlotOccupied.code(),
         CapError::OutOfMemory => Error::NotEnoughMemory.code(),
-        CapError::BadgeAlreadySet | CapError::NotBadgeable => Error::InvalidArgument.code(),
+        CapError::BadgeAlreadySet | CapError::NotBadgeable | CapError::BadGuard => {
+            Error::InvalidArgument.code()
+        }
         CapError::WrongObjectType => Error::InvalidCapability.code(),
         CapError::HasChildren => Error::IllegalOperation.code(),
     }
@@ -2482,7 +2514,7 @@ impl Live {
 fn destroy_thread(k: &mut Kernel, t: Tid) {
     // A caller it owed a reply learns the server is gone (PeerRestarted).
     let _ = k.ipc.destroy(t);
-    let (base, size) = window(t as usize);
+    let CSpace { base, size, .. } = window(t as usize);
     let own = base as usize..(base + size) as usize;
     for s in own.chain([ROOT_SLOTS + t as usize, VSPACE_SLOTS + t as usize]) {
         if k.caps.get(s).is_some() {
@@ -2641,14 +2673,23 @@ fn cnode_copy(k: &mut Kernel, cur: Tid, f: &Args) -> Result<(), u64> {
     k.caps.derive(src, dst, mask, badge).map_err(cap_error)
 }
 
-/// `ThreadSetSpace`: rdi = thread, rsi = CNode. The thread's hidden root
-/// slot gets a copy of the CNode capability, keeping the CNode alive.
+/// `ThreadSetSpace`: rdi = thread, rsi = CNode, rdx = depth (0 for a
+/// one-level CSpace; otherwise the CNode is the root of a two-level one,
+/// addressed that many bits deep, more than the root's own bits and at
+/// most [`CSPACE_MAX_DEPTH`]). The thread's hidden root slot gets a copy
+/// of the CNode capability, keeping the CNode alive.
 fn thread_set_space(k: &mut Kernel, cur: Tid, f: &Args) -> Result<(), u64> {
     let t = thread_cap(k, cur, f.a0)?;
     if !thread_inactive(k, t) {
         return Err(Error::IllegalOperation.code());
     }
     let (base, size) = cnode_cap(k, cur, f.a1)?;
+    let root_bits = size.trailing_zeros() as u64;
+    let depth = match f.a2 {
+        0 => 0,
+        d if d > root_bits && d <= CSPACE_MAX_DEPTH as u64 => d as u8,
+        _ => return Err(Error::InvalidArgument.code()),
+    };
     let src = own_slot(k, cur, f.a1).ok_or(Error::InvalidCapability.code())?;
     let root = ROOT_SLOTS + t as usize;
     if k.caps.get(root).is_some() {
@@ -2657,7 +2698,7 @@ fn thread_set_space(k: &mut Kernel, cur: Tid, f: &Args) -> Result<(), u64> {
     k.caps
         .derive(src, root, Rights::ALL, None)
         .map_err(cap_error)?;
-    k.cspace[t as usize] = (base as u32, size as u32);
+    k.cspace[t as usize] = CSpace { base: base as u32, size: size as u32, depth };
     reap(k);
     Ok(())
 }
@@ -2697,8 +2738,8 @@ fn destroy_cnode(k: &mut Kernel, c: usize) {
         }
     }
     for cs in k.cspace.iter_mut() {
-        if cs.0 as usize == base && cs.1 > 0 {
-            *cs = (0, 0);
+        if cs.base as usize == base && cs.size > 0 {
+            *cs = CSpace::NONE;
         }
     }
 }

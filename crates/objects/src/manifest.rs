@@ -35,6 +35,9 @@
 //!   shared 9 16             # 9 pages (slots 16-24) kept across restarts,
 //!                           # to share with a server (rings, buffers)
 //!   cspace 9                # a CSpace of 2^9 slots (default 2^6)
+//!   cspace 12 8             # or of 2^12 slots in two levels: a root CNode
+//!                           # of 2^4 slots, each holding a CNode of 2^8;
+//!                           # slots are numbered as in one level
 //!   vspace 18               # an address space of 2^18 bytes, page
 //!                           # tables included (default 2^16)
 //!   quota 64                # pages the Memory Server may give it
@@ -177,6 +180,11 @@ pub struct Component<'a> {
     pub memory_bits: u8,
     /// Its CSpace size in bits.
     pub cspace_bits: u8,
+    /// 0 for a one-level CSpace; otherwise it has two levels, a root CNode
+    /// of `cspace_bits - cspace_leaf_bits` bits whose every slot holds a
+    /// CNode of this many, and slot `s` is index `s % 2^leaf` of the CNode
+    /// in root slot `s / 2^leaf`.
+    pub cspace_leaf_bits: u8,
     /// Its address space's size in bits.
     pub vspace_bits: u8,
     /// Pages the Memory Server may give it (heap and frames together).
@@ -215,6 +223,7 @@ impl<'a> Component<'a> {
             arg: 0,
             memory_bits: DEFAULT_MEMORY_BITS,
             cspace_bits: CSPACE_BITS,
+            cspace_leaf_bits: 0,
             vspace_bits: VSPACE_BITS,
             quota_pages: 0,
             heap_pages: 0,
@@ -445,6 +454,17 @@ impl<'a> Manifest<'a> {
                             c.cspace_bits = b as u8
                         }
                         _ => return Err(err("cspace must be 6 to 18 bits", w)),
+                    }
+                    // Two levels: each CNode at least 2^4 slots, as the
+                    // kernel makes them.
+                    if let Some(w) = words.next() {
+                        let min = crate::abi::CNODE_MIN_BITS as u8;
+                        match number(w)? {
+                            l if l >= min as u64 && l + min as u64 <= c.cspace_bits as u64 => {
+                                c.cspace_leaf_bits = l as u8
+                            }
+                            _ => return Err(err("cspace levels must each be 4 bits or more", w)),
+                        }
                     }
                     None
                 }
@@ -737,6 +757,33 @@ component b
  image b").unwrap();
         assert_eq!(m.components[0].as_ref().unwrap().budget, Some((2, 10)));
         assert_eq!(m.components[1].as_ref().unwrap().budget, None, "unlimited by default");
+    }
+
+    #[test]
+    fn cspace_takes_two_levels() {
+        let m = Manifest::parse("component a
+ image a
+ cspace 12 8
+ notification 4000").unwrap();
+        let c = m.components[0].as_ref().unwrap();
+        assert_eq!((c.cspace_bits, c.cspace_leaf_bits), (12, 8));
+        let one = Manifest::parse("component a
+ image a
+ cspace 9").unwrap();
+        assert_eq!(one.components[0].as_ref().unwrap().cspace_leaf_bits, 0);
+        let bad = "cspace levels must each be 4 bits or more";
+        assert_eq!(error("component a
+ image a
+ cspace 12 3"), (3, bad));
+        assert_eq!(error("component a
+ image a
+ cspace 12 9"), (3, bad));
+        assert_eq!(error("component a
+ image a
+ cspace 7 4"), (3, bad));
+        assert_eq!(error("component a
+ image a
+ cspace 12 8 2"), (3, "unexpected word"));
     }
 
     #[test]

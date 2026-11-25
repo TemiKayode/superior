@@ -136,6 +136,15 @@ pub enum Syscall {
     /// Makes the CNode in slot `rsi` the CSpace of the inactive thread in
     /// slot `rdi`. The thread holds its own copy of the CNode capability,
     /// so the CNode lives as long as the thread does (or until revoked).
+    ///
+    /// `rdx` = 0: a one-level CSpace, its slots addressed by index.
+    /// Otherwise the CNode is the root of a two-level CSpace addressed
+    /// `rdx` bits deep (more than the root's own bits, at most 32): an
+    /// address's top bits pick a root slot, which must hold a CNode whose
+    /// guard and size take exactly the bits left; the next bits must equal
+    /// its guard, and the last index it. A CNode's guard is its badge
+    /// (`cap::guard`), set when it is copied (`CNodeCopy`, `CapMint`).
+    /// Root slots are reached through a capability to the root CNode.
     ThreadSetSpace = 25,
     /// Delivers interrupts of the line in IRQ capability `rdi` as a signal
     /// of the notification in slot `rsi` (Write right), with that
