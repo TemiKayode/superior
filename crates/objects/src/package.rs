@@ -123,7 +123,7 @@ pub fn admit_replacing<'a>(
                 CapKind::Provides(s) => return no("provides a service", s),
                 CapKind::Manages(s) => return no("asks to manage a service", s),
                 CapKind::Device(d) => return no("asks for a device", d),
-                CapKind::Control | CapKind::State | CapKind::Shared(_) | CapKind::Spare => {
+                CapKind::Control | CapKind::State | CapKind::Shared(_) | CapKind::Spare | CapKind::Root => {
                     return no("asks for a manager privilege", name);
                 }
             }

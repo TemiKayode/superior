@@ -55,12 +55,19 @@
 //! glibc's dynamic linker's from 8192, hello's from 8256, glibc's from
 //! 8320, the toolchain's from 8832 (tcc, make, libtcc, the archive of the
 //! rest), and binutils' from 9472 (as, ld and their libraries) (`file`
-//! in the manifest); the exec buffer and the framebuffer after the shared
-//! pages, at the end. Process `i` owns the
-//! slots from `PROC_SLOTS + i * PROC_SPAN` (16384 on, 2048 each): its
-//! address space, then its threads (each with a badged fault endpoint)
-//! and pages as made, two slots a page (its frame and the mirror's copy),
-//! so up to 4 MiB of its own.
+//! in the manifest), up to 2^16. The CSpace is in two levels (2^20
+//! slots: a root CNode of 2^10, each slot a CNode of 2^10, a leaf); the
+//! manager makes the leaves for those slots, and this server the rest as
+//! a process needs them, from that process's memory, so they go when it
+//! does. Process `i` owns the slots from `PROC_SLOTS + i * MISC_SPAN`
+//! (65536 on, 4096 each) for its address space, then its threads (each
+//! with a badged fault endpoint), and two slots for each page of its
+//! window from `PAGE_SLOTS * (i + 1)` ([`page_slot`]): the page's frame
+//! (or a file's page mapped there) and the mirror's copy. So its memory
+//! is bounded by its window and by RAM, not by slots. (What is lent to
+//! another server stays below 2^16, as a transfer names a slot in 16
+//! bits: the shared pages, the exec buffer and the framebuffer, after the
+//! files' pool.)
 //!
 //! Signals ([`signal`]): actions per process, masks per thread, `kill`
 //! and `tkill`, handlers run on the thread's stack and returned from. The terminal ([`tty`]): the serial
@@ -119,13 +126,15 @@ const UNTYPED_SPARE_COUNT: u64 = 32;
 /// from the rest of RAM (the component's own memory holds its files).
 const BLOCKS: u64 = 8;
 const BLOCK_BITS: u64 = 20;
-/// Blocks lent to processes that outgrow their own, one at a time (1 MiB
-/// each).
+/// Blocks lent to processes that outgrow their own, one at a time (4 MiB
+/// each: up to 256 MiB in all, on a machine with the RAM).
 const SPARE_BLOCKS: u64 = 1024;
-const SPARES: usize = 32;
+const SPARE_BITS: u64 = 22;
+const SPARES: usize = 64;
+const _: () = assert!(SPARE_BLOCKS + SPARES as u64 <= STATE_BLOCK);
 /// The block this server's state is in, from the rest of RAM.
 const STATE_BLOCK: u64 = 1100;
-const STATE_BLOCK_BITS: u64 = 19;
+const STATE_BLOCK_BITS: u64 = 20;
 /// The notification this server's thread is bound to (so `Recv` also
 /// returns when it is signalled), and two badged copies of it: the UART's
 /// interrupt (bit 0) and the timer for sleepers (bit 1).
@@ -145,6 +154,7 @@ const SMPTEST_FILE: u64 = 213;
 const LIBZ_FILE: u64 = 216;
 const FPTEST_FILE: u64 = 250;
 const PROGRAM_FILE: u64 = 252;
+const PROGRAM_END: u64 = 512;
 /// glibc's dynamic linker, GNU hello and glibc, past the processes' slots.
 const GLIBC_LD_FILE: u64 = 8192;
 const HELLO_FILE: u64 = 8256;
@@ -196,22 +206,38 @@ const LIBEVENT_FILE: u64 = 23376;
 const LIBBZ2_FILE: u64 = 23472;
 const LINKS_END: u64 = 23504;
 /// libwayland's client library, the libffi it calls through, and
-/// libxkbcommon: what a Wayland program links against. After the
-/// framebuffer's slots, at the CNode's end.
+/// libxkbcommon: what a Wayland program links against. At the end of the
+/// slots a manifest can name (2^16).
 const LIBWAYLAND_FILE: u64 = 65360;
 const LIBFFI_FILE: u64 = 65392;
 const LIBXKBCOMMON_FILE: u64 = 65424;
 const WAYLAND_END: u64 = 65520;
-const _: () = assert!(FB_SLOTS + FB_PAGES <= LIBWAYLAND_FILE && WAYLAND_END <= 1 << 16);
-const STATE_SLOTS: u64 = 512;
-const STATE_PAGES: u64 = 128;
+const _: () = assert!(LINKS_END <= LIBWAYLAND_FILE && WAYLAND_END <= ROOT_CNODE);
+/// The CSpace (`cspace 20 10 16` in the manifest): a root CNode of 2^10
+/// slots, each a leaf CNode of 2^10; the manager makes the leaves for
+/// the slots below 2^16, this server the processes' ([`State::leaf`]).
+const CSPACE_BITS: u64 = 20;
+const LEAF_BITS: u64 = 10;
+/// The root CNode (`cnode` in the manifest), and where a leaf is made
+/// before it is put in the root.
+const ROOT_CNODE: u64 = 65534;
+const LEAF_SCRATCH: u64 = 65535;
+/// This server's state's pages (each process's frames among it), then
+/// the files' (the pool), after links'; then the shared pages, the exec
+/// buffer and the framebuffer.
+const STATE_SLOTS: u64 = 23552;
+const STATE_PAGES: u64 = 256;
 const POOL_SLOTS: u64 = STATE_SLOTS + STATE_PAGES;
+const _: () = assert!(LINKS_END <= STATE_SLOTS);
 /// The signal restorer's page ([`signal::TRAMPOLINE`]).
 const TRAMPOLINE_SLOT: u64 = 1000;
-const PROC_SLOTS: u64 = 23552;
-const PROC_SPAN: u64 = 5888;
-/// A frame of a process's that `munmap` gave back ([`Proc::frames`]).
-const FREE: u16 = u16::MAX;
+/// Each process's slots for its address space and threads, past the
+/// manifest's: 4096 each.
+const PROC_SLOTS: u64 = 1 << 16;
+const MISC_SPAN: u64 = 1 << 12;
+/// Each process's page slots ([`page_slot`]): two for each page of its
+/// window, from `PAGE_SLOTS * (i + 1)`.
+const PAGE_SLOTS: u64 = 1 << 17;
 const MAX_PROCS: usize = 7;
 /// Threads, in all processes.
 const MAX_TASKS: usize = 16;
@@ -282,18 +308,24 @@ const FB_VA: u64 = USER_BASE + 0x1_9a00_0000;
 /// While a process has the framebuffer mapped, it is shown as it is drawn,
 /// as a screen would show it: every FB_PERIOD ticks (25 times a second).
 const FB_PERIOD: u64 = TICK_HZ / 25;
-const _: () = assert!(FB_PAGES << 12 <= 1 << FB_BLOCK_BITS && FB_SLOTS + FB_PAGES <= 1 << 16);
+const _: () = assert!(FB_PAGES << 12 <= 1 << FB_BLOCK_BITS && FB_SLOTS + FB_PAGES <= LIBWAYLAND_FILE);
+const _: () = assert!(PAGE_SLOTS == 2 * CHILD_PAGES as u64);
+const _: () = assert!(PROC_SLOTS + MAX_PROCS as u64 * MISC_SPAN <= PAGE_SLOTS);
+const _: () = assert!(PAGE_SLOTS * (MAX_PROCS as u64 + 1) <= 1 << CSPACE_BITS);
+const _: () = assert!(MISC_SPAN % (1 << LEAF_BITS) == 0 && PROC_SLOTS % (1 << LEAF_BITS) == 0);
 /// Shared memory (`memfd_create`): a block of the rest of RAM cut into
-/// SHM_PAGES pages, here at SHM_VA, in the slots after the processes'.
+/// SHM_PAGES pages, here at SHM_VA, in the slots after the files' pool
+/// (below 2^16: a slot a capability is granted from is named in 16 bits,
+/// and these are lent to the compositor).
 /// A memory file holds a run of them, which the processes that map it
 /// share ([`Shm`]).
-const SHM_BLOCK: u64 = PROC_SLOTS + MAX_PROCS as u64 * PROC_SPAN;
+const SHM_BLOCK: u64 = POOL_SLOTS + fs::POOL_PAGES as u64;
 const SHM_BLOCK_BITS: u64 = 21;
 const SHM_SLOTS: u64 = SHM_BLOCK + 1;
 const SHM_PAGES: u64 = 1 << (SHM_BLOCK_BITS - 12);
 const SHM_VA: u64 = USER_BASE + 0x1_9c00_0000;
 const MAX_SHM: usize = 16;
-const _: () = assert!(SHM_SLOTS + SHM_PAGES <= 1 << 16 && FB_VA + FB_PAGES * PAGE <= SHM_VA);
+const _: () = assert!(SHM_SLOTS + SHM_PAGES <= LIBWAYLAND_FILE && FB_VA + FB_PAGES * PAGE <= SHM_VA);
 
 /// A memory file: `size` bytes in the `pages` shared pages from `first`.
 /// Its pages are given back once it is closed and no process maps them
@@ -446,6 +478,11 @@ enum Sys {
     Unlinkat,
     Symlinkat,
     Readlinkat,
+    Link,
+    Statfs,
+    Fstatfs,
+    Fallocate,
+    Getresid,
     Umask,
     Getpid,
     Getppid,
@@ -606,6 +643,11 @@ fn decode(nr: u64, a: [u64; 6]) -> (Sys, [u64; 6]) {
         84 => return (Sys::Unlinkat, [cwd, a[0], AT_REMOVEDIR, 0, 0, 0]),
         87 => return (Sys::Unlinkat, [cwd, a[0], 0, 0, 0, 0]),
         88 => return (Sys::Symlinkat, [a[0], cwd, a[1], 0, 0, 0]),
+        86 | 265 => Sys::Link,
+        285 => Sys::Fallocate,
+        118 | 120 => Sys::Getresid,
+        137 => Sys::Statfs,
+        138 => Sys::Fstatfs,
         89 => return (Sys::Readlinkat, [cwd, a[0], a[1], a[2], 0, 0]),
         95 => Sys::Umask,
         96 => Sys::Gettimeofday,
@@ -652,6 +694,11 @@ fn decode(nr: u64, a: [u64; 6]) -> (Sys, [u64; 6]) {
         34 => Sys::Mkdirat,
         35 => Sys::Unlinkat,
         36 => Sys::Symlinkat,
+        37 => Sys::Link,
+        47 => Sys::Fallocate,
+        148 | 150 => Sys::Getresid,
+        43 => Sys::Statfs,
+        44 => Sys::Fstatfs,
         38 | 276 => Sys::Renameat,
         46 => Sys::Ftruncate,
         48 | 439 => Sys::Faccessat,
@@ -838,7 +885,7 @@ struct Proc {
     /// this one uses: itself, but for a `vfork` child, which borrows its
     /// parent's until it execs or ends ([`State::mem`]).
     mem: u8,
-    /// Slots used of its span.
+    /// Slots used of its address space's and threads' ([`MISC_SPAN`]).
     cursor: u64,
     cwd: u16,
     /// Open-file description + 1, per descriptor.
@@ -848,11 +895,11 @@ struct Proc {
     brk: u64,
     /// Its own pages (mapped in the mirror too).
     present: [u64; CHILD_PAGES / 64],
-    /// What each slot of its span holds that is one of its own pages'
-    /// frames (the slot after is its copy for the mirror): the page's
-    /// number + 1, or [`FREE`] for a frame `munmap` gave back, to be used
-    /// again; 0 for any other slot.
-    frames: [u16; PROC_SPAN as usize],
+    /// Pages whose slots ([`page_slot`]) hold a frame `munmap` gave back:
+    /// in it no more, still mapped in the mirror, to be used again
+    /// ([`State::map_page`]); and how many.
+    parked: [u64; CHILD_PAGES / 64],
+    nparked: u32,
     /// Pages of anonymous mappings not yet touched: each becomes one of
     /// its own when first used (a page fault there, or a system call
     /// writing there).
@@ -943,6 +990,9 @@ struct State {
     futex_seq: u64,
     /// Which process (its index + 1) each spare block is lent to.
     spare_owner: [u8; SPARES],
+    /// Which of the root CNode's slots hold a leaf made for a process
+    /// ([`State::leaf`]).
+    leaves: [u64; (1usize << (CSPACE_BITS - LEAF_BITS)) / 64],
     /// The restorer page's run, which every process maps.
     trampoline: Shared,
     images: [Img; MAX_IMAGES],
@@ -1061,11 +1111,20 @@ impl Strs {
     }
 }
 
-fn slot_base(i: usize) -> u64 {
-    PROC_SLOTS + i as u64 * PROC_SPAN
+fn misc_base(i: usize) -> u64 {
+    PROC_SLOTS + i as u64 * MISC_SPAN
 }
 fn space_slot(i: usize) -> u64 {
-    slot_base(i)
+    misc_base(i)
+}
+/// The slot of process `i`'s page `k` (of its window): its frame, or a
+/// file's page mapped there; the slot after is the frame's copy for the
+/// mirror.
+fn page_slot(i: usize, k: usize) -> u64 {
+    PAGE_SLOTS * (i as u64 + 1) + 2 * k as u64
+}
+fn bit(a: &[u64], k: usize) -> bool {
+    a[k / 64] & 1 << (k % 64) != 0
 }
 fn block_slot(i: usize) -> u64 {
     BLOCKS + i as u64
@@ -1089,6 +1148,31 @@ impl State {
         let k = self.spare_owner.iter().position(|&o| o == 0).ok_or(ENOMEM)?;
         self.spare_owner[k] = i as u8 + 1;
         sys(Syscall::Retype, SPARE_BLOCKS + k as u64, msg).map(drop).map_err(|_| ENOMEM)
+    }
+
+    /// Makes sure the leaf CNode holding process `i`'s `slot` is in the
+    /// root: made from the process's memory, so it goes (and what it
+    /// holds) when the process's blocks are revoked.
+    fn leaf(&mut self, i: usize, slot: u64) -> Result<(), u64> {
+        let r = (slot >> LEAF_BITS) as usize;
+        debug_assert!(slot >= PROC_SLOTS);
+        if bit(&self.leaves, r) {
+            return Ok(());
+        }
+        self.retype(i, ObjectType::CNode, LEAF_BITS, LEAF_SCRATCH)?;
+        let copied = sys(Syscall::CNodeCopy, ROOT_CNODE, [r as u64, LEAF_SCRATCH, ALL, 0]);
+        let _ = syscall(Syscall::CapDelete, LEAF_SCRATCH, [0; 4]);
+        copied.map_err(|_| ENOMEM)?;
+        self.leaves[r / 64] |= 1 << (r % 64);
+        Ok(())
+    }
+
+    /// Forgets the leaves of the slots `from..from + n` (destroyed with
+    /// the blocks they were made from).
+    fn forget_leaves(&mut self, from: u64, n: u64) {
+        for r in (from >> LEAF_BITS) as usize..((from + n) >> LEAF_BITS) as usize {
+            self.leaves[r / 64] &= !(1 << (r % 64));
+        }
     }
 
     /// The process whose memory process `i` uses (see [`Proc::mem`]):
@@ -1241,28 +1325,47 @@ impl State {
         }
         let k = ((va - CHILD) / PAGE) as usize;
         let mirror = va - CHILD + MIRROR + i as u64 * SPAN;
+        let slot = page_slot(i, k);
+        self.leaf(i, slot)?;
         let p = &mut self.procs[i];
-        let n = if let Some(n) = p.frames.iter().position(|&f| f == FREE) {
-            let slot = slot_base(i) + n as u64;
-            sys(Syscall::FrameMap, slot + 1, [mirror, 1, 0, 0]).map_err(|_| ENOMEM)?;
-            // SAFETY: the frame was just mapped here, writable, a whole
-            // page at `mirror`; the process has it nowhere (munmap took
-            // it away) and waits on this server meanwhile.
-            unsafe { core::ptr::write_bytes(mirror as *mut u8, 0, PAGE as usize) };
-            n
-        } else {
-            if p.cursor + 2 > PROC_SPAN {
-                return Err(ENOMEM);
-            }
-            let slot = slot_base(i) + p.cursor;
-            self.retype(i, ObjectType::Frame, 0, slot)?;
-            let p = &mut self.procs[i];
-            sys(Syscall::CapMint, slot, [slot + 1, ALL, 0, 0]).map_err(|_| ENOMEM)?;
-            p.cursor += 2;
-            sys(Syscall::FrameMap, slot + 1, [mirror, 1, 0, 0]).map_err(|_| ENOMEM)?;
-            (slot - slot_base(i)) as usize
+        // A file's page mapped there: its slot is wanted.
+        if bit(&p.mapped, k) {
+            let _ = syscall(Syscall::CapDelete, slot, [0; 4]);
+            p.mapped[k / 64] &= !(1 << (k % 64));
+        }
+        let drop_frame = |slot: u64| {
+            let _ = syscall(Syscall::CapDelete, slot + 1, [0; 4]);
+            let _ = syscall(Syscall::CapDelete, slot, [0; 4]);
+            ENOMEM
         };
-        let slot = slot_base(i) + n as u64;
+        if bit(&p.parked, k) {
+            // Its own frame from before, still in the mirror.
+            p.parked[k / 64] &= !(1 << (k % 64));
+            p.nparked -= 1;
+            // SAFETY: the frame is mapped here, writable, a whole page at
+            // `mirror`; the process has it nowhere (munmap took it away)
+            // and waits on this server meanwhile.
+            unsafe { core::ptr::write_bytes(mirror as *mut u8, 0, PAGE as usize) };
+        } else if p.nparked > 0 {
+            // A frame another page gave back, moved to this page's slot.
+            let w = p.parked.iter().position(|&w| w != 0).ok_or(ENOMEM)?;
+            let j = w * 64 + p.parked[w].trailing_zeros() as usize;
+            let from = page_slot(i, j);
+            sys(Syscall::CapMint, from, [slot, ALL, 0, 0]).map_err(|_| ENOMEM)?;
+            let _ = syscall(Syscall::FrameUnmap, from + 1, [0; 4]);
+            let _ = syscall(Syscall::CapDelete, from + 1, [0; 4]);
+            let _ = syscall(Syscall::CapDelete, from, [0; 4]);
+            p.parked[w] &= !(1 << (j % 64));
+            p.nparked -= 1;
+            sys(Syscall::CapMint, slot, [slot + 1, ALL, 0, 0]).map_err(|_| drop_frame(slot))?;
+            sys(Syscall::FrameMap, slot + 1, [mirror, 1, 0, 0]).map_err(|_| drop_frame(slot))?;
+            // SAFETY: as above, just mapped at `mirror`.
+            unsafe { core::ptr::write_bytes(mirror as *mut u8, 0, PAGE as usize) };
+        } else {
+            self.retype(i, ObjectType::Frame, 0, slot)?;
+            sys(Syscall::CapMint, slot, [slot + 1, ALL, 0, 0]).map_err(|_| drop_frame(slot))?;
+            sys(Syscall::FrameMap, slot + 1, [mirror, 1, 0, 0]).map_err(|_| drop_frame(slot))?;
+        }
         if let Some(bytes) = code {
             let len = bytes.len().min(PAGE as usize);
             // SAFETY: the page is mapped here, writable, at `mirror`, and
@@ -1273,11 +1376,10 @@ impl State {
         let p = &mut self.procs[i];
         if sys(Syscall::FrameMapInto, slot, [va, flags, space_slot(i), 0]).is_err() {
             // Kept for another try.
-            let _ = syscall(Syscall::FrameUnmap, slot + 1, [0; 4]);
-            p.frames[n] = FREE;
+            p.parked[k / 64] |= 1 << (k % 64);
+            p.nparked += 1;
             return Err(ENOMEM);
         }
-        p.frames[n] = k as u16 + 1;
         p.present[k / 64] |= 1 << (k % 64);
         if code.is_some() {
             p.code[k / 64] |= 1 << (k % 64);
@@ -1286,7 +1388,7 @@ impl State {
     }
 
     /// `munmap` of process `i`'s own page at `va`, if it has one there:
-    /// unmapped from it and from the mirror, its frame kept to be used
+    /// unmapped from it, its frame kept (in the mirror still) to be used
     /// again ([`State::map_private`]).
     fn unmap_private(&mut self, i: usize, va: u64) {
         let i = self.mem(i);
@@ -1295,11 +1397,9 @@ impl State {
         }
         let k = ((va - CHILD) / PAGE) as usize;
         let p = &mut self.procs[i];
-        let Some(n) = p.frames.iter().position(|&f| f == k as u16 + 1) else { return };
-        let slot = slot_base(i) + n as u64;
-        let _ = syscall(Syscall::FrameUnmap, slot, [0; 4]);
-        let _ = syscall(Syscall::FrameUnmap, slot + 1, [0; 4]);
-        p.frames[n] = FREE;
+        let _ = syscall(Syscall::FrameUnmap, page_slot(i, k), [0; 4]);
+        p.parked[k / 64] |= 1 << (k % 64);
+        p.nparked += 1;
         p.present[k / 64] &= !(1 << (k % 64));
         p.code[k / 64] &= !(1 << (k % 64));
     }
@@ -1337,14 +1437,23 @@ impl State {
     /// (read-only, or executable).
     fn map_shared(&mut self, i: usize, va: u64, file_slot: u64, flags: u64) -> Result<(), u64> {
         let i = self.mem(i);
+        let k = ((va - CHILD) / PAGE) as usize;
+        let slot = page_slot(i, k);
+        self.leaf(i, slot)?;
         let p = &mut self.procs[i];
-        if p.cursor + 1 > PROC_SPAN {
+        if bit(&p.parked, k) {
+            // A frame given back there: its slot is wanted.
+            let _ = syscall(Syscall::FrameUnmap, slot + 1, [0; 4]);
+            let _ = syscall(Syscall::CapDelete, slot + 1, [0; 4]);
+            let _ = syscall(Syscall::CapDelete, slot, [0; 4]);
+            p.parked[k / 64] &= !(1 << (k % 64));
+            p.nparked -= 1;
+        }
+        sys(Syscall::CapMint, file_slot, [slot, ALL, 0, 0]).map_err(|_| ENOMEM)?;
+        if sys(Syscall::FrameMapInto, slot, [va, flags, space_slot(i), 0]).is_err() {
+            let _ = syscall(Syscall::CapDelete, slot, [0; 4]);
             return Err(ENOMEM);
         }
-        let slot = slot_base(i) + p.cursor;
-        sys(Syscall::CapMint, file_slot, [slot, ALL, 0, 0]).map_err(|_| ENOMEM)?;
-        p.cursor += 1;
-        sys(Syscall::FrameMapInto, slot, [va, flags, space_slot(i), 0]).map_err(|_| ENOMEM)?;
         Ok(())
     }
 
@@ -1524,7 +1633,8 @@ impl State {
         p.reserved = [0; CHILD_PAGES / 64];
         p.code = [0; CHILD_PAGES / 64];
         p.mapped = [0; CHILD_PAGES / 64];
-        p.frames = [0; PROC_SPAN as usize];
+        p.parked = [0; CHILD_PAGES / 64];
+        p.nparked = 0;
         (p.alarm, p.alarm_every) = (0, 0);
         (p.pgid, p.sid) = (pid, pid);
         p.pending = 0;
@@ -1561,9 +1671,10 @@ impl State {
     }
 
     /// Makes process `i`'s address space, and task `t`'s thread and fault
-    /// endpoint, at the start of the process's span.
+    /// endpoint, at the start of the process's slots.
     fn make_space(&mut self, i: usize, t: usize) -> Result<(), &'static str> {
-        let b = slot_base(i);
+        let b = space_slot(i);
+        self.leaf(i, b).map_err(|_| "no room for an address space")?;
         // Room for the page tables of a 256 MiB space, sparse.
         self.retype(i, ObjectType::AddressSpace, 18, b).map_err(|_| "no address space")?;
         self.procs[i].cursor = 1;
@@ -1571,15 +1682,16 @@ impl State {
     }
 
     /// Makes task `t`'s thread and its fault endpoint, in the next slots
-    /// of its process's span.
+    /// of its process's slots.
     fn make_thread(&mut self, t: usize) -> Result<(), u64> {
         let i = self.tasks[t].proc as usize;
         let p = &mut self.procs[i];
-        if p.cursor + 2 > PROC_SPAN {
+        if p.cursor + 2 > MISC_SPAN {
             return Err(ENOMEM);
         }
-        let s = slot_base(i) + p.cursor;
+        let s = misc_base(i) + p.cursor;
         p.cursor += 2;
+        self.leaf(i, s).and_then(|()| self.leaf(i, s + 1)).map_err(|_| EAGAIN)?;
         self.retype(i, ObjectType::Thread, 0, s).map_err(|_| EAGAIN)?;
         sys(Syscall::CapMint, EP, [s + 1, WRITE_RIGHT, t as u64 + 1, 0]).map_err(|_| EAGAIN)?;
         (self.tasks[t].thread, self.tasks[t].fault) = (s, s + 1);
@@ -1615,7 +1727,18 @@ impl State {
                 self.exit(c, signal::SIGKILL);
             }
         }
-        for s in slot_base(i)..slot_base(i) + self.procs[i].cursor {
+        // Files' pages mapped (minted from this server's), then its
+        // address space and threads; its frames and leaves go with its
+        // blocks.
+        for w in 0..CHILD_PAGES / 64 {
+            let mut m = self.procs[i].mapped[w];
+            while m != 0 {
+                let k = w * 64 + m.trailing_zeros() as usize;
+                let _ = syscall(Syscall::CapDelete, page_slot(i, k), [0; 4]);
+                m &= m - 1;
+            }
+        }
+        for s in misc_base(i)..misc_base(i) + self.procs[i].cursor {
             let _ = syscall(Syscall::CapDelete, s, [0; 4]);
         }
         let _ = syscall(Syscall::CapRevoke, block_slot(i), [0; 4]);
@@ -1625,13 +1748,16 @@ impl State {
                 self.spare_owner[k] = 0;
             }
         }
+        self.forget_leaves(misc_base(i), MISC_SPAN);
+        self.forget_leaves(page_slot(i, 0), PAGE_SLOTS);
         let p = &mut self.procs[i];
         p.cursor = 0;
         p.present = [0; CHILD_PAGES / 64];
         p.reserved = [0; CHILD_PAGES / 64];
         p.code = [0; CHILD_PAGES / 64];
         p.mapped = [0; CHILD_PAGES / 64];
-        p.frames = [0; PROC_SPAN as usize];
+        p.parked = [0; CHILD_PAGES / 64];
+        p.nparked = 0;
     }
 
     /// Runs bundle file `image` (a program) as task `t`'s process, its
@@ -2286,6 +2412,26 @@ fn answer(st: &mut State, t: usize, call: Sys, a: [u64; 6]) -> Out {
             }
             st.fs.truncate(o.ino, a[1]).map(|_| 0)
         })),
+        // fallocate (mode 0, as posix_fallocate): a memory file or a file
+        // made at least `offset + len` long; its blocks are not set aside.
+        Sys::Fallocate => r(st.file(i, a[0]).ok_or(EBADF).and_then(|f| {
+            let o = st.files[f];
+            let end = a[2].checked_add(a[3]).filter(|&e| (e as i64) > 0 && a[3] > 0).ok_or(EINVAL)?;
+            if a[1] != 0 {
+                return Err(EOPNOTSUPP);
+            }
+            match o.kind {
+                FileKind::Shm if end > st.shm[o.pipe as usize].size => st.shm_resize(o.pipe as usize, end).map(|_| 0),
+                FileKind::Shm => Ok(0),
+                FileKind::Node if o.flags & O_ACCMODE == 0 => Err(EBADF),
+                FileKind::Node if st.fs.kind(o.ino) != Kind::File => Err(ENODEV),
+                FileKind::Node if end > st.fs.size(o.ino) => st.fs.truncate(o.ino, end).map(|_| 0),
+                FileKind::Node => Ok(0),
+                _ => Err(ESPIPE),
+            }
+        })),
+        // getresuid, getresgid: every process's ids are 0.
+        Sys::Getresid => r([a[0], a[1], a[2]].iter().try_for_each(|&p| st.put(i, p, &[0u8; 4]).map(drop)).map(|_| 0)),
         Sys::Fork => r(fork(st, t)),
         Sys::Vfork => vfork(st, t, 0),
         Sys::Clone if a[0] & CLONE_THREAD != 0 && a[0] & CLONE_VM != 0 => r(new_thread(st, t, a)),
@@ -2334,6 +2480,21 @@ fn answer(st: &mut State, t: usize, call: Sys, a: [u64; 6]) -> Out {
         }),
         Sys::Renameat => r(renameat(st, i, a)),
         Sys::Readlinkat => r(readlinkat(st, i, a)),
+        // No hard links, as on FAT: fontconfig then locks its cache with
+        // a directory instead.
+        Sys::Link => Ret(err(EPERM)),
+        Sys::Statfs => r({
+            let mut p = [0u8; 256];
+            st.cstr(i, a[0], &mut p).and_then(|n| st.fs.resolve(st.procs[i].cwd, &p[..n], true)).and_then(|ino| {
+                let s = statfs_bytes(st, Some(ino));
+                st.put(i, a[1], &s).map(|_| 0)
+            })
+        }),
+        Sys::Fstatfs => r(st.file(i, a[0]).ok_or(EBADF).and_then(|f| {
+            let o = st.files[f];
+            let s = statfs_bytes(st, (o.kind == FileKind::Node).then_some(o.ino));
+            st.put(i, a[1], &s).map(|_| 0)
+        })),
         Sys::Umask => Ret(0o22),
         Sys::Getpid => Ret(st.procs[i].pid as u64),
         Sys::Getpgid => r(group_of(st, i, a[0]).map(|k| st.procs[k].pgid as u64)),
@@ -2479,7 +2640,7 @@ fn fstat(st: &mut State, i: usize, fd: u64, buf: u64) -> Result<u64, u64> {
     let f = st.file(i, fd).ok_or(EBADF)?;
     let o = st.files[f];
     let s = match o.kind {
-        FileKind::Node => stat_bytes(mode_of(st.fs.kind(o.ino)), o.ino as u64, st.fs.size(o.ino)),
+        FileKind::Node => stat_bytes(mode_of(st.fs.kind(o.ino)), st.fs.number(o.ino), st.fs.size(o.ino)),
         FileKind::Console | FileKind::Tty => stat_bytes(0o20620, 0, 0),
         FileKind::Socket | FileKind::Unix => stat_bytes(0o140777, 0, 0),
         FileKind::Shm => stat_bytes(0o100600, 0, st.shm[o.pipe as usize].size),
@@ -2497,7 +2658,7 @@ fn fstatat(st: &mut State, i: usize, a: [u64; 6]) -> Result<u64, u64> {
     }
     let base = st.dir_of(i, a[0])?;
     let ino = st.fs.resolve(base, &p[..n], a[3] & AT_SYMLINK_NOFOLLOW == 0)?;
-    let s = stat_bytes(mode_of(st.fs.kind(ino)), ino as u64, st.fs.size(ino));
+    let s = stat_bytes(mode_of(st.fs.kind(ino)), st.fs.number(ino), st.fs.size(ino));
     st.put(i, a[2], &s[..STAT_LEN])
 }
 
@@ -2974,6 +3135,30 @@ fn renameat(st: &mut State, i: usize, a: [u64; 6]) -> Result<u64, u64> {
     st.fs.rename(ino, d2, name2).map(|_| 0)
 }
 
+/// What `statfs` says of the filesystem `ino` is on (none: a pipe's or a
+/// socket's): the disk's, its free blocks and inodes from the server
+/// (and as many blocks in all), or memory's.
+fn statfs_bytes(st: &State, ino: Option<u16>) -> [u8; 120] {
+    /// What the disk's type is given as ("SUPR"); memory's is tmpfs's.
+    const DISK_MAGIC: u64 = 0x5355_5052;
+    const TMPFS_MAGIC: u64 = 0x0102_1994;
+    let (kind, blocks, files) = match ino {
+        Some(ino) if st.fs.is_remote(ino) => {
+            let (blocks, files) = remote::statfs().unwrap_or((0, 0));
+            (DISK_MAGIC, blocks, files)
+        }
+        _ => (TMPFS_MAGIC, 0, st.fs.free_inodes() as u64),
+    };
+    // type, block size, blocks, free, available, inodes, free, the
+    // filesystem's id, the longest name, fragment size, flags, spare.
+    let words = [kind, PAGE, blocks, blocks, blocks, files, files, 0, fs::NAME_MAX as u64, PAGE, 0, 0, 0, 0, 0];
+    let mut b = [0u8; 120];
+    for (k, w) in words.iter().enumerate() {
+        b[k * 8..k * 8 + 8].copy_from_slice(&w.to_le_bytes());
+    }
+    b
+}
+
 fn readlinkat(st: &mut State, i: usize, a: [u64; 6]) -> Result<u64, u64> {
     let base = st.dir_of(i, a[0])?;
     let mut p = [0u8; 256];
@@ -3314,7 +3499,7 @@ fn fork_on(st: &mut State, t: usize, sp: u64, borrow: bool) -> Result<u64, u64> 
         Err(e)
     };
     if borrow {
-        // Its thread only, in its own span (from 1, as a space's would be).
+        // Its thread only, in its own slots (from 1, as a space's would be).
         st.procs[c].mem = m as u8;
         st.procs[c].vfork = true;
         st.procs[c].cursor = 1;
@@ -3939,7 +4124,14 @@ fn run(st: &mut State, argv: &[&str], env: &[&str], interactive: bool) -> Result
                     continue;
                 }
             }
-            say!("linux: pid {} killed: {what} at pc {pc:#x}, address {nr:#x}", st.procs[i].pid);
+            // A page it may have that could not be made: memory ran out.
+            let m = st.mem(i);
+            if what == "page fault" && st.is_reserved(m, nr & !(PAGE - 1)) {
+                let pages: u32 = st.procs[m].present.iter().map(|w| w.count_ones()).sum();
+                say!("linux: pid {} killed: out of memory at pc {pc:#x}, address {nr:#x} ({pages} pages its own)", st.procs[i].pid);
+            } else {
+                say!("linux: pid {} killed: {what} at pc {pc:#x}, address {nr:#x}", st.procs[i].pid);
+            }
             st.exit(i, signal);
             wake(st);
             continue;
@@ -5515,13 +5707,56 @@ const RUNS: &[(&[&str], u32)] = &[
         0,
     ),
     // A program tcc links against glib from there: a hash table, a regular
-    // expression (PCRE2's), and glib's main loop with a timeout. Then the
-    // packages are removed, so the second boot sees the disk as before.
+    // expression (PCRE2's), and glib's main loop with a timeout.
     (
         &[
             "sh",
             "-c",
-            r#"cd /tmp/cc && printf 'char *g_strdup_printf(const char *, ...); void g_free(void *); const char *glib_check_version(unsigned, unsigned, unsigned);\nvoid *g_hash_table_new(unsigned (*)(const void *), int (*)(const void *, const void *)); unsigned g_str_hash(const void *); int g_str_equal(const void *, const void *);\nint g_hash_table_insert(void *, void *, void *); void *g_hash_table_lookup(void *, const void *);\nint g_regex_match_simple(const char *, const char *, int, int);\nvoid *g_main_loop_new(void *, int); void g_main_loop_run(void *); void g_main_loop_quit(void *); unsigned g_timeout_add(unsigned, int (*)(void *), void *);\nint printf(const char *, ...); int eventfd(unsigned, int); long read(int, void *, unsigned long); long write(int, const void *, unsigned long);\nint ticks;\nint tick(void *loop) { if (++ticks < 3) return 1; g_main_loop_quit(loop); return 0; }\nint main(void) {\n  void *h = g_hash_table_new(g_str_hash, g_str_equal), *loop = g_main_loop_new(0, 0);\n  char *s;\n  g_hash_table_insert(h, "greeting", "hello");\n  g_timeout_add(10, tick, loop);\n  g_main_loop_run(loop);\n  s = g_strdup_printf("glib: version %%s, regex %%d, table says %%s, the main loop ticked %%d times", glib_check_version(2, 76, 0) ? "too old" : "2.76", g_regex_match_simple("^gl[a-z]+$", "glib", 0, 0), (char *)g_hash_table_lookup(h, "greeting"), ticks);\n  printf("%%s\\n", s);\n  g_free(s);\n  {\n    int e = eventfd(2, 1 | 04000); unsigned long v = 0, five = 5; long r[4];\n    r[0] = read(e, &v, 8); r[1] = read(e, &v, 8); r[2] = read(e, &v, 8); write(e, &five, 8); r[3] = read(e, &v, 8);\n    printf("eventfd: reads %%ld %%ld %%ld, after writing 5: %%ld of %%lu\\n", r[0], r[1], r[2], r[3], v);\n  }\n  return 0;\n}\n' > g.c && tcc -o g g.c /opt/alpine/usr/lib/libglib-2.0.so.0 2>&1 && ./g; s=$?; rm -f g g.c; rm -r /opt /etc/ld-musl-$(uname -m).path; exit $s"#,
+            r#"cd /tmp/cc && printf 'char *g_strdup_printf(const char *, ...); void g_free(void *); const char *glib_check_version(unsigned, unsigned, unsigned);\nvoid *g_hash_table_new(unsigned (*)(const void *), int (*)(const void *, const void *)); unsigned g_str_hash(const void *); int g_str_equal(const void *, const void *);\nint g_hash_table_insert(void *, void *, void *); void *g_hash_table_lookup(void *, const void *);\nint g_regex_match_simple(const char *, const char *, int, int);\nvoid *g_main_loop_new(void *, int); void g_main_loop_run(void *); void g_main_loop_quit(void *); unsigned g_timeout_add(unsigned, int (*)(void *), void *);\nint printf(const char *, ...); int eventfd(unsigned, int); long read(int, void *, unsigned long); long write(int, const void *, unsigned long);\nint ticks;\nint tick(void *loop) { if (++ticks < 3) return 1; g_main_loop_quit(loop); return 0; }\nint main(void) {\n  void *h = g_hash_table_new(g_str_hash, g_str_equal), *loop = g_main_loop_new(0, 0);\n  char *s;\n  g_hash_table_insert(h, "greeting", "hello");\n  g_timeout_add(10, tick, loop);\n  g_main_loop_run(loop);\n  s = g_strdup_printf("glib: version %%s, regex %%d, table says %%s, the main loop ticked %%d times", glib_check_version(2, 76, 0) ? "too old" : "2.76", g_regex_match_simple("^gl[a-z]+$", "glib", 0, 0), (char *)g_hash_table_lookup(h, "greeting"), ticks);\n  printf("%%s\\n", s);\n  g_free(s);\n  {\n    int e = eventfd(2, 1 | 04000); unsigned long v = 0, five = 5; long r[4];\n    r[0] = read(e, &v, 8); r[1] = read(e, &v, 8); r[2] = read(e, &v, 8); write(e, &five, 8); r[3] = read(e, &v, 8);\n    printf("eventfd: reads %%ld %%ld %%ld, after writing 5: %%ld of %%lu\\n", r[0], r[1], r[2], r[3], v);\n  }\n  return 0;\n}\n' > g.c && tcc -o g g.c /opt/alpine/usr/lib/libglib-2.0.so.0 2>&1 && ./g; s=$?; rm -f g g.c; exit $s"#,
+        ],
+        0,
+    ),
+    // GIO's libmount and libblkid (in /lib in their packages, so unpacked
+    // into /opt/alpine/usr), and cairo and pango, and what they link to,
+    // installed beside glib, with
+    // one font (DejaVu Sans) and a fontconfig file naming its directory:
+    // a program tcc links against them lays out a line of text in a font
+    // fontconfig picks for "Sans", draws it into an image with cairo and
+    // writes it as a PNG.
+    (
+        &[
+            "sh",
+            "-c",
+            r#"mkdir -p /opt/alpine/fonts && for p in libblkid-2.38.1-r8 libmount-2.38.1-r8; do wget -q -O - http://10.0.3.2:47081/apk/$p.apk | tar -xzf - -C /opt/alpine/usr lib || exit 1; done; for p in libxau-1.0.11-r2 libmd-1.0.4-r2 libbsd-0.11.7-r1 libxdmcp-1.1.4-r2 libxcb-1.15-r1 libx11-1.8.7-r0 libxext-1.3.5-r2 libxrender-0.9.11-r3 libexpat-2.7.0-r0 brotli-libs-1.0.9-r14 libpng-1.6.44-r0 freetype-2.13.0-r5 fontconfig-2.14.2-r3 pixman-0.42.2-r1 cairo-1.17.8-r1 libxft-2.3.8-r1 fribidi-1.0.13-r0 graphite2-1.3.14-r5 harfbuzz-7.3.0-r0 pango-1.50.14-r1; do wget -q -O - http://10.0.3.2:47081/apk/$p.apk | tar -xzf - -C /opt/alpine usr/lib || exit 1; done; wget -q -O - http://10.0.3.2:47081/apk/font-dejavu-2.37-r5.apk | tar -xzf - -C /opt/alpine usr/share/fonts/dejavu/DejaVuSans.ttf || exit 1; printf '<fontconfig><dir>/opt/alpine/usr/share/fonts</dir><cachedir>/tmp/fc</cachedir></fontconfig>
+' > /opt/alpine/fonts/fonts.conf; cd /tmp/cc && printf 'void *cairo_image_surface_create(int, int, int); void *cairo_create(void *); void cairo_set_source_rgb(void *, double, double, double); void cairo_paint(void *); void cairo_move_to(void *, double, double);\nvoid cairo_surface_flush(void *); unsigned char *cairo_image_surface_get_data(void *); int cairo_image_surface_get_stride(void *); const char *cairo_version_string(void); int cairo_surface_write_to_png(void *, const char *);\nvoid *pango_cairo_create_layout(void *); void pango_layout_set_text(void *, const char *, int); void *pango_font_description_from_string(const char *); void pango_layout_set_font_description(void *, void *);\nvoid pango_layout_get_pixel_size(void *, int *, int *); void pango_cairo_show_layout(void *, void *); const char *pango_version_string(void);\nvoid *pango_layout_get_context(void *); void *pango_context_load_font(void *, void *); void *pango_font_describe(void *); char *pango_font_description_to_string(void *);\nint printf(const char *, ...);\nint main(void) {\n  int W = 320, H = 64, w, h, x, y, s, n = 0, x0 = 320, x1 = -1, y0 = 64, y1 = -1; unsigned char *p;\n  void *sf = cairo_image_surface_create(0, W, H), *cr = cairo_create(sf), *l, *d, *f;\n  cairo_set_source_rgb(cr, 1, 1, 1); cairo_paint(cr);\n  l = pango_cairo_create_layout(cr); d = pango_font_description_from_string("Sans 24");\n  pango_layout_set_font_description(l, d); pango_layout_set_text(l, "Superior", -1); pango_layout_get_pixel_size(l, &w, &h);\n  cairo_set_source_rgb(cr, 0, 0, 0); cairo_move_to(cr, 8, 8); pango_cairo_show_layout(cr, l); cairo_surface_flush(sf);\n  p = cairo_image_surface_get_data(sf); s = cairo_image_surface_get_stride(sf);\n  for (y = 0; y < H; y++) for (x = 0; x < W; x++) if (p[y * s + x * 4] < 128) { n++; if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y; }\n  f = pango_context_load_font(pango_layout_get_context(l), d);\n  printf("pango: cairo %%s, pango %%s, font %%s, a line laid out %%dx%%d, %%s\\n", cairo_version_string(), pango_version_string(), f ? pango_font_description_to_string(pango_font_describe(f)) : "none", w, h,\n    n > 200 && x0 >= 8 && x1 < 8 + w && y0 >= 8 && y1 < 8 + h ? "inked inside its box" : "ink missing or outside its box");\n  return cairo_surface_write_to_png(sf, "/tmp/cc/p.png");\n}\n\n' > p.c && tcc -o p p.c /opt/alpine/usr/lib/libcairo.so.2 /opt/alpine/usr/lib/libpango-1.0.so.0 /opt/alpine/usr/lib/libpangocairo-1.0.so.0 2>&1 && FONTCONFIG_FILE=/opt/alpine/fonts/fonts.conf ./p; s=$?; rm -rf p p.c p.png /tmp/fc; exit $s"#,
+        ],
+        0,
+    ),
+    // GTK 3 and the rest of what it links to, installed beside them: a
+    // program tcc links against it opens a window with a label on the
+    // Wayland server here (GDK's Wayland backend, XKB's data for its first
+    // keymap, no accessibility bus) and waits for the label to be drawn.
+    // gdk-pixbuf tells its icons' type (PNG) by GIO's MIME database: here
+    // one of PNG alone, in the text files GIO reads when there is no
+    // cache, as building shared-mime-info's whole one (update-mime-database)
+    // takes more memory than a process has. Then the packages are removed,
+    // so the second boot sees the disk as before.
+    (
+        &[
+            "sh",
+            "-c",
+            r#"for p in xz-libs-5.4.3-r1 libxml2-2.11.8-r3 libjpeg-turbo-2.1.5.1-r3 libwebp-1.3.2-r0 tiff-4.5.1-r0 gdk-pixbuf-2.42.12-r0 libxcomposite-0.4.6-r3 libxfixes-6.0.1-r2 libxcursor-1.2.1-r2 libxdamage-1.1.6-r2 libxi-1.8.1-r0 libxinerama-1.1.5-r2 libxrandr-1.5.3-r2 libatk-1.0-2.48.4-r0 libxtst-1.2.4-r2 dbus-libs-1.14.8-r0 at-spi2-core-2.48.4-r0 libatk-bridge-2.0-2.48.4-r0 cairo-gobject-1.17.8-r1 avahi-libs-0.8-r13 nettle-3.8.1-r2 libunistring-1.1-r1 libidn2-2.3.4-r1 p11-kit-0.24.1-r2 libtasn1-4.20.0-r0 gnutls-3.8.4-r0 cups-libs-2.4.9-r0 libepoxy-1.5.10-r1 wayland-libs-cursor-1.22.0-r2 wayland-libs-egl-1.22.0-r2 gtk+3.0-3.24.43-r0; do wget -q -O - http://10.0.3.2:47081/apk/$p.apk | tar -xzf - -C /opt/alpine usr/lib || exit 1; done; wget -q -O - http://10.0.3.2:47081/apk/xkeyboard-config-2.38-r0.apk | tar -xzf - -C /opt/alpine usr/share/X11/xkb || exit 1; mkdir -p /opt/alpine/usr/share/mime && printf '50:image/png:*.png\n' > /opt/alpine/usr/share/mime/globs2 && printf 'MIME-Magic\000\n[50:image/png]\n>0=\000\010\211PNG\r\n\032\n\n' > /opt/alpine/usr/share/mime/magic; cd /tmp/cc && printf 'int gtk_init_check(int *, char ***); void *gtk_window_new(int); void gtk_window_set_title(void *, const char *); void gtk_window_set_default_size(void *, int, int);\nvoid *gtk_label_new(const char *); void gtk_container_add(void *, void *); void gtk_widget_show_all(void *); void gtk_main(void); void gtk_main_quit(void); void gtk_window_get_size(void *, int *, int *);\nunsigned gtk_get_major_version(void); unsigned gtk_get_minor_version(void); unsigned gtk_get_micro_version(void);\nunsigned long g_signal_connect_data(void *, const char *, void *, void *, void *, int); unsigned g_timeout_add(unsigned, int (*)(void *), void *);\nvoid *gdk_display_get_default(void); const char *g_type_name(unsigned long); int printf(const char *, ...);\nint draws;\nint quit(void *d) { gtk_main_quit(); return 0; }\nint drawn(void *w, void *cr, void *d) { if (!draws++) g_timeout_add(300, quit, 0); return 0; }\nint main(void) {\n  void *w, *l, *dpy; int ww = 0, hh = 0;\n  if (!gtk_init_check(0, 0)) { printf("gtk: no display\\n"); return 1; }\n  dpy = gdk_display_get_default();\n  w = gtk_window_new(0); gtk_window_set_title(w, "gtk test"); gtk_window_set_default_size(w, 240, 80);\n  l = gtk_label_new("Hello from GTK on Superior"); gtk_container_add(w, l);\n  g_signal_connect_data(l, "draw", drawn, 0, 0, 1);\n  gtk_widget_show_all(w);\n  g_timeout_add(60000, quit, 0);\n  gtk_main();\n  gtk_window_get_size(w, &ww, &hh);\n  printf("gtk: %%u.%%u.%%u on %%s, a %%dx%%d window, its label %%s\\n", gtk_get_major_version(), gtk_get_minor_version(), gtk_get_micro_version(), g_type_name(**(unsigned long **)dpy), ww, hh, draws ? "drawn" : "never drawn");\n  return !draws;\n}\n' > gt.c && tcc -o gt gt.c /opt/alpine/usr/lib/libgtk-3.so.0 /opt/alpine/usr/lib/libgdk-3.so.0 /opt/alpine/usr/lib/libgobject-2.0.so.0 /opt/alpine/usr/lib/libglib-2.0.so.0 2>&1 && GDK_BACKEND=wayland XKB_CONFIG_ROOT=/opt/alpine/usr/share/X11/xkb XDG_DATA_DIRS=/opt/alpine/usr/share XDG_RUNTIME_DIR=/tmp WAYLAND_DISPLAY=wayland-0 NO_AT_BRIDGE=1 GTK_A11Y=none FONTCONFIG_FILE=/opt/alpine/fonts/fonts.conf ./gt; s=$?; rm -rf gt gt.c /tmp/fc; rm -r /opt /etc/ld-musl-$(uname -m).path; exit $s"#,
+        ],
+        0,
+    ),
+    // A big program: 96 MiB of its own, a page at a time, more than a
+    // process's block and many spare blocks (4 MiB each) lent to it, and
+    // more than the 27904 slots a process once had (some 54 MiB).
+    (
+        &[
+            "sh",
+            "-c",
+            r#"cd /tmp/cc && printf 'int printf(const char *, ...); void *malloc(unsigned long);\nint main(void) {\n  unsigned long n = 96UL << 20, i, sum = 0;\n  unsigned char *p = malloc(n);\n  if (!p) { printf("big: no memory\\n"); return 1; }\n  for (i = 0; i < n; i += 4096) p[i] = i >> 12;\n  for (i = 0; i < n; i += 4096) sum += p[i];\n  printf("big: %%lu MiB touched, sum %%lu\\n", n >> 20, sum);\n  return 0;\n}\n' > big.c && tcc -o big big.c 2>&1 && ./big; s=$?; rm -f big big.c; exit $s"#,
         ],
         0,
     ),
@@ -5638,7 +5873,7 @@ fn setup() -> Result<&'static mut State, &'static str> {
     // larger a process can grow), at least one.
     let mut spares = 0;
     while spares < SPARES && from < UNTYPED_SPARE + UNTYPED_SPARE_COUNT {
-        if sys(Syscall::Retype, from, [ObjectType::Untyped as u64, BLOCK_BITS, SPARE_BLOCKS + spares as u64, 0]).is_ok() {
+        if sys(Syscall::Retype, from, [ObjectType::Untyped as u64, SPARE_BITS, SPARE_BLOCKS + spares as u64, 0]).is_ok() {
             spares += 1;
         } else {
             from += 1;
@@ -5678,7 +5913,7 @@ fn setup() -> Result<&'static mut State, &'static str> {
     let smptest = map_file(SMPTEST_FILE, SMPTEST_VA, LIBZ_FILE - SMPTEST_FILE);
     let libz = map_file(LIBZ_FILE, LIBZ_VA, FPTEST_FILE - LIBZ_FILE);
     let fptest = map_file(FPTEST_FILE, FPTEST_VA, PROGRAM_FILE - FPTEST_FILE);
-    let program = map_file(PROGRAM_FILE, PROGRAM_VA, STATE_SLOTS - PROGRAM_FILE);
+    let program = map_file(PROGRAM_FILE, PROGRAM_VA, PROGRAM_END - PROGRAM_FILE);
     let glibc_ld = map_file(GLIBC_LD_FILE, GLIBC_LD_VA, HELLO_FILE - GLIBC_LD_FILE);
     let hello = map_file(HELLO_FILE, HELLO_VA, LIBC_FILE - HELLO_FILE);
     let libc = map_file(LIBC_FILE, LIBC_VA, LIBC_PAGES);

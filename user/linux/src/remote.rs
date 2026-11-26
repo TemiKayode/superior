@@ -140,12 +140,24 @@ pub fn write(handle: u64, off: u64, data: &[u8]) -> Result<(), u64> {
     Ok(())
 }
 
+/// The disk's free blocks and inodes.
+pub fn statfs() -> Result<(u64, u64), u64> {
+    call([fs::STATFS, 0, 0, 0]).map(|r| (r[0], r[1]))
+}
+
 pub fn truncate(handle: u64, len: u64) -> Result<(), u64> {
     call([fs::TRUNCATE, handle, len, 0]).map(drop)
 }
 
-/// Directory `handle`'s entries from position `cookie`, into the buffer:
-/// how many, and the position after them.
+/// Directory `handle`'s entries from position `cookie`, into the buffer,
+/// each one's position after them (see [`position`]): how many, and the
+/// position after them.
 pub fn readdir(handle: u64, cookie: u64) -> Result<(usize, u64), u64> {
-    call([fs::READDIR, handle, cookie, 0]).map(|r| (r[0] as usize, r[1]))
+    call([fs::READDIR, handle, cookie, fs::READDIR_POSITIONS]).map(|r| (r[0] as usize, r[1]))
+}
+
+/// The position of entry `k` the last [`readdir`] put in the buffer.
+pub fn position(k: usize) -> u64 {
+    let at = fs::POSITIONS_AT + 4 * k;
+    u32::from_le_bytes(buf()[at..at + 4].try_into().unwrap()) as u64
 }

@@ -794,8 +794,9 @@ pub mod root {
     pub const REBOOTS_SHIFT: u32 = 32;
     /// Least size of [`UNTYPED`], in bits: 64 MiB, what every component's
     /// memory comes from. The kernel makes it larger for a bundle that
-    /// needs it (room for twice the bundle: the Linux personality's files,
-    /// gcc's among them, are copied into its memory).
+    /// needs it (room for four times the bundle: the Linux personality's
+    /// files, gcc's among them, are copied into its memory, a block half
+    /// the manager's).
     pub const UNTYPED_BITS: u8 = 26;
     /// Where the bundle is mapped, as an offset from the user window's base.
     pub const BUNDLE_OFFSET: u64 = 0x1_0000_0000;

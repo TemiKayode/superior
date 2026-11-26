@@ -89,8 +89,10 @@ const VSPACE_SLOTS: usize = ROOT_SLOTS + MAX_THREADS;
 const CNODE_POOL: usize = VSPACE_SLOTS + MAX_THREADS;
 /// CNodes are made of 16-slot chunks, aligned to their own size.
 const CNODE_CHUNK: usize = 16;
+/// 16,384 slots: an 8 MiB CNode (the Linux personality's, 2^18 slots) takes
+/// a 1 GiB machine's RAM-sized part, and the rest still fit above it.
 #[cfg(not(feature = "selftest"))]
-const BASE_CHUNKS: usize = 512;
+const BASE_CHUNKS: usize = 1024;
 /// Self-test builds keep the pool this small, so the self-test can fill it.
 #[cfg(feature = "selftest")]
 const BASE_CHUNKS: usize = 16;

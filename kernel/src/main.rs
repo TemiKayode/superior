@@ -243,8 +243,9 @@ fn start_component_manager() -> Result<(), &'static str> {
     static STATE_STORE: AtomicU64 = AtomicU64::new(0);
     if UNTYPED.load(Ordering::SeqCst) == 0 {
         // The components' memory holds copies of the bundle's files: room
-        // for twice the bundle, and never less than the least.
-        let bits = ((2 * bundle.len() as u64).next_power_of_two().ilog2() as u8).max(root::UNTYPED_BITS);
+        // for four times the bundle (one component's block, aligned to its
+        // size, may take half), and never less than the least.
+        let bits = ((4 * bundle.len() as u64).next_power_of_two().ilog2() as u8).max(root::UNTYPED_BITS);
         UNTYPED_BITS.store(bits, Ordering::SeqCst);
         let base = memory::carve(bits).ok_or("no memory for the Component Manager")?;
         let store = memory::carve(12 + root::STATE_PAGES.ilog2() as u8)

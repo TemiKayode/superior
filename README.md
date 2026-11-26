@@ -214,7 +214,7 @@ holds the rest):
   capability or thread refers to it; revoking the untyped it came from destroys it.
   CNode slots come from a pool in the kernel's capability table, which the kernel
   sets aside at boot from its own memory, sized to RAM: a slot for every page plus
-  8,192 (139,840 slots, 88 bytes each with the records of where each frame is
+  16,384 (148,032 slots, 88 bytes each with the records of where each frame is
   mapped, 16 MiB on the 512 MiB QEMU machines). Each slot links to its first child
   and its siblings and counts its copies, so revoke, delete and retype take time
   in proportion to the capabilities they touch, never to the table; the model
@@ -646,7 +646,8 @@ holds the rest):
     zeroed once at first boot, is handed to each new manager, which gives components
     their state pages from it, so they outlive the reboot. At most five reboots in
     60 s, then the system stops.
-  - Components may have larger CSpaces (manifest `cspace`, up to 2^18 slots). The
+  - Components may have larger CSpaces (manifest `cspace`, up to 2^18 slots, or
+    in two levels up to 2^32 with CNodes made for 2^18 of them). The
     manager makes a component's CNode first from its block, so a large one, aligned
     to its size, wastes none of it. A component's address space may be larger too
     (manifest `vspace`, up to 2^20 bytes, page tables included), for a driver that
@@ -2116,6 +2117,75 @@ holds the rest):
   (all of it, or one with `EFD_SEMAPHORE`), blocking at zero, with
   `EFD_NONBLOCK` and `EFD_CLOEXEC`, and readable in `poll` and `epoll`
   while above zero. glib's main loop wakes through one.
+- Room for big programs: the Linux personality's CNode is 2^18 slots (8 MiB),
+  past the 2^16 a manifest names, so each of its seven processes has a
+  27,904-slot span, some 54 MiB of its own pages, up from 11.5 MiB; it is
+  lent memory 4 MiB at a time, up to 64 blocks (256 MiB), up from 32 of
+  1 MiB. Its own memory is 128 MiB (`memory 27`, now allowed when the
+  bundle is large enough: the kernel gives the manager four times the
+  bundle, up from twice, so 256 MiB for its 59 MiB one), its
+  state and the file pool move to slot 23,552 (the state holds every
+  process's frame table, 256 pages), and its test machines have 1 GiB.
+  The kernel's CNode pool has 16,384 slots past the RAM-sized part, up
+  from 8,192, so the big CNode fits on a 1 GiB machine beside the others.
+  `linux-test` has a program touch 48 MiB on both ISAs.
+- cairo and pango, the first of GTK 3's libraries: `linux-test` installs
+  them onto the disk beside glib with what they link to, 22 packages
+  (fontconfig, FreeType, HarfBuzz, FriBidi, pixman, libpng, the X libraries
+  cairo is built with, and util-linux's libmount and libblkid, which glib's
+  GIO links to), and one font, DejaVu Sans, with a fontconfig file naming
+  its directory. A program tcc links against them lays out a line in the
+  font fontconfig picks for "Sans", draws it into an image with cairo and
+  writes it as a PNG, on both ISAs. On the way:
+  - A directory's entries keep their positions while others are removed.
+    The personality counted a disk directory's entries from its first, so
+    `rm -r`, which lists a directory as it empties it, skipped entries and
+    left it full once it had more than a batch. `READDIR` can now return
+    each entry's slot (stable: a removed entry's slot stays empty), and
+    those are the positions `getdents` gives.
+  - A disk file's inode number is the server's. The personality gave its
+    own, from a slot let go of once nothing has the file open and then
+    reused, so musl's dynamic linker, which takes a library with the
+    number of one it has loaded for that one, linked GIO against the
+    wrong library.
+  - `statfs` and `fstatfs` (the disk's free blocks and inodes, from the
+    server), and `link` and `linkat`, refused with `EPERM`, as on FAT:
+    fontconfig then locks its cache with a directory.
+- GTK 3: `linux-test` installs it and the rest of what it links to, 31
+  more packages (gdk-pixbuf and its image libraries, ATK and its bridge,
+  D-Bus's, CUPS's with GnuTLS, epoxy, the X libraries GDK's X backend is
+  built with), and XKB's data, which GDK makes its first keymap from. A
+  program tcc links against it opens a window with a label through GDK's
+  Wayland backend, on the personality's Wayland server, and sees the
+  label drawn, on both ISAs. On the way:
+  - The Wayland server offers `wl_data_device_manager`, whose sources and
+    devices are made and nothing more (GTK 3 binds a seat only once there
+    is one; without a seat it took a keymap from nowhere and crashed),
+    and `wl_output`, the 800x600 screen.
+  - `fallocate` (mode 0: a memory file or a file made at least that long;
+    GTK sets aside its buffers' memory so), and `getresuid` and
+    `getresgid` (every id 0).
+  - A process killed for a page it may have that could not be made says
+    it ran out of memory, and how many pages it had.
+  - gdk-pixbuf tells GTK's icons' type (PNG) by GIO's MIME database. The
+    test writes one of PNG alone, in the text files GIO reads when there
+    is no cache. (shared-mime-info's whole one writes a file per type,
+    851, some with names longer than the disk's 58 bytes.)
+- Memory bounded by RAM, not slots: the Linux personality's CSpace is in
+  two levels (`cspace 20 10 16`: 2^20 slots, a root of 2^10 CNodes of
+  2^10), the manager making the CNodes for the 2^16 slots its manifest
+  names and leaving the rest empty. `cnode 65534` gives it a copy of its
+  root, and it makes the others as a process needs them, from that
+  process's memory, so they go with it. Each process has fixed slots, two
+  for every page of its 256 MiB window (its frame, or a file's page, and
+  the mirror's copy), and 4,096 for its address space and threads; a
+  frame `munmap` gave back stays in the mirror and is moved to the next
+  page made. The CNodes take some 2 MiB of the personality's memory, not
+  8. `linux-test` has a program touch 96 MiB on both ISAs; one asking for
+  128 MiB on the 1 GiB test machine now gets some 114 MiB before the
+  RAM lent to the personality runs out. The manifest's `cspace` takes a
+  third number, the bits of slots the manager makes CNodes for (up to
+  18), and a two-level CSpace may be up to 32 bits.
 - `exec` copies a program's arguments and environment to its stack a piece
   at a time. Before, one longer than 4 KiB (a long `sh -c` script) ran
   past the copy buffer and stopped the personality.

@@ -175,6 +175,9 @@ struct Image {
     /// AArch64 UEFI: firmware in place of QEMU's edk2 (one built with
     /// Secure Boot).
     firmware: Option<PathBuf>,
+    /// QEMU's `-m`: the machine's RAM (Superior's images; seL4's have
+    /// their own).
+    memory: &'static str,
 }
 
 /// The disk drivers, each with the PCI function its test disk appears as
@@ -758,24 +761,141 @@ fn alpine_apk(repo: &str, package: &str, sha256: &str, isa: &str) -> Result<Path
 
 /// Packages the Linux test's guest installs itself, onto its disk: served
 /// by the host's HTTP server at `/apk/<package>.apk`, unpacked by BusyBox's
-/// tar under `/opt/alpine`. glib, and the libintl and PCRE2 it links to.
+/// tar under `/opt/alpine`. glib, and the libintl and PCRE2 it links to
+/// (and util-linux's libmount and libblkid, which its GIO does); then
+/// cairo and pango with what they link to (fontconfig, FreeType,
+/// HarfBuzz, pixman, and the X libraries cairo is built with), and DejaVu,
+/// of which one font is unpacked; then GTK 3 and the rest of what it links
+/// to (GDK's image loaders' libraries, ATK and its bridge, D-Bus's, CUPS's
+/// with GnuTLS, epoxy, and the X libraries GDK's X backend is built with),
+/// and XKB's data, which GDK makes its first keymap from.
 type DiskPackage = (&'static str, &'static str, &'static str);
-const DISK_PACKAGES_X86_64: [DiskPackage; 3] = [
+const DISK_PACKAGES_X86_64: &[DiskPackage] = &[
     ("v3.18/main", "libintl-0.21.1-r7", "fd037a245ebae75479cc0844302465db1d807906f0b18d097939a77c008a67c3"),
     ("v3.18/main", "pcre2-10.42-r1", "4204b387996078ca226b3c6717f67069d63df7958b7fc3846d0cf0edd3f728cd"),
     ("v3.18/main", "glib-2.76.6-r0", "e0cdde2133d4f5356c788dc1f508ff8579bce4997837344dea7fe268e6b3b84b"),
+    ("v3.18/main", "libblkid-2.38.1-r8", "5d65ec5d522c64f1da9dc3c300ac1cea245d61af589b396168231a6825968a05"),
+    ("v3.18/main", "libmount-2.38.1-r8", "8cdec06283f8466665cdbd2b771774e2c62efde11395b9ff5baef7ff87420699"),
+    ("v3.18/main", "libxau-1.0.11-r2", "c623438e0c4455843a3e0f0d5ce842d8acbe8b610ad1b328890d10960321b795"),
+    ("v3.18/main", "libmd-1.0.4-r2", "b88a8fcd6e247d789a3b94d97b3865badb3279da9932dc6676b5b40bcb895580"),
+    ("v3.18/main", "libbsd-0.11.7-r1", "c5185357d55216474e5cce93a3f426f15f63d77d1aee183568027fa23c546de4"),
+    ("v3.18/main", "libxdmcp-1.1.4-r2", "ee02126ffed8e09f6165c780dc5860c49777be40f6a74cffb1b216184db5a3af"),
+    ("v3.18/main", "libxcb-1.15-r1", "787f692f6238f0176a6becffd22aff74f221137e18eebb31c19580ac72aa8098"),
+    ("v3.18/main", "libx11-1.8.7-r0", "2d1439ce444507dcbda9e9d28a3c4065f03c1373e717a976d8bcbd4a3914b349"),
+    ("v3.18/main", "libxext-1.3.5-r2", "f91c598238d663b4d04ea0123363eb5b52ad2d424f966a3ca506c804f4b0cead"),
+    ("v3.18/main", "libxrender-0.9.11-r3", "f2d46da2e776ffdb1e7b125d521aae3c94bc4d5e33aaba25cb257517103cac7c"),
+    ("v3.18/main", "libexpat-2.7.0-r0", "147bc6582b464fa781d885bedb96a41685dd210a58f46d6c2f5e1a632b8a1d40"),
+    ("v3.18/main", "brotli-libs-1.0.9-r14", "a050368dc4cec051cc9094e997be17b52507943b1ed4d6c4b80cfba49f09a00e"),
+    ("v3.18/main", "libpng-1.6.44-r0", "72df3a7d553672932c14f93b89623fba202cf554e6e02d7807c0113e685ab481"),
+    ("v3.18/main", "freetype-2.13.0-r5", "769f0d67619fb66e84b23e062be2779eea5c0591145bde8f848077e61a1dd47b"),
+    ("v3.18/main", "fontconfig-2.14.2-r3", "b594bd0690371285f7ba252351a77525824390a45aafd551e165d36ed5d1898a"),
+    ("v3.18/main", "pixman-0.42.2-r1", "302471e5b8aba2c60960d90c8d974b5e23f01f59d971d3b4c73bfcbc71d3f297"),
+    ("v3.18/main", "cairo-1.17.8-r1", "e329aa55ddc64457d9c87b04dc90f3351b981311053857b23b0e11bb06e7716e"),
+    ("v3.18/main", "libxft-2.3.8-r1", "f9b6d84d923105dc02fa8e96744446f86de9aef76cc40c9f84b31a34e0f9d0e2"),
+    ("v3.18/main", "fribidi-1.0.13-r0", "fc3e2c31c05137ad1dd4fd2c51136892f32161f6b30def7b4c0607819ad7dd32"),
+    ("v3.18/main", "graphite2-1.3.14-r5", "450ac59b8900278e870dae037b80be69bf5d583be2f67b2d019d3563e07ce30a"),
+    ("v3.18/main", "harfbuzz-7.3.0-r0", "a4d55b1b57b122cb432581c2face0c98eda2758fc05a5e5061d546b5c1f47474"),
+    ("v3.18/main", "pango-1.50.14-r1", "45d83a85c57b1767e6b90b1cb40553f50f9df1d3cd8454423bc073deec7a8fec"),
+    ("v3.18/main", "font-dejavu-2.37-r5", "a948474983462287df6e2612f9b6e127661cfef3aa1a72599d061b08fa46969f"),
+    ("v3.18/main", "xz-libs-5.4.3-r1", "5a963c33cec7b976edbdc5fbb48f1b336251d60171559bfafe339cb874d0e3cf"),
+    ("v3.18/main", "libxml2-2.11.8-r3", "5a14c5516979a5b4fd2d14e5ae852f1824ac6930c600285c2df282bfef0c10b1"),
+    ("v3.18/main", "libjpeg-turbo-2.1.5.1-r3", "29b31a9facab381913fa1794e90ec3374e3052a4601ac3171765e6389e840f36"),
+    ("v3.18/main", "libwebp-1.3.2-r0", "0545f32202b578aa21d4fc113deabe83c15f47eaa450aca6a63e80963c858874"),
+    ("v3.18/main", "tiff-4.5.1-r0", "d45ce4cfe70ba97ab52def26f7068cf095f669e64f389dd320225efb849c3ca2"),
+    ("v3.18/main", "gdk-pixbuf-2.42.12-r0", "b2983249f3c8fd33f7bdbd6d36c869e682eaa5a9d9314734896b35c1a89615e8"),
+    ("v3.18/main", "libxcomposite-0.4.6-r3", "f48802d76e0d52e290613674d4ede271bc37abd05b0ba7bb10c7edcb5648b75e"),
+    ("v3.18/main", "libxfixes-6.0.1-r2", "81dd8170d0aea5ff97b868d043be240521e1e51b312e8c2ab71ed8ce9cdfc81d"),
+    ("v3.18/main", "libxcursor-1.2.1-r2", "f7d0c3687643047bcf825bce346087535f5ba4e0253dab1849f681a7095806b1"),
+    ("v3.18/main", "libxdamage-1.1.6-r2", "d1915663235b0a8ec13559f79b55227da95ed9f22d060ffc826de2884e1af599"),
+    ("v3.18/main", "libxi-1.8.1-r0", "4a3efc1472e543e1c4af370f922d2d59f2389f2fdc55f35dd96ec0bd08aee67f"),
+    ("v3.18/main", "libxinerama-1.1.5-r2", "4aae7e046cb2ad7d7229c9ff04ca9e1459128b12d9f4a98febf059af54690f05"),
+    ("v3.18/main", "libxrandr-1.5.3-r2", "55c4b72ecf8e2b5ab95ef60b6d6ee8482e17735f03a7dd2b9d21b31c4ddc2b32"),
+    ("v3.18/main", "libatk-1.0-2.48.4-r0", "c17512497051a963f8a3d04122279a701262c3ac7757e4a610ce71653261a6bc"),
+    ("v3.18/main", "libxtst-1.2.4-r2", "5df9a1722f39dde40402d6067ff81ec972fd951c7a07a284de3a00088d5ae75e"),
+    ("v3.18/main", "dbus-libs-1.14.8-r0", "4da930dd629e1b85e5b6ab66cbd349701e825566e2411f537df002f81fdf96ee"),
+    ("v3.18/main", "at-spi2-core-2.48.4-r0", "4ba04905628b37cb3ef10c4add1acc667b1d9887a132f20c15339d6257028294"),
+    ("v3.18/main", "libatk-bridge-2.0-2.48.4-r0", "c3c55af6c1d1f436f882cf9f1d6940e340bcfeeb09480f3048158c15be8a950d"),
+    ("v3.18/main", "cairo-gobject-1.17.8-r1", "145ca9d930fe2847be6c1e66da3babe9e13775a0baa5059cd82e9b3e0eee475d"),
+    ("v3.18/main", "avahi-libs-0.8-r13", "12afa85501c5c9611ae5e7819e2a832f5b3a73ee53f8cbc52f76ca44b754c0e9"),
+    ("v3.18/main", "nettle-3.8.1-r2", "3f700122c934e214c99dd2c79df24474f2300460b92ce2f914377d33b4f4cbd8"),
+    ("v3.18/main", "libunistring-1.1-r1", "f129f8acb735956d7d57fee22114fd5bd95d028564dee9aad0eb3ab310e16228"),
+    ("v3.18/main", "libidn2-2.3.4-r1", "a8a61b4669cc5a1c726a9fca1ba8e642e1dc9fe8daa845588c0a8360ec6828e3"),
+    ("v3.18/main", "p11-kit-0.24.1-r2", "106ffbd3903beaced1cc79b08a028fe63e24a773624d92db96c8b5c2860c9e44"),
+    ("v3.18/main", "libtasn1-4.20.0-r0", "4af432a1ac3de10a437bc54fa5fd6b8284417af30fffeded8ff53b04f8c30738"),
+    ("v3.18/main", "gnutls-3.8.4-r0", "dd1071dd6213aaf54002afdc0348a77cdf9c90368d3733c7948d55471f78f109"),
+    ("v3.18/main", "cups-libs-2.4.9-r0", "6883af8e085b8126c2905ef9d8b336829914e7d6dcb37d45ed1c592a4d39f35e"),
+    ("v3.18/main", "libepoxy-1.5.10-r1", "d4295c90a3977b6f3d62eafcbcdce029adec6f94298ccc433e615e94da44e9fc"),
+    ("v3.18/main", "wayland-libs-cursor-1.22.0-r2", "083f584f39251e3e609d8cb306f847a99fe987359bfd369978842715a33bf6b0"),
+    ("v3.18/main", "wayland-libs-egl-1.22.0-r2", "202d2332f48fe2b8e5339be5f6154eddd78648d6b20de57bceaec98c8d238ccf"),
+    ("v3.18/main", "gtk+3.0-3.24.43-r0", "ffbaef21f24b7e1d5ae63a6ed818f08490bdf5250873b1bf5dd29909b865aae2"),
+    ("v3.18/main", "xkeyboard-config-2.38-r0", "e213dd0a37f319e4040a84f83e57cc735afcee8ecef1962d05a4a555c1e3f2e0"),
 ];
-const DISK_PACKAGES_AARCH64: [DiskPackage; 3] = [
+const DISK_PACKAGES_AARCH64: &[DiskPackage] = &[
     ("v3.18/main", "libintl-0.21.1-r7", "8e4fae02dccbdb52ccf588ec0e32b1f36817c7e176eb80fc6e0ab7bd98027a36"),
     ("v3.18/main", "pcre2-10.42-r1", "8fe7998769545233bfa1365a4c846bd541341948b5e3b59482b7fe907819e07d"),
     ("v3.18/main", "glib-2.76.6-r0", "d60ec850dcc98c1e6caeda3567d73adccefbe7c9f681c9aa040315bad74188bf"),
+    ("v3.18/main", "libblkid-2.38.1-r8", "ae48e6df6338589a108e27954824c0215d70085981561a05559b27524d8d2001"),
+    ("v3.18/main", "libmount-2.38.1-r8", "c6f8e906e8b5396d4efedd7c8ebacff4bd8da8fdde3ee62a322d9b029a212847"),
+    ("v3.18/main", "libxau-1.0.11-r2", "55b7537ae2b71c41725bcaaa88fc57f54f2b72c8264fdbc875c08b7d378942bb"),
+    ("v3.18/main", "libmd-1.0.4-r2", "10ba20592072304db5af3df6bf89de56974ce465f986069ab81f58a14a7bd5bd"),
+    ("v3.18/main", "libbsd-0.11.7-r1", "c27da9b0e6803b4ddc3b6880ee723ed22870fdd7401c1e72f7407c352503724e"),
+    ("v3.18/main", "libxdmcp-1.1.4-r2", "82202af3b5cbd40159769e181fe12ba6e3911ec9533a970f096a189ddb2a6e65"),
+    ("v3.18/main", "libxcb-1.15-r1", "99f9e0d224eccacc6a6aba15356cfef7d45f58c4a9f9a191fb8e08d3c6f76ba7"),
+    ("v3.18/main", "libx11-1.8.7-r0", "5d809911a9f6f012906f860187f06ba5845fd0005c0589041b663b3af5d81f22"),
+    ("v3.18/main", "libxext-1.3.5-r2", "6721a0228ed1fa08663e8db8352033738dafe466f5d72b0e01a804c69d1079ee"),
+    ("v3.18/main", "libxrender-0.9.11-r3", "595565d7df036fd5cd4b18bb1f4bbebfd410d58dcbb6d32d0de2bd0447307172"),
+    ("v3.18/main", "libexpat-2.7.0-r0", "68d0395e5c481c72c3d0a63d22b858f7617e801f9bb09b5749810982326b4048"),
+    ("v3.18/main", "brotli-libs-1.0.9-r14", "e1273d073d68333cfcbf6d1895f6ab00fcbe44c2091b8ddc4af8681a86132cd6"),
+    ("v3.18/main", "libpng-1.6.44-r0", "925ba27c715c5bcaa8405a54e834204cec733e1c43bfa9f318044c1c86bd664d"),
+    ("v3.18/main", "freetype-2.13.0-r5", "f51847fce6594de8a1b28414e58529187304378941c1e06f9d4028766d095946"),
+    ("v3.18/main", "fontconfig-2.14.2-r3", "67144d54af21cd15c8902573309f95276cb393aa63500d375ec20dbc6a33afb1"),
+    ("v3.18/main", "pixman-0.42.2-r1", "f90d6e1481c529760d393fc5943b59506eff7ba424884a674dc66ab137143bd9"),
+    ("v3.18/main", "cairo-1.17.8-r1", "509fe44acebffc1459149cd97dfb0a844aeeb5c20f56c73376be4313ad266d07"),
+    ("v3.18/main", "libxft-2.3.8-r1", "2f4f7a12e1b8dbab9b9fc1634038fdd195e2d0cc595b680ad947f40e81545439"),
+    ("v3.18/main", "fribidi-1.0.13-r0", "ce0c1e7f9d94ad324e31afd75314787d99dbc053dcddca525f53b17b39b8831c"),
+    ("v3.18/main", "graphite2-1.3.14-r5", "0e38a05cb20efdcf4e420611b0e7b1474e04a3779fb342bbecd2ae6116b4705a"),
+    ("v3.18/main", "harfbuzz-7.3.0-r0", "b2f82884b0fea95b35d9057b23269a0c9b03cf836fae30ee75837a95ed1a9e67"),
+    ("v3.18/main", "pango-1.50.14-r1", "fd944c0fe05dbe5d75392b79a3f9674532ae39ef5824dee8cd0c6a676da0859c"),
+    ("v3.18/main", "font-dejavu-2.37-r5", "c0bc0bedec1d19ed5ae28fd772378758039948d5660b43aa4de61f3cd0c29370"),
+    ("v3.18/main", "xz-libs-5.4.3-r1", "c599eeba662a117e86b9188716a9b7b71e5591fe4fd4b521518271c4f5f422bf"),
+    ("v3.18/main", "libxml2-2.11.8-r3", "822443d930dba664f4854e352a810fa4b9ef38233688550fb24c936ffae533af"),
+    ("v3.18/main", "libjpeg-turbo-2.1.5.1-r3", "f24f1c8f1c558f535721943feba6a134dd2370644e8262b7f84e3b569c35254f"),
+    ("v3.18/main", "libwebp-1.3.2-r0", "7c703c5fc2b943c6b425a17cd58c6a1789d1d28ca3f3ecdf5bcc1f5aa30d59de"),
+    ("v3.18/main", "tiff-4.5.1-r0", "b6250cbe8a6dc44b246d636e88c11bd5ff4a6e9b76d38f91a1f527fcf0ad2ffe"),
+    ("v3.18/main", "gdk-pixbuf-2.42.12-r0", "10577637dd4289a43bcf035ef492861b90f543c7a6aa456991700e03037589c5"),
+    ("v3.18/main", "libxcomposite-0.4.6-r3", "a7b787f76ac86ad3afbff198fa5251c2699894462cee25a439254f9f35c17dcb"),
+    ("v3.18/main", "libxfixes-6.0.1-r2", "4821a6e3ceaa9118f0017249359e3a7d1aeca7b479a2dc95e7cf071a4920b229"),
+    ("v3.18/main", "libxcursor-1.2.1-r2", "5e6edd1bc6d2006305e443f89b28fa0696614a71cdb5983daa431780b8fe377d"),
+    ("v3.18/main", "libxdamage-1.1.6-r2", "25c340b6b9a84b3c2f0469483c2ca48246805e63846d4c327c819fe23e1b61c2"),
+    ("v3.18/main", "libxi-1.8.1-r0", "cb8382687ccf43c9dd5419f97b9dfad67556b3e337e675b40989655999c6a9ce"),
+    ("v3.18/main", "libxinerama-1.1.5-r2", "651fc57bb6b0674a2f9a2084f26a6b26d85e0e311ded60758c27b4ac406623ec"),
+    ("v3.18/main", "libxrandr-1.5.3-r2", "6c9cac156ed71275d92bbbe4fdb9a02c7ae96a50dcfc3763dcb0b73d947f8cec"),
+    ("v3.18/main", "libatk-1.0-2.48.4-r0", "4ba252f1458f710d84e01735aeb5cc10aa0c71999821fe3864dfd03627e43ea0"),
+    ("v3.18/main", "libxtst-1.2.4-r2", "e6752414f8829ce9e8ab8cab4dadaf3b2939771b00a3c81f876eac7d7a56894a"),
+    ("v3.18/main", "dbus-libs-1.14.8-r0", "754f30f5e44281ab7870984b08bc92d54190c373bde2ffdedbdeb63fbdf592fc"),
+    ("v3.18/main", "at-spi2-core-2.48.4-r0", "87f7f28cd87718f2ff76cbd1a9cb425d360cde56d04938b7dcca94b1075eb132"),
+    ("v3.18/main", "libatk-bridge-2.0-2.48.4-r0", "8023a5c1e674b20785f861e68b06b9dc7582065b06274e64e31bccca71cc745d"),
+    ("v3.18/main", "cairo-gobject-1.17.8-r1", "86ea74ebd888414bc1b1b8085863fddb28c3d13e5aa9d9d94dcbfd59acc7980d"),
+    ("v3.18/main", "avahi-libs-0.8-r13", "57c30eac05f6363dae67da8daa56c16e866386e31ff37cdf77125c93336954d1"),
+    ("v3.18/main", "nettle-3.8.1-r2", "843d813e01b0446be398aecc8bbb1932cdee8600d23cb39d22a88c052ca32c02"),
+    ("v3.18/main", "libunistring-1.1-r1", "b6da9482d4bb462b9f5605aad06b7117441840f5bfd5fa4a59111309de4c8cc4"),
+    ("v3.18/main", "libidn2-2.3.4-r1", "13b47ce739b46f9795c726ea7869fae71ebf6112c989d696ad22e287dca43938"),
+    ("v3.18/main", "p11-kit-0.24.1-r2", "e0f0a5bc5af011aee076542a7a47ca556e84ed3e2b0dbd5425e665aaba640ec3"),
+    ("v3.18/main", "libtasn1-4.20.0-r0", "cdfff363b5476a1f33432b4f5eabac77415d20de72b1622b4481800b8e8966e1"),
+    ("v3.18/main", "gnutls-3.8.4-r0", "f8237e40533d397ed736be86e6a8e04266a5ea64f60c3bfce6e18a57f25b4f9c"),
+    ("v3.18/main", "cups-libs-2.4.9-r0", "446d93673d7861e276e1aa9818f672467a4740cae5989d5117f31c64e59c58fa"),
+    ("v3.18/main", "libepoxy-1.5.10-r1", "5febabba2742e13ddd38c39f089a05da8cd4fe08d0dc0252839af7f4da4dd312"),
+    ("v3.18/main", "wayland-libs-cursor-1.22.0-r2", "fe1c0816c65c7d68ebc7e9e9cf844bd1a6351a51ebcb6621d20d53b0c87f6e50"),
+    ("v3.18/main", "wayland-libs-egl-1.22.0-r2", "78492681088fdfbd5194201109ef63004a0d11b41ba53fee08928125796015ab"),
+    ("v3.18/main", "gtk+3.0-3.24.43-r0", "da3e268f267d86eec184b51b8ada6f2ba669f6d3d13dde35cf2b385ec9e36a55"),
+    ("v3.18/main", "xkeyboard-config-2.38-r0", "28774f1e6c213b59a34b4d321f1867dd7341684ee15404b0bf9fbca14dc2e049"),
 ];
 
 /// The disk packages for `arch`, each as (its request path, its bytes).
 fn disk_packages(arch: Arch) -> Result<Vec<(String, Vec<u8>)>, String> {
     let (isa, packages) = match arch {
-        Arch::X86_64 => ("x86_64", &DISK_PACKAGES_X86_64),
-        Arch::Aarch64 => ("aarch64", &DISK_PACKAGES_AARCH64),
+        Arch::X86_64 => ("x86_64", DISK_PACKAGES_X86_64),
+        Arch::Aarch64 => ("aarch64", DISK_PACKAGES_AARCH64),
     };
     packages
         .iter()
@@ -1303,6 +1423,16 @@ fn linux_test(img: &Image) -> Result<(), String> {
         // An eventfd as a semaphore, made with 2: two reads of 1, then
         // EAGAIN; a write of 5, and a read of 1 again.
         "linux: > eventfd: reads 8 8 -1, after writing 5: 8 of 1",
+        // cairo and pango installed beside it: a line of text laid out in
+        // DejaVu Sans (fontconfig's pick for "Sans") and drawn inside the
+        // box pango gave it.
+        "linux: > pango: cairo 1.17.8, pango 1.50.14, font DejaVu Sans 24, a line laid out 135x38, inked inside its box",
+        // GTK 3 installed beside them: a window with a label, opened on
+        // the personality's Wayland server and drawn.
+        "linux: > gtk: 3.24.43 on GdkWaylandDisplay, a 240x80 window, its label drawn",
+        // 96 MiB touched by one process (24576 pages, numbered mod 256), past
+        // the 27904 slots (some 54 MiB) a process once had.
+        "linux: > big: 96 MiB touched, sum 3133440",
         // The terminal session (its steps were checked as it ran).
         "linux: running sh (pid ",
         "linux: sh exited with status 0",
@@ -2158,6 +2288,9 @@ fn image_sealed(
         smp: None,
         vars: None,
         firmware: None,
+        // The Linux personality's: 128 MiB of its own (its files) and a
+        // big program's memory from the rest of RAM.
+        memory: if matches!(manifest, "linux" | "linux-verify") { "1G" } else { "512M" },
     })
 }
 
@@ -2268,6 +2401,7 @@ fn sel4_image() -> Result<Image, String> {
         smp: None,
         vars: None,
         firmware: None,
+        memory: "512M",
     })
 }
 
@@ -2610,7 +2744,7 @@ fn qemu_command(img: &Image) -> Command {
                 // OVMF, the UEFI firmware QEMU ships, in place of SeaBIOS.
                 q.arg("-drive")
                     .arg(format!("if=pflash,format=raw,readonly=on,file={}", ovmf().display()))
-                    .args(["-m", "512M"]);
+                    .args(["-m", img.memory]);
             }
             q.args(["-device", "isa-debug-exit,iobase=0xf4,iosize=0x04"]);
             // The suspend test's clock keeps running while the machine is
@@ -2679,12 +2813,12 @@ fn qemu_command(img: &Image) -> Command {
                 .args(["-m", SEL4_MEMORY]);
             } else {
                 q.args(["-semihosting-config", "enable=on,target=native"])
-                    .args(["-m", "512M"]);
+                    .args(["-m", img.memory]);
             }
         }
     }
     if img.arch == Arch::X86_64 {
-        q.args(["-m", "512M"]);
+        q.args(["-m", img.memory]);
     }
     // Several CPUs, except for seL4's images (built for one).
     if !img.sel4 {

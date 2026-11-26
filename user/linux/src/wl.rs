@@ -4,8 +4,11 @@
 //! and speaks Wayland's wire protocol to each client that connects: the
 //! core (`wl_display`, `wl_registry`, `wl_callback`), `wl_compositor`
 //! with surfaces and regions, `wl_shm` with pools and buffers (a pool's
-//! memory a memory file, [`crate::Shm`], passed with it), and
-//! `xdg_wm_base` with `xdg_surface` and `xdg_toplevel`.
+//! memory a memory file, [`crate::Shm`], passed with it),
+//! `xdg_wm_base` with `xdg_surface` and `xdg_toplevel`, and
+//! `wl_data_device_manager`, whose sources and devices are made and
+//! nothing more: no selection or drag is passed on (GTK 3 binds a seat
+//! only once there is one), and `wl_output`, the screen ([`SCREEN`]).
 //!
 //! Each toplevel is a window of the compositor's, undecorated (a Wayland
 //! client draws its own), made the size of the first buffer committed to
@@ -53,7 +56,19 @@ const MAX_POOLS: usize = 8;
 const MAX_FRAMES: usize = 4;
 
 /// The globals, by name (their index + 1): interface and version.
-const GLOBALS: [(&[u8], u32); 4] = [(b"wl_compositor", 4), (b"wl_shm", 1), (b"xdg_wm_base", 1), (b"wl_seat", 5)];
+const GLOBALS: [(&[u8], u32); 6] = [
+    (b"wl_compositor", 4),
+    (b"wl_shm", 1),
+    (b"xdg_wm_base", 1),
+    (b"wl_seat", 5),
+    (b"wl_data_device_manager", 3),
+    (b"wl_output", 2),
+];
+
+/// The screen `wl_output` describes: the test machines' (xtask's), at 96
+/// dots an inch, 60 times a second. The compositor has no call that
+/// says its size.
+const SCREEN: (u32, u32) = (800, 600);
 
 /// `wl_shm` formats: ARGB8888 and XRGB8888, which the screen's pixels are.
 const ARGB8888: u32 = 0;
@@ -84,6 +99,11 @@ enum Iface {
     Seat,
     Pointer,
     Keyboard,
+    /// The data device manager, its sources and devices (kept, unused).
+    DataManager,
+    DataSource,
+    DataDevice,
+    Output,
 }
 
 /// A client's object: its id, interface, and the table entry it is (a
@@ -476,6 +496,8 @@ fn request(st: &mut State, sv: &mut Server, c: usize, id: u32, op: u16, args: &[
                 2 => Iface::Shm,
                 3 => Iface::WmBase,
                 4 => Iface::Seat,
+                5 => Iface::DataManager,
+                6 => Iface::Output,
                 _ => return Err(bad(INVALID_METHOD)),
             };
             let version = version.clamp(1, GLOBALS[name as usize - 1].1) as u8;
@@ -483,6 +505,19 @@ fn request(st: &mut State, sv: &mut Server, c: usize, id: u32, op: u16, args: &[
             if iface == Iface::Shm {
                 send(st, sv, c, Msg::new(new, 0).u(ARGB8888));
                 send(st, sv, c, Msg::new(new, 0).u(XRGB8888));
+            }
+            // wl_output: where it is and how big (millimetres), its one
+            // mode (current and preferred, in millihertz), then (version
+            // 2) its scale and that this is all.
+            if iface == Iface::Output {
+                let mm = |px: u32| (px * 254 / 960) as u32;
+                let msg = Msg::new(new, 0).u(0).u(0).u(mm(SCREEN.0)).u(mm(SCREEN.1)).u(0).s(b"Superior").s(b"screen").u(0);
+                send(st, sv, c, msg);
+                send(st, sv, c, Msg::new(new, 1).u(3).u(SCREEN.0).u(SCREEN.1).u(60_000));
+                if version >= 2 {
+                    send(st, sv, c, Msg::new(new, 3).u(1));
+                    send(st, sv, c, Msg::new(new, 2));
+                }
             }
             // wl_seat: a pointer and a keyboard (capabilities), its name.
             if iface == Iface::Seat {
@@ -668,6 +703,16 @@ fn request(st: &mut State, sv: &mut Server, c: usize, id: u32, op: u16, args: &[
         (Iface::Seat, 3) | (Iface::Pointer, 1) | (Iface::Keyboard, 0) => remove(st, sv, c, id),
         // wl_pointer.set_cursor: the compositor draws its own.
         (Iface::Pointer, 0) => {}
+        // wl_data_device_manager.create_data_source, get_data_device;
+        // wl_data_source.offer, set_actions; wl_data_device.start_drag,
+        // set_selection: taken, and nothing passed on. Then their
+        // destroy and release.
+        (Iface::DataManager, 0) => add(sv, c, a.u().map_err(bad)?, Iface::DataSource, 0)?,
+        (Iface::DataManager, 1) => add(sv, c, a.u().map_err(bad)?, Iface::DataDevice, 0)?,
+        (Iface::DataSource, 0) | (Iface::DataSource, 2) | (Iface::DataDevice, 0) | (Iface::DataDevice, 1) => {}
+        (Iface::DataSource, 1) | (Iface::DataDevice, 2) => remove(st, sv, c, id),
+        // wl_output.release (version 3).
+        (Iface::Output, 0) => remove(st, sv, c, id),
         _ => return Err(bad(INVALID_METHOD)),
     }
     Ok(())
