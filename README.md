@@ -2128,6 +2128,28 @@ holds the rest):
   The kernel's CNode pool has 16,384 slots past the RAM-sized part, up
   from 8,192, so the big CNode fits on a 1 GiB machine beside the others.
   `linux-test` has a program touch 48 MiB on both ISAs.
+- cairo and pango, the first of GTK 3's libraries: `linux-test` installs
+  them onto the disk beside glib with what they link to, 22 packages
+  (fontconfig, FreeType, HarfBuzz, FriBidi, pixman, libpng, the X libraries
+  cairo is built with, and util-linux's libmount and libblkid, which glib's
+  GIO links to), and one font, DejaVu Sans, with a fontconfig file naming
+  its directory. A program tcc links against them lays out a line in the
+  font fontconfig picks for "Sans", draws it into an image with cairo and
+  writes it as a PNG, on both ISAs. On the way:
+  - A directory's entries keep their positions while others are removed.
+    The personality counted a disk directory's entries from its first, so
+    `rm -r`, which lists a directory as it empties it, skipped entries and
+    left it full once it had more than a batch. `READDIR` can now return
+    each entry's slot (stable: a removed entry's slot stays empty), and
+    those are the positions `getdents` gives.
+  - A disk file's inode number is the server's. The personality gave its
+    own, from a slot let go of once nothing has the file open and then
+    reused, so musl's dynamic linker, which takes a library with the
+    number of one it has loaded for that one, linked GIO against the
+    wrong library.
+  - `statfs` and `fstatfs` (the disk's free blocks and inodes, from the
+    server), and `link` and `linkat`, refused with `EPERM`, as on FAT:
+    fontconfig then locks its cache with a directory.
 - `exec` copies a program's arguments and environment to its stack a piece
   at a time. Before, one longer than 4 KiB (a long `sh -c` script) ran
   past the copy buffer and stopped the personality.

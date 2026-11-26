@@ -761,24 +761,74 @@ fn alpine_apk(repo: &str, package: &str, sha256: &str, isa: &str) -> Result<Path
 
 /// Packages the Linux test's guest installs itself, onto its disk: served
 /// by the host's HTTP server at `/apk/<package>.apk`, unpacked by BusyBox's
-/// tar under `/opt/alpine`. glib, and the libintl and PCRE2 it links to.
+/// tar under `/opt/alpine`. glib, and the libintl and PCRE2 it links to
+/// (and util-linux's libmount and libblkid, which its GIO does); then
+/// cairo and pango with what they link to (fontconfig, FreeType,
+/// HarfBuzz, pixman, and the X libraries cairo is built with), and DejaVu,
+/// of which one font is unpacked.
 type DiskPackage = (&'static str, &'static str, &'static str);
-const DISK_PACKAGES_X86_64: [DiskPackage; 3] = [
+const DISK_PACKAGES_X86_64: &[DiskPackage] = &[
     ("v3.18/main", "libintl-0.21.1-r7", "fd037a245ebae75479cc0844302465db1d807906f0b18d097939a77c008a67c3"),
     ("v3.18/main", "pcre2-10.42-r1", "4204b387996078ca226b3c6717f67069d63df7958b7fc3846d0cf0edd3f728cd"),
     ("v3.18/main", "glib-2.76.6-r0", "e0cdde2133d4f5356c788dc1f508ff8579bce4997837344dea7fe268e6b3b84b"),
+    ("v3.18/main", "libblkid-2.38.1-r8", "5d65ec5d522c64f1da9dc3c300ac1cea245d61af589b396168231a6825968a05"),
+    ("v3.18/main", "libmount-2.38.1-r8", "8cdec06283f8466665cdbd2b771774e2c62efde11395b9ff5baef7ff87420699"),
+    ("v3.18/main", "libxau-1.0.11-r2", "c623438e0c4455843a3e0f0d5ce842d8acbe8b610ad1b328890d10960321b795"),
+    ("v3.18/main", "libmd-1.0.4-r2", "b88a8fcd6e247d789a3b94d97b3865badb3279da9932dc6676b5b40bcb895580"),
+    ("v3.18/main", "libbsd-0.11.7-r1", "c5185357d55216474e5cce93a3f426f15f63d77d1aee183568027fa23c546de4"),
+    ("v3.18/main", "libxdmcp-1.1.4-r2", "ee02126ffed8e09f6165c780dc5860c49777be40f6a74cffb1b216184db5a3af"),
+    ("v3.18/main", "libxcb-1.15-r1", "787f692f6238f0176a6becffd22aff74f221137e18eebb31c19580ac72aa8098"),
+    ("v3.18/main", "libx11-1.8.7-r0", "2d1439ce444507dcbda9e9d28a3c4065f03c1373e717a976d8bcbd4a3914b349"),
+    ("v3.18/main", "libxext-1.3.5-r2", "f91c598238d663b4d04ea0123363eb5b52ad2d424f966a3ca506c804f4b0cead"),
+    ("v3.18/main", "libxrender-0.9.11-r3", "f2d46da2e776ffdb1e7b125d521aae3c94bc4d5e33aaba25cb257517103cac7c"),
+    ("v3.18/main", "libexpat-2.7.0-r0", "147bc6582b464fa781d885bedb96a41685dd210a58f46d6c2f5e1a632b8a1d40"),
+    ("v3.18/main", "brotli-libs-1.0.9-r14", "a050368dc4cec051cc9094e997be17b52507943b1ed4d6c4b80cfba49f09a00e"),
+    ("v3.18/main", "libpng-1.6.44-r0", "72df3a7d553672932c14f93b89623fba202cf554e6e02d7807c0113e685ab481"),
+    ("v3.18/main", "freetype-2.13.0-r5", "769f0d67619fb66e84b23e062be2779eea5c0591145bde8f848077e61a1dd47b"),
+    ("v3.18/main", "fontconfig-2.14.2-r3", "b594bd0690371285f7ba252351a77525824390a45aafd551e165d36ed5d1898a"),
+    ("v3.18/main", "pixman-0.42.2-r1", "302471e5b8aba2c60960d90c8d974b5e23f01f59d971d3b4c73bfcbc71d3f297"),
+    ("v3.18/main", "cairo-1.17.8-r1", "e329aa55ddc64457d9c87b04dc90f3351b981311053857b23b0e11bb06e7716e"),
+    ("v3.18/main", "libxft-2.3.8-r1", "f9b6d84d923105dc02fa8e96744446f86de9aef76cc40c9f84b31a34e0f9d0e2"),
+    ("v3.18/main", "fribidi-1.0.13-r0", "fc3e2c31c05137ad1dd4fd2c51136892f32161f6b30def7b4c0607819ad7dd32"),
+    ("v3.18/main", "graphite2-1.3.14-r5", "450ac59b8900278e870dae037b80be69bf5d583be2f67b2d019d3563e07ce30a"),
+    ("v3.18/main", "harfbuzz-7.3.0-r0", "a4d55b1b57b122cb432581c2face0c98eda2758fc05a5e5061d546b5c1f47474"),
+    ("v3.18/main", "pango-1.50.14-r1", "45d83a85c57b1767e6b90b1cb40553f50f9df1d3cd8454423bc073deec7a8fec"),
+    ("v3.18/main", "font-dejavu-2.37-r5", "a948474983462287df6e2612f9b6e127661cfef3aa1a72599d061b08fa46969f"),
 ];
-const DISK_PACKAGES_AARCH64: [DiskPackage; 3] = [
+const DISK_PACKAGES_AARCH64: &[DiskPackage] = &[
     ("v3.18/main", "libintl-0.21.1-r7", "8e4fae02dccbdb52ccf588ec0e32b1f36817c7e176eb80fc6e0ab7bd98027a36"),
     ("v3.18/main", "pcre2-10.42-r1", "8fe7998769545233bfa1365a4c846bd541341948b5e3b59482b7fe907819e07d"),
     ("v3.18/main", "glib-2.76.6-r0", "d60ec850dcc98c1e6caeda3567d73adccefbe7c9f681c9aa040315bad74188bf"),
+    ("v3.18/main", "libblkid-2.38.1-r8", "ae48e6df6338589a108e27954824c0215d70085981561a05559b27524d8d2001"),
+    ("v3.18/main", "libmount-2.38.1-r8", "c6f8e906e8b5396d4efedd7c8ebacff4bd8da8fdde3ee62a322d9b029a212847"),
+    ("v3.18/main", "libxau-1.0.11-r2", "55b7537ae2b71c41725bcaaa88fc57f54f2b72c8264fdbc875c08b7d378942bb"),
+    ("v3.18/main", "libmd-1.0.4-r2", "10ba20592072304db5af3df6bf89de56974ce465f986069ab81f58a14a7bd5bd"),
+    ("v3.18/main", "libbsd-0.11.7-r1", "c27da9b0e6803b4ddc3b6880ee723ed22870fdd7401c1e72f7407c352503724e"),
+    ("v3.18/main", "libxdmcp-1.1.4-r2", "82202af3b5cbd40159769e181fe12ba6e3911ec9533a970f096a189ddb2a6e65"),
+    ("v3.18/main", "libxcb-1.15-r1", "99f9e0d224eccacc6a6aba15356cfef7d45f58c4a9f9a191fb8e08d3c6f76ba7"),
+    ("v3.18/main", "libx11-1.8.7-r0", "5d809911a9f6f012906f860187f06ba5845fd0005c0589041b663b3af5d81f22"),
+    ("v3.18/main", "libxext-1.3.5-r2", "6721a0228ed1fa08663e8db8352033738dafe466f5d72b0e01a804c69d1079ee"),
+    ("v3.18/main", "libxrender-0.9.11-r3", "595565d7df036fd5cd4b18bb1f4bbebfd410d58dcbb6d32d0de2bd0447307172"),
+    ("v3.18/main", "libexpat-2.7.0-r0", "68d0395e5c481c72c3d0a63d22b858f7617e801f9bb09b5749810982326b4048"),
+    ("v3.18/main", "brotli-libs-1.0.9-r14", "e1273d073d68333cfcbf6d1895f6ab00fcbe44c2091b8ddc4af8681a86132cd6"),
+    ("v3.18/main", "libpng-1.6.44-r0", "925ba27c715c5bcaa8405a54e834204cec733e1c43bfa9f318044c1c86bd664d"),
+    ("v3.18/main", "freetype-2.13.0-r5", "f51847fce6594de8a1b28414e58529187304378941c1e06f9d4028766d095946"),
+    ("v3.18/main", "fontconfig-2.14.2-r3", "67144d54af21cd15c8902573309f95276cb393aa63500d375ec20dbc6a33afb1"),
+    ("v3.18/main", "pixman-0.42.2-r1", "f90d6e1481c529760d393fc5943b59506eff7ba424884a674dc66ab137143bd9"),
+    ("v3.18/main", "cairo-1.17.8-r1", "509fe44acebffc1459149cd97dfb0a844aeeb5c20f56c73376be4313ad266d07"),
+    ("v3.18/main", "libxft-2.3.8-r1", "2f4f7a12e1b8dbab9b9fc1634038fdd195e2d0cc595b680ad947f40e81545439"),
+    ("v3.18/main", "fribidi-1.0.13-r0", "ce0c1e7f9d94ad324e31afd75314787d99dbc053dcddca525f53b17b39b8831c"),
+    ("v3.18/main", "graphite2-1.3.14-r5", "0e38a05cb20efdcf4e420611b0e7b1474e04a3779fb342bbecd2ae6116b4705a"),
+    ("v3.18/main", "harfbuzz-7.3.0-r0", "b2f82884b0fea95b35d9057b23269a0c9b03cf836fae30ee75837a95ed1a9e67"),
+    ("v3.18/main", "pango-1.50.14-r1", "fd944c0fe05dbe5d75392b79a3f9674532ae39ef5824dee8cd0c6a676da0859c"),
+    ("v3.18/main", "font-dejavu-2.37-r5", "c0bc0bedec1d19ed5ae28fd772378758039948d5660b43aa4de61f3cd0c29370"),
 ];
 
 /// The disk packages for `arch`, each as (its request path, its bytes).
 fn disk_packages(arch: Arch) -> Result<Vec<(String, Vec<u8>)>, String> {
     let (isa, packages) = match arch {
-        Arch::X86_64 => ("x86_64", &DISK_PACKAGES_X86_64),
-        Arch::Aarch64 => ("aarch64", &DISK_PACKAGES_AARCH64),
+        Arch::X86_64 => ("x86_64", DISK_PACKAGES_X86_64),
+        Arch::Aarch64 => ("aarch64", DISK_PACKAGES_AARCH64),
     };
     packages
         .iter()
@@ -1306,6 +1356,10 @@ fn linux_test(img: &Image) -> Result<(), String> {
         // An eventfd as a semaphore, made with 2: two reads of 1, then
         // EAGAIN; a write of 5, and a read of 1 again.
         "linux: > eventfd: reads 8 8 -1, after writing 5: 8 of 1",
+        // cairo and pango installed beside it: a line of text laid out in
+        // DejaVu Sans (fontconfig's pick for "Sans") and drawn inside the
+        // box pango gave it.
+        "linux: > pango: cairo 1.17.8, pango 1.50.14, font DejaVu Sans 24, a line laid out 135x38, inked inside its box",
         // 48 MiB touched by one process (12288 pages, numbered mod 256).
         "linux: > big: 48 MiB touched, sum 1566720",
         // The terminal session (its steps were checked as it ran).

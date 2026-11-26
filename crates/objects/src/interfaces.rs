@@ -941,10 +941,17 @@ pub mod fs {
     /// directory) of the same kind at `to`. A directory cannot move into
     /// itself.
     pub const RENAME: u64 = 8;
-    /// `[READDIR, handle, cookie]` with a frame granted: fills it with up
-    /// to 64 [`Entry`] records from position `cookie` (start with 0).
-    /// Reply `[status, entries, next cookie]`; no entries means the end.
+    /// `[READDIR, handle, cookie, flags]` with a frame granted: fills it
+    /// with up to 64 [`Entry`] records from position `cookie` (start with
+    /// 0). Reply `[status, entries, next cookie]`; no entries means the
+    /// end. A position is an entry's slot in the directory, which no
+    /// other entry's removal moves. With [`READDIR_POSITIONS`] in `flags`,
+    /// at most [`POSITIONS_MAX`] entries, and each one's position as a
+    /// little-endian u32 from [`POSITIONS_AT`] in the frame (a 4 KiB one).
     pub const READDIR: u64 = 9;
+    pub const READDIR_POSITIONS: u64 = 1;
+    pub const POSITIONS_MAX: usize = 60;
+    pub const POSITIONS_AT: usize = POSITIONS_MAX * ENTRY;
     /// `[TRUNCATE, handle, size]`: sets a file's size; bytes past the old
     /// end read as zero.
     pub const TRUNCATE: u64 = 10;

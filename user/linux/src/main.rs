@@ -463,6 +463,9 @@ enum Sys {
     Unlinkat,
     Symlinkat,
     Readlinkat,
+    Link,
+    Statfs,
+    Fstatfs,
     Umask,
     Getpid,
     Getppid,
@@ -623,6 +626,9 @@ fn decode(nr: u64, a: [u64; 6]) -> (Sys, [u64; 6]) {
         84 => return (Sys::Unlinkat, [cwd, a[0], AT_REMOVEDIR, 0, 0, 0]),
         87 => return (Sys::Unlinkat, [cwd, a[0], 0, 0, 0, 0]),
         88 => return (Sys::Symlinkat, [a[0], cwd, a[1], 0, 0, 0]),
+        86 | 265 => Sys::Link,
+        137 => Sys::Statfs,
+        138 => Sys::Fstatfs,
         89 => return (Sys::Readlinkat, [cwd, a[0], a[1], a[2], 0, 0]),
         95 => Sys::Umask,
         96 => Sys::Gettimeofday,
@@ -669,6 +675,9 @@ fn decode(nr: u64, a: [u64; 6]) -> (Sys, [u64; 6]) {
         34 => Sys::Mkdirat,
         35 => Sys::Unlinkat,
         36 => Sys::Symlinkat,
+        37 => Sys::Link,
+        43 => Sys::Statfs,
+        44 => Sys::Fstatfs,
         38 | 276 => Sys::Renameat,
         46 => Sys::Ftruncate,
         48 | 439 => Sys::Faccessat,
@@ -2351,6 +2360,21 @@ fn answer(st: &mut State, t: usize, call: Sys, a: [u64; 6]) -> Out {
         }),
         Sys::Renameat => r(renameat(st, i, a)),
         Sys::Readlinkat => r(readlinkat(st, i, a)),
+        // No hard links, as on FAT: fontconfig then locks its cache with
+        // a directory instead.
+        Sys::Link => Ret(err(EPERM)),
+        Sys::Statfs => r({
+            let mut p = [0u8; 256];
+            st.cstr(i, a[0], &mut p).and_then(|n| st.fs.resolve(st.procs[i].cwd, &p[..n], true)).and_then(|ino| {
+                let s = statfs_bytes(st, Some(ino));
+                st.put(i, a[1], &s).map(|_| 0)
+            })
+        }),
+        Sys::Fstatfs => r(st.file(i, a[0]).ok_or(EBADF).and_then(|f| {
+            let o = st.files[f];
+            let s = statfs_bytes(st, (o.kind == FileKind::Node).then_some(o.ino));
+            st.put(i, a[1], &s).map(|_| 0)
+        })),
         Sys::Umask => Ret(0o22),
         Sys::Getpid => Ret(st.procs[i].pid as u64),
         Sys::Getpgid => r(group_of(st, i, a[0]).map(|k| st.procs[k].pgid as u64)),
@@ -2496,7 +2520,7 @@ fn fstat(st: &mut State, i: usize, fd: u64, buf: u64) -> Result<u64, u64> {
     let f = st.file(i, fd).ok_or(EBADF)?;
     let o = st.files[f];
     let s = match o.kind {
-        FileKind::Node => stat_bytes(mode_of(st.fs.kind(o.ino)), o.ino as u64, st.fs.size(o.ino)),
+        FileKind::Node => stat_bytes(mode_of(st.fs.kind(o.ino)), st.fs.number(o.ino), st.fs.size(o.ino)),
         FileKind::Console | FileKind::Tty => stat_bytes(0o20620, 0, 0),
         FileKind::Socket | FileKind::Unix => stat_bytes(0o140777, 0, 0),
         FileKind::Shm => stat_bytes(0o100600, 0, st.shm[o.pipe as usize].size),
@@ -2514,7 +2538,7 @@ fn fstatat(st: &mut State, i: usize, a: [u64; 6]) -> Result<u64, u64> {
     }
     let base = st.dir_of(i, a[0])?;
     let ino = st.fs.resolve(base, &p[..n], a[3] & AT_SYMLINK_NOFOLLOW == 0)?;
-    let s = stat_bytes(mode_of(st.fs.kind(ino)), ino as u64, st.fs.size(ino));
+    let s = stat_bytes(mode_of(st.fs.kind(ino)), st.fs.number(ino), st.fs.size(ino));
     st.put(i, a[2], &s[..STAT_LEN])
 }
 
@@ -2989,6 +3013,30 @@ fn renameat(st: &mut State, i: usize, a: [u64; 6]) -> Result<u64, u64> {
     let ino = st.fs.lookup(d1, name1).ok_or(ENOENT)?;
     let (d2, name2) = st.fs.parent_of(b2, &p2[..n2])?;
     st.fs.rename(ino, d2, name2).map(|_| 0)
+}
+
+/// What `statfs` says of the filesystem `ino` is on (none: a pipe's or a
+/// socket's): the disk's, its free blocks and inodes from the server
+/// (and as many blocks in all), or memory's.
+fn statfs_bytes(st: &State, ino: Option<u16>) -> [u8; 120] {
+    /// What the disk's type is given as ("SUPR"); memory's is tmpfs's.
+    const DISK_MAGIC: u64 = 0x5355_5052;
+    const TMPFS_MAGIC: u64 = 0x0102_1994;
+    let (kind, blocks, files) = match ino {
+        Some(ino) if st.fs.is_remote(ino) => {
+            let (blocks, files) = remote::statfs().unwrap_or((0, 0));
+            (DISK_MAGIC, blocks, files)
+        }
+        _ => (TMPFS_MAGIC, 0, st.fs.free_inodes() as u64),
+    };
+    // type, block size, blocks, free, available, inodes, free, the
+    // filesystem's id, the longest name, fragment size, flags, spare.
+    let words = [kind, PAGE, blocks, blocks, blocks, files, files, 0, fs::NAME_MAX as u64, PAGE, 0, 0, 0, 0, 0];
+    let mut b = [0u8; 120];
+    for (k, w) in words.iter().enumerate() {
+        b[k * 8..k * 8 + 8].copy_from_slice(&w.to_le_bytes());
+    }
+    b
 }
 
 fn readlinkat(st: &mut State, i: usize, a: [u64; 6]) -> Result<u64, u64> {
@@ -5532,13 +5580,29 @@ const RUNS: &[(&[&str], u32)] = &[
         0,
     ),
     // A program tcc links against glib from there: a hash table, a regular
-    // expression (PCRE2's), and glib's main loop with a timeout. Then the
-    // packages are removed, so the second boot sees the disk as before.
+    // expression (PCRE2's), and glib's main loop with a timeout.
     (
         &[
             "sh",
             "-c",
-            r#"cd /tmp/cc && printf 'char *g_strdup_printf(const char *, ...); void g_free(void *); const char *glib_check_version(unsigned, unsigned, unsigned);\nvoid *g_hash_table_new(unsigned (*)(const void *), int (*)(const void *, const void *)); unsigned g_str_hash(const void *); int g_str_equal(const void *, const void *);\nint g_hash_table_insert(void *, void *, void *); void *g_hash_table_lookup(void *, const void *);\nint g_regex_match_simple(const char *, const char *, int, int);\nvoid *g_main_loop_new(void *, int); void g_main_loop_run(void *); void g_main_loop_quit(void *); unsigned g_timeout_add(unsigned, int (*)(void *), void *);\nint printf(const char *, ...); int eventfd(unsigned, int); long read(int, void *, unsigned long); long write(int, const void *, unsigned long);\nint ticks;\nint tick(void *loop) { if (++ticks < 3) return 1; g_main_loop_quit(loop); return 0; }\nint main(void) {\n  void *h = g_hash_table_new(g_str_hash, g_str_equal), *loop = g_main_loop_new(0, 0);\n  char *s;\n  g_hash_table_insert(h, "greeting", "hello");\n  g_timeout_add(10, tick, loop);\n  g_main_loop_run(loop);\n  s = g_strdup_printf("glib: version %%s, regex %%d, table says %%s, the main loop ticked %%d times", glib_check_version(2, 76, 0) ? "too old" : "2.76", g_regex_match_simple("^gl[a-z]+$", "glib", 0, 0), (char *)g_hash_table_lookup(h, "greeting"), ticks);\n  printf("%%s\\n", s);\n  g_free(s);\n  {\n    int e = eventfd(2, 1 | 04000); unsigned long v = 0, five = 5; long r[4];\n    r[0] = read(e, &v, 8); r[1] = read(e, &v, 8); r[2] = read(e, &v, 8); write(e, &five, 8); r[3] = read(e, &v, 8);\n    printf("eventfd: reads %%ld %%ld %%ld, after writing 5: %%ld of %%lu\\n", r[0], r[1], r[2], r[3], v);\n  }\n  return 0;\n}\n' > g.c && tcc -o g g.c /opt/alpine/usr/lib/libglib-2.0.so.0 2>&1 && ./g; s=$?; rm -f g g.c; rm -r /opt /etc/ld-musl-$(uname -m).path; exit $s"#,
+            r#"cd /tmp/cc && printf 'char *g_strdup_printf(const char *, ...); void g_free(void *); const char *glib_check_version(unsigned, unsigned, unsigned);\nvoid *g_hash_table_new(unsigned (*)(const void *), int (*)(const void *, const void *)); unsigned g_str_hash(const void *); int g_str_equal(const void *, const void *);\nint g_hash_table_insert(void *, void *, void *); void *g_hash_table_lookup(void *, const void *);\nint g_regex_match_simple(const char *, const char *, int, int);\nvoid *g_main_loop_new(void *, int); void g_main_loop_run(void *); void g_main_loop_quit(void *); unsigned g_timeout_add(unsigned, int (*)(void *), void *);\nint printf(const char *, ...); int eventfd(unsigned, int); long read(int, void *, unsigned long); long write(int, const void *, unsigned long);\nint ticks;\nint tick(void *loop) { if (++ticks < 3) return 1; g_main_loop_quit(loop); return 0; }\nint main(void) {\n  void *h = g_hash_table_new(g_str_hash, g_str_equal), *loop = g_main_loop_new(0, 0);\n  char *s;\n  g_hash_table_insert(h, "greeting", "hello");\n  g_timeout_add(10, tick, loop);\n  g_main_loop_run(loop);\n  s = g_strdup_printf("glib: version %%s, regex %%d, table says %%s, the main loop ticked %%d times", glib_check_version(2, 76, 0) ? "too old" : "2.76", g_regex_match_simple("^gl[a-z]+$", "glib", 0, 0), (char *)g_hash_table_lookup(h, "greeting"), ticks);\n  printf("%%s\\n", s);\n  g_free(s);\n  {\n    int e = eventfd(2, 1 | 04000); unsigned long v = 0, five = 5; long r[4];\n    r[0] = read(e, &v, 8); r[1] = read(e, &v, 8); r[2] = read(e, &v, 8); write(e, &five, 8); r[3] = read(e, &v, 8);\n    printf("eventfd: reads %%ld %%ld %%ld, after writing 5: %%ld of %%lu\\n", r[0], r[1], r[2], r[3], v);\n  }\n  return 0;\n}\n' > g.c && tcc -o g g.c /opt/alpine/usr/lib/libglib-2.0.so.0 2>&1 && ./g; s=$?; rm -f g g.c; exit $s"#,
+        ],
+        0,
+    ),
+    // GIO's libmount and libblkid (in /lib in their packages, so unpacked
+    // into /opt/alpine/usr), and cairo and pango, and what they link to,
+    // installed beside glib, with
+    // one font (DejaVu Sans) and a fontconfig file naming its directory:
+    // a program tcc links against them lays out a line of text in a font
+    // fontconfig picks for "Sans", draws it into an image with cairo and
+    // writes it as a PNG. Then the packages are removed, so the second
+    // boot sees the disk as before.
+    (
+        &[
+            "sh",
+            "-c",
+            r#"mkdir -p /opt/alpine/fonts && for p in libblkid-2.38.1-r8 libmount-2.38.1-r8; do wget -q -O - http://10.0.3.2:47081/apk/$p.apk | tar -xzf - -C /opt/alpine/usr lib || exit 1; done; for p in libxau-1.0.11-r2 libmd-1.0.4-r2 libbsd-0.11.7-r1 libxdmcp-1.1.4-r2 libxcb-1.15-r1 libx11-1.8.7-r0 libxext-1.3.5-r2 libxrender-0.9.11-r3 libexpat-2.7.0-r0 brotli-libs-1.0.9-r14 libpng-1.6.44-r0 freetype-2.13.0-r5 fontconfig-2.14.2-r3 pixman-0.42.2-r1 cairo-1.17.8-r1 libxft-2.3.8-r1 fribidi-1.0.13-r0 graphite2-1.3.14-r5 harfbuzz-7.3.0-r0 pango-1.50.14-r1; do wget -q -O - http://10.0.3.2:47081/apk/$p.apk | tar -xzf - -C /opt/alpine usr/lib || exit 1; done; wget -q -O - http://10.0.3.2:47081/apk/font-dejavu-2.37-r5.apk | tar -xzf - -C /opt/alpine usr/share/fonts/dejavu/DejaVuSans.ttf || exit 1; printf '<fontconfig><dir>/opt/alpine/usr/share/fonts</dir><cachedir>/tmp/fc</cachedir></fontconfig>
+' > /opt/alpine/fonts/fonts.conf; cd /tmp/cc && printf 'void *cairo_image_surface_create(int, int, int); void *cairo_create(void *); void cairo_set_source_rgb(void *, double, double, double); void cairo_paint(void *); void cairo_move_to(void *, double, double);\nvoid cairo_surface_flush(void *); unsigned char *cairo_image_surface_get_data(void *); int cairo_image_surface_get_stride(void *); const char *cairo_version_string(void); int cairo_surface_write_to_png(void *, const char *);\nvoid *pango_cairo_create_layout(void *); void pango_layout_set_text(void *, const char *, int); void *pango_font_description_from_string(const char *); void pango_layout_set_font_description(void *, void *);\nvoid pango_layout_get_pixel_size(void *, int *, int *); void pango_cairo_show_layout(void *, void *); const char *pango_version_string(void);\nvoid *pango_layout_get_context(void *); void *pango_context_load_font(void *, void *); void *pango_font_describe(void *); char *pango_font_description_to_string(void *);\nint printf(const char *, ...);\nint main(void) {\n  int W = 320, H = 64, w, h, x, y, s, n = 0, x0 = 320, x1 = -1, y0 = 64, y1 = -1; unsigned char *p;\n  void *sf = cairo_image_surface_create(0, W, H), *cr = cairo_create(sf), *l, *d, *f;\n  cairo_set_source_rgb(cr, 1, 1, 1); cairo_paint(cr);\n  l = pango_cairo_create_layout(cr); d = pango_font_description_from_string("Sans 24");\n  pango_layout_set_font_description(l, d); pango_layout_set_text(l, "Superior", -1); pango_layout_get_pixel_size(l, &w, &h);\n  cairo_set_source_rgb(cr, 0, 0, 0); cairo_move_to(cr, 8, 8); pango_cairo_show_layout(cr, l); cairo_surface_flush(sf);\n  p = cairo_image_surface_get_data(sf); s = cairo_image_surface_get_stride(sf);\n  for (y = 0; y < H; y++) for (x = 0; x < W; x++) if (p[y * s + x * 4] < 128) { n++; if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y; }\n  f = pango_context_load_font(pango_layout_get_context(l), d);\n  printf("pango: cairo %%s, pango %%s, font %%s, a line laid out %%dx%%d, %%s\\n", cairo_version_string(), pango_version_string(), f ? pango_font_description_to_string(pango_font_describe(f)) : "none", w, h,\n    n > 200 && x0 >= 8 && x1 < 8 + w && y0 >= 8 && y1 < 8 + h ? "inked inside its box" : "ink missing or outside its box");\n  return cairo_surface_write_to_png(sf, "/tmp/cc/p.png");\n}\n\n' > p.c && tcc -o p p.c /opt/alpine/usr/lib/libcairo.so.2 /opt/alpine/usr/lib/libpango-1.0.so.0 /opt/alpine/usr/lib/libpangocairo-1.0.so.0 2>&1 && FONTCONFIG_FILE=/opt/alpine/fonts/fonts.conf ./p; s=$?; rm -rf p p.c p.png /tmp/fc; rm -r /opt /etc/ld-musl-$(uname -m).path; exit $s"#,
         ],
         0,
     ),

@@ -125,10 +125,10 @@ pub struct Fs {
     /// The root's inode once it is the server's (0 until then).
     pub mount: u16,
     /// The entries the buffer holds from the server's last `READDIR`, if
-    /// no call since: the directory's handle, the position asked for, the
-    /// entries before it (as [`Fs::entry`] counts them), how many came,
-    /// the position after them, and [`remote::calls`] then.
-    listed: Cell<[u64; 6]>,
+    /// no call since: the directory's handle, the server's position asked
+    /// for, how many came, the position after them, and [`remote::calls`]
+    /// then.
+    listed: Cell<[u64; 5]>,
 }
 
 /// Files from the bundle at most.
@@ -309,6 +309,16 @@ impl Fs {
         }
     }
 
+    /// Inode `ino`'s number as `stat` and `getdents` give it: the
+    /// server's (past MAX_INODES) for one of its files, as the inode
+    /// here is let go of when nothing needs it and its slot reused
+    /// (musl's dynamic linker takes a library with the number of one
+    /// it has loaded for that one).
+    pub fn number(&self, ino: u16) -> u64 {
+        let n = &self.inodes[ino as usize];
+        if n.remote { MAX_INODES as u64 + (n.handle & 0xffff_ffff) } else { ino as u64 }
+    }
+
     pub fn name(&self, ino: u16) -> &[u8] {
         let i = &self.inodes[ino as usize];
         &i.name[..i.nlen as usize]
@@ -467,44 +477,50 @@ impl Fs {
                 return found;
             }
         }
-        // Then the server's, but for those hidden by its own.
-        let mut k = pos.saturating_sub(SERVER_POS);
+        // Then the server's, but for those hidden by its own. Their
+        // positions are the server's (past SERVER_POS), which removing an
+        // entry does not move: `rm -r` lists a directory as it empties it.
+        let mut from = pos.saturating_sub(SERVER_POS);
         loop {
-            let (ino, kind, name, len) = self.remote_entry(dir, k)?;
+            let (at, ino, kind, name, len) = self.remote_entry(dir, from)?;
             let hidden = self.cached(dir, &name[..len]).is_some_and(|i| !self.is_remote(i));
             if !hidden {
-                return Some(make(SERVER_POS + k + 1, ino, kind, &name[..len]));
+                return Some(make(SERVER_POS + at + 1, ino, kind, &name[..len]));
             }
-            k += 1;
+            from = at + 1;
         }
     }
 
-    /// Remote directory `dir`'s entry `k` (from 0): its inode number (the
-    /// one here if it has one), kind and name. Entries come from the
-    /// server 64 at a time, the last batch kept while the buffer holds it.
-    fn remote_entry(&self, dir: u16, k: u64) -> Option<(u64, Kind, [u8; NAME_MAX], usize)> {
+    /// Remote directory `dir`'s first entry at the server's position
+    /// `from` or after it: its position, inode number (the one here if it
+    /// has one), kind and name. Entries come from the server up to 60 at a
+    /// time, the last batch kept while the buffer holds it.
+    fn remote_entry(&self, dir: u16, from: u64) -> Option<(u64, u64, Kind, [u8; NAME_MAX], usize)> {
         let handle = self.inodes[dir as usize].handle;
-        let [h, cookie, base, count, next, stamp] = self.listed.get();
-        let kept = h == handle && stamp == remote::calls() && base <= k;
-        let at = if kept && k < base + count {
-            k - base
-        } else {
-            let (mut cookie, mut base) = if kept { (next, base + count) } else { (0, 0) };
-            loop {
-                let (count, next) = remote::readdir(handle, cookie).ok()?;
-                if count == 0 {
-                    return None;
+        let [h, asked, count, next, stamp] = self.listed.get();
+        let kept = h == handle && stamp == remote::calls() && asked <= from && from < next;
+        let in_batch = |count: u64| (0..count as usize).find(|&k| remote::position(k) >= from);
+        let k = match kept.then(|| in_batch(count)).flatten() {
+            Some(k) => k,
+            None => {
+                // Past the batch kept (none at `from` or after in it, so
+                // none before its end): from its end; else from `from`.
+                let mut cookie = if kept { next } else { from };
+                loop {
+                    let (count, next) = remote::readdir(handle, cookie).ok()?;
+                    if count == 0 {
+                        return None;
+                    }
+                    self.listed.set([handle, cookie, count as u64, next, remote::calls()]);
+                    if let Some(k) = in_batch(count as u64) {
+                        break k;
+                    }
+                    cookie = next;
                 }
-                if k < base + count as u64 {
-                    self.listed.set([handle, cookie, base, count as u64, next, remote::calls()]);
-                    break k - base;
-                }
-                base += count as u64;
-                cookie = next;
             }
         };
-        let _ = cookie;
-        let e = server::Entry(&remote::buf()[at as usize * server::ENTRY..(at as usize + 1) * server::ENTRY]);
+        let at = remote::position(k);
+        let e = server::Entry(&remote::buf()[k * server::ENTRY..(k + 1) * server::ENTRY]);
         let mut name = [0u8; NAME_MAX];
         let len = e.name().len();
         name[..len].copy_from_slice(e.name());
@@ -514,8 +530,8 @@ impl Fs {
             _ => Kind::File,
         };
         let theirs = u32::from_le_bytes(e.0[..4].try_into().unwrap()) as u64;
-        let ino = self.cached(dir, &name[..len]).map_or(MAX_INODES as u64 + theirs, |i| i as u64);
-        Some((ino, kind, name, len))
+        let ino = self.cached(dir, &name[..len]).map_or(MAX_INODES as u64 + theirs, |i| self.number(i));
+        Some((at, ino, kind, name, len))
     }
 
     /// Follows `path` from `cwd` (or the root, if absolute). The last part

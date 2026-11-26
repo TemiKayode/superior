@@ -1500,7 +1500,13 @@ impl Fs {
             return Err(Status::NotDir);
         }
         let out = io.begin(true).ok_or(Status::Invalid)?;
-        let room = out.len().min(fs::BLOCK as usize) / fs::ENTRY;
+        // With each entry's position after the entries, if asked for.
+        let positions = m[3] & fs::READDIR_POSITIONS != 0;
+        if positions && out.len() < fs::POSITIONS_AT + 4 * fs::POSITIONS_MAX {
+            io.end();
+            return Err(Status::Invalid);
+        }
+        let room = if positions { fs::POSITIONS_MAX } else { out.len().min(fs::BLOCK as usize) / fs::ENTRY };
         let total = n.size() / fs::BLOCK * ENTRIES;
         let (mut i, mut count) = (m[2], 0usize);
         let mut loaded = u64::MAX;
@@ -1517,6 +1523,10 @@ impl Fs {
             let e = &buf(B_LOOK)[idx * fs::ENTRY..(idx + 1) * fs::ENTRY];
             if u32_at(e, 0) != 0 {
                 out[count * fs::ENTRY..(count + 1) * fs::ENTRY].copy_from_slice(e);
+                if positions {
+                    let at = fs::POSITIONS_AT + 4 * count;
+                    out[at..at + 4].copy_from_slice(&(i as u32).to_le_bytes());
+                }
                 count += 1;
             }
             i += 1;
