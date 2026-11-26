@@ -175,6 +175,9 @@ struct Image {
     /// AArch64 UEFI: firmware in place of QEMU's edk2 (one built with
     /// Secure Boot).
     firmware: Option<PathBuf>,
+    /// QEMU's `-m`: the machine's RAM (Superior's images; seL4's have
+    /// their own).
+    memory: &'static str,
 }
 
 /// The disk drivers, each with the PCI function its test disk appears as
@@ -1303,6 +1306,8 @@ fn linux_test(img: &Image) -> Result<(), String> {
         // An eventfd as a semaphore, made with 2: two reads of 1, then
         // EAGAIN; a write of 5, and a read of 1 again.
         "linux: > eventfd: reads 8 8 -1, after writing 5: 8 of 1",
+        // 48 MiB touched by one process (12288 pages, numbered mod 256).
+        "linux: > big: 48 MiB touched, sum 1566720",
         // The terminal session (its steps were checked as it ran).
         "linux: running sh (pid ",
         "linux: sh exited with status 0",
@@ -2158,6 +2163,9 @@ fn image_sealed(
         smp: None,
         vars: None,
         firmware: None,
+        // The Linux personality's: 128 MiB of its own (its files) and a
+        // big program's memory from the rest of RAM.
+        memory: if matches!(manifest, "linux" | "linux-verify") { "1G" } else { "512M" },
     })
 }
 
@@ -2268,6 +2276,7 @@ fn sel4_image() -> Result<Image, String> {
         smp: None,
         vars: None,
         firmware: None,
+        memory: "512M",
     })
 }
 
@@ -2610,7 +2619,7 @@ fn qemu_command(img: &Image) -> Command {
                 // OVMF, the UEFI firmware QEMU ships, in place of SeaBIOS.
                 q.arg("-drive")
                     .arg(format!("if=pflash,format=raw,readonly=on,file={}", ovmf().display()))
-                    .args(["-m", "512M"]);
+                    .args(["-m", img.memory]);
             }
             q.args(["-device", "isa-debug-exit,iobase=0xf4,iosize=0x04"]);
             // The suspend test's clock keeps running while the machine is
@@ -2679,12 +2688,12 @@ fn qemu_command(img: &Image) -> Command {
                 .args(["-m", SEL4_MEMORY]);
             } else {
                 q.args(["-semihosting-config", "enable=on,target=native"])
-                    .args(["-m", "512M"]);
+                    .args(["-m", img.memory]);
             }
         }
     }
     if img.arch == Arch::X86_64 {
-        q.args(["-m", "512M"]);
+        q.args(["-m", img.memory]);
     }
     // Several CPUs, except for seL4's images (built for one).
     if !img.sel4 {

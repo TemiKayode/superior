@@ -20,7 +20,8 @@
 # made from one of seven blocks cut from the untyped memory in slot 0, and
 # revoked when it exits or execs; the eighth block holds the
 # personality's state and the files' pages. A process that outgrows its
-# block is lent one of four more, cut from the rest of RAM (untyped spare).
+# block is lent more, 4 MiB at a time, cut from the rest of RAM (untyped
+# spare).
 # The root (with /home) is the filesystem server's, on a disk the test
 # makes empty; what the runs leave there, boot/linux-verify.manifest reads
 # back. Sockets are the network server's: the runs fetch a page over HTTP
@@ -89,15 +90,16 @@ component net
 component linux
   image linux
   priority 10
-  # Its CNode (2^16 slots: the state's and files' pages, the files,
-  # glibc's from 8192, the toolchain's from 8832, binutils' from 9472,
-  # gcc's from 11072, links' from 21552, a 5888-slot span per process
-  # from 23552, then the shared pages, the exec buffer and the
-  # framebuffer's), address space, image, stack,
-  # the thirty-eight files (copied into its memory, 64 MiB for them; its
-  # processes' memory is cut from the rest of RAM).
-  memory 26
-  cspace 16
+  # Its CNode (2^18 slots: the files, glibc's from 8192, the
+  # toolchain's from 8832, binutils' from 9472, gcc's from 11072, links'
+  # from 21552, the state's and files' pages from 23552, then the shared
+  # pages, the exec buffer and the framebuffer's, the Wayland libraries'
+  # from 65360; past what a manifest names, a 27904-slot span per process
+  # from 65536), address space, image, stack, the thirty-eight
+  # files (copied into its memory, 128 MiB for them and the 8 MiB CNode;
+  # its processes' memory is cut from the rest of RAM).
+  memory 27
+  cspace 18
   vspace 20
   # The files, smallest first: memory is handed out in order, and each
   # block is aligned to its size.

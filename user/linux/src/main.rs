@@ -55,12 +55,14 @@
 //! glibc's dynamic linker's from 8192, hello's from 8256, glibc's from
 //! 8320, the toolchain's from 8832 (tcc, make, libtcc, the archive of the
 //! rest), and binutils' from 9472 (as, ld and their libraries) (`file`
-//! in the manifest); the exec buffer and the framebuffer after the shared
-//! pages, at the end. Process `i` owns the
-//! slots from `PROC_SLOTS + i * PROC_SPAN` (16384 on, 2048 each): its
+//! in the manifest), up to 2^16. Past them, process `i` owns the slots
+//! from `PROC_SLOTS + i * PROC_SPAN` (65536 on, 27904 each): its
 //! address space, then its threads (each with a badged fault endpoint)
 //! and pages as made, two slots a page (its frame and the mirror's copy),
-//! so up to 4 MiB of its own.
+//! so up to some 54 MiB of its own, to the end of the CNode's 2^18 slots.
+//! (What is lent to another server stays below 2^16, as a transfer names
+//! a slot in 16 bits: the shared pages, the exec buffer and the
+//! framebuffer, after the files' pool.)
 //!
 //! Signals ([`signal`]): actions per process, masks per thread, `kill`
 //! and `tkill`, handlers run on the thread's stack and returned from. The terminal ([`tty`]): the serial
@@ -119,13 +121,15 @@ const UNTYPED_SPARE_COUNT: u64 = 32;
 /// from the rest of RAM (the component's own memory holds its files).
 const BLOCKS: u64 = 8;
 const BLOCK_BITS: u64 = 20;
-/// Blocks lent to processes that outgrow their own, one at a time (1 MiB
-/// each).
+/// Blocks lent to processes that outgrow their own, one at a time (4 MiB
+/// each: up to 256 MiB in all, on a machine with the RAM).
 const SPARE_BLOCKS: u64 = 1024;
-const SPARES: usize = 32;
+const SPARE_BITS: u64 = 22;
+const SPARES: usize = 64;
+const _: () = assert!(SPARE_BLOCKS + SPARES as u64 <= STATE_BLOCK);
 /// The block this server's state is in, from the rest of RAM.
 const STATE_BLOCK: u64 = 1100;
-const STATE_BLOCK_BITS: u64 = 19;
+const STATE_BLOCK_BITS: u64 = 20;
 /// The notification this server's thread is bound to (so `Recv` also
 /// returns when it is signalled), and two badged copies of it: the UART's
 /// interrupt (bit 0) and the timer for sleepers (bit 1).
@@ -145,6 +149,7 @@ const SMPTEST_FILE: u64 = 213;
 const LIBZ_FILE: u64 = 216;
 const FPTEST_FILE: u64 = 250;
 const PROGRAM_FILE: u64 = 252;
+const PROGRAM_END: u64 = 512;
 /// glibc's dynamic linker, GNU hello and glibc, past the processes' slots.
 const GLIBC_LD_FILE: u64 = 8192;
 const HELLO_FILE: u64 = 8256;
@@ -196,20 +201,29 @@ const LIBEVENT_FILE: u64 = 23376;
 const LIBBZ2_FILE: u64 = 23472;
 const LINKS_END: u64 = 23504;
 /// libwayland's client library, the libffi it calls through, and
-/// libxkbcommon: what a Wayland program links against. After the
-/// framebuffer's slots, at the CNode's end.
+/// libxkbcommon: what a Wayland program links against. At the end of the
+/// slots a manifest can name (2^16).
 const LIBWAYLAND_FILE: u64 = 65360;
 const LIBFFI_FILE: u64 = 65392;
 const LIBXKBCOMMON_FILE: u64 = 65424;
 const WAYLAND_END: u64 = 65520;
-const _: () = assert!(FB_SLOTS + FB_PAGES <= LIBWAYLAND_FILE && WAYLAND_END <= 1 << 16);
-const STATE_SLOTS: u64 = 512;
-const STATE_PAGES: u64 = 128;
+const _: () = assert!(LINKS_END <= LIBWAYLAND_FILE && WAYLAND_END <= PROC_SLOTS);
+/// The CNode's size (`cspace` in the manifest): past the manifest's
+/// slots, the processes'.
+const CSPACE_BITS: u64 = 18;
+/// This server's state's pages (each process's frames among it), then
+/// the files' (the pool), after links'; then the shared pages, the exec
+/// buffer and the framebuffer.
+const STATE_SLOTS: u64 = 23552;
+const STATE_PAGES: u64 = 256;
 const POOL_SLOTS: u64 = STATE_SLOTS + STATE_PAGES;
+const _: () = assert!(LINKS_END <= STATE_SLOTS);
 /// The signal restorer's page ([`signal::TRAMPOLINE`]).
 const TRAMPOLINE_SLOT: u64 = 1000;
-const PROC_SLOTS: u64 = 23552;
-const PROC_SPAN: u64 = 5888;
+/// Each process's slots, past the manifest's: 27904, two a page, so up to
+/// some 54 MiB of its own.
+const PROC_SLOTS: u64 = 1 << 16;
+const PROC_SPAN: u64 = 27904;
 /// A frame of a process's that `munmap` gave back ([`Proc::frames`]).
 const FREE: u16 = u16::MAX;
 const MAX_PROCS: usize = 7;
@@ -282,18 +296,21 @@ const FB_VA: u64 = USER_BASE + 0x1_9a00_0000;
 /// While a process has the framebuffer mapped, it is shown as it is drawn,
 /// as a screen would show it: every FB_PERIOD ticks (25 times a second).
 const FB_PERIOD: u64 = TICK_HZ / 25;
-const _: () = assert!(FB_PAGES << 12 <= 1 << FB_BLOCK_BITS && FB_SLOTS + FB_PAGES <= 1 << 16);
+const _: () = assert!(FB_PAGES << 12 <= 1 << FB_BLOCK_BITS && FB_SLOTS + FB_PAGES <= LIBWAYLAND_FILE);
+const _: () = assert!(PROC_SLOTS + MAX_PROCS as u64 * PROC_SPAN <= 1 << CSPACE_BITS);
 /// Shared memory (`memfd_create`): a block of the rest of RAM cut into
-/// SHM_PAGES pages, here at SHM_VA, in the slots after the processes'.
+/// SHM_PAGES pages, here at SHM_VA, in the slots after the files' pool
+/// (below 2^16: a slot a capability is granted from is named in 16 bits,
+/// and these are lent to the compositor).
 /// A memory file holds a run of them, which the processes that map it
 /// share ([`Shm`]).
-const SHM_BLOCK: u64 = PROC_SLOTS + MAX_PROCS as u64 * PROC_SPAN;
+const SHM_BLOCK: u64 = POOL_SLOTS + fs::POOL_PAGES as u64;
 const SHM_BLOCK_BITS: u64 = 21;
 const SHM_SLOTS: u64 = SHM_BLOCK + 1;
 const SHM_PAGES: u64 = 1 << (SHM_BLOCK_BITS - 12);
 const SHM_VA: u64 = USER_BASE + 0x1_9c00_0000;
 const MAX_SHM: usize = 16;
-const _: () = assert!(SHM_SLOTS + SHM_PAGES <= 1 << 16 && FB_VA + FB_PAGES * PAGE <= SHM_VA);
+const _: () = assert!(SHM_SLOTS + SHM_PAGES <= LIBWAYLAND_FILE && FB_VA + FB_PAGES * PAGE <= SHM_VA);
 
 /// A memory file: `size` bytes in the `pages` shared pages from `first`.
 /// Its pages are given back once it is closed and no process maps them
@@ -5525,6 +5542,16 @@ const RUNS: &[(&[&str], u32)] = &[
         ],
         0,
     ),
+    // A big program: 48 MiB of its own, a page at a time, more than a
+    // process's block and many spare blocks (4 MiB each) lent to it.
+    (
+        &[
+            "sh",
+            "-c",
+            r#"cd /tmp/cc && printf 'int printf(const char *, ...); void *malloc(unsigned long);\nint main(void) {\n  unsigned long n = 48UL << 20, i, sum = 0;\n  unsigned char *p = malloc(n);\n  if (!p) { printf("big: no memory\\n"); return 1; }\n  for (i = 0; i < n; i += 4096) p[i] = i >> 12;\n  for (i = 0; i < n; i += 4096) sum += p[i];\n  printf("big: %%lu MiB touched, sum %%lu\\n", n >> 20, sum);\n  return 0;\n}\n' > big.c && tcc -o big big.c 2>&1 && ./big; s=$?; rm -f big big.c; exit $s"#,
+        ],
+        0,
+    ),
 ];
 
 /// The second boot's runs (`arg 1`, boot/linux-verify.manifest): what the
@@ -5638,7 +5665,7 @@ fn setup() -> Result<&'static mut State, &'static str> {
     // larger a process can grow), at least one.
     let mut spares = 0;
     while spares < SPARES && from < UNTYPED_SPARE + UNTYPED_SPARE_COUNT {
-        if sys(Syscall::Retype, from, [ObjectType::Untyped as u64, BLOCK_BITS, SPARE_BLOCKS + spares as u64, 0]).is_ok() {
+        if sys(Syscall::Retype, from, [ObjectType::Untyped as u64, SPARE_BITS, SPARE_BLOCKS + spares as u64, 0]).is_ok() {
             spares += 1;
         } else {
             from += 1;
@@ -5678,7 +5705,7 @@ fn setup() -> Result<&'static mut State, &'static str> {
     let smptest = map_file(SMPTEST_FILE, SMPTEST_VA, LIBZ_FILE - SMPTEST_FILE);
     let libz = map_file(LIBZ_FILE, LIBZ_VA, FPTEST_FILE - LIBZ_FILE);
     let fptest = map_file(FPTEST_FILE, FPTEST_VA, PROGRAM_FILE - FPTEST_FILE);
-    let program = map_file(PROGRAM_FILE, PROGRAM_VA, STATE_SLOTS - PROGRAM_FILE);
+    let program = map_file(PROGRAM_FILE, PROGRAM_VA, PROGRAM_END - PROGRAM_FILE);
     let glibc_ld = map_file(GLIBC_LD_FILE, GLIBC_LD_VA, HELLO_FILE - GLIBC_LD_FILE);
     let hello = map_file(HELLO_FILE, HELLO_VA, LIBC_FILE - HELLO_FILE);
     let libc = map_file(LIBC_FILE, LIBC_VA, LIBC_PAGES);

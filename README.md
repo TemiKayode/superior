@@ -214,7 +214,7 @@ holds the rest):
   capability or thread refers to it; revoking the untyped it came from destroys it.
   CNode slots come from a pool in the kernel's capability table, which the kernel
   sets aside at boot from its own memory, sized to RAM: a slot for every page plus
-  8,192 (139,840 slots, 88 bytes each with the records of where each frame is
+  16,384 (148,032 slots, 88 bytes each with the records of where each frame is
   mapped, 16 MiB on the 512 MiB QEMU machines). Each slot links to its first child
   and its siblings and counts its copies, so revoke, delete and retype take time
   in proportion to the capabilities they touch, never to the table; the model
@@ -2116,6 +2116,18 @@ holds the rest):
   (all of it, or one with `EFD_SEMAPHORE`), blocking at zero, with
   `EFD_NONBLOCK` and `EFD_CLOEXEC`, and readable in `poll` and `epoll`
   while above zero. glib's main loop wakes through one.
+- Room for big programs: the Linux personality's CNode is 2^18 slots (8 MiB),
+  past the 2^16 a manifest names, so each of its seven processes has a
+  27,904-slot span, some 54 MiB of its own pages, up from 11.5 MiB; it is
+  lent memory 4 MiB at a time, up to 64 blocks (256 MiB), up from 32 of
+  1 MiB. Its own memory is 128 MiB (`memory 27`, now allowed when the
+  bundle is large enough: the kernel gives the manager four times the
+  bundle, up from twice, so 256 MiB for its 59 MiB one), its
+  state and the file pool move to slot 23,552 (the state holds every
+  process's frame table, 256 pages), and its test machines have 1 GiB.
+  The kernel's CNode pool has 16,384 slots past the RAM-sized part, up
+  from 8,192, so the big CNode fits on a 1 GiB machine beside the others.
+  `linux-test` has a program touch 48 MiB on both ISAs.
 - `exec` copies a program's arguments and environment to its stack a piece
   at a time. Before, one longer than 4 KiB (a long `sh -c` script) ran
   past the copy buffer and stopped the personality.

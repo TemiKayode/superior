@@ -82,10 +82,13 @@ pub const CSPACE_SLOTS: usize = 1 << CSPACE_BITS;
 pub const CSPACE_MAX_BITS: u8 = 18;
 /// Most pages a heap may span.
 pub const MAX_HEAP_PAGES: u64 = 4096;
-/// Bounds on the per-instance untyped block, in bits (at most the
-/// manager's least memory, [`root::UNTYPED_BITS`](crate::abi::root::UNTYPED_BITS)).
+/// Bounds on the per-instance untyped block, in bits. Past the manager's
+/// least memory, [`root::UNTYPED_BITS`](crate::abi::root::UNTYPED_BITS),
+/// only with a bundle large enough that the kernel gives it more (the
+/// Linux personality's, 128 MiB of a 256 MiB manager: four times its
+/// 59 MiB bundle, rounded up).
 pub const MEMORY_MIN_BITS: u8 = 16;
-pub const MEMORY_MAX_BITS: u8 = 26;
+pub const MEMORY_MAX_BITS: u8 = 27;
 pub const DEFAULT_MEMORY_BITS: u8 = 20;
 /// Bounds on a component's address space (its top table and the pool its
 /// page tables come from), in bits: 2^16 bytes holds 15 page tables, for
@@ -443,7 +446,7 @@ impl<'a> Manifest<'a> {
                         b if (MEMORY_MIN_BITS as u64..=MEMORY_MAX_BITS as u64).contains(&b) => {
                             c.memory_bits = b as u8
                         }
-                        _ => return Err(err("memory must be 16 to 26 bits", w)),
+                        _ => return Err(err("memory must be 16 to 27 bits", w)),
                     }
                     None
                 }
@@ -880,7 +883,7 @@ component b
         );
         assert_eq!(
             error("component a\n image a\n memory 30"),
-            (3, "memory must be 16 to 26 bits")
+            (3, "memory must be 16 to 27 bits")
         );
         assert_eq!(
             error("component a\n image a\n control 1 2"),
