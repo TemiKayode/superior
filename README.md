@@ -2150,6 +2150,27 @@ holds the rest):
   - `statfs` and `fstatfs` (the disk's free blocks and inodes, from the
     server), and `link` and `linkat`, refused with `EPERM`, as on FAT:
     fontconfig then locks its cache with a directory.
+- GTK 3: `linux-test` installs it and the rest of what it links to, 31
+  more packages (gdk-pixbuf and its image libraries, ATK and its bridge,
+  D-Bus's, CUPS's with GnuTLS, epoxy, the X libraries GDK's X backend is
+  built with), and XKB's data, which GDK makes its first keymap from. A
+  program tcc links against it opens a window with a label through GDK's
+  Wayland backend, on the personality's Wayland server, and sees the
+  label drawn, on both ISAs. On the way:
+  - The Wayland server offers `wl_data_device_manager`, whose sources and
+    devices are made and nothing more (GTK 3 binds a seat only once there
+    is one; without a seat it took a keymap from nowhere and crashed),
+    and `wl_output`, the 800x600 screen.
+  - `fallocate` (mode 0: a memory file or a file made at least that long;
+    GTK sets aside its buffers' memory so), and `getresuid` and
+    `getresgid` (every id 0).
+  - A process killed for a page it may have that could not be made says
+    it ran out of memory, and how many pages it had.
+  - gdk-pixbuf tells GTK's icons' type (PNG) by GIO's MIME database. The
+    test writes one of PNG alone, in the text files GIO reads when there
+    is no cache: building shared-mime-info's whole one takes
+    `update-mime-database` more than a process's some 54 MiB. That limit
+    is what stands before the browsers, which need several times it.
 - `exec` copies a program's arguments and environment to its stack a piece
   at a time. Before, one longer than 4 KiB (a long `sh -c` script) ran
   past the copy buffer and stopped the personality.

@@ -466,6 +466,8 @@ enum Sys {
     Link,
     Statfs,
     Fstatfs,
+    Fallocate,
+    Getresid,
     Umask,
     Getpid,
     Getppid,
@@ -627,6 +629,8 @@ fn decode(nr: u64, a: [u64; 6]) -> (Sys, [u64; 6]) {
         87 => return (Sys::Unlinkat, [cwd, a[0], 0, 0, 0, 0]),
         88 => return (Sys::Symlinkat, [a[0], cwd, a[1], 0, 0, 0]),
         86 | 265 => Sys::Link,
+        285 => Sys::Fallocate,
+        118 | 120 => Sys::Getresid,
         137 => Sys::Statfs,
         138 => Sys::Fstatfs,
         89 => return (Sys::Readlinkat, [cwd, a[0], a[1], a[2], 0, 0]),
@@ -676,6 +680,8 @@ fn decode(nr: u64, a: [u64; 6]) -> (Sys, [u64; 6]) {
         35 => Sys::Unlinkat,
         36 => Sys::Symlinkat,
         37 => Sys::Link,
+        47 => Sys::Fallocate,
+        148 | 150 => Sys::Getresid,
         43 => Sys::Statfs,
         44 => Sys::Fstatfs,
         38 | 276 => Sys::Renameat,
@@ -2312,6 +2318,26 @@ fn answer(st: &mut State, t: usize, call: Sys, a: [u64; 6]) -> Out {
             }
             st.fs.truncate(o.ino, a[1]).map(|_| 0)
         })),
+        // fallocate (mode 0, as posix_fallocate): a memory file or a file
+        // made at least `offset + len` long; its blocks are not set aside.
+        Sys::Fallocate => r(st.file(i, a[0]).ok_or(EBADF).and_then(|f| {
+            let o = st.files[f];
+            let end = a[2].checked_add(a[3]).filter(|&e| (e as i64) > 0 && a[3] > 0).ok_or(EINVAL)?;
+            if a[1] != 0 {
+                return Err(EOPNOTSUPP);
+            }
+            match o.kind {
+                FileKind::Shm if end > st.shm[o.pipe as usize].size => st.shm_resize(o.pipe as usize, end).map(|_| 0),
+                FileKind::Shm => Ok(0),
+                FileKind::Node if o.flags & O_ACCMODE == 0 => Err(EBADF),
+                FileKind::Node if st.fs.kind(o.ino) != Kind::File => Err(ENODEV),
+                FileKind::Node if end > st.fs.size(o.ino) => st.fs.truncate(o.ino, end).map(|_| 0),
+                FileKind::Node => Ok(0),
+                _ => Err(ESPIPE),
+            }
+        })),
+        // getresuid, getresgid: every process's ids are 0.
+        Sys::Getresid => r([a[0], a[1], a[2]].iter().try_for_each(|&p| st.put(i, p, &[0u8; 4]).map(drop)).map(|_| 0)),
         Sys::Fork => r(fork(st, t)),
         Sys::Vfork => vfork(st, t, 0),
         Sys::Clone if a[0] & CLONE_THREAD != 0 && a[0] & CLONE_VM != 0 => r(new_thread(st, t, a)),
@@ -4004,7 +4030,14 @@ fn run(st: &mut State, argv: &[&str], env: &[&str], interactive: bool) -> Result
                     continue;
                 }
             }
-            say!("linux: pid {} killed: {what} at pc {pc:#x}, address {nr:#x}", st.procs[i].pid);
+            // A page it may have that could not be made: memory ran out.
+            let m = st.mem(i);
+            if what == "page fault" && st.is_reserved(m, nr & !(PAGE - 1)) {
+                let pages = st.procs[m].cursor / 2;
+                say!("linux: pid {} killed: out of memory at pc {pc:#x}, address {nr:#x} ({pages} pages its own)", st.procs[i].pid);
+            } else {
+                say!("linux: pid {} killed: {what} at pc {pc:#x}, address {nr:#x}", st.procs[i].pid);
+            }
             st.exit(i, signal);
             wake(st);
             continue;
@@ -5595,14 +5628,30 @@ const RUNS: &[(&[&str], u32)] = &[
     // one font (DejaVu Sans) and a fontconfig file naming its directory:
     // a program tcc links against them lays out a line of text in a font
     // fontconfig picks for "Sans", draws it into an image with cairo and
-    // writes it as a PNG. Then the packages are removed, so the second
-    // boot sees the disk as before.
+    // writes it as a PNG.
     (
         &[
             "sh",
             "-c",
             r#"mkdir -p /opt/alpine/fonts && for p in libblkid-2.38.1-r8 libmount-2.38.1-r8; do wget -q -O - http://10.0.3.2:47081/apk/$p.apk | tar -xzf - -C /opt/alpine/usr lib || exit 1; done; for p in libxau-1.0.11-r2 libmd-1.0.4-r2 libbsd-0.11.7-r1 libxdmcp-1.1.4-r2 libxcb-1.15-r1 libx11-1.8.7-r0 libxext-1.3.5-r2 libxrender-0.9.11-r3 libexpat-2.7.0-r0 brotli-libs-1.0.9-r14 libpng-1.6.44-r0 freetype-2.13.0-r5 fontconfig-2.14.2-r3 pixman-0.42.2-r1 cairo-1.17.8-r1 libxft-2.3.8-r1 fribidi-1.0.13-r0 graphite2-1.3.14-r5 harfbuzz-7.3.0-r0 pango-1.50.14-r1; do wget -q -O - http://10.0.3.2:47081/apk/$p.apk | tar -xzf - -C /opt/alpine usr/lib || exit 1; done; wget -q -O - http://10.0.3.2:47081/apk/font-dejavu-2.37-r5.apk | tar -xzf - -C /opt/alpine usr/share/fonts/dejavu/DejaVuSans.ttf || exit 1; printf '<fontconfig><dir>/opt/alpine/usr/share/fonts</dir><cachedir>/tmp/fc</cachedir></fontconfig>
-' > /opt/alpine/fonts/fonts.conf; cd /tmp/cc && printf 'void *cairo_image_surface_create(int, int, int); void *cairo_create(void *); void cairo_set_source_rgb(void *, double, double, double); void cairo_paint(void *); void cairo_move_to(void *, double, double);\nvoid cairo_surface_flush(void *); unsigned char *cairo_image_surface_get_data(void *); int cairo_image_surface_get_stride(void *); const char *cairo_version_string(void); int cairo_surface_write_to_png(void *, const char *);\nvoid *pango_cairo_create_layout(void *); void pango_layout_set_text(void *, const char *, int); void *pango_font_description_from_string(const char *); void pango_layout_set_font_description(void *, void *);\nvoid pango_layout_get_pixel_size(void *, int *, int *); void pango_cairo_show_layout(void *, void *); const char *pango_version_string(void);\nvoid *pango_layout_get_context(void *); void *pango_context_load_font(void *, void *); void *pango_font_describe(void *); char *pango_font_description_to_string(void *);\nint printf(const char *, ...);\nint main(void) {\n  int W = 320, H = 64, w, h, x, y, s, n = 0, x0 = 320, x1 = -1, y0 = 64, y1 = -1; unsigned char *p;\n  void *sf = cairo_image_surface_create(0, W, H), *cr = cairo_create(sf), *l, *d, *f;\n  cairo_set_source_rgb(cr, 1, 1, 1); cairo_paint(cr);\n  l = pango_cairo_create_layout(cr); d = pango_font_description_from_string("Sans 24");\n  pango_layout_set_font_description(l, d); pango_layout_set_text(l, "Superior", -1); pango_layout_get_pixel_size(l, &w, &h);\n  cairo_set_source_rgb(cr, 0, 0, 0); cairo_move_to(cr, 8, 8); pango_cairo_show_layout(cr, l); cairo_surface_flush(sf);\n  p = cairo_image_surface_get_data(sf); s = cairo_image_surface_get_stride(sf);\n  for (y = 0; y < H; y++) for (x = 0; x < W; x++) if (p[y * s + x * 4] < 128) { n++; if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y; }\n  f = pango_context_load_font(pango_layout_get_context(l), d);\n  printf("pango: cairo %%s, pango %%s, font %%s, a line laid out %%dx%%d, %%s\\n", cairo_version_string(), pango_version_string(), f ? pango_font_description_to_string(pango_font_describe(f)) : "none", w, h,\n    n > 200 && x0 >= 8 && x1 < 8 + w && y0 >= 8 && y1 < 8 + h ? "inked inside its box" : "ink missing or outside its box");\n  return cairo_surface_write_to_png(sf, "/tmp/cc/p.png");\n}\n\n' > p.c && tcc -o p p.c /opt/alpine/usr/lib/libcairo.so.2 /opt/alpine/usr/lib/libpango-1.0.so.0 /opt/alpine/usr/lib/libpangocairo-1.0.so.0 2>&1 && FONTCONFIG_FILE=/opt/alpine/fonts/fonts.conf ./p; s=$?; rm -rf p p.c p.png /tmp/fc; rm -r /opt /etc/ld-musl-$(uname -m).path; exit $s"#,
+' > /opt/alpine/fonts/fonts.conf; cd /tmp/cc && printf 'void *cairo_image_surface_create(int, int, int); void *cairo_create(void *); void cairo_set_source_rgb(void *, double, double, double); void cairo_paint(void *); void cairo_move_to(void *, double, double);\nvoid cairo_surface_flush(void *); unsigned char *cairo_image_surface_get_data(void *); int cairo_image_surface_get_stride(void *); const char *cairo_version_string(void); int cairo_surface_write_to_png(void *, const char *);\nvoid *pango_cairo_create_layout(void *); void pango_layout_set_text(void *, const char *, int); void *pango_font_description_from_string(const char *); void pango_layout_set_font_description(void *, void *);\nvoid pango_layout_get_pixel_size(void *, int *, int *); void pango_cairo_show_layout(void *, void *); const char *pango_version_string(void);\nvoid *pango_layout_get_context(void *); void *pango_context_load_font(void *, void *); void *pango_font_describe(void *); char *pango_font_description_to_string(void *);\nint printf(const char *, ...);\nint main(void) {\n  int W = 320, H = 64, w, h, x, y, s, n = 0, x0 = 320, x1 = -1, y0 = 64, y1 = -1; unsigned char *p;\n  void *sf = cairo_image_surface_create(0, W, H), *cr = cairo_create(sf), *l, *d, *f;\n  cairo_set_source_rgb(cr, 1, 1, 1); cairo_paint(cr);\n  l = pango_cairo_create_layout(cr); d = pango_font_description_from_string("Sans 24");\n  pango_layout_set_font_description(l, d); pango_layout_set_text(l, "Superior", -1); pango_layout_get_pixel_size(l, &w, &h);\n  cairo_set_source_rgb(cr, 0, 0, 0); cairo_move_to(cr, 8, 8); pango_cairo_show_layout(cr, l); cairo_surface_flush(sf);\n  p = cairo_image_surface_get_data(sf); s = cairo_image_surface_get_stride(sf);\n  for (y = 0; y < H; y++) for (x = 0; x < W; x++) if (p[y * s + x * 4] < 128) { n++; if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y; }\n  f = pango_context_load_font(pango_layout_get_context(l), d);\n  printf("pango: cairo %%s, pango %%s, font %%s, a line laid out %%dx%%d, %%s\\n", cairo_version_string(), pango_version_string(), f ? pango_font_description_to_string(pango_font_describe(f)) : "none", w, h,\n    n > 200 && x0 >= 8 && x1 < 8 + w && y0 >= 8 && y1 < 8 + h ? "inked inside its box" : "ink missing or outside its box");\n  return cairo_surface_write_to_png(sf, "/tmp/cc/p.png");\n}\n\n' > p.c && tcc -o p p.c /opt/alpine/usr/lib/libcairo.so.2 /opt/alpine/usr/lib/libpango-1.0.so.0 /opt/alpine/usr/lib/libpangocairo-1.0.so.0 2>&1 && FONTCONFIG_FILE=/opt/alpine/fonts/fonts.conf ./p; s=$?; rm -rf p p.c p.png /tmp/fc; exit $s"#,
+        ],
+        0,
+    ),
+    // GTK 3 and the rest of what it links to, installed beside them: a
+    // program tcc links against it opens a window with a label on the
+    // Wayland server here (GDK's Wayland backend, XKB's data for its first
+    // keymap, no accessibility bus) and waits for the label to be drawn.
+    // gdk-pixbuf tells its icons' type (PNG) by GIO's MIME database: here
+    // one of PNG alone, in the text files GIO reads when there is no
+    // cache, as building shared-mime-info's whole one (update-mime-database)
+    // takes more memory than a process has. Then the packages are removed,
+    // so the second boot sees the disk as before.
+    (
+        &[
+            "sh",
+            "-c",
+            r#"for p in xz-libs-5.4.3-r1 libxml2-2.11.8-r3 libjpeg-turbo-2.1.5.1-r3 libwebp-1.3.2-r0 tiff-4.5.1-r0 gdk-pixbuf-2.42.12-r0 libxcomposite-0.4.6-r3 libxfixes-6.0.1-r2 libxcursor-1.2.1-r2 libxdamage-1.1.6-r2 libxi-1.8.1-r0 libxinerama-1.1.5-r2 libxrandr-1.5.3-r2 libatk-1.0-2.48.4-r0 libxtst-1.2.4-r2 dbus-libs-1.14.8-r0 at-spi2-core-2.48.4-r0 libatk-bridge-2.0-2.48.4-r0 cairo-gobject-1.17.8-r1 avahi-libs-0.8-r13 nettle-3.8.1-r2 libunistring-1.1-r1 libidn2-2.3.4-r1 p11-kit-0.24.1-r2 libtasn1-4.20.0-r0 gnutls-3.8.4-r0 cups-libs-2.4.9-r0 libepoxy-1.5.10-r1 wayland-libs-cursor-1.22.0-r2 wayland-libs-egl-1.22.0-r2 gtk+3.0-3.24.43-r0; do wget -q -O - http://10.0.3.2:47081/apk/$p.apk | tar -xzf - -C /opt/alpine usr/lib || exit 1; done; wget -q -O - http://10.0.3.2:47081/apk/xkeyboard-config-2.38-r0.apk | tar -xzf - -C /opt/alpine usr/share/X11/xkb || exit 1; mkdir -p /opt/alpine/usr/share/mime && printf '50:image/png:*.png\n' > /opt/alpine/usr/share/mime/globs2 && printf 'MIME-Magic\000\n[50:image/png]\n>0=\000\010\211PNG\r\n\032\n\n' > /opt/alpine/usr/share/mime/magic; cd /tmp/cc && printf 'int gtk_init_check(int *, char ***); void *gtk_window_new(int); void gtk_window_set_title(void *, const char *); void gtk_window_set_default_size(void *, int, int);\nvoid *gtk_label_new(const char *); void gtk_container_add(void *, void *); void gtk_widget_show_all(void *); void gtk_main(void); void gtk_main_quit(void); void gtk_window_get_size(void *, int *, int *);\nunsigned gtk_get_major_version(void); unsigned gtk_get_minor_version(void); unsigned gtk_get_micro_version(void);\nunsigned long g_signal_connect_data(void *, const char *, void *, void *, void *, int); unsigned g_timeout_add(unsigned, int (*)(void *), void *);\nvoid *gdk_display_get_default(void); const char *g_type_name(unsigned long); int printf(const char *, ...);\nint draws;\nint quit(void *d) { gtk_main_quit(); return 0; }\nint drawn(void *w, void *cr, void *d) { if (!draws++) g_timeout_add(300, quit, 0); return 0; }\nint main(void) {\n  void *w, *l, *dpy; int ww = 0, hh = 0;\n  if (!gtk_init_check(0, 0)) { printf("gtk: no display\\n"); return 1; }\n  dpy = gdk_display_get_default();\n  w = gtk_window_new(0); gtk_window_set_title(w, "gtk test"); gtk_window_set_default_size(w, 240, 80);\n  l = gtk_label_new("Hello from GTK on Superior"); gtk_container_add(w, l);\n  g_signal_connect_data(l, "draw", drawn, 0, 0, 1);\n  gtk_widget_show_all(w);\n  g_timeout_add(60000, quit, 0);\n  gtk_main();\n  gtk_window_get_size(w, &ww, &hh);\n  printf("gtk: %%u.%%u.%%u on %%s, a %%dx%%d window, its label %%s\\n", gtk_get_major_version(), gtk_get_minor_version(), gtk_get_micro_version(), g_type_name(**(unsigned long **)dpy), ww, hh, draws ? "drawn" : "never drawn");\n  return !draws;\n}\n' > gt.c && tcc -o gt gt.c /opt/alpine/usr/lib/libgtk-3.so.0 /opt/alpine/usr/lib/libgdk-3.so.0 /opt/alpine/usr/lib/libgobject-2.0.so.0 /opt/alpine/usr/lib/libglib-2.0.so.0 2>&1 && GDK_BACKEND=wayland XKB_CONFIG_ROOT=/opt/alpine/usr/share/X11/xkb XDG_DATA_DIRS=/opt/alpine/usr/share XDG_RUNTIME_DIR=/tmp WAYLAND_DISPLAY=wayland-0 NO_AT_BRIDGE=1 GTK_A11Y=none FONTCONFIG_FILE=/opt/alpine/fonts/fonts.conf ./gt; s=$?; rm -rf gt gt.c /tmp/fc; rm -r /opt /etc/ld-musl-$(uname -m).path; exit $s"#,
         ],
         0,
     ),
