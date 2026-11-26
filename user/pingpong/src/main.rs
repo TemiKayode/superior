@@ -947,6 +947,132 @@ fn cnode_tests() -> bool {
     pass
 }
 
+/// Two-level CSpaces: a 16-slot root CNode whose slot 3 holds a 128-slot
+/// CNode with a 2-bit guard (and whose slot 5 holds the same CNode with
+/// none, which leaves bits over), addressed 13 bits deep.
+const TL_GUARD: u64 = superior_objects::cap::guard(0b10, 2);
+const TL_DEPTH: u64 = 4 + 2 + 7;
+/// Index 0 of the second-level CNode: root slot 3, then the guard.
+const TL_ADDR: u64 = 3 << 9 | 0b10 << 7;
+const TL_DONE: u64 = TL_ADDR | 5;
+const TL_PARK: u64 = TL_ADDR | 6;
+const TL_BADGE: u64 = 0x3;
+static TL_REFUSED: AtomicU64 = AtomicU64::new(u64::MAX);
+
+extern "C" fn two_level_worker(done: u64) -> ! {
+    // Each of these is refused: the wrong guard; the same CNode through
+    // root slot 5, whose capability has no guard, so its size does not
+    // take the bits left; an address past the depth; and the slot's index
+    // as if the space were flat (root slot 0 holds nothing).
+    let wrong = [done ^ (0b11 << 7), 5 << 9 | (done & 0x1ff), done | 1 << 13, done & 0x7f];
+    let refused = wrong
+        .iter()
+        .filter(|&&a| syscall(Syscall::Signal, a, [0; 4]).status == Error::InvalidCapability.code())
+        .count();
+    TL_REFUSED.store(refused as u64, Ordering::SeqCst);
+    syscall(Syscall::Signal, done, [0; 4]);
+    loop {
+        // Nobody sends here: this blocks until the client suspends it.
+        syscall(Syscall::Recv, TL_PARK, [0; 4]);
+        syscall(Syscall::Signal, done, [0; 4]);
+    }
+}
+
+/// A thread whose CSpace has two levels: its capabilities resolve through
+/// a root CNode and a guarded second-level CNode, wrong addresses are
+/// refused, and the second-level CNode lives exactly as long as a root
+/// slot (or another capability) holds it.
+fn two_level_tests() -> bool {
+    use ObjectType::{CNode, Endpoint, Frame, Notification, Thread};
+    const ROOT: u64 = CN;
+    const LEAF: u64 = CN_BIG;
+    let mut pass = true;
+    let setup = [
+        retype(UNTYPED, CNode, 4, ROOT),
+        retype(UNTYPED, CNode, 7, LEAF),
+        retype(UNTYPED, Thread, 0, TCB2),
+        retype(UNTYPED, Frame, 0, STACK_FRAME),
+        map(STACK_FRAME, VA_STACK, true),
+        retype(UNTYPED, Notification, 0, DONE_NTFN),
+        retype(UNTYPED, Endpoint, 0, PARK_EP),
+        cnode_op(Syscall::CNodeCopy, LEAF, [5, DONE_NTFN, RIGHT_WRITE, TL_BADGE]),
+        cnode_op(Syscall::CNodeCopy, ROOT, [3, LEAF, RIGHTS_ALL, TL_GUARD]),
+        cnode_op(Syscall::CNodeCopy, ROOT, [5, LEAF, RIGHTS_ALL, 0]),
+    ];
+    pass &= expect(
+        "a root CNode holds a 128-slot CNode with a 2-bit guard",
+        ok(setup.iter().all(|&s| s == 0)),
+        1,
+    );
+    let long_guard = cnode_op(
+        Syscall::CNodeCopy,
+        ROOT,
+        [6, LEAF, RIGHTS_ALL, superior_objects::cap::guard(0b100, 2)],
+    );
+    let shallow = tcb2(Syscall::ThreadSetSpace, [ROOT, 4, 0, 0]);
+    let deep = tcb2(Syscall::ThreadSetSpace, [ROOT, 33, 0, 0]);
+    let bad = Error::InvalidArgument.code();
+    pass &= expect(
+        "a guard longer than its length, and depths not past the root or past 32 bits, are refused",
+        ok(long_guard == bad && shallow == bad && deep == bad),
+        1,
+    );
+
+    let entry = two_level_worker as *const () as u64;
+    let top = VA_STACK + 0x1000;
+    let space = tcb2(Syscall::ThreadSetSpace, [ROOT, TL_DEPTH, 0, 0]);
+    // Copied in through the thread's own addresses, so through both levels.
+    let copied = tcb2(Syscall::ThreadCopyCap, [PARK_EP, TL_PARK, RIGHT_READ, 0]);
+    let off_guard = tcb2(Syscall::ThreadCopyCap, [PARK_EP, TL_PARK ^ (0b11 << 7), RIGHT_READ, 0]);
+    let conf = tcb2(Syscall::ThreadConfigure, [entry, top, TL_DONE, 5]);
+    let run = tcb2(Syscall::ThreadResume, [0; 4]);
+    let w = syscall(Syscall::Wait, DONE_NTFN, [0; 4]);
+    pass &= expect(
+        "a thread runs in a two-level CSpace; a wrong guard, a CNode too small for the bits, an empty root slot and an address past the depth are refused",
+        ok(space == 0
+            && copied == 0
+            && off_guard == bad
+            && conf == 0
+            && run == 0
+            && w.status == 0
+            && w.badge == TL_BADGE
+            && TL_REFUSED.load(Ordering::SeqCst) == 4),
+        1,
+    );
+
+    // The root slots hold the second-level CNode: deleting this capability
+    // leaves it alive, and the pool has no room for another of its size.
+    let gone = syscall(Syscall::CapDelete, LEAF, [0; 4]).status;
+    let stop = tcb2(Syscall::ThreadSuspend, [0; 4]);
+    let go = tcb2(Syscall::ThreadResume, [0; 4]);
+    let w = syscall(Syscall::Wait, DONE_NTFN, [0; 4]);
+    let no_room = retype(UNTYPED, CNode, 7, LEAF);
+    pass &= expect(
+        "a second-level CNode outlives its creator's capability while a root slot holds it",
+        ok(gone == 0
+            && stop == 0
+            && go == 0
+            && w.status == 0
+            && w.badge == TL_BADGE
+            && no_room == Error::ObjectTableFull.code()),
+        1,
+    );
+
+    // Emptying the root slots that hold it destroys it: its room is free
+    // again while the root lives on.
+    let del = syscall(Syscall::CapDelete, TCB2, [0; 4]).status;
+    let d3 = cnode_op(Syscall::CNodeDelete, ROOT, [3, 0, 0, 0]);
+    let d5 = cnode_op(Syscall::CNodeDelete, ROOT, [5, 0, 0, 0]);
+    let room = retype(UNTYPED, CNode, 7, LEAF);
+    let rv = syscall(Syscall::CapRevoke, UNTYPED, [0; 4]).status;
+    pass &= expect(
+        "deleting a second-level CNode from the root slots frees it",
+        ok(del == 0 && d3 == 0 && d5 == 0 && room == 0 && rv == 0),
+        1,
+    );
+    pass
+}
+
 /// Address-space objects: made from untyped memory, paying for their own
 /// page tables, mapped into by a capability holder (writable or
 /// executable, never both), and destroyed with the memory they came from.
@@ -1082,6 +1208,7 @@ fn client() -> ! {
     pass &= fault_tests();
     pass &= thread_tests();
     pass &= cnode_tests();
+    pass &= two_level_tests();
     pass &= vspace_tests();
 
     // Round trips through the server.

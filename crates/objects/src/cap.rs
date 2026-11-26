@@ -159,11 +159,41 @@ impl Object {
         }
     }
 
-    /// Only communication objects carry badges; the badge tells a server
-    /// which client or which object a message is about.
+    /// Communication objects carry badges; the badge tells a server which
+    /// client or which object a message is about. A CNode's badge is its
+    /// guard ([`guard_of`]), set once like a badge.
     pub const fn badgeable(&self) -> bool {
-        matches!(self, Object::Endpoint { .. } | Object::Notification { .. })
+        matches!(
+            self,
+            Object::Endpoint { .. } | Object::Notification { .. } | Object::CNode { .. }
+        )
     }
+}
+
+/// Longest guard a CNode capability can carry, in bits.
+pub const GUARD_MAX_BITS: u8 = 32;
+/// Deepest two-level CSpace address, in bits.
+pub const CSPACE_MAX_DEPTH: u8 = 32;
+
+/// A CNode capability's badge as its guard: (value, length in bits), where
+/// the badge is the value in bits 0-31 and the length in bits 32-39. `None`
+/// if the badge is no guard (a value too long for its length, a length past
+/// [`GUARD_MAX_BITS`], or other bits set). Badge 0 is the empty guard.
+pub const fn guard_of(badge: u64) -> Option<(u32, u8)> {
+    let bits = (badge >> 32) as u8;
+    let value = badge as u32;
+    if badge >> 40 != 0 || bits > GUARD_MAX_BITS {
+        return None;
+    }
+    if bits < 32 && value >> bits != 0 {
+        return None;
+    }
+    Some((value, bits))
+}
+
+/// The badge that gives a CNode capability guard `value` of `bits` bits.
+pub const fn guard(value: u32, bits: u8) -> u64 {
+    (bits as u64) << 32 | value as u64
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -200,6 +230,8 @@ pub enum CapError {
     HasChildren,
     /// The untyped block has no aligned room left of the requested size.
     OutOfMemory,
+    /// A CNode's badge that is no guard ([`guard_of`]).
+    BadGuard,
 }
 
 /// No slot: the end of a list of children.
@@ -367,6 +399,38 @@ impl Table {
         self.slots.iter().filter_map(|s| s.cap.as_ref())
     }
 
+    /// Resolves address `cptr` in a two-level CSpace: a root CNode of
+    /// `1 << root_bits` slots from `root`, read `depth` bits deep. The top
+    /// `root_bits` of the address pick a root slot, which must hold a CNode
+    /// capability whose guard and size use exactly the bits left: the next
+    /// bits must equal its guard, and the last ones index it. Returns the
+    /// table index of that second-level slot, or `None` (an address past
+    /// `depth` bits, a root slot holding no CNode, a guard that does not
+    /// match, or a CNode whose guard and size do not fill the bits left).
+    ///
+    /// So every address resolves to at most one slot, inside the CNode the
+    /// root slot names, and only if it carries that CNode's guard: an
+    /// address meant for one table never lands in another.
+    pub fn resolve(&self, root: usize, root_bits: u8, depth: u8, cptr: u64) -> Option<usize> {
+        if depth > CSPACE_MAX_DEPTH || root_bits >= depth || cptr >> depth != 0 {
+            return None;
+        }
+        let rest = depth - root_bits;
+        let cap = self.get(root + (cptr >> rest) as usize)?;
+        let Object::CNode { base, size_bits } = cap.object else {
+            return None;
+        };
+        let (value, bits) = guard_of(cap.badge)?;
+        if bits as u32 + size_bits as u32 != rest as u32 {
+            return None;
+        }
+        let low = cptr & ((1u64 << rest) - 1);
+        if low >> size_bits != value as u64 {
+            return None;
+        }
+        Some(base as usize + (low & ((1u64 << size_bits) - 1)) as usize)
+    }
+
     /// Derives a new capability from `src` into the empty slot `dst`.
     ///
     /// The new rights are `src.rights ∩ mask`, so rights can only shrink.
@@ -390,6 +454,9 @@ impl Table {
             }
             if parent.badge != 0 {
                 return Err(CapError::BadgeAlreadySet);
+            }
+            if matches!(parent.object, Object::CNode { .. }) && guard_of(b).is_none() {
+                return Err(CapError::BadGuard);
             }
             child.badge = b;
         }

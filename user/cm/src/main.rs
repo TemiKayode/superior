@@ -137,7 +137,10 @@ const PACKAGE_PAGES: u64 = SYSTEM_PAGES + SYSTEM_MAX_PAGES;
 const PACKAGE_MAX_PAGES: u64 = package::BYTES.div_ceil(4096) as u64;
 /// Where each page of a `file` is made before it goes to the component.
 const FILE_SCRATCH: u64 = (1 << root::CNODE_BITS) - 1;
-const _: () = assert!(PACKAGE_PAGES + PACKAGE_MAX_PAGES * package::COUNT as u64 <= FILE_SCRATCH);
+/// Where each second-level CNode of a two-level CSpace is made and filled
+/// before it goes into the root.
+const LEAF_SCRATCH: u64 = FILE_SCRATCH - 1;
+const _: () = assert!(PACKAGE_PAGES + PACKAGE_MAX_PAGES * package::COUNT as u64 <= LEAF_SCRATCH);
 /// The manager's badge on the system disk (clients' are their numbers).
 const BADGE_SYSTEM_DISK: u64 = 0x1000;
 
@@ -209,6 +212,32 @@ fn retype_into(ut: u64, ty: ObjectType, bits: u64, cnode: u64, index: u64) -> Re
 
 fn cnode_copy(cnode: u64, index: u64, src: u64, mask: u64, badge: u64) -> Result<(), u64> {
     sys(Syscall::CNodeCopy, cnode, [index, src, mask, badge]).map(drop)
+}
+
+/// Where a component's capabilities go while it is built: the CNode in
+/// slot `cnode`, which holds its slots `lo` to `lo + size - 1` (all of a
+/// one-level CSpace, or one second-level CNode of a two-level one). Slots
+/// outside it are left for another pass.
+#[derive(Clone, Copy)]
+struct Dest {
+    cnode: u64,
+    lo: u64,
+    size: u64,
+}
+
+impl Dest {
+    /// The CNode index of the component's slot `slot`, if this holds it.
+    fn index(&self, slot: u64) -> Option<u64> {
+        slot.checked_sub(self.lo).filter(|&i| i < self.size)
+    }
+
+    fn copy(&self, slot: u64, src: u64, mask: u64, badge: u64) -> Result<(), u64> {
+        self.index(slot).map_or(Ok(()), |i| cnode_copy(self.cnode, i, src, mask, badge))
+    }
+
+    fn retype(&self, ut: u64, ty: ObjectType, bits: u64, slot: u64) -> Result<(), u64> {
+        self.index(slot).map_or(Ok(()), |i| retype_into(ut, ty, bits, self.cnode, i))
+    }
 }
 
 fn mint(src: u64, dst: u64, mask: u64, badge: u64) -> Result<(), u64> {
@@ -321,6 +350,73 @@ impl<'a> Manager<'a> {
         Ok(())
     }
 
+    /// Places component `i`'s capabilities (manifest `c`) that `to` holds.
+    fn place(&self, i: usize, c: &Component, ut: u64, to: Dest) -> Result<(), Failure> {
+        for cap in c.caps() {
+            let slot = cap.slot as u64;
+            let r = match cap.kind {
+                CapKind::Provides(s) => {
+                    let ep = SERVICES + self.service_index(s).unwrap() as u64;
+                    to.copy(slot, ep, READ | WRITE | GRANT_REPLY, 0)
+                }
+                CapKind::Uses(s) | CapKind::Manages(s) => {
+                    let ep = SERVICES + self.service_index(s).unwrap() as u64;
+                    // The Memory Server learns the client's quota from
+                    // the badge, which the client cannot change; a manager
+                    // is known by its badge's mark.
+                    let badge = if s == "mem" {
+                        mem::badge(i, c.quota_pages)
+                    } else if matches!(cap.kind, CapKind::Manages(_)) {
+                        (i as u64 + 1) | MANAGER_BADGE
+                    } else {
+                        i as u64 + 1
+                    };
+                    // Grant: a client may lend the server a capability
+                    // (a buffer frame to DMA into, say).
+                    to.copy(slot, ep, WRITE | GRANT | GRANT_REPLY, badge)
+                }
+                CapKind::Device(d) => match device(d) {
+                    Some((src, count)) => {
+                        let r = (0..count)
+                            .try_for_each(|k| to.copy(slot + k, src + k, ALL, 0));
+                        // A machine without an IOMMU (or a PS/2 controller,
+                        // or a boot framebuffer) has none to give: the slot
+                        // stays empty, and the component copes.
+                        if matches!(d, "iommu" | "intx" | "ps2" | "framebuffer") { Ok(()) } else { r }
+                    }
+                    None => return Err(("unknown device", 0)),
+                },
+                CapKind::Notification => to.retype(ut, ObjectType::Notification, 0, slot),
+                CapKind::Untyped(bits) => {
+                    to.retype(ut, ObjectType::Untyped, bits as u64, slot)
+                }
+                CapKind::Control => {
+                    to.copy(slot, CONTROL, WRITE, BADGE_REPORT + i as u64)
+                }
+                CapKind::State => to.copy(slot, root::STATE_STORE + i as u64, ALL, 0),
+                CapKind::File(name) => match self.file(i, name) {
+                    Some(bytes) => copy_file(bytes, ut, to, slot),
+                    None => return Err(("file not in the bundle", 0)),
+                },
+                CapKind::Shared(n) => (0..n as u64)
+                    .try_for_each(|p| to.copy(slot + p, self.shared[i] + p, ALL, 0)),
+                // Each spare block the kernel gave, made over whole as a
+                // child of the manager's, so stopping the component takes
+                // it all back (`stop`).
+                CapKind::Spare => (0..root::SPARE_COUNT)
+                    .map_while(|k| {
+                        let r = syscall(Syscall::UntypedInfo, root::SPARE + k, [0; 4]);
+                        (r.status == 0).then_some((k, r.msg[0]))
+                    })
+                    .try_for_each(|(k, bits)| {
+                        to.retype(root::SPARE + k, ObjectType::Untyped, bits, slot + k)
+                    }),
+            };
+            r.map_err(|e| ("placing a capability", e))?;
+        }
+        Ok(())
+    }
+
     /// Builds an instance of component `i`, its thread not yet started.
     /// Its untyped block (and state page) are made the first time and
     /// kept: a later instance is built from the same block once
@@ -353,8 +449,12 @@ impl<'a> Manager<'a> {
             self.made[i] = true;
         }
         // The CNode first: the largest object, aligned to its size, so a
-        // big one (the Memory Server's) wastes none of the block.
-        retype(ut, ObjectType::CNode, c.cspace_bits as u64, cnode).map_err(|e| ("CNode", e))?;
+        // big one (the Memory Server's) wastes none of the block. With two
+        // levels, this is the root, and each CNode under it is made as its
+        // capabilities are placed (`place`).
+        let leaf = c.cspace_leaf_bits as u64;
+        let root_bits = c.cspace_bits as u64 - leaf;
+        retype(ut, ObjectType::CNode, root_bits, cnode).map_err(|e| ("CNode", e))?;
         retype(ut, ObjectType::AddressSpace, c.vspace_bits as u64, vspace)
             .map_err(|e| ("address space", e))?;
         retype(ut, ObjectType::Thread, 0, tcb).map_err(|e| ("thread", e))?;
@@ -365,67 +465,23 @@ impl<'a> Manager<'a> {
             retype(ut, ObjectType::Frame, 0, f).map_err(|e| ("stack", e))?;
             map_into(f, STACK_TOP - (p + 1) * PAGE, MAP_WRITE, vspace).map_err(|e| ("stack", e))?;
         }
-        for cap in c.caps() {
-            let slot = cap.slot as u64;
-            let r = match cap.kind {
-                CapKind::Provides(s) => {
-                    let ep = SERVICES + self.service_index(s).unwrap() as u64;
-                    cnode_copy(cnode, slot, ep, READ | WRITE | GRANT_REPLY, 0)
-                }
-                CapKind::Uses(s) | CapKind::Manages(s) => {
-                    let ep = SERVICES + self.service_index(s).unwrap() as u64;
-                    // The Memory Server learns the client's quota from
-                    // the badge, which the client cannot change; a manager
-                    // is known by its badge's mark.
-                    let badge = if s == "mem" {
-                        mem::badge(i, c.quota_pages)
-                    } else if matches!(cap.kind, CapKind::Manages(_)) {
-                        (i as u64 + 1) | MANAGER_BADGE
-                    } else {
-                        i as u64 + 1
-                    };
-                    // Grant: a client may lend the server a capability
-                    // (a buffer frame to DMA into, say).
-                    cnode_copy(cnode, slot, ep, WRITE | GRANT | GRANT_REPLY, badge)
-                }
-                CapKind::Device(d) => match device(d) {
-                    Some((src, count)) => {
-                        let r = (0..count)
-                            .try_for_each(|k| cnode_copy(cnode, slot + k, src + k, ALL, 0));
-                        // A machine without an IOMMU (or a PS/2 controller,
-                        // or a boot framebuffer) has none to give: the slot
-                        // stays empty, and the component copes.
-                        if matches!(d, "iommu" | "intx" | "ps2" | "framebuffer") { Ok(()) } else { r }
-                    }
-                    None => return Err(("unknown device", 0)),
-                },
-                CapKind::Notification => retype_into(ut, ObjectType::Notification, 0, cnode, slot),
-                CapKind::Untyped(bits) => {
-                    retype_into(ut, ObjectType::Untyped, bits as u64, cnode, slot)
-                }
-                CapKind::Control => {
-                    cnode_copy(cnode, slot, CONTROL, WRITE, BADGE_REPORT + i as u64)
-                }
-                CapKind::State => cnode_copy(cnode, slot, root::STATE_STORE + i as u64, ALL, 0),
-                CapKind::File(name) => match self.file(i, name) {
-                    Some(bytes) => copy_file(bytes, ut, cnode, slot),
-                    None => return Err(("file not in the bundle", 0)),
-                },
-                CapKind::Shared(n) => (0..n as u64)
-                    .try_for_each(|p| cnode_copy(cnode, slot + p, self.shared[i] + p, ALL, 0)),
-                // Each spare block the kernel gave, made over whole as a
-                // child of the manager's, so stopping the component takes
-                // it all back (`stop`).
-                CapKind::Spare => (0..root::SPARE_COUNT)
-                    .map_while(|k| {
-                        let r = syscall(Syscall::UntypedInfo, root::SPARE + k, [0; 4]);
-                        (r.status == 0).then_some((k, r.msg[0]))
-                    })
-                    .try_for_each(|(k, bits)| {
-                        retype_into(root::SPARE + k, ObjectType::Untyped, bits, cnode, slot + k)
-                    }),
-            };
-            r.map_err(|e| ("placing a capability", e))?;
+        if leaf == 0 {
+            let all = Dest { cnode, lo: 0, size: 1 << c.cspace_bits };
+            self.place(i, &c, ut, all)?;
+        } else {
+            // Each second-level CNode is made and filled in a slot of the
+            // manager's, copied into the root and that slot emptied: the
+            // root's copy is then the only one, so emptying the root (when
+            // the component stops) destroys it.
+            for r in 0..1u64 << root_bits {
+                retype(ut, ObjectType::CNode, leaf, LEAF_SCRATCH).map_err(|e| ("CNode", e))?;
+                let part = Dest { cnode: LEAF_SCRATCH, lo: r << leaf, size: 1 << leaf };
+                let placed = self
+                    .place(i, &c, ut, part)
+                    .and_then(|()| cnode_copy(cnode, r, LEAF_SCRATCH, ALL, 0).map_err(|e| ("CNode", e)));
+                let _ = syscall(Syscall::CapDelete, LEAF_SCRATCH, [0; 4]);
+                placed?;
+            }
         }
         sys(
             Syscall::ThreadConfigure,
@@ -450,7 +506,11 @@ impl<'a> Manager<'a> {
         }
         sys(Syscall::ThreadSetVSpace, tcb, [vspace, 0, 0, 0])
             .map_err(|e| ("set address space", e))?;
-        sys(Syscall::ThreadSetSpace, tcb, [cnode, 0, 0, 0]).map_err(|e| ("set CSpace", e))?;
+        let depth = if leaf == 0 { 0 } else { c.cspace_bits as u64 };
+        sys(Syscall::ThreadSetSpace, tcb, [cnode, depth, 0, 0]).map_err(|e| ("set CSpace", e))?;
+        if leaf != 0 {
+            say!("{}: CSpace in two levels, {} CNodes of {} slots", c.name, 1u64 << root_bits, 1u64 << leaf);
+        }
         let fault = FAULT_CAP + i as u64;
         sys(Syscall::ThreadSetFaultHandler, tcb, [fault, 0, 0, 0])
             .map_err(|e| ("set fault handler", e))?;
@@ -1346,8 +1406,11 @@ fn map_into(frame: u64, va: u64, flags: u64, vspace: u64) -> Result<(), u64> {
 /// in consecutive indexes of the CNode in slot `cnode` from `index`. Each
 /// page is written through the scratch mapping; the component's copy is
 /// the only capability left to it.
-fn copy_file(bytes: &[u8], ut: u64, cnode: u64, index: u64) -> Result<(), u64> {
+fn copy_file(bytes: &[u8], ut: u64, to: Dest, index: u64) -> Result<(), u64> {
     for (p, chunk) in bytes.chunks(PAGE as usize).enumerate() {
+        if to.index(index + p as u64).is_none() {
+            continue;
+        }
         retype(ut, ObjectType::Frame, 0, FILE_SCRATCH)?;
         let r = sys(Syscall::FrameMap, FILE_SCRATCH, [SCRATCH_VA, 1, 0, 0])
             .map(|_| {
@@ -1358,7 +1421,7 @@ fn copy_file(bytes: &[u8], ut: u64, cnode: u64, index: u64) -> Result<(), u64> {
                 }
             })
             .and_then(|_| sys(Syscall::FrameUnmap, FILE_SCRATCH, [0; 4]))
-            .and_then(|_| cnode_copy(cnode, index + p as u64, FILE_SCRATCH, ALL, 0));
+            .and_then(|_| to.copy(index + p as u64, FILE_SCRATCH, ALL, 0));
         let _ = syscall(Syscall::CapDelete, FILE_SCRATCH, [0; 4]);
         r?;
     }
