@@ -38,6 +38,10 @@
 //!   cspace 12 8             # or of 2^12 slots in two levels: a root CNode
 //!                           # of 2^4 slots, each holding a CNode of 2^8;
 //!                           # slots are numbered as in one level
+//!   cspace 20 10 16         # two levels, CNodes made under the root for
+//!                           # slots below 2^16 only (the rest empty)
+//!   cnode 65534             # a copy of its CSpace's root CNode, to put
+//!                           # CNodes of its own in the root's empty slots
 //!   vspace 18               # an address space of 2^18 bytes, page
 //!                           # tables included (default 2^16)
 //!   quota 64                # pages the Memory Server may give it
@@ -155,6 +159,10 @@ pub enum CapKind<'a> {
     /// with zeros): data a component reads, like the Linux personality's
     /// programs.
     File(&'a str),
+    /// A copy of the component's own root CNode (of a CSpace in two
+    /// levels), with which it makes the root's empty slots CNodes of its
+    /// own: what it addresses past the slots the manager filled.
+    Root,
 }
 
 /// Most `app-service` lines.
@@ -188,6 +196,10 @@ pub struct Component<'a> {
     /// CNode of this many, and slot `s` is index `s % 2^leaf` of the CNode
     /// in root slot `s / 2^leaf`.
     pub cspace_leaf_bits: u8,
+    /// With two levels: CNodes are made under the root for the slots below
+    /// 2^this only, the root's other slots left empty for the component
+    /// to fill ([`CapKind::Root`]). 0 for all of them.
+    pub cspace_made_bits: u8,
     /// Its address space's size in bits.
     pub vspace_bits: u8,
     /// Pages the Memory Server may give it (heap and frames together).
@@ -227,6 +239,7 @@ impl<'a> Component<'a> {
             memory_bits: DEFAULT_MEMORY_BITS,
             cspace_bits: CSPACE_BITS,
             cspace_leaf_bits: 0,
+            cspace_made_bits: 0,
             vspace_bits: VSPACE_BITS,
             quota_pages: 0,
             heap_pages: 0,
@@ -451,24 +464,35 @@ impl<'a> Manifest<'a> {
                     None
                 }
                 "cspace" => {
-                    let w = arg("cspace needs a size in bits")?;
-                    match number(w)? {
-                        b if (CSPACE_BITS as u64..=CSPACE_MAX_BITS as u64).contains(&b) => {
-                            c.cspace_bits = b as u8
-                        }
-                        _ => return Err(err("cspace must be 6 to 18 bits", w)),
-                    }
+                    let size = arg("cspace needs a size in bits")?;
+                    let bits = number(size)?;
                     // Two levels: each CNode at least 2^4 slots, as the
-                    // kernel makes them.
+                    // kernel makes them; at most 32 bits in all, and slots
+                    // made by the manager for at most 2^18.
                     if let Some(w) = words.next() {
-                        let min = crate::abi::CNODE_MIN_BITS as u8;
+                        let min = crate::abi::CNODE_MIN_BITS as u64;
+                        if !(CSPACE_BITS as u64..=crate::cap::CSPACE_MAX_DEPTH as u64).contains(&bits) {
+                            return Err(err("cspace in two levels must be 6 to 32 bits", size));
+                        }
                         match number(w)? {
-                            l if l >= min as u64 && l + min as u64 <= c.cspace_bits as u64 => {
-                                c.cspace_leaf_bits = l as u8
-                            }
+                            l if l >= min && l + min <= bits => c.cspace_leaf_bits = l as u8,
                             _ => return Err(err("cspace levels must each be 4 bits or more", w)),
                         }
+                        let made = match words.next() {
+                            Some(w) => match number(w)? {
+                                m if m >= c.cspace_leaf_bits as u64 && m <= bits => m,
+                                _ => return Err(err("cspace's made slots must be from its CNodes' size to its own", w)),
+                            },
+                            None => bits,
+                        };
+                        if made > CSPACE_MAX_BITS as u64 {
+                            return Err(err("cspace must have 18 bits of slots made or fewer", size));
+                        }
+                        c.cspace_made_bits = if made == bits { 0 } else { made as u8 };
+                    } else if !(CSPACE_BITS as u64..=CSPACE_MAX_BITS as u64).contains(&bits) {
+                        return Err(err("cspace must be 6 to 18 bits", size));
                     }
+                    c.cspace_bits = bits as u8;
                     None
                 }
                 "vspace" => {
@@ -538,6 +562,12 @@ impl<'a> Manifest<'a> {
                     Some((CapKind::Device(d), arg("device needs a slot")?))
                 }
                 "notification" => Some((CapKind::Notification, arg("notification needs a slot")?)),
+                "cnode" => {
+                    if c.cspace_leaf_bits == 0 {
+                        return Err(err("cnode needs a cspace in two levels before it", key));
+                    }
+                    Some((CapKind::Root, arg("cnode needs a slot")?))
+                }
                 "control" => Some((CapKind::Control, arg("control needs a slot")?)),
                 "file" => {
                     let f = arg("file needs a bundle entry")?;
@@ -774,6 +804,28 @@ component b
  image a
  cspace 9").unwrap();
         assert_eq!(one.components[0].as_ref().unwrap().cspace_leaf_bits, 0);
+        let big = Manifest::parse("component a
+ image a
+ cspace 20 10 16
+ cnode 65534").unwrap();
+        let c = big.components[0].as_ref().unwrap();
+        assert_eq!((c.cspace_bits, c.cspace_leaf_bits, c.cspace_made_bits), (20, 10, 16));
+        assert_eq!(c.caps().next().map(|x| (x.kind, x.slot)), Some((CapKind::Root, 65534)));
+        assert_eq!(error("component a
+ image a
+ cspace 20 10"), (3, "cspace must have 18 bits of slots made or fewer"));
+        assert_eq!(error("component a
+ image a
+ cspace 20 10 8"), (3, "cspace's made slots must be from its CNodes' size to its own"));
+        assert_eq!(error("component a
+ image a
+ cspace 33 10 16"), (3, "cspace in two levels must be 6 to 32 bits"));
+        assert_eq!(error("component a
+ image a
+ cnode 5"), (3, "cnode needs a cspace in two levels before it"));
+        assert_eq!(error("component a
+ image a
+ cspace 20"), (3, "cspace must be 6 to 18 bits"));
         let bad = "cspace levels must each be 4 bits or more";
         assert_eq!(error("component a
  image a
@@ -786,7 +838,7 @@ component b
  cspace 7 4"), (3, bad));
         assert_eq!(error("component a
  image a
- cspace 12 8 2"), (3, "unexpected word"));
+ cspace 12 8 2"), (3, "cspace's made slots must be from its CNodes' size to its own"));
     }
 
     #[test]

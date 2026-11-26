@@ -394,6 +394,8 @@ impl<'a> Manager<'a> {
                     to.copy(slot, CONTROL, WRITE, BADGE_REPORT + i as u64)
                 }
                 CapKind::State => to.copy(slot, root::STATE_STORE + i as u64, ALL, 0),
+                // Its root CNode, made first (`build`).
+                CapKind::Root => to.copy(slot, BLOCKS + i as u64 * BLOCK + B_CNODE, ALL, 0),
                 CapKind::File(name) => match self.file(i, name) {
                     Some(bytes) => copy_file(bytes, ut, to, slot),
                     None => return Err(("file not in the bundle", 0)),
@@ -472,8 +474,10 @@ impl<'a> Manager<'a> {
             // Each second-level CNode is made and filled in a slot of the
             // manager's, copied into the root and that slot emptied: the
             // root's copy is then the only one, so emptying the root (when
-            // the component stops) destroys it.
-            for r in 0..1u64 << root_bits {
+            // the component stops) destroys it. Only those for the slots
+            // the manifest says to make: the component fills the rest.
+            let made = if c.cspace_made_bits == 0 { c.cspace_bits } else { c.cspace_made_bits } as u64;
+            for r in 0..1u64 << (made - leaf) {
                 retype(ut, ObjectType::CNode, leaf, LEAF_SCRATCH).map_err(|e| ("CNode", e))?;
                 let part = Dest { cnode: LEAF_SCRATCH, lo: r << leaf, size: 1 << leaf };
                 let placed = self
@@ -509,7 +513,14 @@ impl<'a> Manager<'a> {
         let depth = if leaf == 0 { 0 } else { c.cspace_bits as u64 };
         sys(Syscall::ThreadSetSpace, tcb, [cnode, depth, 0, 0]).map_err(|e| ("set CSpace", e))?;
         if leaf != 0 {
-            say!("{}: CSpace in two levels, {} CNodes of {} slots", c.name, 1u64 << root_bits, 1u64 << leaf);
+            let made = if c.cspace_made_bits == 0 { c.cspace_bits } else { c.cspace_made_bits } as u64;
+            say!(
+                "{}: CSpace in two levels, {} CNodes of {} slots (a root of {})",
+                c.name,
+                1u64 << (made - leaf),
+                1u64 << leaf,
+                1u64 << root_bits
+            );
         }
         let fault = FAULT_CAP + i as u64;
         sys(Syscall::ThreadSetFaultHandler, tcb, [fault, 0, 0, 0])

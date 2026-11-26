@@ -55,14 +55,19 @@
 //! glibc's dynamic linker's from 8192, hello's from 8256, glibc's from
 //! 8320, the toolchain's from 8832 (tcc, make, libtcc, the archive of the
 //! rest), and binutils' from 9472 (as, ld and their libraries) (`file`
-//! in the manifest), up to 2^16. Past them, process `i` owns the slots
-//! from `PROC_SLOTS + i * PROC_SPAN` (65536 on, 27904 each): its
-//! address space, then its threads (each with a badged fault endpoint)
-//! and pages as made, two slots a page (its frame and the mirror's copy),
-//! so up to some 54 MiB of its own, to the end of the CNode's 2^18 slots.
-//! (What is lent to another server stays below 2^16, as a transfer names
-//! a slot in 16 bits: the shared pages, the exec buffer and the
-//! framebuffer, after the files' pool.)
+//! in the manifest), up to 2^16. The CSpace is in two levels (2^20
+//! slots: a root CNode of 2^10, each slot a CNode of 2^10, a leaf); the
+//! manager makes the leaves for those slots, and this server the rest as
+//! a process needs them, from that process's memory, so they go when it
+//! does. Process `i` owns the slots from `PROC_SLOTS + i * MISC_SPAN`
+//! (65536 on, 4096 each) for its address space, then its threads (each
+//! with a badged fault endpoint), and two slots for each page of its
+//! window from `PAGE_SLOTS * (i + 1)` ([`page_slot`]): the page's frame
+//! (or a file's page mapped there) and the mirror's copy. So its memory
+//! is bounded by its window and by RAM, not by slots. (What is lent to
+//! another server stays below 2^16, as a transfer names a slot in 16
+//! bits: the shared pages, the exec buffer and the framebuffer, after the
+//! files' pool.)
 //!
 //! Signals ([`signal`]): actions per process, masks per thread, `kill`
 //! and `tkill`, handlers run on the thread's stack and returned from. The terminal ([`tty`]): the serial
@@ -207,10 +212,16 @@ const LIBWAYLAND_FILE: u64 = 65360;
 const LIBFFI_FILE: u64 = 65392;
 const LIBXKBCOMMON_FILE: u64 = 65424;
 const WAYLAND_END: u64 = 65520;
-const _: () = assert!(LINKS_END <= LIBWAYLAND_FILE && WAYLAND_END <= PROC_SLOTS);
-/// The CNode's size (`cspace` in the manifest): past the manifest's
-/// slots, the processes'.
-const CSPACE_BITS: u64 = 18;
+const _: () = assert!(LINKS_END <= LIBWAYLAND_FILE && WAYLAND_END <= ROOT_CNODE);
+/// The CSpace (`cspace 20 10 16` in the manifest): a root CNode of 2^10
+/// slots, each a leaf CNode of 2^10; the manager makes the leaves for
+/// the slots below 2^16, this server the processes' ([`State::leaf`]).
+const CSPACE_BITS: u64 = 20;
+const LEAF_BITS: u64 = 10;
+/// The root CNode (`cnode` in the manifest), and where a leaf is made
+/// before it is put in the root.
+const ROOT_CNODE: u64 = 65534;
+const LEAF_SCRATCH: u64 = 65535;
 /// This server's state's pages (each process's frames among it), then
 /// the files' (the pool), after links'; then the shared pages, the exec
 /// buffer and the framebuffer.
@@ -220,12 +231,13 @@ const POOL_SLOTS: u64 = STATE_SLOTS + STATE_PAGES;
 const _: () = assert!(LINKS_END <= STATE_SLOTS);
 /// The signal restorer's page ([`signal::TRAMPOLINE`]).
 const TRAMPOLINE_SLOT: u64 = 1000;
-/// Each process's slots, past the manifest's: 27904, two a page, so up to
-/// some 54 MiB of its own.
+/// Each process's slots for its address space and threads, past the
+/// manifest's: 4096 each.
 const PROC_SLOTS: u64 = 1 << 16;
-const PROC_SPAN: u64 = 27904;
-/// A frame of a process's that `munmap` gave back ([`Proc::frames`]).
-const FREE: u16 = u16::MAX;
+const MISC_SPAN: u64 = 1 << 12;
+/// Each process's page slots ([`page_slot`]): two for each page of its
+/// window, from `PAGE_SLOTS * (i + 1)`.
+const PAGE_SLOTS: u64 = 1 << 17;
 const MAX_PROCS: usize = 7;
 /// Threads, in all processes.
 const MAX_TASKS: usize = 16;
@@ -297,7 +309,10 @@ const FB_VA: u64 = USER_BASE + 0x1_9a00_0000;
 /// as a screen would show it: every FB_PERIOD ticks (25 times a second).
 const FB_PERIOD: u64 = TICK_HZ / 25;
 const _: () = assert!(FB_PAGES << 12 <= 1 << FB_BLOCK_BITS && FB_SLOTS + FB_PAGES <= LIBWAYLAND_FILE);
-const _: () = assert!(PROC_SLOTS + MAX_PROCS as u64 * PROC_SPAN <= 1 << CSPACE_BITS);
+const _: () = assert!(PAGE_SLOTS == 2 * CHILD_PAGES as u64);
+const _: () = assert!(PROC_SLOTS + MAX_PROCS as u64 * MISC_SPAN <= PAGE_SLOTS);
+const _: () = assert!(PAGE_SLOTS * (MAX_PROCS as u64 + 1) <= 1 << CSPACE_BITS);
+const _: () = assert!(MISC_SPAN % (1 << LEAF_BITS) == 0 && PROC_SLOTS % (1 << LEAF_BITS) == 0);
 /// Shared memory (`memfd_create`): a block of the rest of RAM cut into
 /// SHM_PAGES pages, here at SHM_VA, in the slots after the files' pool
 /// (below 2^16: a slot a capability is granted from is named in 16 bits,
@@ -870,7 +885,7 @@ struct Proc {
     /// this one uses: itself, but for a `vfork` child, which borrows its
     /// parent's until it execs or ends ([`State::mem`]).
     mem: u8,
-    /// Slots used of its span.
+    /// Slots used of its address space's and threads' ([`MISC_SPAN`]).
     cursor: u64,
     cwd: u16,
     /// Open-file description + 1, per descriptor.
@@ -880,11 +895,11 @@ struct Proc {
     brk: u64,
     /// Its own pages (mapped in the mirror too).
     present: [u64; CHILD_PAGES / 64],
-    /// What each slot of its span holds that is one of its own pages'
-    /// frames (the slot after is its copy for the mirror): the page's
-    /// number + 1, or [`FREE`] for a frame `munmap` gave back, to be used
-    /// again; 0 for any other slot.
-    frames: [u16; PROC_SPAN as usize],
+    /// Pages whose slots ([`page_slot`]) hold a frame `munmap` gave back:
+    /// in it no more, still mapped in the mirror, to be used again
+    /// ([`State::map_page`]); and how many.
+    parked: [u64; CHILD_PAGES / 64],
+    nparked: u32,
     /// Pages of anonymous mappings not yet touched: each becomes one of
     /// its own when first used (a page fault there, or a system call
     /// writing there).
@@ -975,6 +990,9 @@ struct State {
     futex_seq: u64,
     /// Which process (its index + 1) each spare block is lent to.
     spare_owner: [u8; SPARES],
+    /// Which of the root CNode's slots hold a leaf made for a process
+    /// ([`State::leaf`]).
+    leaves: [u64; (1usize << (CSPACE_BITS - LEAF_BITS)) / 64],
     /// The restorer page's run, which every process maps.
     trampoline: Shared,
     images: [Img; MAX_IMAGES],
@@ -1093,11 +1111,20 @@ impl Strs {
     }
 }
 
-fn slot_base(i: usize) -> u64 {
-    PROC_SLOTS + i as u64 * PROC_SPAN
+fn misc_base(i: usize) -> u64 {
+    PROC_SLOTS + i as u64 * MISC_SPAN
 }
 fn space_slot(i: usize) -> u64 {
-    slot_base(i)
+    misc_base(i)
+}
+/// The slot of process `i`'s page `k` (of its window): its frame, or a
+/// file's page mapped there; the slot after is the frame's copy for the
+/// mirror.
+fn page_slot(i: usize, k: usize) -> u64 {
+    PAGE_SLOTS * (i as u64 + 1) + 2 * k as u64
+}
+fn bit(a: &[u64], k: usize) -> bool {
+    a[k / 64] & 1 << (k % 64) != 0
 }
 fn block_slot(i: usize) -> u64 {
     BLOCKS + i as u64
@@ -1121,6 +1148,31 @@ impl State {
         let k = self.spare_owner.iter().position(|&o| o == 0).ok_or(ENOMEM)?;
         self.spare_owner[k] = i as u8 + 1;
         sys(Syscall::Retype, SPARE_BLOCKS + k as u64, msg).map(drop).map_err(|_| ENOMEM)
+    }
+
+    /// Makes sure the leaf CNode holding process `i`'s `slot` is in the
+    /// root: made from the process's memory, so it goes (and what it
+    /// holds) when the process's blocks are revoked.
+    fn leaf(&mut self, i: usize, slot: u64) -> Result<(), u64> {
+        let r = (slot >> LEAF_BITS) as usize;
+        debug_assert!(slot >= PROC_SLOTS);
+        if bit(&self.leaves, r) {
+            return Ok(());
+        }
+        self.retype(i, ObjectType::CNode, LEAF_BITS, LEAF_SCRATCH)?;
+        let copied = sys(Syscall::CNodeCopy, ROOT_CNODE, [r as u64, LEAF_SCRATCH, ALL, 0]);
+        let _ = syscall(Syscall::CapDelete, LEAF_SCRATCH, [0; 4]);
+        copied.map_err(|_| ENOMEM)?;
+        self.leaves[r / 64] |= 1 << (r % 64);
+        Ok(())
+    }
+
+    /// Forgets the leaves of the slots `from..from + n` (destroyed with
+    /// the blocks they were made from).
+    fn forget_leaves(&mut self, from: u64, n: u64) {
+        for r in (from >> LEAF_BITS) as usize..((from + n) >> LEAF_BITS) as usize {
+            self.leaves[r / 64] &= !(1 << (r % 64));
+        }
     }
 
     /// The process whose memory process `i` uses (see [`Proc::mem`]):
@@ -1273,28 +1325,47 @@ impl State {
         }
         let k = ((va - CHILD) / PAGE) as usize;
         let mirror = va - CHILD + MIRROR + i as u64 * SPAN;
+        let slot = page_slot(i, k);
+        self.leaf(i, slot)?;
         let p = &mut self.procs[i];
-        let n = if let Some(n) = p.frames.iter().position(|&f| f == FREE) {
-            let slot = slot_base(i) + n as u64;
-            sys(Syscall::FrameMap, slot + 1, [mirror, 1, 0, 0]).map_err(|_| ENOMEM)?;
-            // SAFETY: the frame was just mapped here, writable, a whole
-            // page at `mirror`; the process has it nowhere (munmap took
-            // it away) and waits on this server meanwhile.
-            unsafe { core::ptr::write_bytes(mirror as *mut u8, 0, PAGE as usize) };
-            n
-        } else {
-            if p.cursor + 2 > PROC_SPAN {
-                return Err(ENOMEM);
-            }
-            let slot = slot_base(i) + p.cursor;
-            self.retype(i, ObjectType::Frame, 0, slot)?;
-            let p = &mut self.procs[i];
-            sys(Syscall::CapMint, slot, [slot + 1, ALL, 0, 0]).map_err(|_| ENOMEM)?;
-            p.cursor += 2;
-            sys(Syscall::FrameMap, slot + 1, [mirror, 1, 0, 0]).map_err(|_| ENOMEM)?;
-            (slot - slot_base(i)) as usize
+        // A file's page mapped there: its slot is wanted.
+        if bit(&p.mapped, k) {
+            let _ = syscall(Syscall::CapDelete, slot, [0; 4]);
+            p.mapped[k / 64] &= !(1 << (k % 64));
+        }
+        let drop_frame = |slot: u64| {
+            let _ = syscall(Syscall::CapDelete, slot + 1, [0; 4]);
+            let _ = syscall(Syscall::CapDelete, slot, [0; 4]);
+            ENOMEM
         };
-        let slot = slot_base(i) + n as u64;
+        if bit(&p.parked, k) {
+            // Its own frame from before, still in the mirror.
+            p.parked[k / 64] &= !(1 << (k % 64));
+            p.nparked -= 1;
+            // SAFETY: the frame is mapped here, writable, a whole page at
+            // `mirror`; the process has it nowhere (munmap took it away)
+            // and waits on this server meanwhile.
+            unsafe { core::ptr::write_bytes(mirror as *mut u8, 0, PAGE as usize) };
+        } else if p.nparked > 0 {
+            // A frame another page gave back, moved to this page's slot.
+            let w = p.parked.iter().position(|&w| w != 0).ok_or(ENOMEM)?;
+            let j = w * 64 + p.parked[w].trailing_zeros() as usize;
+            let from = page_slot(i, j);
+            sys(Syscall::CapMint, from, [slot, ALL, 0, 0]).map_err(|_| ENOMEM)?;
+            let _ = syscall(Syscall::FrameUnmap, from + 1, [0; 4]);
+            let _ = syscall(Syscall::CapDelete, from + 1, [0; 4]);
+            let _ = syscall(Syscall::CapDelete, from, [0; 4]);
+            p.parked[w] &= !(1 << (j % 64));
+            p.nparked -= 1;
+            sys(Syscall::CapMint, slot, [slot + 1, ALL, 0, 0]).map_err(|_| drop_frame(slot))?;
+            sys(Syscall::FrameMap, slot + 1, [mirror, 1, 0, 0]).map_err(|_| drop_frame(slot))?;
+            // SAFETY: as above, just mapped at `mirror`.
+            unsafe { core::ptr::write_bytes(mirror as *mut u8, 0, PAGE as usize) };
+        } else {
+            self.retype(i, ObjectType::Frame, 0, slot)?;
+            sys(Syscall::CapMint, slot, [slot + 1, ALL, 0, 0]).map_err(|_| drop_frame(slot))?;
+            sys(Syscall::FrameMap, slot + 1, [mirror, 1, 0, 0]).map_err(|_| drop_frame(slot))?;
+        }
         if let Some(bytes) = code {
             let len = bytes.len().min(PAGE as usize);
             // SAFETY: the page is mapped here, writable, at `mirror`, and
@@ -1305,11 +1376,10 @@ impl State {
         let p = &mut self.procs[i];
         if sys(Syscall::FrameMapInto, slot, [va, flags, space_slot(i), 0]).is_err() {
             // Kept for another try.
-            let _ = syscall(Syscall::FrameUnmap, slot + 1, [0; 4]);
-            p.frames[n] = FREE;
+            p.parked[k / 64] |= 1 << (k % 64);
+            p.nparked += 1;
             return Err(ENOMEM);
         }
-        p.frames[n] = k as u16 + 1;
         p.present[k / 64] |= 1 << (k % 64);
         if code.is_some() {
             p.code[k / 64] |= 1 << (k % 64);
@@ -1318,7 +1388,7 @@ impl State {
     }
 
     /// `munmap` of process `i`'s own page at `va`, if it has one there:
-    /// unmapped from it and from the mirror, its frame kept to be used
+    /// unmapped from it, its frame kept (in the mirror still) to be used
     /// again ([`State::map_private`]).
     fn unmap_private(&mut self, i: usize, va: u64) {
         let i = self.mem(i);
@@ -1327,11 +1397,9 @@ impl State {
         }
         let k = ((va - CHILD) / PAGE) as usize;
         let p = &mut self.procs[i];
-        let Some(n) = p.frames.iter().position(|&f| f == k as u16 + 1) else { return };
-        let slot = slot_base(i) + n as u64;
-        let _ = syscall(Syscall::FrameUnmap, slot, [0; 4]);
-        let _ = syscall(Syscall::FrameUnmap, slot + 1, [0; 4]);
-        p.frames[n] = FREE;
+        let _ = syscall(Syscall::FrameUnmap, page_slot(i, k), [0; 4]);
+        p.parked[k / 64] |= 1 << (k % 64);
+        p.nparked += 1;
         p.present[k / 64] &= !(1 << (k % 64));
         p.code[k / 64] &= !(1 << (k % 64));
     }
@@ -1369,14 +1437,23 @@ impl State {
     /// (read-only, or executable).
     fn map_shared(&mut self, i: usize, va: u64, file_slot: u64, flags: u64) -> Result<(), u64> {
         let i = self.mem(i);
+        let k = ((va - CHILD) / PAGE) as usize;
+        let slot = page_slot(i, k);
+        self.leaf(i, slot)?;
         let p = &mut self.procs[i];
-        if p.cursor + 1 > PROC_SPAN {
+        if bit(&p.parked, k) {
+            // A frame given back there: its slot is wanted.
+            let _ = syscall(Syscall::FrameUnmap, slot + 1, [0; 4]);
+            let _ = syscall(Syscall::CapDelete, slot + 1, [0; 4]);
+            let _ = syscall(Syscall::CapDelete, slot, [0; 4]);
+            p.parked[k / 64] &= !(1 << (k % 64));
+            p.nparked -= 1;
+        }
+        sys(Syscall::CapMint, file_slot, [slot, ALL, 0, 0]).map_err(|_| ENOMEM)?;
+        if sys(Syscall::FrameMapInto, slot, [va, flags, space_slot(i), 0]).is_err() {
+            let _ = syscall(Syscall::CapDelete, slot, [0; 4]);
             return Err(ENOMEM);
         }
-        let slot = slot_base(i) + p.cursor;
-        sys(Syscall::CapMint, file_slot, [slot, ALL, 0, 0]).map_err(|_| ENOMEM)?;
-        p.cursor += 1;
-        sys(Syscall::FrameMapInto, slot, [va, flags, space_slot(i), 0]).map_err(|_| ENOMEM)?;
         Ok(())
     }
 
@@ -1556,7 +1633,8 @@ impl State {
         p.reserved = [0; CHILD_PAGES / 64];
         p.code = [0; CHILD_PAGES / 64];
         p.mapped = [0; CHILD_PAGES / 64];
-        p.frames = [0; PROC_SPAN as usize];
+        p.parked = [0; CHILD_PAGES / 64];
+        p.nparked = 0;
         (p.alarm, p.alarm_every) = (0, 0);
         (p.pgid, p.sid) = (pid, pid);
         p.pending = 0;
@@ -1593,9 +1671,10 @@ impl State {
     }
 
     /// Makes process `i`'s address space, and task `t`'s thread and fault
-    /// endpoint, at the start of the process's span.
+    /// endpoint, at the start of the process's slots.
     fn make_space(&mut self, i: usize, t: usize) -> Result<(), &'static str> {
-        let b = slot_base(i);
+        let b = space_slot(i);
+        self.leaf(i, b).map_err(|_| "no room for an address space")?;
         // Room for the page tables of a 256 MiB space, sparse.
         self.retype(i, ObjectType::AddressSpace, 18, b).map_err(|_| "no address space")?;
         self.procs[i].cursor = 1;
@@ -1603,15 +1682,16 @@ impl State {
     }
 
     /// Makes task `t`'s thread and its fault endpoint, in the next slots
-    /// of its process's span.
+    /// of its process's slots.
     fn make_thread(&mut self, t: usize) -> Result<(), u64> {
         let i = self.tasks[t].proc as usize;
         let p = &mut self.procs[i];
-        if p.cursor + 2 > PROC_SPAN {
+        if p.cursor + 2 > MISC_SPAN {
             return Err(ENOMEM);
         }
-        let s = slot_base(i) + p.cursor;
+        let s = misc_base(i) + p.cursor;
         p.cursor += 2;
+        self.leaf(i, s).and_then(|()| self.leaf(i, s + 1)).map_err(|_| EAGAIN)?;
         self.retype(i, ObjectType::Thread, 0, s).map_err(|_| EAGAIN)?;
         sys(Syscall::CapMint, EP, [s + 1, WRITE_RIGHT, t as u64 + 1, 0]).map_err(|_| EAGAIN)?;
         (self.tasks[t].thread, self.tasks[t].fault) = (s, s + 1);
@@ -1647,7 +1727,18 @@ impl State {
                 self.exit(c, signal::SIGKILL);
             }
         }
-        for s in slot_base(i)..slot_base(i) + self.procs[i].cursor {
+        // Files' pages mapped (minted from this server's), then its
+        // address space and threads; its frames and leaves go with its
+        // blocks.
+        for w in 0..CHILD_PAGES / 64 {
+            let mut m = self.procs[i].mapped[w];
+            while m != 0 {
+                let k = w * 64 + m.trailing_zeros() as usize;
+                let _ = syscall(Syscall::CapDelete, page_slot(i, k), [0; 4]);
+                m &= m - 1;
+            }
+        }
+        for s in misc_base(i)..misc_base(i) + self.procs[i].cursor {
             let _ = syscall(Syscall::CapDelete, s, [0; 4]);
         }
         let _ = syscall(Syscall::CapRevoke, block_slot(i), [0; 4]);
@@ -1657,13 +1748,16 @@ impl State {
                 self.spare_owner[k] = 0;
             }
         }
+        self.forget_leaves(misc_base(i), MISC_SPAN);
+        self.forget_leaves(page_slot(i, 0), PAGE_SLOTS);
         let p = &mut self.procs[i];
         p.cursor = 0;
         p.present = [0; CHILD_PAGES / 64];
         p.reserved = [0; CHILD_PAGES / 64];
         p.code = [0; CHILD_PAGES / 64];
         p.mapped = [0; CHILD_PAGES / 64];
-        p.frames = [0; PROC_SPAN as usize];
+        p.parked = [0; CHILD_PAGES / 64];
+        p.nparked = 0;
     }
 
     /// Runs bundle file `image` (a program) as task `t`'s process, its
@@ -3405,7 +3499,7 @@ fn fork_on(st: &mut State, t: usize, sp: u64, borrow: bool) -> Result<u64, u64> 
         Err(e)
     };
     if borrow {
-        // Its thread only, in its own span (from 1, as a space's would be).
+        // Its thread only, in its own slots (from 1, as a space's would be).
         st.procs[c].mem = m as u8;
         st.procs[c].vfork = true;
         st.procs[c].cursor = 1;
@@ -4033,7 +4127,7 @@ fn run(st: &mut State, argv: &[&str], env: &[&str], interactive: bool) -> Result
             // A page it may have that could not be made: memory ran out.
             let m = st.mem(i);
             if what == "page fault" && st.is_reserved(m, nr & !(PAGE - 1)) {
-                let pages = st.procs[m].cursor / 2;
+                let pages: u32 = st.procs[m].present.iter().map(|w| w.count_ones()).sum();
                 say!("linux: pid {} killed: out of memory at pc {pc:#x}, address {nr:#x} ({pages} pages its own)", st.procs[i].pid);
             } else {
                 say!("linux: pid {} killed: {what} at pc {pc:#x}, address {nr:#x}", st.procs[i].pid);
@@ -5655,13 +5749,14 @@ const RUNS: &[(&[&str], u32)] = &[
         ],
         0,
     ),
-    // A big program: 48 MiB of its own, a page at a time, more than a
-    // process's block and many spare blocks (4 MiB each) lent to it.
+    // A big program: 96 MiB of its own, a page at a time, more than a
+    // process's block and many spare blocks (4 MiB each) lent to it, and
+    // more than the 27904 slots a process once had (some 54 MiB).
     (
         &[
             "sh",
             "-c",
-            r#"cd /tmp/cc && printf 'int printf(const char *, ...); void *malloc(unsigned long);\nint main(void) {\n  unsigned long n = 48UL << 20, i, sum = 0;\n  unsigned char *p = malloc(n);\n  if (!p) { printf("big: no memory\\n"); return 1; }\n  for (i = 0; i < n; i += 4096) p[i] = i >> 12;\n  for (i = 0; i < n; i += 4096) sum += p[i];\n  printf("big: %%lu MiB touched, sum %%lu\\n", n >> 20, sum);\n  return 0;\n}\n' > big.c && tcc -o big big.c 2>&1 && ./big; s=$?; rm -f big big.c; exit $s"#,
+            r#"cd /tmp/cc && printf 'int printf(const char *, ...); void *malloc(unsigned long);\nint main(void) {\n  unsigned long n = 96UL << 20, i, sum = 0;\n  unsigned char *p = malloc(n);\n  if (!p) { printf("big: no memory\\n"); return 1; }\n  for (i = 0; i < n; i += 4096) p[i] = i >> 12;\n  for (i = 0; i < n; i += 4096) sum += p[i];\n  printf("big: %%lu MiB touched, sum %%lu\\n", n >> 20, sum);\n  return 0;\n}\n' > big.c && tcc -o big big.c 2>&1 && ./big; s=$?; rm -f big big.c; exit $s"#,
         ],
         0,
     ),

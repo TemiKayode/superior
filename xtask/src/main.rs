@@ -1430,8 +1430,9 @@ fn linux_test(img: &Image) -> Result<(), String> {
         // GTK 3 installed beside them: a window with a label, opened on
         // the personality's Wayland server and drawn.
         "linux: > gtk: 3.24.43 on GdkWaylandDisplay, a 240x80 window, its label drawn",
-        // 48 MiB touched by one process (12288 pages, numbered mod 256).
-        "linux: > big: 48 MiB touched, sum 1566720",
+        // 96 MiB touched by one process (24576 pages, numbered mod 256), past
+        // the 27904 slots (some 54 MiB) a process once had.
+        "linux: > big: 96 MiB touched, sum 3133440",
         // The terminal session (its steps were checked as it ran).
         "linux: running sh (pid ",
         "linux: sh exited with status 0",

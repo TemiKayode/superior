@@ -646,7 +646,8 @@ holds the rest):
     zeroed once at first boot, is handed to each new manager, which gives components
     their state pages from it, so they outlive the reboot. At most five reboots in
     60 s, then the system stops.
-  - Components may have larger CSpaces (manifest `cspace`, up to 2^18 slots). The
+  - Components may have larger CSpaces (manifest `cspace`, up to 2^18 slots, or
+    in two levels up to 2^32 with CNodes made for 2^18 of them). The
     manager makes a component's CNode first from its block, so a large one, aligned
     to its size, wastes none of it. A component's address space may be larger too
     (manifest `vspace`, up to 2^20 bytes, page tables included), for a driver that
@@ -2168,9 +2169,23 @@ holds the rest):
     it ran out of memory, and how many pages it had.
   - gdk-pixbuf tells GTK's icons' type (PNG) by GIO's MIME database. The
     test writes one of PNG alone, in the text files GIO reads when there
-    is no cache: building shared-mime-info's whole one takes
-    `update-mime-database` more than a process's some 54 MiB. That limit
-    is what stands before the browsers, which need several times it.
+    is no cache. (shared-mime-info's whole one writes a file per type,
+    851, some with names longer than the disk's 58 bytes.)
+- Memory bounded by RAM, not slots: the Linux personality's CSpace is in
+  two levels (`cspace 20 10 16`: 2^20 slots, a root of 2^10 CNodes of
+  2^10), the manager making the CNodes for the 2^16 slots its manifest
+  names and leaving the rest empty. `cnode 65534` gives it a copy of its
+  root, and it makes the others as a process needs them, from that
+  process's memory, so they go with it. Each process has fixed slots, two
+  for every page of its 256 MiB window (its frame, or a file's page, and
+  the mirror's copy), and 4,096 for its address space and threads; a
+  frame `munmap` gave back stays in the mirror and is moved to the next
+  page made. The CNodes take some 2 MiB of the personality's memory, not
+  8. `linux-test` has a program touch 96 MiB on both ISAs; one asking for
+  128 MiB on the 1 GiB test machine now gets some 114 MiB before the
+  RAM lent to the personality runs out. The manifest's `cspace` takes a
+  third number, the bits of slots the manager makes CNodes for (up to
+  18), and a two-level CSpace may be up to 32 bits.
 - `exec` copies a program's arguments and environment to its stack a piece
   at a time. Before, one longer than 4 KiB (a long `sh -c` script) ran
   past the copy buffer and stopped the personality.
